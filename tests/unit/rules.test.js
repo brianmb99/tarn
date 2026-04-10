@@ -52,18 +52,24 @@ const baseContext = {
 
 // ============ Null / empty rules ============
 
-describe('evaluateRules — null/empty', () => {
-  it('should allow when rules is null', async () => {
+describe('evaluateRules — null/empty/unset', () => {
+  it('should DENY when rules is null (no rules set by app)', async () => {
     const result = await evaluateRules(createMockDB(), null, baseContext);
-    assert.equal(result.allowed, true);
+    assert.equal(result.allowed, false);
+    assert.ok(result.failedRule.includes('No rules set'));
   });
 
-  it('should allow when rules is empty string', async () => {
+  it('should DENY when rules is undefined', async () => {
+    const result = await evaluateRules(createMockDB(), undefined, baseContext);
+    assert.equal(result.allowed, false);
+  });
+
+  it('should DENY when rules is empty string', async () => {
     const result = await evaluateRules(createMockDB(), '', baseContext);
-    assert.equal(result.allowed, true);
+    assert.equal(result.allowed, false);
   });
 
-  it('should allow when rules is empty array', async () => {
+  it('should ALLOW when rules is empty array (app explicitly set no restrictions)', async () => {
     const result = await evaluateRules(createMockDB(), '[]', baseContext);
     assert.equal(result.allowed, true);
   });

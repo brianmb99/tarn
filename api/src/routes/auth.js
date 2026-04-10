@@ -8,7 +8,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough } from '../cache.js';
 
-const PROTOCOL_VERSION = '0.3.0';
+import { PROTOCOL_VERSION } from '../constants.js';
 
 // ============ HELPERS ============
 

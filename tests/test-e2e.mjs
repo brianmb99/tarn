@@ -508,6 +508,13 @@ await test('Change credentials: existing entries still readable', async () => {
   await client.register(oldEmail, oldPassword);
   const dlk = client.dataLookupKey;
 
+  // Set rules (TarnClient register doesn't set rules — app must do it)
+  const { execSync } = await import('child_process');
+  execSync(
+    `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+    { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
+  );
+
   // Create entries with old credentials
   // (Use raw API since TarnClient.createEntry calls Turbo which may fail in local dev)
   const oldKeys = await deriveAllKeys(oldEmail, oldPassword, DEFAULT_APP_ID);

@@ -277,6 +277,6 @@ export async function upsertWriteThrough(db, txid, tags) {
  */
 export async function trackPendingTx(db, txid, dataLookupKey, app, type) {
   await db.prepare(
-    'INSERT OR IGNORE INTO pending_txs (txid, wallet_addr, data_lookup_key, app, type) VALUES (?1, ?2, ?3, ?4, ?5)'
-  ).bind(txid, dataLookupKey, dataLookupKey, app, type).run();
+    'INSERT OR IGNORE INTO pending_txs (txid, wallet_addr, data_lookup_key, app, type) VALUES (?1, NULL, ?2, ?3, ?4)'
+  ).bind(txid, dataLookupKey, app, type).run();
 }

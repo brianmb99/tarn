@@ -112,7 +112,7 @@ export async function handleCreateEntry(request, env, ctx, cors) {
 
   // Validate App tag matches JWT app claim
   const app = tagValue(tags, 'App') || '';
-  if (auth.app && app !== auth.app) {
+  if (!auth.app || app !== auth.app) {
     return errorResponse('App tag does not match authenticated app', 403, cors);
   }
   const type = tagValue(tags, 'Type') || '';

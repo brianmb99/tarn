@@ -41,6 +41,13 @@ export async function handleSyncAck(request, env, cors) {
   if (!Array.isArray(txids) || txids.length === 0) {
     return errorResponse('txids[] required', 400, cors);
   }
+  if (txids.length > 100) {
+    return errorResponse('txids[] max 100 items', 400, cors);
+  }
+  // Validate all items are non-empty strings
+  if (!txids.every(t => typeof t === 'string' && t.length > 0 && t.length < 100)) {
+    return errorResponse('txids[] must contain non-empty strings', 400, cors);
+  }
 
   // Delete matching rows for this user
   const placeholders = txids.map(() => '?').join(',');

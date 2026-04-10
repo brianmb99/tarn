@@ -6,7 +6,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { upsertWriteThrough } from '../cache.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 
-const PROTOCOL_VERSION = '0.3.0';
+import { PROTOCOL_VERSION } from '../constants.js';
 
 /**
  * Set write authorization rules for a user.
@@ -43,22 +43,17 @@ export async function handleSetRules(dataLookupKey, request, env, ctx, cors) {
     return errorResponse('rules must be an array', 400, cors);
   }
 
-  // Verify user account exists
+  // Verify user account exists AND belongs to this app
   const account = await env.DB.prepare(
-    'SELECT data_lookup_key FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT data_lookup_key, app FROM accounts WHERE data_lookup_key = ?1'
   ).bind(dataLookupKey).first();
 
   if (!account) {
     return errorResponse('User account not found', 404, cors);
   }
 
-  // Verify user has entries for this app (they're "our" user)
-  const hasEntries = await env.DB.prepare(
-    'SELECT 1 FROM entries WHERE lookup_key = ?1 AND app = ?2 AND is_tombstone = 0 LIMIT 1'
-  ).bind(dataLookupKey, appId).first();
-
-  if (!hasEntries) {
-    return errorResponse('User has no entries for this app', 403, cors);
+  if (account.app !== appId) {
+    return errorResponse('User is not registered for this app', 403, cors);
   }
 
   // Update rules in D1

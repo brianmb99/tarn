@@ -1,6 +1,7 @@
 // Health check endpoint
 
 import { jsonResponse } from '../worker.js';
+import { PROTOCOL_VERSION } from '../constants.js';
 
 const ARWEAVE_GRAPHQL = 'https://arweave.net/graphql';
 
@@ -31,7 +32,7 @@ export async function handleHealth(env, cors) {
   const healthy = checks.d1?.reachable && checks.arweave?.reachable;
 
   return jsonResponse(
-    { healthy, version: '0.3.0', checks },
+    { healthy, version: PROTOCOL_VERSION, checks },
     healthy ? 200 : 503,
     cors,
   );

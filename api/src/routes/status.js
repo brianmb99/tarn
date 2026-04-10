@@ -4,6 +4,7 @@
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getAddress } from '../ans104.js';
+import { PROTOCOL_VERSION } from '../constants.js';
 
 /**
  * GET /api/v1/status
@@ -98,7 +99,7 @@ export async function handleStatus(request, env, cors) {
     status.pending_txs = pendingTxs?.count ?? 0;
   } catch {}
 
-  status.protocol_version = '0.3.0';
+  status.protocol_version = PROTOCOL_VERSION;
   status.timestamp = new Date().toISOString();
 
   return jsonResponse(status, 200, cors);

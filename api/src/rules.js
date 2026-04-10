@@ -4,7 +4,9 @@
 /**
  * Evaluate write authorization rules for a user.
  * @param {Object} db - D1 database binding
- * @param {string|null} rulesJson - JSON string of rules array (null = unrestricted)
+ * @param {string|null} rulesJson - JSON string of rules array.
+ *   null = DENY (app must set rules before user can write).
+ *   '[]' (empty array) = ALLOW (app explicitly set no restrictions).
  * @param {Object} context - Write context
  * @param {string} context.data_lookup_key - The user's data lookup key
  * @param {string} context.app - App identifier from tags
@@ -13,8 +15,15 @@
  * @returns {Promise<{allowed: boolean, failedRule?: string}>}
  */
 export async function evaluateRules(db, rulesJson, context) {
-  // Null or empty rules = unrestricted
-  if (!rulesJson) return { allowed: true };
+  // Null = DENY. App must explicitly set rules (even empty array) before user can write.
+  if (rulesJson === null || rulesJson === undefined) {
+    return { allowed: false, failedRule: 'No rules set — app must configure write rules for this account' };
+  }
+
+  // Empty string = DENY (malformed)
+  if (rulesJson === '') {
+    return { allowed: false, failedRule: 'Empty rules — app must configure write rules' };
+  }
 
   let rules;
   try {

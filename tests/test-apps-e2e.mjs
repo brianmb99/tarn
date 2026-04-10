@@ -359,7 +359,7 @@ if (appReady) {
     assert(res.status === 200, `Status failed: ${res.status} ${res.text}`);
     assert(typeof res.json.users?.total === 'number', 'Should have users.total');
     assert(typeof res.json.entries?.total === 'number', 'Should have entries.total');
-    assert(res.json.protocol_version === '0.3.0', 'Should have protocol version');
+    assert(res.json.protocol_version === '0.4.0', 'Should have protocol version');
     assert(res.json.timestamp, 'Should have timestamp');
   });
 

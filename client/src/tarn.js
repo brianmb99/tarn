@@ -323,6 +323,18 @@ export class TarnClient {
 
   #requireAuth() {
     if (!this.#jwt) throw new Error('Not authenticated — call register() or login() first');
+    // Check JWT expiry (decode payload without verification — just for timing)
+    try {
+      const parts = this.#jwt.split('.');
+      const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+      if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+        this.#jwt = null; // Clear expired token
+        throw new Error('JWT expired — call login() to re-authenticate');
+      }
+    } catch (e) {
+      if (e.message.includes('expired')) throw e;
+      // If decoding fails, let the server reject it
+    }
   }
 
   async #authenticate() {

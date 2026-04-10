@@ -84,7 +84,7 @@ export default {
 
       // Entries — reads (public, IP rate-limited)
       if (path === '/api/v1/entries' && method === 'GET') {
-        return await handleEntries(url, env, ctx, cors);
+        return await handleEntries(url, env, ctx, cors, request);
       }
       if (path.startsWith('/api/v1/entries/') && method === 'GET') {
         const txid = path.slice('/api/v1/entries/'.length);

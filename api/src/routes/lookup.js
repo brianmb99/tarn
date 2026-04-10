@@ -35,7 +35,7 @@ export async function handleLookup(url, request, env, ctx, cors) {
   }
 
   // Validate lookup key format (64-char hex)
-  if (!/^[a-f0-9]{64}$/i.test(key)) {
+  if (!/^[a-f0-9]{64}$/.test(key)) {
     return errorResponse('Invalid key format: expected 64-char hex', 400, cors);
   }
 
