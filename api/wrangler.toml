@@ -1,0 +1,33 @@
+name = "tarn-api"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Custom domain — Wrangler creates DNS record on first deploy
+routes = [
+  { pattern = "api.getbookish.app", custom_domain = true },
+  { pattern = "api.tarn.dev", custom_domain = true }
+]
+
+[observability]
+enabled = true
+
+# D1 Database (entries cache)
+[[d1_databases]]
+binding = "DB"
+database_name = "bookish-api-cache"
+database_id = "46d5b598-19a3-4751-b4ce-70e903c5d4bf"
+
+# KV Namespace (IP rate limiting + write rate limiting)
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "3e2a7f0cba82490eb3053f1d5b7af5a8"
+
+# KV Namespace (auth nonces — 5 min TTL, single-use)
+[[kv_namespaces]]
+binding = "AUTH_KV"
+id = "f93f7550a0ed496eb2e4fd1c2e9bc75d"
+
+# Secrets (set via wrangler secret put <NAME> --name tarn-api):
+#   JWT_SECRET    - Base64-encoded 256-bit HMAC key for JWT signing
+#   BASE_RPC_URL  - Alchemy/paid Base RPC endpoint for fee broadcast

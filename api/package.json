@@ -1,0 +1,19 @@
+{
+  "name": "tarn-api",
+  "version": "1.0.0",
+  "description": "Tarn API — encrypted data platform cache and write layer",
+  "main": "src/worker.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test.mjs",
+    "migrate": "wrangler d1 migrations apply bookish-api-cache"
+  },
+  "dependencies": {
+    "ethers": "^6.15.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
