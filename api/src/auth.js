@@ -1,35 +1,47 @@
-// Auth primitives: JWT, challenge/nonce, signature verification
-// Uses WebCrypto HMAC-SHA256 for JWT (zero deps) and ethers for EIP-191 signature recovery.
-
-import { ethers } from 'ethers';
+// Auth primitives: JWT, challenge/nonce management
+// Uses WebCrypto HMAC-SHA256 for JWT (zero deps).
+// P-256 signature verification is in crypto.js (separate module).
 
 const JWT_TTL_SECONDS = 900; // 15 minutes
 const NONCE_TTL_SECONDS = 300; // 5 minutes
 
+export { JWT_TTL_SECONDS, NONCE_TTL_SECONDS };
+
 // ============ CHALLENGE / NONCE ============
 
-export function generateChallenge(address) {
+/**
+ * Generate a challenge nonce for P-256 signing.
+ * The client signs the raw nonce bytes with their private key.
+ * @returns {string} 64-character hex nonce
+ */
+export function generateChallenge() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
-  const nonce = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-  const message = [
-    'Sign this message to authenticate with Tarn API.',
-    '',
-    `Address: ${address}`,
-    `Nonce: ${nonce}`,
-    `Timestamp: ${new Date().toISOString()}`,
-  ].join('\n');
-  return { nonce, message };
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function storeNonce(env, nonce, address) {
+/**
+ * Store a nonce in AUTH_KV, scoped to a credential_lookup_key.
+ * Nonces are single-use and expire after NONCE_TTL_SECONDS.
+ * @param {Object} env - Worker environment (needs AUTH_KV binding)
+ * @param {string} nonce - The nonce to store
+ * @param {string} credentialLookupKey - The credential_lookup_key this nonce is for
+ */
+export async function storeNonce(env, nonce, credentialLookupKey) {
   await env.AUTH_KV.put(
     `nonce:${nonce}`,
-    JSON.stringify({ address: address.toLowerCase(), createdAt: Date.now() }),
+    JSON.stringify({ credentialLookupKey, createdAt: Date.now() }),
     { expirationTtl: NONCE_TTL_SECONDS }
   );
 }
 
+/**
+ * Consume a nonce (single-use). Returns stored data or null.
+ * Deletes the nonce from KV immediately to prevent replay.
+ * @param {Object} env - Worker environment
+ * @param {string} nonce - The nonce to consume
+ * @returns {Promise<{credentialLookupKey: string, createdAt: number}|null>}
+ */
 export async function consumeNonce(env, nonce) {
   const key = `nonce:${nonce}`;
   const raw = await env.AUTH_KV.get(key);
@@ -40,17 +52,6 @@ export async function consumeNonce(env, nonce) {
     return JSON.parse(raw);
   } catch {
     return null;
-  }
-}
-
-// ============ SIGNATURE VERIFICATION ============
-
-export function verifySignature(message, signature, expectedAddress) {
-  try {
-    const recovered = ethers.verifyMessage(message, signature);
-    return recovered.toLowerCase() === expectedAddress.toLowerCase();
-  } catch {
-    return false;
   }
 }
 
@@ -81,6 +82,12 @@ function base64urlDecode(str) {
   return atob(padded);
 }
 
+/**
+ * Sign a JWT with HMAC-SHA256.
+ * @param {Object} payload - JWT claims (sub, role, data_lookup_key, etc.)
+ * @param {string} secret - Base64-encoded HMAC secret
+ * @returns {Promise<string>} Signed JWT
+ */
 export async function signJWT(payload, secret) {
   const key = await getHMACKey(secret);
   const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
@@ -95,6 +102,12 @@ export async function signJWT(payload, secret) {
   return `${header}.${body}.${base64url(sig)}`;
 }
 
+/**
+ * Verify a JWT and return its payload, or null if invalid/expired.
+ * @param {string} token - JWT string
+ * @param {string} secret - Base64-encoded HMAC secret
+ * @returns {Promise<Object|null>} Decoded payload or null
+ */
 export async function verifyJWT(token, secret) {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
@@ -113,4 +126,11 @@ export async function verifyJWT(token, secret) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Clear cached HMAC key (for testing).
+ */
+export function _resetHMACKey() {
+  _hmacKey = null;
 }

@@ -3,7 +3,9 @@
 import { verifyJWT } from '../auth.js';
 
 /**
- * Verify JWT from Authorization header. Returns { address } on success.
+ * Verify JWT from Authorization header.
+ * Returns { data_lookup_key, role } for user tokens,
+ * or { data_lookup_key: app_id, role: 'app' } for app tokens.
  * Returns null if no token or invalid token — caller decides the error response.
  */
 export async function requireAuth(request, env) {
@@ -16,5 +18,8 @@ export async function requireAuth(request, env) {
   const payload = await verifyJWT(token, env.JWT_SECRET);
   if (!payload || !payload.sub) return null;
 
-  return { address: payload.sub };
+  return {
+    data_lookup_key: payload.sub,
+    role: payload.role || 'user',
+  };
 }
