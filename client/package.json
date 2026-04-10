@@ -1,0 +1,10 @@
+{
+  "name": "tarn-client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/tarn.js",
+  "exports": {
+    ".": "./src/tarn.js",
+    "./crypto": "./src/crypto.js"
+  }
+}
