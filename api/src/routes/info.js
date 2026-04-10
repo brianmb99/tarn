@@ -1,13 +1,8 @@
-// Health check and fee schedule endpoints
+// Health check endpoint
 
 import { jsonResponse } from '../worker.js';
-import { FEE_SCHEDULE } from '../constants.js';
 
 const ARWEAVE_GRAPHQL = 'https://arweave.net/graphql';
-
-export function handleFees(cors) {
-  return jsonResponse(FEE_SCHEDULE, 200, cors);
-}
 
 export async function handleHealth(env, cors) {
   const checks = {};
@@ -36,7 +31,7 @@ export async function handleHealth(env, cors) {
   const healthy = checks.d1?.reachable && checks.arweave?.reachable;
 
   return jsonResponse(
-    { healthy, version: '1.0.0', checks },
+    { healthy, version: '0.3.0', checks },
     healthy ? 200 : 503,
     cors,
   );

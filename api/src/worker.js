@@ -1,10 +1,10 @@
 // Tarn API — Encrypted data platform cache and write layer
-// Phase 1: Reads public, IP rate-limited. Phase 2: Authenticated writes.
+// Identity: ECDSA P-256 challenge-response auth. Data: AES-256-GCM encrypted blobs on Arweave.
 
-import { handleHealth, handleFees } from './routes/info.js';
+import { handleHealth } from './routes/info.js';
 import { handleEntries, handleEntryById } from './routes/entries.js';
 import { handleLookup } from './routes/lookup.js';
-import { handleChallenge, handleVerify } from './routes/auth.js';
+import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
 import { handleCreateEntry, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 
@@ -24,8 +24,7 @@ function getCorsHeaders(request) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Payment, X-Arweave-Tags, X-Signed-DataItem',
-    'Access-Control-Expose-Headers': 'X-Payment-Required',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Arweave-Tags',
   };
 }
 
@@ -57,7 +56,10 @@ export default {
     const method = request.method;
 
     try {
-      // Auth (public)
+      // Auth — registration and login
+      if (path === '/api/v1/auth/register' && method === 'POST') {
+        return await handleRegister(request, env, ctx, cors);
+      }
       if (path === '/api/v1/auth/challenge' && method === 'POST') {
         return await handleChallenge(request, env, cors);
       }
@@ -65,15 +67,20 @@ export default {
         return await handleVerify(request, env, cors);
       }
 
-      // Info (public, GET only)
+      // Auth — credential management (authenticated)
+      if (path === '/api/v1/auth' && method === 'PUT') {
+        return await handleCredentialChange(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/auth' && method === 'DELETE') {
+        return await handleDeleteAccount(request, env, ctx, cors);
+      }
+
+      // Info (public)
       if (path === '/api/v1/health' && method === 'GET') {
         return await handleHealth(env, cors);
       }
-      if (path === '/api/v1/fees' && method === 'GET') {
-        return handleFees(cors);
-      }
 
-      // Entries — reads
+      // Entries — reads (public, IP rate-limited)
       if (path === '/api/v1/entries' && method === 'GET') {
         return await handleEntries(url, env, ctx, cors);
       }
@@ -109,9 +116,16 @@ export default {
         return await handleSyncAck(request, env, cors);
       }
 
-      // Lookup (credentials, account metadata, GET only)
+      // Lookup (credentials, account metadata)
       if (path === '/api/v1/lookup' && method === 'GET') {
         return await handleLookup(url, request, env, ctx, cors);
+      }
+
+      // App management — rules (authenticated, app role)
+      const rulesMatch = path.match(/^\/api\/v1\/accounts\/([a-f0-9]{64})\/rules$/);
+      if (rulesMatch && method === 'PUT') {
+        // Deferred to Phase 4: import handleSetRules from './routes/apps.js'
+        return errorResponse('Not implemented', 501, cors);
       }
 
       return errorResponse('Not found', 404, cors);
