@@ -230,9 +230,9 @@ export class TarnClient {
     const entries = [];
     for (const entry of res.json.entries || []) {
       try {
-        const blobRes = await fetch(entry.gatewayUrl);
-        if (!blobRes.ok) continue;
-        const blobBytes = new Uint8Array(await blobRes.arrayBuffer());
+        // Try Turbo gateway first (near-instant for recent uploads), then Arweave L1
+        const blobBytes = await this.#fetchBlob(entry.txid);
+        if (!blobBytes) continue;
         const data = await decrypt(this.#dataEncryptionKey, blobBytes);
         entries.push({ txid: entry.txid, data, tags: entry.tags });
       } catch (err) {
@@ -363,6 +363,28 @@ export class TarnClient {
     }
 
     this.#jwt = verifyRes.json.jwt;
+  }
+
+  /**
+   * Fetch encrypted blob from gateways. Tries Turbo first (fast for recent uploads), Arweave L1 fallback.
+   */
+  async #fetchBlob(txid) {
+    const gateways = [
+      `https://turbo-gateway.com/${txid}`,
+      `https://arweave.net/${txid}`,
+    ];
+
+    for (const url of gateways) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (res.ok) {
+          return new Uint8Array(await res.arrayBuffer());
+        }
+      } catch {
+        // Try next gateway
+      }
+    }
+    return null;
   }
 
   async #fetch(path, { method = 'GET', body = null, auth = false } = {}) {

@@ -8,6 +8,7 @@ import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, 
 import { handleCreateEntry, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules } from './routes/apps.js';
+import { handleStatus } from './routes/status.js';
 
 // ============ CORS ============
 
@@ -120,6 +121,11 @@ export default {
       // Lookup (credentials, account metadata)
       if (path === '/api/v1/lookup' && method === 'GET') {
         return await handleLookup(url, request, env, ctx, cors);
+      }
+
+      // Status (authenticated — app or user)
+      if (path === '/api/v1/status' && method === 'GET') {
+        return await handleStatus(request, env, cors);
       }
 
       // App management — rules (authenticated, app role)

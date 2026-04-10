@@ -1,23 +1,22 @@
 // Sync endpoints: pending tx status and acknowledgment
-// Replaces upload-proxy's KV-based sync state with D1.
+// Tracks recently uploaded entries per data_lookup_key for client sync.
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
+import { isValidHex64 } from '../crypto.js';
 
-const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
-
-// GET /api/v1/sync/status?addr=0x... — no auth required
+// GET /api/v1/sync/status?key=<data_lookup_key> — no auth required
 export async function handleSyncStatus(url, env, cors) {
-  const addr = url.searchParams.get('addr')?.toLowerCase();
-  if (!addr || !ADDRESS_RE.test(addr)) {
-    return errorResponse('Missing or invalid addr parameter', 400, cors);
+  const key = url.searchParams.get('key');
+  if (!key || !isValidHex64(key)) {
+    return errorResponse('Missing or invalid key parameter (64-char hex)', 400, cors);
   }
 
   const result = await env.DB.prepare(
     `SELECT txid FROM pending_txs
-     WHERE wallet_addr = ?1 AND created_at > datetime('now', '-6 hours')
+     WHERE data_lookup_key = ?1 AND created_at > datetime('now', '-6 hours')
      ORDER BY created_at DESC`
-  ).bind(addr).all();
+  ).bind(key).all();
 
   const txids = (result.results || []).map(r => r.txid);
 
@@ -43,16 +42,16 @@ export async function handleSyncAck(request, env, cors) {
     return errorResponse('txids[] required', 400, cors);
   }
 
-  // Delete matching rows for this wallet
+  // Delete matching rows for this user
   const placeholders = txids.map(() => '?').join(',');
   const result = await env.DB.prepare(
-    `DELETE FROM pending_txs WHERE wallet_addr = ?1 AND txid IN (${placeholders})`
-  ).bind(auth.address.toLowerCase(), ...txids).run();
+    `DELETE FROM pending_txs WHERE data_lookup_key = ?1 AND txid IN (${placeholders})`
+  ).bind(auth.data_lookup_key, ...txids).run();
 
   const remaining = await env.DB.prepare(
     `SELECT COUNT(*) as count FROM pending_txs
-     WHERE wallet_addr = ?1 AND created_at > datetime('now', '-6 hours')`
-  ).bind(auth.address.toLowerCase()).first();
+     WHERE data_lookup_key = ?1 AND created_at > datetime('now', '-6 hours')`
+  ).bind(auth.data_lookup_key).first();
 
   return jsonResponse({
     removed: result.meta?.changes || 0,
