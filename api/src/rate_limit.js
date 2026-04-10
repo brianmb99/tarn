@@ -1,10 +1,10 @@
-// Write rate limiting: 100 writes per hour per wallet address
+// Write rate limiting: 100 writes per hour per data_lookup_key
 
 const MAX_WRITES_PER_HOUR = 100;
 
-export async function checkWriteRateLimit(env, walletAddr) {
+export async function checkWriteRateLimit(env, dataLookupKey) {
   const hour = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
-  const key = `write:${walletAddr.toLowerCase()}:${hour}`;
+  const key = `write:${dataLookupKey}:${hour}`;
   const count = parseInt(await env.RATE_KV.get(key) || '0');
   if (count >= MAX_WRITES_PER_HOUR) {
     return { allowed: false, remaining: 0 };

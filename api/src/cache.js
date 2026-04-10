@@ -64,14 +64,14 @@ export async function upsertEntries(db, edges) {
 // ============ RESOLUTION ============
 
 /**
- * Get resolved (live) entries for a wallet+app+type.
+ * Get resolved (live) entries for a data_lookup_key+app+type.
  * Filters tombstones, superseded Prev-chain entries, and Eid duplicates.
  */
-export async function getResolvedEntries(db, app, type, addr, { limit = 100, cursor = null } = {}) {
+export async function getResolvedEntries(db, app, type, dataLookupKey, { limit = 100, cursor = null } = {}) {
   // Fetch all entries for this scope (including tombstones and superseded)
   const all = await db.prepare(
-    'SELECT * FROM entries WHERE app = ?1 AND type = ?2 AND wallet_addr = ?3'
-  ).bind(app, type, addr.toLowerCase()).all();
+    'SELECT * FROM entries WHERE app = ?1 AND type = ?2 AND lookup_key = ?3'
+  ).bind(app, type, dataLookupKey).all();
 
   const rows = all.results || [];
   const live = resolveEntries(rows);
@@ -179,11 +179,11 @@ async function setCacheMeta(db, key, value) {
 }
 
 /**
- * Refresh cache for wallet-addressed entries. Stale-while-revalidate pattern.
- * Returns cache status for the response.
+ * Refresh cache for data entries by data_lookup_key. Stale-while-revalidate pattern.
+ * Queries Arweave by Lk tag, upserts into D1.
  */
-export async function refreshCache(env, ctx, app, type, addr) {
-  const cacheKey = `refresh:${addr.toLowerCase()}:${app}:${type}`;
+export async function refreshCache(env, ctx, app, type, dataLookupKey) {
+  const cacheKey = `refresh:${dataLookupKey}:${app}:${type}`;
   const meta = await getCacheMeta(env.DB, cacheKey);
   const now = Date.now();
 
@@ -191,14 +191,9 @@ export async function refreshCache(env, ctx, app, type, addr) {
     return { lastRefresh: meta.updated_at, stale: false };
   }
 
-  // Get known txids for incremental refresh
-  const known = await env.DB.prepare(
-    'SELECT txid FROM entries WHERE app = ?1 AND type = ?2 AND wallet_addr = ?3'
-  ).bind(app, type, addr.toLowerCase()).all();
-  const knownTxids = new Set((known.results || []).map(r => r.txid));
-
   const doRefresh = async () => {
-    const { edges, error } = await fetchAllPages(addr, { app, type }, knownTxids.size > 0 ? knownTxids : null);
+    // Use lookup key search (Lk tag) for data entries
+    const { edges, error } = await searchEntriesByLookupKey(dataLookupKey, { app, type });
     if (edges.length > 0) {
       await upsertEntries(env.DB, edges);
     }
@@ -280,8 +275,8 @@ export async function upsertWriteThrough(db, txid, tags) {
 /**
  * Track a pending transaction in D1 for sync status.
  */
-export async function trackPendingTx(db, txid, walletAddr, app, type) {
+export async function trackPendingTx(db, txid, dataLookupKey, app, type) {
   await db.prepare(
-    'INSERT OR IGNORE INTO pending_txs (txid, wallet_addr, app, type) VALUES (?1, ?2, ?3, ?4)'
-  ).bind(txid, walletAddr.toLowerCase(), app, type).run();
+    'INSERT OR IGNORE INTO pending_txs (txid, wallet_addr, data_lookup_key, app, type) VALUES (?1, ?2, ?3, ?4, ?5)'
+  ).bind(txid, dataLookupKey, dataLookupKey, app, type).run();
 }

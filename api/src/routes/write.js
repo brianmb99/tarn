@@ -1,19 +1,13 @@
 // Write endpoints: POST/PUT/DELETE entries
-// Ports upload-proxy logic with write-through D1 cache and pending tx tracking.
+// Auth via ECDSA P-256 JWT, write authorization via rules engine.
 
-import { ethers } from 'ethers';
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { checkWriteRateLimit } from '../rate_limit.js';
 import { upsertWriteThrough, trackPendingTx, getEntryByTxid } from '../cache.js';
-import {
-  PROTOCOL_WALLET, EXPECTED_FEE_WEI, MAX_UPLOAD_BYTES,
-  FEE_EXEMPT_TYPES, FEE_SCHEDULE,
-} from '../constants.js';
-
-const TURBO_UPLOAD_SIGNED_URL = 'https://upload.ardrive.io/v1/tx';
-const TURBO_GATEWAY = 'https://turbo-gateway.com';
-const BASE_RPC_FALLBACK = 'https://mainnet.base.org';
+import { evaluateRules } from '../rules.js';
+import { forwardToTurbo, TURBO_GATEWAY } from '../turbo.js';
+import { MAX_UPLOAD_BYTES } from '../constants.js';
 
 // ============ HELPERS ============
 
@@ -33,61 +27,14 @@ function tagValue(tags, name) {
   return tags.find(t => t.name === name)?.value || null;
 }
 
-function isFeeExempt(tags) {
-  if (tags.some(t => t.name === 'Prev' && t.value)) return true;
-  if (tags.some(t => t.name === 'Op' && t.value === 'tombstone')) return true;
-  const type = tagValue(tags, 'Type');
-  if (type && FEE_EXEMPT_TYPES.has(type)) return true;
-  return false;
-}
-
-function parsePayment(request) {
-  const raw = request.headers.get('X-Payment');
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
-}
-
-function validateSignedTx(payment) {
-  if (!payment?.signedTx) return 'missing signedTx field';
-  try {
-    const tx = ethers.Transaction.from(payment.signedTx);
-    if (!tx.to || tx.to.toLowerCase() !== PROTOCOL_WALLET.toLowerCase()) {
-      return `wrong recipient: expected ${PROTOCOL_WALLET}, got ${tx.to}`;
-    }
-    if (tx.value < BigInt(EXPECTED_FEE_WEI)) {
-      return `fee too low: expected >= ${EXPECTED_FEE_WEI} wei, got ${tx.value}`;
-    }
-    if (tx.chainId !== 8453n) {
-      return `wrong chain: expected 8453, got ${tx.chainId}`;
-    }
-    return null;
-  } catch (e) {
-    return `invalid signed transaction: ${e.message}`;
-  }
-}
-
-async function broadcastFee(signedTx, env) {
-  const rpcUrl = env?.BASE_RPC_URL || BASE_RPC_FALLBACK;
-  const network = ethers.Network.from(8453);
-  const provider = new ethers.JsonRpcProvider(rpcUrl, network, { staticNetwork: true });
-  const txResponse = await provider.broadcastTransaction(signedTx);
-  return { txHash: txResponse.hash };
-}
-
-async function forwardToTurbo(body) {
-  const res = await fetch(TURBO_UPLOAD_SIGNED_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body,
-    signal: AbortSignal.timeout(30000),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    return { ok: false, status: res.status, body: text.slice(0, 500) };
-  }
-  let result;
-  try { result = JSON.parse(text); } catch { result = { raw: text }; }
-  return { ok: true, result, txid: result.id || result.dataItemId };
+/**
+ * Look up account rules_json by data_lookup_key.
+ */
+async function getAccountRules(db, dataLookupKey) {
+  const account = await db.prepare(
+    'SELECT rules_json FROM accounts WHERE data_lookup_key = ?1'
+  ).bind(dataLookupKey).first();
+  return account?.rules_json || null;
 }
 
 // ============ POST /api/v1/entries — Create ============
@@ -98,7 +45,7 @@ export async function handleCreateEntry(request, env, ctx, cors) {
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit
-  const { allowed, remaining } = await checkWriteRateLimit(env, auth.address);
+  const { allowed, remaining } = await checkWriteRateLimit(env, auth.data_lookup_key);
   if (!allowed) {
     return jsonResponse(
       { error: 'Rate limit exceeded', retryAfter: 3600 },
@@ -123,66 +70,53 @@ export async function handleCreateEntry(request, env, ctx, cors) {
   const { tags, error: tagError } = parseTags(request);
   if (tagError) return errorResponse(tagError, 400, cors);
 
-  // Validate wallet match
-  const addrTag = tagValue(tags, 'Addr');
-  if (!addrTag || addrTag.toLowerCase() !== auth.address.toLowerCase()) {
-    return errorResponse('Addr tag does not match authenticated wallet', 403, cors);
+  // Validate Lk tag matches authenticated user
+  const lkTag = tagValue(tags, 'Lk');
+  if (!lkTag || lkTag !== auth.data_lookup_key) {
+    return errorResponse('Lk tag does not match authenticated identity', 403, cors);
   }
 
-  // Fee handling
-  let feeTxHash = null;
-  let feeError = null;
-  if (!isFeeExempt(tags)) {
-    const payment = parsePayment(request);
-    if (!payment) {
-      return jsonResponse(
-        { error: 'Payment required', feeSchedule: FEE_SCHEDULE },
-        402, cors
-      );
-    }
-    const valError = validateSignedTx(payment);
-    if (valError) {
-      return jsonResponse(
-        { error: 'Invalid payment', detail: valError, feeSchedule: FEE_SCHEDULE },
-        402, cors
-      );
-    }
-    try {
-      const result = await broadcastFee(payment.signedTx, env);
-      feeTxHash = result.txHash;
-      console.log(`[tarn-api] Fee broadcast: ${feeTxHash}`);
-    } catch (e) {
-      feeError = e.message;
-      console.error(`[tarn-api] Fee broadcast failed (non-blocking): ${feeError}`);
-    }
+  // Evaluate write authorization rules
+  const app = tagValue(tags, 'App') || '';
+  const type = tagValue(tags, 'Type') || '';
+
+  const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
+  const ruleResult = await evaluateRules(env.DB, rulesJson, {
+    data_lookup_key: auth.data_lookup_key,
+    app,
+    type,
+    payloadBytes: body.byteLength,
+  });
+
+  if (!ruleResult.allowed) {
+    return jsonResponse(
+      { error: 'Write denied by authorization rules', detail: ruleResult.failedRule },
+      403, cors
+    );
   }
 
   // Forward to Turbo
   const turbo = await forwardToTurbo(body);
   if (!turbo.ok) {
     return jsonResponse(
-      { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body, feeTxHash, feeError },
+      { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },
       502, cors
     );
   }
 
   const txid = turbo.txid;
-  const app = tagValue(tags, 'App') || '';
-  const type = tagValue(tags, 'Type') || '';
 
   // Write-through cache + pending tracking (non-blocking)
   if (txid) {
     ctx.waitUntil(Promise.all([
       upsertWriteThrough(env.DB, txid, tags),
-      trackPendingTx(env.DB, txid, auth.address, app, type),
+      trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
     ]));
   }
 
   return jsonResponse({
     id: txid,
     gateway: txid ? `${TURBO_GATEWAY}/${txid}` : null,
-    feeTxHash,
-    feeError,
     status: 'pending',
   }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
 }
@@ -195,7 +129,7 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit
-  const { allowed, remaining } = await checkWriteRateLimit(env, auth.address);
+  const { allowed, remaining } = await checkWriteRateLimit(env, auth.data_lookup_key);
   if (!allowed) {
     return jsonResponse(
       { error: 'Rate limit exceeded', retryAfter: 3600 },
@@ -203,9 +137,9 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     );
   }
 
-  // Validate prior entry exists and belongs to this wallet
+  // Validate prior entry exists and belongs to this user
   const prior = await getEntryByTxid(env.DB, priorTxid);
-  if (!prior || (prior.wallet_addr && prior.wallet_addr.toLowerCase() !== auth.address.toLowerCase())) {
+  if (!prior || (prior.lookup_key && prior.lookup_key !== auth.data_lookup_key)) {
     return errorResponse('Entry not found', 404, cors);
   }
 
@@ -220,9 +154,9 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
   const { tags, error: tagError } = parseTags(request);
   if (tagError) return errorResponse(tagError, 400, cors);
 
-  const addrTag = tagValue(tags, 'Addr');
-  if (!addrTag || addrTag.toLowerCase() !== auth.address.toLowerCase()) {
-    return errorResponse('Addr tag does not match authenticated wallet', 403, cors);
+  const lkTag = tagValue(tags, 'Lk');
+  if (!lkTag || lkTag !== auth.data_lookup_key) {
+    return errorResponse('Lk tag does not match authenticated identity', 403, cors);
   }
 
   const prevTag = tagValue(tags, 'Prev');
@@ -230,7 +164,26 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     return errorResponse('Prev tag must match the entry being edited', 400, cors);
   }
 
-  // Edits are always fee-exempt — forward to Turbo
+  // Evaluate write rules (edits count too)
+  const app = tagValue(tags, 'App') || '';
+  const type = tagValue(tags, 'Type') || '';
+
+  const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
+  const ruleResult = await evaluateRules(env.DB, rulesJson, {
+    data_lookup_key: auth.data_lookup_key,
+    app,
+    type,
+    payloadBytes: body.byteLength,
+  });
+
+  if (!ruleResult.allowed) {
+    return jsonResponse(
+      { error: 'Write denied by authorization rules', detail: ruleResult.failedRule },
+      403, cors
+    );
+  }
+
+  // Forward to Turbo
   const turbo = await forwardToTurbo(body);
   if (!turbo.ok) {
     return jsonResponse(
@@ -240,13 +193,11 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
   }
 
   const txid = turbo.txid;
-  const app = tagValue(tags, 'App') || '';
-  const type = tagValue(tags, 'Type') || '';
 
   if (txid) {
     ctx.waitUntil(Promise.all([
       upsertWriteThrough(env.DB, txid, tags),
-      trackPendingTx(env.DB, txid, auth.address, app, type),
+      trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
     ]));
   }
 
@@ -266,7 +217,7 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit
-  const { allowed, remaining } = await checkWriteRateLimit(env, auth.address);
+  const { allowed, remaining } = await checkWriteRateLimit(env, auth.data_lookup_key);
   if (!allowed) {
     return jsonResponse(
       { error: 'Rate limit exceeded', retryAfter: 3600 },
@@ -274,9 +225,9 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     );
   }
 
-  // Validate target entry exists and belongs to this wallet
+  // Validate target entry exists and belongs to this user
   const target = await getEntryByTxid(env.DB, targetTxid);
-  if (!target || (target.wallet_addr && target.wallet_addr.toLowerCase() !== auth.address.toLowerCase())) {
+  if (!target || (target.lookup_key && target.lookup_key !== auth.data_lookup_key)) {
     return errorResponse('Entry not found', 404, cors);
   }
 
@@ -288,9 +239,9 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
   const { tags, error: tagError } = parseTags(request);
   if (tagError) return errorResponse(tagError, 400, cors);
 
-  const addrTag = tagValue(tags, 'Addr');
-  if (!addrTag || addrTag.toLowerCase() !== auth.address.toLowerCase()) {
-    return errorResponse('Addr tag does not match authenticated wallet', 403, cors);
+  const lkTag = tagValue(tags, 'Lk');
+  if (!lkTag || lkTag !== auth.data_lookup_key) {
+    return errorResponse('Lk tag does not match authenticated identity', 403, cors);
   }
 
   if (!tags.some(t => t.name === 'Op' && t.value === 'tombstone')) {
@@ -301,7 +252,26 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     return errorResponse('Ref tag must match the entry being deleted', 400, cors);
   }
 
-  // Tombstones are always fee-exempt — forward to Turbo
+  // Evaluate write rules (tombstones count too — expired subscriptions can't delete)
+  const app = tagValue(tags, 'App') || '';
+  const type = tagValue(tags, 'Type') || '';
+
+  const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
+  const ruleResult = await evaluateRules(env.DB, rulesJson, {
+    data_lookup_key: auth.data_lookup_key,
+    app,
+    type,
+    payloadBytes: body.byteLength,
+  });
+
+  if (!ruleResult.allowed) {
+    return jsonResponse(
+      { error: 'Write denied by authorization rules', detail: ruleResult.failedRule },
+      403, cors
+    );
+  }
+
+  // Forward to Turbo
   const turbo = await forwardToTurbo(body);
   if (!turbo.ok) {
     return jsonResponse(
@@ -311,13 +281,11 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
   }
 
   const txid = turbo.txid;
-  const app = tagValue(tags, 'App') || '';
-  const type = tagValue(tags, 'Type') || '';
 
   if (txid) {
     ctx.waitUntil(Promise.all([
       upsertWriteThrough(env.DB, txid, tags),
-      trackPendingTx(env.DB, txid, auth.address, app, type),
+      trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
     ]));
   }
 

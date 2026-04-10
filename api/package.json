@@ -10,9 +10,7 @@
     "test": "node test.mjs",
     "migrate": "wrangler d1 migrations apply bookish-api-cache"
   },
-  "dependencies": {
-    "ethers": "^6.15.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "wrangler": "^3.0.0"
   }

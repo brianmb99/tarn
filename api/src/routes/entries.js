@@ -1,5 +1,4 @@
-// Entry listing and single-entry endpoints
-// Phase 1d: full implementation. This is the stub.
+// Entry listing and single-entry endpoints (read-only, unauthenticated)
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { getResolvedEntries, getEntryByTxid, refreshCache } from '../cache.js';
@@ -7,20 +6,20 @@ import { getResolvedEntries, getEntryByTxid, refreshCache } from '../cache.js';
 export async function handleEntries(url, env, ctx, cors) {
   const app = url.searchParams.get('app');
   const type = url.searchParams.get('type');
-  const addr = url.searchParams.get('addr');
+  const key = url.searchParams.get('key');
 
-  if (!app || !type || !addr) {
-    return errorResponse('Missing required params: app, type, addr', 400, cors);
+  if (!app || !type || !key) {
+    return errorResponse('Missing required params: app, type, key', 400, cors);
   }
 
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
   const cursor = url.searchParams.get('cursor') || null;
 
   // Check cache freshness and refresh if needed
-  const cacheStatus = await refreshCache(env, ctx, app, type, addr);
+  const cacheStatus = await refreshCache(env, ctx, app, type, key);
 
   // Resolve live entries (tombstone + Prev-chain + Eid filtering)
-  const { entries, total } = await getResolvedEntries(env.DB, app, type, addr, { limit, cursor });
+  const { entries, total } = await getResolvedEntries(env.DB, app, type, key, { limit, cursor });
 
   return jsonResponse({
     entries: entries.map(e => ({
@@ -46,15 +45,15 @@ export async function handleEntries(url, env, ctx, cors) {
 }
 
 export async function handleEntryById(txid, url, env, ctx, cors) {
-  const addr = url.searchParams.get('addr') || null;
+  const key = url.searchParams.get('key') || null;
 
   const entry = await getEntryByTxid(env.DB, txid);
   if (!entry) {
     return errorResponse('Entry not found', 404, cors);
   }
 
-  // If addr provided, verify ownership
-  if (addr && entry.wallet_addr && entry.wallet_addr.toLowerCase() !== addr.toLowerCase()) {
+  // If key provided, verify ownership
+  if (key && entry.lookup_key && entry.lookup_key !== key) {
     return errorResponse('Entry not found', 404, cors);
   }
 
