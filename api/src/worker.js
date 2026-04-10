@@ -7,6 +7,7 @@ import { handleLookup } from './routes/lookup.js';
 import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
 import { handleCreateEntry, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
+import { handleSetRules } from './routes/apps.js';
 
 // ============ CORS ============
 
@@ -124,8 +125,7 @@ export default {
       // App management — rules (authenticated, app role)
       const rulesMatch = path.match(/^\/api\/v1\/accounts\/([a-f0-9]{64})\/rules$/);
       if (rulesMatch && method === 'PUT') {
-        // Deferred to Phase 4: import handleSetRules from './routes/apps.js'
-        return errorResponse('Not implemented', 501, cors);
+        return await handleSetRules(rulesMatch[1], request, env, ctx, cors);
       }
 
       return errorResponse('Not found', 404, cors);
