@@ -18,8 +18,8 @@ function generateDataLookupKey() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey) {
-  return JSON.stringify({ data_lookup_key: dataLookupKey, wrapped_data_key: wrappedDataKey, public_key: publicKey });
+function buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app) {
+  return JSON.stringify({ data_lookup_key: dataLookupKey, wrapped_data_key: wrappedDataKey, public_key: publicKey, app });
 }
 
 function buildCredentialTags(credentialLookupKey) {
@@ -35,8 +35,8 @@ function buildCredentialTags(credentialLookupKey) {
  * Persist a credential mapping blob to Arweave (non-blocking).
  * Returns immediately — upload runs in ctx.waitUntil.
  */
-function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey) {
-  const blobBody = buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey);
+function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey, app) {
+  const blobBody = buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app);
   const tags = buildCredentialTags(credentialLookupKey);
 
   ctx.waitUntil((async () => {
@@ -64,7 +64,30 @@ function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wra
 
 // ============ POST /api/v1/auth/register ============
 
+const MAX_REGISTRATIONS_PER_HOUR = 100;
+
+async function checkRegistrationRateLimit(env, request) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const data = new TextEncoder().encode(ip + '-tarn-register-salt');
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const ipHash = Array.from(new Uint8Array(hash)).slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
+  const hour = new Date().toISOString().slice(0, 13);
+  const key = `register:${ipHash}:${hour}`;
+  const count = parseInt(await env.RATE_KV.get(key) || '0');
+  if (count >= MAX_REGISTRATIONS_PER_HOUR) {
+    return { allowed: false };
+  }
+  await env.RATE_KV.put(key, String(count + 1), { expirationTtl: 3600 });
+  return { allowed: true };
+}
+
 export async function handleRegister(request, env, ctx, cors) {
+  // IP rate limit
+  const { allowed } = await checkRegistrationRateLimit(env, request);
+  if (!allowed) {
+    return errorResponse('Registration rate limit exceeded', 429, cors);
+  }
+
   let body;
   try {
     body = await request.json();
@@ -132,7 +155,7 @@ export async function handleRegister(request, env, ctx, cors) {
   ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now()).run();
 
   // Persist credential mapping to Arweave (non-blocking)
-  persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key);
+  persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app);
 
   return jsonResponse({ data_lookup_key }, 201, cors);
 }
@@ -309,7 +332,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
   ]);
 
   // Persist new credential mapping to Arweave (non-blocking)
-  persistCredentialBlob(ctx, env, new_credential_lookup_key, auth.data_lookup_key, new_wrapped_data_key, new_public_key);
+  persistCredentialBlob(ctx, env, new_credential_lookup_key, auth.data_lookup_key, new_wrapped_data_key, new_public_key, current.app);
 
   return jsonResponse({ ok: true }, 200, cors);
 }

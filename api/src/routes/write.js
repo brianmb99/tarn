@@ -183,6 +183,12 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     return errorResponse('Lk tag does not match authenticated identity', 403, cors);
   }
 
+  // Validate App tag matches JWT app claim
+  const app = tagValue(tags, 'App') || '';
+  if (!auth.app || app !== auth.app) {
+    return errorResponse('App tag does not match authenticated app', 403, cors);
+  }
+
   const prevTag = tagValue(tags, 'Prev');
   if (!prevTag || prevTag !== priorTxid) {
     return errorResponse('Prev tag must match the entry being edited', 400, cors);
@@ -192,7 +198,7 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
   const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
   const ruleResult = await evaluateRules(env.DB, rulesJson, {
     data_lookup_key: auth.data_lookup_key,
-    app: tagValue(tags, 'App') || '',
+    app,
     type: tagValue(tags, 'Type') || '',
     payloadBytes: body.byteLength,
   });
@@ -253,6 +259,12 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     return errorResponse('Lk tag does not match authenticated identity', 403, cors);
   }
 
+  // Validate App tag matches JWT app claim
+  const app = tagValue(tags, 'App') || '';
+  if (!auth.app || app !== auth.app) {
+    return errorResponse('App tag does not match authenticated app', 403, cors);
+  }
+
   if (!tags.some(t => t.name === 'Op' && t.value === 'tombstone')) {
     return errorResponse('Missing Op=tombstone tag', 400, cors);
   }
@@ -265,7 +277,7 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
   const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
   const ruleResult = await evaluateRules(env.DB, rulesJson, {
     data_lookup_key: auth.data_lookup_key,
-    app: tagValue(tags, 'App') || '',
+    app,
     type: tagValue(tags, 'Type') || '',
     payloadBytes: body.byteLength,
   });

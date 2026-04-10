@@ -104,7 +104,7 @@ async function rawRegisterAndLogin() {
   const rulesSql = `UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'`;
   try {
     execSync(
-      `npx wrangler d1 execute bookish-api-cache --local --command "${rulesSql}"`,
+      `npx wrangler d1 execute tarn-api-cache --local --command "${rulesSql}"`,
       { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
     );
   } catch {}
@@ -511,7 +511,7 @@ await test('Change credentials: existing entries still readable', async () => {
   // Set rules (TarnClient register doesn't set rules — app must do it)
   const { execSync } = await import('child_process');
   execSync(
-    `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+    `npx wrangler d1 execute tarn-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
     { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
   );
 
