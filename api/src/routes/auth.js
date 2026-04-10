@@ -5,7 +5,7 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { generateChallenge, storeNonce, consumeNonce, signJWT } from '../auth.js';
 import { importPublicKey, verifySignature, isValidHex64 } from '../crypto.js';
 import { requireAuth } from '../middleware/auth.js';
-import { uploadToArweave } from '../turbo.js';
+import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough } from '../cache.js';
 
 const PROTOCOL_VERSION = '0.3.0';
@@ -47,12 +47,14 @@ function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wra
         return;
       }
       const blobBytes = new TextEncoder().encode(blobBody);
-      const turbo = await uploadToArweave(blobBytes, tags, signingKey);
-      if (turbo.ok && turbo.txid) {
-        await upsertWriteThrough(env.DB, turbo.txid, tags);
-        console.log(`[tarn-api] Credential blob uploaded: ${turbo.txid}`);
+      const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
+      await upsertWriteThrough(env.DB, txid, tags);
+      console.log(`[tarn-api] Credential blob cached: ${txid}`);
+      const turbo = await uploadSignedDataItem(signedDataItem);
+      if (turbo.ok) {
+        console.log(`[tarn-api] Credential blob uploaded to Turbo: ${txid}`);
       } else {
-        console.warn('[tarn-api] Credential blob upload failed:', turbo.body || turbo.status);
+        console.warn(`[tarn-api] Credential blob Turbo upload failed: ${turbo.status} ${turbo.body}`);
       }
     } catch (err) {
       console.error('[tarn-api] Credential blob upload error:', err.message);
@@ -343,10 +345,12 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
           return;
         }
         const tombstoneBody = new TextEncoder().encode(JSON.stringify({ tombstone: true }));
-        const turbo = await uploadToArweave(tombstoneBody, tombstoneTags, signingKey);
-        if (turbo.ok && turbo.txid) {
-          await upsertWriteThrough(env.DB, turbo.txid, tombstoneTags);
-          console.log(`[tarn-api] Account tombstone uploaded: ${turbo.txid}`);
+        const { signedDataItem, txid } = await buildSignedDataItem(tombstoneBody, tombstoneTags, signingKey);
+        await upsertWriteThrough(env.DB, txid, tombstoneTags);
+        console.log(`[tarn-api] Account tombstone cached: ${txid}`);
+        const turbo = await uploadSignedDataItem(signedDataItem);
+        if (turbo.ok) {
+          console.log(`[tarn-api] Account tombstone uploaded to Turbo: ${txid}`);
         }
       } catch (err) {
         console.error('[tarn-api] Account tombstone upload error:', err.message);

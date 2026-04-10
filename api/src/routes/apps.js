@@ -4,7 +4,7 @@
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { upsertWriteThrough } from '../cache.js';
-import { uploadToArweave } from '../turbo.js';
+import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 
 const PROTOCOL_VERSION = '0.3.0';
 
@@ -89,10 +89,12 @@ export async function handleSetRules(dataLookupKey, request, env, ctx, cors) {
         return;
       }
       const blobBytes = new TextEncoder().encode(configBody);
-      const turbo = await uploadToArweave(blobBytes, tags, signingKey);
-      if (turbo.ok && turbo.txid) {
-        await upsertWriteThrough(env.DB, turbo.txid, tags);
-        console.log(`[tarn-api] App-config uploaded: ${turbo.txid}`);
+      const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
+      await upsertWriteThrough(env.DB, txid, tags);
+      console.log(`[tarn-api] App-config cached: ${txid}`);
+      const turbo = await uploadSignedDataItem(signedDataItem);
+      if (turbo.ok) {
+        console.log(`[tarn-api] App-config uploaded to Turbo: ${txid}`);
       }
     } catch (err) {
       console.error('[tarn-api] App-config upload error:', err.message);

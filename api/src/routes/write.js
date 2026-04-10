@@ -1,12 +1,15 @@
 // Write endpoints: POST/PUT/DELETE entries
 // Auth via ECDSA P-256 JWT, write authorization via rules engine.
+// Pattern: build + sign DataItem → compute txid locally → cache in D1 → upload to Turbo in background.
+// This means D1 cache is immediately populated and reads work instantly.
+// Turbo upload is best-effort (background). If it fails, data is in D1 but not yet on Arweave.
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { checkWriteRateLimit } from '../rate_limit.js';
 import { upsertWriteThrough, trackPendingTx, getEntryByTxid } from '../cache.js';
 import { evaluateRules } from '../rules.js';
-import { uploadToArweave, forwardToTurbo, TURBO_GATEWAY } from '../turbo.js';
+import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../turbo.js';
 import { MAX_UPLOAD_BYTES } from '../constants.js';
 
 // ============ HELPERS ============
@@ -27,14 +30,45 @@ function tagValue(tags, name) {
   return tags.find(t => t.name === name)?.value || null;
 }
 
-/**
- * Look up account rules_json by data_lookup_key.
- */
 async function getAccountRules(db, dataLookupKey) {
   const account = await db.prepare(
     'SELECT rules_json FROM accounts WHERE data_lookup_key = ?1'
   ).bind(dataLookupKey).first();
   return account?.rules_json || null;
+}
+
+/**
+ * Common write flow: build DataItem, cache in D1, upload to Turbo in background.
+ * Returns the txid (computed locally from DataItem signature).
+ */
+async function signCacheAndUpload(body, tags, env, ctx, auth) {
+  const signingKey = env.APP_SIGNING_KEY;
+  if (!signingKey) {
+    return { error: 'Server signing key not configured', status: 500 };
+  }
+
+  // Build and sign DataItem, compute txid locally
+  const { signedDataItem, txid } = await buildSignedDataItem(new Uint8Array(body), tags, signingKey);
+
+  const app = tagValue(tags, 'App') || '';
+  const type = tagValue(tags, 'Type') || '';
+
+  // Write to D1 cache immediately (synchronous)
+  await upsertWriteThrough(env.DB, txid, tags);
+  await trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type);
+
+  // Upload to Turbo in background (non-blocking)
+  ctx.waitUntil((async () => {
+    const result = await uploadSignedDataItem(signedDataItem);
+    if (result.ok) {
+      console.log(`[tarn-api] Turbo upload OK: ${txid}`);
+    } else {
+      console.warn(`[tarn-api] Turbo upload failed for ${txid}: ${result.status} ${result.body}`);
+      // Data is still in D1 cache. Will sync to Arweave on retry or backfill.
+    }
+  })());
+
+  return { txid };
 }
 
 // ============ POST /api/v1/entries — Create ============
@@ -95,33 +129,15 @@ export async function handleCreateEntry(request, env, ctx, cors) {
     );
   }
 
-  // Sign DataItem server-side and upload to Turbo
-  const signingKey = env.APP_SIGNING_KEY;
-  if (!signingKey) {
-    return errorResponse('Server signing key not configured', 500, cors);
-  }
-
-  const turbo = await uploadToArweave(new Uint8Array(body), tags, signingKey);
-  if (!turbo.ok) {
-    return jsonResponse(
-      { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },
-      502, cors
-    );
-  }
-
-  const txid = turbo.txid;
-
-  // Write-through cache + pending tracking (non-blocking)
-  if (txid) {
-    ctx.waitUntil(Promise.all([
-      upsertWriteThrough(env.DB, txid, tags),
-      trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
-    ]));
+  // Sign, cache, upload
+  const result = await signCacheAndUpload(body, tags, env, ctx, auth);
+  if (result.error) {
+    return errorResponse(result.error, result.status, cors);
   }
 
   return jsonResponse({
-    id: txid,
-    gateway: txid ? `${TURBO_GATEWAY}/${txid}` : null,
+    id: result.txid,
+    gateway: `${TURBO_GATEWAY}/${result.txid}`,
     status: 'pending',
   }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
 }
@@ -169,15 +185,12 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     return errorResponse('Prev tag must match the entry being edited', 400, cors);
   }
 
-  // Evaluate write rules (edits count too)
-  const app = tagValue(tags, 'App') || '';
-  const type = tagValue(tags, 'Type') || '';
-
+  // Evaluate write rules
   const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
   const ruleResult = await evaluateRules(env.DB, rulesJson, {
     data_lookup_key: auth.data_lookup_key,
-    app,
-    type,
+    app: tagValue(tags, 'App') || '',
+    type: tagValue(tags, 'Type') || '',
     payloadBytes: body.byteLength,
   });
 
@@ -188,27 +201,15 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     );
   }
 
-  // Sign DataItem server-side and upload to Turbo
-  const turbo = await uploadToArweave(new Uint8Array(body), tags, env.APP_SIGNING_KEY);
-  if (!turbo.ok) {
-    return jsonResponse(
-      { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },
-      502, cors
-    );
-  }
-
-  const txid = turbo.txid;
-
-  if (txid) {
-    ctx.waitUntil(Promise.all([
-      upsertWriteThrough(env.DB, txid, tags),
-      trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
-    ]));
+  // Sign, cache, upload
+  const result = await signCacheAndUpload(body, tags, env, ctx, auth);
+  if (result.error) {
+    return errorResponse(result.error, result.status, cors);
   }
 
   return jsonResponse({
-    id: txid,
-    gateway: txid ? `${TURBO_GATEWAY}/${txid}` : null,
+    id: result.txid,
+    gateway: `${TURBO_GATEWAY}/${result.txid}`,
     prevTxid: priorTxid,
     status: 'pending',
   }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
@@ -257,15 +258,12 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     return errorResponse('Ref tag must match the entry being deleted', 400, cors);
   }
 
-  // Evaluate write rules (tombstones count too — expired subscriptions can't delete)
-  const app = tagValue(tags, 'App') || '';
-  const type = tagValue(tags, 'Type') || '';
-
+  // Evaluate write rules
   const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
   const ruleResult = await evaluateRules(env.DB, rulesJson, {
     data_lookup_key: auth.data_lookup_key,
-    app,
-    type,
+    app: tagValue(tags, 'App') || '',
+    type: tagValue(tags, 'Type') || '',
     payloadBytes: body.byteLength,
   });
 
@@ -276,27 +274,15 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     );
   }
 
-  // Sign DataItem server-side and upload to Turbo
-  const turbo = await uploadToArweave(new Uint8Array(body), tags, env.APP_SIGNING_KEY);
-  if (!turbo.ok) {
-    return jsonResponse(
-      { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },
-      502, cors
-    );
-  }
-
-  const txid = turbo.txid;
-
-  if (txid) {
-    ctx.waitUntil(Promise.all([
-      upsertWriteThrough(env.DB, txid, tags),
-      trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
-    ]));
+  // Sign, cache, upload
+  const result = await signCacheAndUpload(body, tags, env, ctx, auth);
+  if (result.error) {
+    return errorResponse(result.error, result.status, cors);
   }
 
   return jsonResponse({
-    id: txid,
-    gateway: txid ? `${TURBO_GATEWAY}/${txid}` : null,
+    id: result.txid,
+    gateway: `${TURBO_GATEWAY}/${result.txid}`,
     tombstoneRef: targetTxid,
     status: 'pending',
   }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });

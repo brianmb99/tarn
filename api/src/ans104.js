@@ -126,6 +126,25 @@ export async function createSignedDataItem(privateKeyHex, data, tags) {
 }
 
 /**
+ * Compute the DataItem ID (Arweave transaction ID) from signed DataItem bytes.
+ * The ID is the base64url-encoded SHA-256 hash of the signature.
+ * @param {Uint8Array} signedDataItem - Full signed DataItem bytes
+ * @returns {Promise<string>} Base64url-encoded transaction ID (43 chars)
+ */
+export async function computeDataItemId(signedDataItem) {
+  // DataItem layout: sigType(2) | signature(65) | ...
+  // The ID is SHA-256 of the signature bytes
+  const signature = signedDataItem.slice(2, 2 + SIG_LEN);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', signature));
+  return base64url(hash);
+}
+
+function base64url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+/**
  * Derive the Ethereum address from a private key (for logging/debugging).
  * @param {string} privateKeyHex
  * @returns {string} Checksummed Ethereum address (0x-prefixed)
