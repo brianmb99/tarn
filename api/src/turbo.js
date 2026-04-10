@@ -5,7 +5,8 @@
 
 import { createSignedDataItem, computeDataItemId } from './ans104.js';
 
-const TURBO_UPLOAD_URL = 'https://upload.ardrive.io/v1/tx';
+// Ethereum-signed DataItems must use the /ethereum token endpoint
+const TURBO_UPLOAD_URL = 'https://upload.ardrive.io/v1/tx/ethereum';
 export const TURBO_GATEWAY = 'https://turbo-gateway.com';
 
 /**
