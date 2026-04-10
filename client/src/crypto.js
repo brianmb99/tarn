@@ -1,6 +1,9 @@
 // Tarn Client Crypto — key derivation, encryption, signing
 // Pure WebCrypto — works in browsers and Node.js 15+.
-// This is the client-side counterpart to api/src/crypto.js.
+//
+// Key derivation uses HKDF-Expand (RFC 5869) with structured info strings.
+// Key wrapping uses AES-KW (RFC 3394).
+// All sub-keys include app_id for per-app isolation.
 
 // ============ CONSTANTS ============
 
@@ -8,43 +11,67 @@ const PBKDF2_ITERATIONS = 600000;
 const PBKDF2_HASH = 'SHA-256';
 const KEY_LENGTH_BITS = 256;
 
-const CREDENTIAL_LOOKUP_DOMAIN = 'tarn-credential-lookup-v1';
-const CREDENTIAL_ENCRYPT_DOMAIN = 'tarn-credential-encrypt-v1';
-const SIGNING_DOMAIN = 'tarn-signing-v1';
+// Structured HKDF info: protocol || purpose || app_id || version || counter
+const PROTOCOL_ID = 'tarn';
+const DERIVATION_VERSION = '1';
+const HKDF_COUNTER = new Uint8Array([0x01]); // Single-block HKDF-Expand
+
+// P-256 curve order (n) — for private key range validation
+// n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+const P256_ORDER = BigInt('0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551');
 
 // PKCS#8 DER template for P-256 private key (without public key section)
-// 73 bytes total: 41 fixed bytes + 32 variable (private key d)
 const PKCS8_P256_PREFIX = new Uint8Array([
-  0x30, 0x41, // SEQUENCE, 65 bytes
-  0x02, 0x01, 0x00, // INTEGER 0 (version)
-  0x30, 0x13, // SEQUENCE, 19 bytes
-  0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID ecPublicKey
-  0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID prime256v1
-  0x04, 0x27, // OCTET STRING, 39 bytes
-  0x30, 0x25, // SEQUENCE, 37 bytes
-  0x02, 0x01, 0x01, // INTEGER 1 (version)
-  0x04, 0x20, // OCTET STRING, 32 bytes
-  // ... 32 bytes of private key d follow
+  0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13,
+  0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+  0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+  0x04, 0x27, 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
 ]);
 
 // ============ EMAIL NORMALIZATION ============
 
-/**
- * Normalize email for consistent key derivation.
- * @param {string} email
- * @returns {string}
- */
 export function normalizeEmail(email) {
   if (!email || typeof email !== 'string') throw new Error('Email is required');
   return email.trim().toLowerCase();
+}
+
+// ============ HKDF-EXPAND (RFC 5869) ============
+
+/**
+ * HKDF-Expand with a single 32-byte output block.
+ * This is equivalent to: HMAC-SHA256(prk, info || 0x01)
+ *
+ * @param {Uint8Array} prk - Pseudorandom key (master_key)
+ * @param {string} purpose - Key purpose: "lookup", "encrypt", or "sign"
+ * @param {string} appId - App identifier
+ * @param {number} [counter=1] - HKDF counter (for P-256 retry)
+ * @returns {Promise<Uint8Array>} 32-byte derived key
+ */
+async function hkdfExpand(prk, purpose, appId, counter = 1) {
+  const encoder = new TextEncoder();
+
+  // Import master_key as HMAC key
+  const hmacKey = await crypto.subtle.importKey(
+    'raw', prk, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+
+  // info = protocol || purpose || app_id || version || counter_byte
+  const info = concatBytes(
+    encoder.encode(PROTOCOL_ID + purpose + appId + DERIVATION_VERSION),
+    new Uint8Array([counter])
+  );
+
+  const result = await crypto.subtle.sign('HMAC', hmacKey, info);
+  return new Uint8Array(result);
 }
 
 // ============ KEY DERIVATION ============
 
 /**
  * Derive master_key from email + password via PBKDF2-SHA256.
- * @param {string} email - User email (will be normalized)
- * @param {string} password - User password
+ * The master_key is app-independent — app isolation happens in sub-key derivation.
+ * @param {string} email
+ * @param {string} password
  * @returns {Promise<Uint8Array>} 32-byte master key
  */
 export async function deriveMasterKey(email, password) {
@@ -53,16 +80,13 @@ export async function deriveMasterKey(email, password) {
   const normalizedEmail = normalizeEmail(email);
   const encoder = new TextEncoder();
 
-  // Salt = SHA-256(normalizedEmail + domain)
-  const saltInput = encoder.encode(normalizedEmail + CREDENTIAL_LOOKUP_DOMAIN);
-  const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', saltInput));
+  // Salt = SHA-256(normalizedEmail)
+  const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(normalizedEmail)));
 
-  // Import password as PBKDF2 key material
   const passwordKey = await crypto.subtle.importKey(
     'raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']
   );
 
-  // Derive master key
   const masterKeyBits = await crypto.subtle.deriveBits(
     { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: PBKDF2_HASH },
     passwordKey,
@@ -73,56 +97,72 @@ export async function deriveMasterKey(email, password) {
 }
 
 /**
- * Derive credential_lookup_key from master_key.
+ * Derive credential_lookup_key from master_key for a specific app.
  * @param {Uint8Array} masterKey
+ * @param {string} appId - Registered app identifier
  * @returns {Promise<string>} 64-char hex string
  */
-export async function deriveCredentialLookupKey(masterKey) {
-  const input = concatBytes(masterKey, new TextEncoder().encode(CREDENTIAL_LOOKUP_DOMAIN));
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+export async function deriveCredentialLookupKey(masterKey, appId) {
+  if (!appId) throw new Error('appId is required');
+  const hash = await hkdfExpand(masterKey, 'lookup', appId);
   return bytesToHex(hash);
 }
 
 /**
- * Derive credential_encryption_key from master_key.
- * This is also the initial data_encryption_key at account creation.
+ * Derive credential encryption key material from master_key for a specific app.
+ * Returns both an AES-GCM key (for data encryption) and an AES-KW key (for key wrapping).
+ * Both are derived from the same raw bytes — same key, different WebCrypto usages.
  * @param {Uint8Array} masterKey
- * @returns {Promise<CryptoKey>} AES-256-GCM key
+ * @param {string} appId
+ * @returns {Promise<{gcmKey: CryptoKey, kwKey: CryptoKey, rawBytes: Uint8Array}>}
  */
-export async function deriveCredentialEncryptionKey(masterKey) {
-  const input = concatBytes(masterKey, new TextEncoder().encode(CREDENTIAL_ENCRYPT_DOMAIN));
-  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
-  return await crypto.subtle.importKey(
-    'raw', hash, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
-  );
+export async function deriveCredentialEncryptionKey(masterKey, appId) {
+  if (!appId) throw new Error('appId is required');
+  const keyBytes = await hkdfExpand(masterKey, 'encrypt', appId);
+
+  const [gcmKey, kwKey] = await Promise.all([
+    crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', keyBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+  ]);
+
+  return { gcmKey, kwKey, rawBytes: keyBytes };
 }
 
 /**
- * Derive ECDSA P-256 signing key pair from master_key.
- * Deterministic: same master_key always produces the same key pair.
+ * Derive ECDSA P-256 signing key pair from master_key for a specific app.
+ * Deterministic: same master_key + appId always produces the same key pair.
+ * Validates that the derived scalar is in [1, n-1] per P-256 spec.
  * @param {Uint8Array} masterKey
+ * @param {string} appId
  * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey}>}
  */
-export async function deriveSigningKeyPair(masterKey) {
-  const input = concatBytes(masterKey, new TextEncoder().encode(SIGNING_DOMAIN));
-  const seed = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+export async function deriveSigningKeyPair(masterKey, appId) {
+  if (!appId) throw new Error('appId is required');
 
-  // Build PKCS#8 DER: prefix + 32 bytes of seed
+  // Derive seed, validate P-256 range, retry with incrementing counter if needed
+  let seed;
+  for (let counter = 1; counter <= 3; counter++) {
+    seed = await hkdfExpand(masterKey, 'sign', appId, counter);
+    const scalar = bytesToBigInt(seed);
+    if (scalar > 0n && scalar < P256_ORDER) break;
+    if (counter === 3) throw new Error('Failed to derive valid P-256 private key (extremely unlikely)');
+  }
+
+  // Build PKCS#8 DER
   const pkcs8 = new Uint8Array(PKCS8_P256_PREFIX.length + seed.length);
   pkcs8.set(PKCS8_P256_PREFIX, 0);
   pkcs8.set(seed, PKCS8_P256_PREFIX.length);
 
-  // Import as ECDSA P-256 private key
   const privateKey = await crypto.subtle.importKey(
     'pkcs8', pkcs8,
     { name: 'ECDSA', namedCurve: 'P-256' },
-    true, // extractable (needed to derive public key)
+    true,
     ['sign']
   );
 
-  // Export as JWK to get the public key components, then re-import as public key
+  // Derive public key from private key via JWK round-trip
   const jwk = await crypto.subtle.exportKey('jwk', privateKey);
-  delete jwk.d; // Remove private component
+  delete jwk.d;
   jwk.key_ops = ['verify'];
 
   const publicKey = await crypto.subtle.importKey(
@@ -136,16 +176,16 @@ export async function deriveSigningKeyPair(masterKey) {
 }
 
 /**
- * Export public key to base64-encoded SPKI format (for sending to API).
+ * Export public key to base64-encoded SPKI format.
  * @param {CryptoKey} publicKey
- * @returns {Promise<string>} Base64 SPKI
+ * @returns {Promise<string>}
  */
 export async function exportPublicKey(publicKey) {
   const der = await crypto.subtle.exportKey('spki', publicKey);
   return bytesToBase64(new Uint8Array(der));
 }
 
-// ============ AES-256-GCM ENCRYPTION ============
+// ============ AES-256-GCM ENCRYPTION (data blobs) ============
 
 /**
  * Encrypt JSON payload with AES-256-GCM.
@@ -157,12 +197,9 @@ export async function encrypt(key, plaintext) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const data = new TextEncoder().encode(JSON.stringify(plaintext));
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    data
+    { name: 'AES-GCM', iv }, key, data
   ));
 
-  // Wire format: IV || ciphertext (includes 16-byte GCM tag appended by WebCrypto)
   const result = new Uint8Array(iv.length + ciphertext.length);
   result.set(iv, 0);
   result.set(ciphertext, iv.length);
@@ -173,89 +210,57 @@ export async function encrypt(key, plaintext) {
  * Decrypt AES-256-GCM encrypted bytes to JSON.
  * @param {CryptoKey} key - AES-256-GCM key
  * @param {Uint8Array} blob - Wire format: IV(12) || ciphertext+tag
- * @returns {Promise<Object>} Decrypted JSON object
+ * @returns {Promise<Object>}
  */
 export async function decrypt(key, blob) {
   if (blob.length < 13) throw new Error('Blob too short');
-
   const iv = blob.slice(0, 12);
   const ciphertext = blob.slice(12);
-
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    ciphertext
-  );
-
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
 
-// ============ WRAPPED DATA KEY ============
+// ============ AES-KW KEY WRAPPING (RFC 3394) ============
 
 /**
- * Wrap (encrypt) a data encryption key with a credential encryption key.
- * At registration: key wraps itself (redundant self-encryption).
+ * Wrap data_encryption_key using AES-KW.
+ * At registration: self-wrap (key wraps itself).
  * After credential change: old key wrapped with new key.
- * @param {CryptoKey} dataKey - The key to wrap (data_encryption_key)
- * @param {CryptoKey} wrappingKey - The key to wrap with (credential_encryption_key)
- * @returns {Promise<string>} Base64-encoded wrapped key
+ * @param {CryptoKey} dataKey - Key to wrap
+ * @param {CryptoKey} wrappingKey - Key to wrap with (credential_encryption_key)
+ * @returns {Promise<string>} Base64-encoded AES-KW ciphertext (40 bytes: 32 key + 8 overhead)
  */
 export async function wrapDataKey(dataKey, wrappingKey) {
-  // Export data key as raw bytes, then encrypt with wrapping key
-  const rawKey = new Uint8Array(await crypto.subtle.exportKey('raw', dataKey));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    wrappingKey,
-    rawKey
-  ));
-
-  // Wire format: IV || ciphertext+tag
-  const wrapped = new Uint8Array(iv.length + ciphertext.length);
-  wrapped.set(iv, 0);
-  wrapped.set(ciphertext, iv.length);
-
-  return bytesToBase64(wrapped);
+  const wrapped = await crypto.subtle.wrapKey('raw', dataKey, wrappingKey, 'AES-KW');
+  return bytesToBase64(new Uint8Array(wrapped));
 }
 
 /**
- * Unwrap (decrypt) a wrapped data key.
- * @param {string} wrappedBase64 - Base64-encoded wrapped key
+ * Unwrap data_encryption_key using AES-KW.
+ * @param {string} wrappedBase64 - Base64-encoded AES-KW ciphertext
  * @param {CryptoKey} unwrappingKey - credential_encryption_key
  * @returns {Promise<CryptoKey>} Unwrapped AES-256-GCM data encryption key
  */
 export async function unwrapDataKey(wrappedBase64, unwrappingKey) {
   const wrapped = base64ToBytes(wrappedBase64);
-  if (wrapped.length < 13) throw new Error('Wrapped key too short');
-
-  const iv = wrapped.slice(0, 12);
-  const ciphertext = wrapped.slice(12);
-
-  const rawKey = new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
-    unwrappingKey,
-    ciphertext
-  ));
-
-  return await crypto.subtle.importKey(
-    'raw', rawKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
+  return await crypto.subtle.unwrapKey(
+    'raw', wrapped, unwrappingKey, 'AES-KW',
+    { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
   );
 }
 
 // ============ CHALLENGE SIGNING ============
 
 /**
- * Sign a nonce (challenge) with the ECDSA P-256 private key.
- * @param {CryptoKey} privateKey - P-256 private key
- * @param {string} nonceHex - 64-char hex nonce from the API
+ * Sign a nonce with the ECDSA P-256 private key.
+ * @param {CryptoKey} privateKey
+ * @param {string} nonceHex - 64-char hex nonce
  * @returns {Promise<string>} Base64-encoded raw ECDSA signature (64 bytes: r||s)
  */
 export async function signChallenge(privateKey, nonceHex) {
   const nonceBytes = hexToBytes(nonceHex);
   const signature = await crypto.subtle.sign(
-    { name: 'ECDSA', hash: 'SHA-256' },
-    privateKey,
-    nonceBytes
+    { name: 'ECDSA', hash: 'SHA-256' }, privateKey, nonceBytes
   );
   return bytesToBase64(new Uint8Array(signature));
 }
@@ -263,22 +268,19 @@ export async function signChallenge(privateKey, nonceHex) {
 // ============ CONVENIENCE: DERIVE ALL KEYS ============
 
 /**
- * Derive all keys from email + password in one call.
+ * Derive all keys from email + password + app in one call.
  * @param {string} email
  * @param {string} password
- * @returns {Promise<{
- *   masterKey: Uint8Array,
- *   credentialLookupKey: string,
- *   credentialEncryptionKey: CryptoKey,
- *   signingKeyPair: {privateKey: CryptoKey, publicKey: CryptoKey}
- * }>}
+ * @param {string} appId - Registered app identifier
+ * @returns {Promise<{masterKey, credentialLookupKey, credentialEncryptionKey: {gcmKey, kwKey, rawBytes}, signingKeyPair}>}
  */
-export async function deriveAllKeys(email, password) {
+export async function deriveAllKeys(email, password, appId) {
+  if (!appId) throw new Error('appId is required');
   const masterKey = await deriveMasterKey(email, password);
   const [credentialLookupKey, credentialEncryptionKey, signingKeyPair] = await Promise.all([
-    deriveCredentialLookupKey(masterKey),
-    deriveCredentialEncryptionKey(masterKey),
-    deriveSigningKeyPair(masterKey),
+    deriveCredentialLookupKey(masterKey, appId),
+    deriveCredentialEncryptionKey(masterKey, appId),
+    deriveSigningKeyPair(masterKey, appId),
   ]);
   return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair };
 }
@@ -300,6 +302,12 @@ function hexToBytes(hex) {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
   return bytes;
+}
+
+function bytesToBigInt(bytes) {
+  let result = 0n;
+  for (const b of bytes) result = (result << 8n) | BigInt(b);
+  return result;
 }
 
 export function bytesToBase64(bytes) {

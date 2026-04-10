@@ -7,8 +7,12 @@ import {
   deriveAllKeys, exportPublicKey, wrapDataKey, unwrapDataKey,
   signChallenge, encrypt, decrypt, bytesToBase64, base64ToBytes,
 } from '../client/src/crypto.js';
+import { seedTestApp, DEFAULT_APP_ID } from './helpers.mjs';
 
 const API_BASE = process.argv[2] || 'http://localhost:8787';
+
+// Seed the test app before any tests run
+await seedTestApp();
 
 let passed = 0;
 let failed = 0;
@@ -58,9 +62,9 @@ async function fetchJSON(path, opts = {}) {
 async function rawRegisterAndLogin() {
   const email = randomEmail();
   const password = 'e2e-test-pass';
-  const keys = await deriveAllKeys(email, password);
+  const keys = await deriveAllKeys(email, password, DEFAULT_APP_ID);
   const pub = await exportPublicKey(keys.signingKeyPair.publicKey);
-  const wdk = await wrapDataKey(keys.credentialEncryptionKey, keys.credentialEncryptionKey);
+  const wdk = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
 
   const regRes = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
@@ -68,6 +72,7 @@ async function rawRegisterAndLogin() {
       credential_lookup_key: keys.credentialLookupKey,
       public_key: pub,
       wrapped_data_key: wdk,
+      app: DEFAULT_APP_ID,
     }),
   });
   assert(regRes.status === 201, `Register failed: ${regRes.status} ${regRes.text}`);
@@ -94,9 +99,19 @@ async function rawRegisterAndLogin() {
   });
   assert(vRes.status === 200, `Verify failed: ${vRes.status}`);
 
+  // Set default rules (unrestricted) — in production, the app sets this
+  const { execSync } = await import('child_process');
+  const rulesSql = `UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'`;
+  try {
+    execSync(
+      `npx wrangler d1 execute bookish-api-cache --local --command "${rulesSql}"`,
+      { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
+    );
+  } catch {}
+
   return {
     email, password, keys, dlk, jwt: vRes.json.jwt,
-    dataEncryptionKey: keys.credentialEncryptionKey,
+    dataEncryptionKey: keys.credentialEncryptionKey.gcmKey,
   };
 }
 
@@ -136,20 +151,20 @@ await test('Create entry and read back from D1 cache', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
   const payload = { title: 'Test Book', author: 'Test Author', rating: 5 };
 
-  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', payload);
+  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', payload);
   assert(txid, 'Should get txid');
 
   // Read entries from API (D1 cache — write-through should have populated it)
   // Small delay for ctx.waitUntil to complete
   await sleep(200);
 
-  const readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   assert(readRes.status === 200, `Read failed: ${readRes.status}`);
   assert(readRes.json.entries.length >= 1, `Expected at least 1 entry, got ${readRes.json.entries.length}`);
 
   const entry = readRes.json.entries.find(e => e.txid === txid);
   assert(entry, `Entry ${txid} not found in read results`);
-  assert(entry.tags.some(t => t.name === 'App' && t.value === 'testapp'), 'Should have App tag');
+  assert(entry.tags.some(t => t.name === 'App' && t.value === DEFAULT_APP_ID), 'Should have App tag');
   assert(entry.tags.some(t => t.name === 'Lk' && t.value === dlk), 'Should have Lk tag');
 });
 
@@ -157,11 +172,11 @@ await test('Create entry and decrypt the blob from gateway URL', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
   const payload = { title: 'Gateway Test', secret: 'classified-data-12345' };
 
-  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', payload);
+  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', payload);
   await sleep(200);
 
   // Read entry list to get gateway URL
-  const readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   const entry = readRes.json.entries.find(e => e.txid === txid);
   assert(entry, 'Entry should be in read results');
   assert(entry.gatewayUrl, 'Entry should have gatewayUrl');
@@ -192,13 +207,13 @@ await test('Create 3 entries, read back all 3', async () => {
 
   const txids = [];
   for (let i = 0; i < 3; i++) {
-    const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry',
+    const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry',
       { index: i, title: `Book ${i}` });
     txids.push(txid);
   }
   await sleep(300);
 
-  const readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   assert(readRes.status === 200, `Read failed: ${readRes.status}`);
 
   // All 3 should be present
@@ -216,14 +231,14 @@ await test('Update entry: old version superseded, new version returned', async (
 
   // Create original
   const originalPayload = { title: 'Original Title', version: 1 };
-  const originalTxid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', originalPayload);
+  const originalTxid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', originalPayload);
   await sleep(200);
 
   // Update with Prev tag
   const updatedPayload = { title: 'Updated Title', version: 2 };
   const encrypted = await encrypt(dataEncryptionKey, updatedPayload);
   const tags = [
-    { name: 'App', value: 'testapp' },
+    { name: 'App', value: DEFAULT_APP_ID },
     { name: 'Type', value: 'entry' },
     { name: 'Lk', value: dlk },
     { name: 'Prev', value: originalTxid },
@@ -246,7 +261,7 @@ await test('Update entry: old version superseded, new version returned', async (
   await sleep(200);
 
   // Read back — should only see the updated version (original superseded by Prev-chain)
-  const readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   const entries = readRes.json.entries;
 
   const hasUpdated = entries.some(e => e.txid === updatedTxid);
@@ -265,7 +280,7 @@ await test('Update: wrong prior_txid returns 404', async () => {
     headers: {
       'Authorization': `Bearer ${jwt}`,
       'X-Arweave-Tags': JSON.stringify([
-        { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+        { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
         { name: 'Lk', value: dlk }, { name: 'Prev', value: 'nonexistent_txid_12345' },
         { name: 'Enc', value: 'aes-256-gcm' }, { name: 'V', value: '0.3.0' },
       ]),
@@ -284,17 +299,17 @@ await test('Delete entry: tombstoned entry hidden from reads', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
 
   // Create
-  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', { title: 'To Delete' });
+  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', { title: 'To Delete' });
   await sleep(200);
 
   // Verify it exists
-  let readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  let readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   assert(readRes.json.entries.some(e => e.txid === txid), 'Entry should exist before deletion');
 
   // Tombstone it
   const tombstonePayload = await encrypt(dataEncryptionKey, { tombstone: true, ref: txid });
   const tombstoneTags = [
-    { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+    { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
     { name: 'Lk', value: dlk }, { name: 'Op', value: 'tombstone' },
     { name: 'Ref', value: txid }, { name: 'Enc', value: 'aes-256-gcm' },
     { name: 'V', value: '0.3.0' },
@@ -314,7 +329,7 @@ await test('Delete entry: tombstoned entry hidden from reads', async () => {
   await sleep(200);
 
   // Read back — entry should be hidden
-  readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   assert(!readRes.json.entries.some(e => e.txid === txid), 'Tombstoned entry should be hidden from reads');
 });
 
@@ -327,11 +342,11 @@ await test('User A cannot see User B entries', async () => {
   const userB = await rawRegisterAndLogin();
 
   // User A creates an entry
-  await rawCreateEntry(userA.jwt, userA.dlk, userA.dataEncryptionKey, 'testapp', 'entry', { owner: 'A' });
+  await rawCreateEntry(userA.jwt, userA.dlk, userA.dataEncryptionKey, DEFAULT_APP_ID, 'entry', { owner: 'A' });
   await sleep(200);
 
   // User B reads with their own key — should see nothing
-  const readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${userB.dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${userB.dlk}`);
   assert(readRes.status === 200);
   assert(readRes.json.entries.length === 0, `User B should see 0 entries, saw ${readRes.json.entries.length}`);
 });
@@ -342,7 +357,7 @@ await test('User A cannot write with User B Lk tag', async () => {
 
   const encrypted = await encrypt(userA.dataEncryptionKey, { sneaky: true });
   const tags = [
-    { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+    { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
     { name: 'Lk', value: userB.dlk }, // Wrong! Using B's lookup key
     { name: 'Enc', value: 'aes-256-gcm' }, { name: 'V', value: '0.3.0' },
   ];
@@ -363,13 +378,13 @@ await test('User A cannot update User B entry', async () => {
   const userA = await rawRegisterAndLogin();
   const userB = await rawRegisterAndLogin();
 
-  const txid = await rawCreateEntry(userB.jwt, userB.dlk, userB.dataEncryptionKey, 'testapp', 'entry', { owner: 'B' });
+  const txid = await rawCreateEntry(userB.jwt, userB.dlk, userB.dataEncryptionKey, DEFAULT_APP_ID, 'entry', { owner: 'B' });
   await sleep(200);
 
   // User A tries to update B's entry
   const encrypted = await encrypt(userA.dataEncryptionKey, { hijacked: true });
   const tags = [
-    { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+    { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
     { name: 'Lk', value: userA.dlk }, { name: 'Prev', value: txid },
     { name: 'Enc', value: 'aes-256-gcm' }, { name: 'V', value: '0.3.0' },
   ];
@@ -392,7 +407,7 @@ console.log('\n=== 6. Write Rules ===');
 
 await test('No rules: write succeeds', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
-  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', { test: true });
+  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', { test: true });
   assert(txid, 'Write should succeed with no rules');
 });
 
@@ -408,7 +423,7 @@ await test('max_bytes rule: oversized payload rejected', async () => {
   const bigPayload = { data: 'x'.repeat(200000) };
   const encrypted = await encrypt(dataEncryptionKey, bigPayload);
   const tags = [
-    { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+    { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
     { name: 'Lk', value: dlk }, { name: 'Enc', value: 'aes-256-gcm' },
     { name: 'V', value: '0.3.0' },
   ];
@@ -433,7 +448,7 @@ await test('Unauthenticated write: rejected', async () => {
     method: 'POST',
     headers: {
       'X-Arweave-Tags': JSON.stringify([
-        { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+        { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
         { name: 'Lk', value: dlk }, { name: 'Enc', value: 'aes-256-gcm' },
         { name: 'V', value: '0.3.0' },
       ]),
@@ -452,7 +467,7 @@ await test('Empty payload: rejected', async () => {
     headers: {
       'Authorization': `Bearer ${jwt}`,
       'X-Arweave-Tags': JSON.stringify([
-        { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+        { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
         { name: 'Lk', value: dlk }, { name: 'Enc', value: 'aes-256-gcm' },
         { name: 'V', value: '0.3.0' },
       ]),
@@ -489,13 +504,13 @@ await test('Change credentials: existing entries still readable', async () => {
   const newPassword = 'new-pass-e2e';
 
   // Register + login via TarnClient
-  const client = new TarnClient(API_BASE);
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   await client.register(oldEmail, oldPassword);
   const dlk = client.dataLookupKey;
 
   // Create entries with old credentials
   // (Use raw API since TarnClient.createEntry calls Turbo which may fail in local dev)
-  const oldKeys = await deriveAllKeys(oldEmail, oldPassword);
+  const oldKeys = await deriveAllKeys(oldEmail, oldPassword, DEFAULT_APP_ID);
 
   // Challenge + verify to get JWT (client already did this, but let's get our own)
   const cRes1 = await fetchJSON('/api/v1/auth/challenge', {
@@ -509,7 +524,7 @@ await test('Change credentials: existing entries still readable', async () => {
   });
   const jwt1 = vRes1.json.jwt;
 
-  const txid1 = await rawCreateEntry(jwt1, dlk, oldKeys.credentialEncryptionKey, 'testapp', 'entry',
+  const txid1 = await rawCreateEntry(jwt1, dlk, oldKeys.credentialEncryptionKey.gcmKey, DEFAULT_APP_ID, 'entry',
     { title: 'Before Change', secret: 'old-secret' });
   await sleep(200);
 
@@ -517,12 +532,12 @@ await test('Change credentials: existing entries still readable', async () => {
   await client.changeCredentials(newEmail, newPassword);
 
   // Login with new credentials
-  const client2 = new TarnClient(API_BASE);
+  const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   await client2.login(newEmail, newPassword);
   assert(client2.dataLookupKey === dlk, 'data_lookup_key should be preserved');
 
   // Read entries — should still see them
-  const readRes = await fetchJSON(`/api/v1/entries?app=testapp&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
   assert(readRes.json.entries.some(e => e.txid === txid1), 'Entry created with old creds should still be in cache');
 
   // Old credentials should fail
@@ -533,22 +548,22 @@ await test('Change credentials: existing entries still readable', async () => {
   assert(cResOld.status === 404, 'Old credential_lookup_key should no longer exist');
 });
 
-// ============ 8. APP ISOLATION ============
+// ============ 8. TYPE ISOLATION ============
 
-console.log('\n=== 8. App Isolation ===');
+console.log('\n=== 8. Type Isolation ===');
 
-await test('Entries from different apps are isolated by query', async () => {
+await test('Entries of different types are isolated by query', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
 
-  await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'app_alpha', 'entry', { from: 'alpha' });
-  await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'app_beta', 'entry', { from: 'beta' });
+  await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', { from: 'entry' });
+  await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'note', { from: 'note' });
   await sleep(200);
 
-  const alphaRes = await fetchJSON(`/api/v1/entries?app=app_alpha&type=entry&key=${dlk}`);
-  const betaRes = await fetchJSON(`/api/v1/entries?app=app_beta&type=entry&key=${dlk}`);
+  const entryRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  const noteRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=note&key=${dlk}`);
 
-  assert(alphaRes.json.entries.length === 1, `Alpha should have 1 entry, got ${alphaRes.json.entries.length}`);
-  assert(betaRes.json.entries.length === 1, `Beta should have 1 entry, got ${betaRes.json.entries.length}`);
+  assert(entryRes.json.entries.length === 1, `entry type should have 1 entry, got ${entryRes.json.entries.length}`);
+  assert(noteRes.json.entries.length === 1, `note type should have 1 entry, got ${noteRes.json.entries.length}`);
 });
 
 // ============ 9. SINGLE ENTRY BY TXID ============
@@ -557,7 +572,7 @@ console.log('\n=== 9. Single Entry Lookup ===');
 
 await test('Get single entry by txid', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
-  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', { single: true });
+  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', { single: true });
   await sleep(200);
 
   const res = await fetchJSON(`/api/v1/entries/${txid}`);
@@ -572,7 +587,7 @@ await test('Get nonexistent entry returns 404', async () => {
 
 await test('Get entry with wrong key param returns 404', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
-  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, 'testapp', 'entry', { test: true });
+  const txid = await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'entry', { test: true });
   await sleep(200);
 
   const wrongKey = 'f'.repeat(64);
@@ -588,7 +603,7 @@ await test('Create entry: API returns txid and gateway URL', async () => {
   const { jwt, dlk, dataEncryptionKey } = await rawRegisterAndLogin();
   const encrypted = await encrypt(dataEncryptionKey, { arweave: 'test' });
   const tags = [
-    { name: 'App', value: 'testapp' }, { name: 'Type', value: 'entry' },
+    { name: 'App', value: DEFAULT_APP_ID }, { name: 'Type', value: 'entry' },
     { name: 'Lk', value: dlk }, { name: 'Enc', value: 'aes-256-gcm' },
     { name: 'V', value: '0.3.0' },
   ];

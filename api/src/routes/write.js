@@ -110,8 +110,11 @@ export async function handleCreateEntry(request, env, ctx, cors) {
     return errorResponse('Lk tag does not match authenticated identity', 403, cors);
   }
 
-  // Evaluate write authorization rules
+  // Validate App tag matches JWT app claim
   const app = tagValue(tags, 'App') || '';
+  if (auth.app && app !== auth.app) {
+    return errorResponse('App tag does not match authenticated app', 403, cors);
+  }
   const type = tagValue(tags, 'Type') || '';
 
   const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);

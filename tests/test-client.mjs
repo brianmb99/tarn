@@ -4,8 +4,12 @@
 
 import { TarnClient } from '../client/src/tarn.js';
 import { deriveAllKeys, exportPublicKey, wrapDataKey } from '../client/src/crypto.js';
+import { seedTestApp, DEFAULT_APP_ID } from './helpers.mjs';
 
 const API_BASE = process.argv[2] || 'http://localhost:8787';
+
+// Seed the test app before any tests run
+await seedTestApp();
 
 let passed = 0;
 let failed = 0;
@@ -39,7 +43,7 @@ function randomEmail() {
 console.log('\n=== Registration ===');
 
 await test('Register: happy path', async () => {
-  const client = new TarnClient(API_BASE);
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
   const { dataLookupKey } = await client.register(email, 'test-password-123');
 
@@ -49,11 +53,11 @@ await test('Register: happy path', async () => {
 });
 
 await test('Register: duplicate email produces 409', async () => {
-  const client = new TarnClient(API_BASE);
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
   await client.register(email, 'password');
 
-  const client2 = new TarnClient(API_BASE);
+  const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
     await client2.register(email, 'password');
     assert(false, 'Should have thrown');
@@ -71,11 +75,11 @@ await test('Login: happy path', async () => {
   const password = 'login-test-pass';
 
   // Register first
-  const client1 = new TarnClient(API_BASE);
+  const client1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const { dataLookupKey } = await client1.register(email, password);
 
   // Login from "another device"
-  const client2 = new TarnClient(API_BASE);
+  const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const result = await client2.login(email, password);
 
   assert(result.dataLookupKey === dataLookupKey, 'Login should return same dataLookupKey');
@@ -84,10 +88,10 @@ await test('Login: happy path', async () => {
 
 await test('Login: wrong password fails', async () => {
   const email = randomEmail();
-  const client1 = new TarnClient(API_BASE);
+  const client1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   await client1.register(email, 'correct-password');
 
-  const client2 = new TarnClient(API_BASE);
+  const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
     await client2.login(email, 'wrong-password');
     assert(false, 'Should have thrown');
@@ -99,7 +103,7 @@ await test('Login: wrong password fails', async () => {
 });
 
 await test('Login: non-existent account fails', async () => {
-  const client = new TarnClient(API_BASE);
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
     await client.login('nobody@example.com', 'password');
     assert(false, 'Should have thrown');
@@ -117,8 +121,8 @@ await test('Same email+password always derives same keys', async () => {
   const email = 'determinism@test.com';
   const password = 'test123';
 
-  const keys1 = await deriveAllKeys(email, password);
-  const keys2 = await deriveAllKeys(email, password);
+  const keys1 = await deriveAllKeys(email, password, DEFAULT_APP_ID);
+  const keys2 = await deriveAllKeys(email, password, DEFAULT_APP_ID);
 
   assert(keys1.credentialLookupKey === keys2.credentialLookupKey,
     'credentialLookupKey should be deterministic');
@@ -129,23 +133,23 @@ await test('Same email+password always derives same keys', async () => {
 });
 
 await test('Different emails derive different keys', async () => {
-  const keys1 = await deriveAllKeys('alice@test.com', 'same-password');
-  const keys2 = await deriveAllKeys('bob@test.com', 'same-password');
+  const keys1 = await deriveAllKeys('alice@test.com', 'same-password', DEFAULT_APP_ID);
+  const keys2 = await deriveAllKeys('bob@test.com', 'same-password', DEFAULT_APP_ID);
 
   assert(keys1.credentialLookupKey !== keys2.credentialLookupKey,
     'Different emails should produce different keys');
 });
 
 await test('Wrapped data key self-encryption round-trip', async () => {
-  const keys = await deriveAllKeys('wrap-test@test.com', 'password');
+  const keys = await deriveAllKeys('wrap-test@test.com', 'password', DEFAULT_APP_ID);
 
   // Self-encryption at registration
-  const wrapped = await wrapDataKey(keys.credentialEncryptionKey, keys.credentialEncryptionKey);
+  const wrapped = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
   assert(typeof wrapped === 'string', 'Wrapped key should be base64 string');
 
   // Unwrap should recover the same key
   const { unwrapDataKey: unwrap } = await import('../client/src/crypto.js');
-  const unwrapped = await unwrap(wrapped, keys.credentialEncryptionKey);
+  const unwrapped = await unwrap(wrapped, keys.credentialEncryptionKey.kwKey);
   assert(unwrapped instanceof CryptoKey, 'Unwrapped should be CryptoKey');
 
   // Verify the unwrapped key works for encryption
@@ -167,7 +171,7 @@ await test('Change credentials: new login works, old fails', async () => {
   const newPassword = 'new-pass';
 
   // Register + login
-  const client = new TarnClient(API_BASE);
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const { dataLookupKey } = await client.register(oldEmail, oldPassword);
 
   // Change credentials
@@ -175,12 +179,12 @@ await test('Change credentials: new login works, old fails', async () => {
   assert(client.isAuthenticated, 'Should be re-authenticated after credential change');
 
   // New credentials should work
-  const client2 = new TarnClient(API_BASE);
+  const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const result = await client2.login(newEmail, newPassword);
   assert(result.dataLookupKey === dataLookupKey, 'data_lookup_key should be preserved');
 
   // Old credentials should fail
-  const client3 = new TarnClient(API_BASE);
+  const client3 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
     await client3.login(oldEmail, oldPassword);
     assert(false, 'Old credentials should fail');
@@ -198,7 +202,7 @@ await test('Delete account: login fails after', async () => {
   const email = randomEmail();
   const password = 'delete-me';
 
-  const client = new TarnClient(API_BASE);
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   await client.register(email, password);
   assert(client.isAuthenticated, 'Should be authenticated');
 
@@ -206,7 +210,7 @@ await test('Delete account: login fails after', async () => {
   assert(!client.isAuthenticated, 'Should not be authenticated after deletion');
 
   // Login should fail
-  const client2 = new TarnClient(API_BASE);
+  const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
     await client2.login(email, password);
     assert(false, 'Login should fail after deletion');

@@ -1,6 +1,9 @@
 // Tarn Client — JavaScript API client for the Tarn protocol
 // Handles key derivation, encryption/decryption, and all API interactions.
 // Works in browsers and Node.js 15+.
+//
+// Each TarnClient instance is scoped to one app. Same email+password with
+// different app IDs produces completely isolated accounts.
 
 import {
   deriveAllKeys,
@@ -15,6 +18,7 @@ import {
 
 export class TarnClient {
   #apiBase;
+  #appId;
   #jwt = null;
   #dataLookupKey = null;
   #dataEncryptionKey = null;
@@ -24,23 +28,26 @@ export class TarnClient {
 
   /**
    * @param {string} apiBaseUrl - Tarn API base URL (e.g., 'https://api.tarn.dev')
+   * @param {string} appId - Registered app identifier (e.g., 'bookish')
    */
-  constructor(apiBaseUrl) {
+  constructor(apiBaseUrl, appId) {
+    if (!appId) throw new Error('appId is required');
     this.#apiBase = apiBaseUrl.replace(/\/$/, '');
+    this.#appId = appId;
   }
 
   // ============ AUTH ============
 
   /**
-   * Register a new account.
+   * Register a new account for this app.
    * @param {string} email
    * @param {string} password
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async register(email, password) {
-    const keys = await deriveAllKeys(email, password);
+    const keys = await deriveAllKeys(email, password, this.#appId);
     const publicKeyBase64 = await exportPublicKey(keys.signingKeyPair.publicKey);
-    const wrappedDataKey = await wrapDataKey(keys.credentialEncryptionKey, keys.credentialEncryptionKey);
+    const wrappedDataKey = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
 
     const res = await this.#fetch('/api/v1/auth/register', {
       method: 'POST',
@@ -48,6 +55,7 @@ export class TarnClient {
         credential_lookup_key: keys.credentialLookupKey,
         public_key: publicKeyBase64,
         wrapped_data_key: wrappedDataKey,
+        app: this.#appId,
       },
     });
 
@@ -55,27 +63,25 @@ export class TarnClient {
       throw new Error(`Registration failed: ${res.json?.error || res.status}`);
     }
 
-    // Store keys for subsequent operations
     this.#credentialLookupKey = keys.credentialLookupKey;
     this.#credentialEncryptionKey = keys.credentialEncryptionKey;
     this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = res.json.data_lookup_key;
-    this.#dataEncryptionKey = keys.credentialEncryptionKey; // Same at creation
+    this.#dataEncryptionKey = keys.credentialEncryptionKey.gcmKey; // AES-GCM for data
 
-    // Immediately login to get JWT
     await this.#authenticate();
 
     return { dataLookupKey: this.#dataLookupKey };
   }
 
   /**
-   * Log in to an existing account.
+   * Log in to an existing account for this app.
    * @param {string} email
    * @param {string} password
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async login(email, password) {
-    const keys = await deriveAllKeys(email, password);
+    const keys = await deriveAllKeys(email, password, this.#appId);
 
     this.#credentialLookupKey = keys.credentialLookupKey;
     this.#credentialEncryptionKey = keys.credentialEncryptionKey;
@@ -96,13 +102,13 @@ export class TarnClient {
 
     this.#dataLookupKey = challengeRes.json.data_lookup_key;
 
-    // Unwrap data encryption key
+    // Unwrap data encryption key (AES-KW)
     this.#dataEncryptionKey = await unwrapDataKey(
       challengeRes.json.wrapped_data_key,
-      keys.credentialEncryptionKey
+      keys.credentialEncryptionKey.kwKey
     );
 
-    // Verify (sign nonce)
+    // Verify
     await this.#verifyChallenge(challengeRes.json.nonce);
 
     return { dataLookupKey: this.#dataLookupKey };
@@ -110,18 +116,16 @@ export class TarnClient {
 
   /**
    * Change credentials (email and/or password).
-   * Requires an active session (must be logged in).
+   * Requires an active session.
    * @param {string} newEmail
    * @param {string} newPassword
    */
   async changeCredentials(newEmail, newPassword) {
     this.#requireAuth();
 
-    const newKeys = await deriveAllKeys(newEmail, newPassword);
+    const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-
-    // Re-wrap the SAME data_encryption_key with the new credential key
-    const newWrappedDataKey = await wrapDataKey(this.#dataEncryptionKey, newKeys.credentialEncryptionKey);
+    const newWrappedDataKey = await wrapDataKey(this.#dataEncryptionKey, newKeys.credentialEncryptionKey.kwKey);
 
     const res = await this.#fetch('/api/v1/auth', {
       method: 'PUT',
@@ -137,32 +141,25 @@ export class TarnClient {
       throw new Error(`Credential change failed: ${res.json?.error || res.status}`);
     }
 
-    // Update local state
     this.#credentialLookupKey = newKeys.credentialLookupKey;
     this.#credentialEncryptionKey = newKeys.credentialEncryptionKey;
     this.#signingKeyPair = newKeys.signingKeyPair;
 
-    // Re-authenticate with new credentials
     await this.#authenticate();
   }
 
   /**
    * Delete the account permanently.
-   * @returns {Promise<void>}
    */
   async deleteAccount() {
     this.#requireAuth();
 
-    const res = await this.#fetch('/api/v1/auth', {
-      method: 'DELETE',
-      auth: true,
-    });
+    const res = await this.#fetch('/api/v1/auth', { method: 'DELETE', auth: true });
 
     if (res.status !== 200) {
       throw new Error(`Account deletion failed: ${res.json?.error || res.status}`);
     }
 
-    // Clear all local state
     this.#jwt = null;
     this.#dataLookupKey = null;
     this.#dataEncryptionKey = null;
@@ -175,22 +172,21 @@ export class TarnClient {
 
   /**
    * Create a new data entry.
-   * @param {string} app - App identifier (e.g., 'bookish')
    * @param {string} type - Entry type (e.g., 'entry')
    * @param {Object} plaintext - JSON-serializable payload
-   * @param {Array<{name: string, value: string}>} extraTags - Additional Arweave tags
+   * @param {Array<{name: string, value: string}>} extraTags
    * @returns {Promise<{txid: string}>}
    */
-  async createEntry(app, type, plaintext, extraTags = []) {
+  async createEntry(type, plaintext, extraTags = []) {
     this.#requireAuth();
 
     const encrypted = await encrypt(this.#dataEncryptionKey, plaintext);
     const tags = [
-      { name: 'App', value: app },
+      { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
       { name: 'Lk', value: this.#dataLookupKey },
       { name: 'Enc', value: 'aes-256-gcm' },
-      { name: 'V', value: '0.3.0' },
+      { name: 'V', value: '0.4.0' },
       ...extraTags,
     ];
 
@@ -214,14 +210,13 @@ export class TarnClient {
 
   /**
    * Retrieve and decrypt entries.
-   * @param {string} app - App identifier
    * @param {string} type - Entry type
    * @returns {Promise<Array<{txid: string, data: Object, tags: Array}>>}
    */
-  async getEntries(app, type) {
+  async getEntries(type) {
     this.#requireAuth();
 
-    const res = await this.#fetch(`/api/v1/entries?app=${app}&type=${type}&key=${this.#dataLookupKey}`);
+    const res = await this.#fetch(`/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}`);
 
     if (res.status !== 200) {
       throw new Error(`Get entries failed: ${res.json?.error || res.status}`);
@@ -230,13 +225,11 @@ export class TarnClient {
     const entries = [];
     for (const entry of res.json.entries || []) {
       try {
-        // Try Turbo gateway first (near-instant for recent uploads), then Arweave L1
         const blobBytes = await this.#fetchBlob(entry.txid);
         if (!blobBytes) continue;
         const data = await decrypt(this.#dataEncryptionKey, blobBytes);
         entries.push({ txid: entry.txid, data, tags: entry.tags });
       } catch (err) {
-        // Skip entries that can't be decrypted (may be from different key era)
         console.warn(`Failed to decrypt entry ${entry.txid}:`, err.message);
       }
     }
@@ -246,23 +239,22 @@ export class TarnClient {
 
   /**
    * Update an existing entry.
-   * @param {string} priorTxid - Txid of the entry being updated
-   * @param {string} app - App identifier
+   * @param {string} priorTxid
    * @param {string} type - Entry type
-   * @param {Object} plaintext - New JSON payload
+   * @param {Object} plaintext
    * @returns {Promise<{txid: string}>}
    */
-  async updateEntry(priorTxid, app, type, plaintext) {
+  async updateEntry(priorTxid, type, plaintext) {
     this.#requireAuth();
 
     const encrypted = await encrypt(this.#dataEncryptionKey, plaintext);
     const tags = [
-      { name: 'App', value: app },
+      { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
       { name: 'Lk', value: this.#dataLookupKey },
       { name: 'Prev', value: priorTxid },
       { name: 'Enc', value: 'aes-256-gcm' },
-      { name: 'V', value: '0.3.0' },
+      { name: 'V', value: '0.4.0' },
     ];
 
     const res = await this.#fetchRaw(`/api/v1/entries/${priorTxid}`, {
@@ -285,23 +277,22 @@ export class TarnClient {
 
   /**
    * Delete an entry (tombstone).
-   * @param {string} targetTxid - Txid of the entry to delete
-   * @param {string} app - App identifier
+   * @param {string} targetTxid
    * @param {string} type - Entry type
    * @returns {Promise<{txid: string}>}
    */
-  async deleteEntry(targetTxid, app, type) {
+  async deleteEntry(targetTxid, type) {
     this.#requireAuth();
 
     const encrypted = await encrypt(this.#dataEncryptionKey, { tombstone: true, ref: targetTxid });
     const tags = [
-      { name: 'App', value: app },
+      { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
       { name: 'Lk', value: this.#dataLookupKey },
       { name: 'Op', value: 'tombstone' },
       { name: 'Ref', value: targetTxid },
       { name: 'Enc', value: 'aes-256-gcm' },
-      { name: 'V', value: '0.3.0' },
+      { name: 'V', value: '0.4.0' },
     ];
 
     const res = await this.#fetchRaw(`/api/v1/entries/${targetTxid}`, {
@@ -325,6 +316,7 @@ export class TarnClient {
   // ============ ACCESSORS ============
 
   get dataLookupKey() { return this.#dataLookupKey; }
+  get appId() { return this.#appId; }
   get isAuthenticated() { return !!this.#jwt; }
 
   // ============ PRIVATE ============
@@ -365,9 +357,6 @@ export class TarnClient {
     this.#jwt = verifyRes.json.jwt;
   }
 
-  /**
-   * Fetch encrypted blob from gateways. Tries Turbo first (fast for recent uploads), Arweave L1 fallback.
-   */
   async #fetchBlob(txid) {
     const gateways = [
       `https://turbo-gateway.com/${txid}`,
@@ -377,12 +366,8 @@ export class TarnClient {
     for (const url of gateways) {
       try {
         const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-        if (res.ok) {
-          return new Uint8Array(await res.arrayBuffer());
-        }
-      } catch {
-        // Try next gateway
-      }
+        if (res.ok) return new Uint8Array(await res.arrayBuffer());
+      } catch {}
     }
     return null;
   }

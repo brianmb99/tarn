@@ -8,8 +8,12 @@
 import {
   deriveAllKeys, exportPublicKey, wrapDataKey, signChallenge, encrypt,
 } from '../client/src/crypto.js';
+import { seedTestApp, DEFAULT_APP_ID } from './helpers.mjs';
 
 const API_BASE = process.argv[2] || 'http://localhost:8787';
+
+// Seed the default test app for user registration
+await seedTestApp();
 
 let passed = 0;
 let failed = 0;
@@ -61,7 +65,8 @@ async function fetchJSON(path, opts = {}) {
 let appPrivateKey;
 let appPublicKeyBase64;
 let appJwt;
-const APP_ID = 'test-app-' + Date.now();
+// Use DEFAULT_APP_ID so the app identity matches user registrations
+const APP_ID = DEFAULT_APP_ID;
 
 async function setupApp() {
   // Generate a P-256 key pair for the app
@@ -146,13 +151,13 @@ function hexToBytes(hex) {
 async function registerUser() {
   const email = randomEmail();
   const password = 'test-pass';
-  const keys = await deriveAllKeys(email, password);
+  const keys = await deriveAllKeys(email, password, DEFAULT_APP_ID);
   const pub = await exportPublicKey(keys.signingKeyPair.publicKey);
-  const wdk = await wrapDataKey(keys.credentialEncryptionKey, keys.credentialEncryptionKey);
+  const wdk = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
 
   const regRes = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: keys.credentialLookupKey, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: keys.credentialLookupKey, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
   assert(regRes.status === 201, `Register failed: ${regRes.status}`);
   const dlk = regRes.json.data_lookup_key;
@@ -167,7 +172,16 @@ async function registerUser() {
     body: JSON.stringify({ credential_lookup_key: keys.credentialLookupKey, nonce: cRes.json.nonce, signature: sig }),
   });
 
-  return { dlk, jwt: vRes.json.jwt, encKey: keys.credentialEncryptionKey };
+  // Set default rules (unrestricted) — in production, the app sets this
+  const { execSync } = await import('child_process');
+  try {
+    execSync(
+      `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+      { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
+    );
+  } catch {}
+
+  return { dlk, jwt: vRes.json.jwt, encKey: keys.credentialEncryptionKey.gcmKey };
 }
 
 async function createEntry(jwt, dlk, encKey, app, payload) {

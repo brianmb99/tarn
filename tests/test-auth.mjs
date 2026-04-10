@@ -3,7 +3,12 @@
 // Requires: wrangler dev running (or deployed API URL)
 // Uses Node.js built-in WebCrypto for P-256 key generation and signing.
 
+import { seedTestApp, DEFAULT_APP_ID } from './helpers.mjs';
+
 const BASE_URL = process.argv[2] || 'http://localhost:8787';
+
+// Seed the test app before any tests run
+await seedTestApp();
 
 let passed = 0;
 let failed = 0;
@@ -93,7 +98,7 @@ await test('Register: happy path', async () => {
 
   const { status, json } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
 
   assert(status === 201, `Expected 201, got ${status}: ${JSON.stringify(json)}`);
@@ -111,14 +116,14 @@ await test('Register: duplicate credential_lookup_key -> 409', async () => {
   // First registration
   const { status: s1 } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
   assert(s1 === 201, `First registration should succeed, got ${s1}`);
 
   // Duplicate
   const { status: s2, json } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
   assert(s2 === 409, `Expected 409, got ${s2}: ${JSON.stringify(json)}`);
 });
@@ -129,7 +134,7 @@ await test('Register: invalid credential_lookup_key -> 400', async () => {
 
   const { status } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: 'too-short', public_key: pub, wrapped_data_key: 'x' }),
+    body: JSON.stringify({ credential_lookup_key: 'too-short', public_key: pub, wrapped_data_key: 'x', app: DEFAULT_APP_ID }),
   });
   assert(status === 400, `Expected 400, got ${status}`);
 });
@@ -137,7 +142,7 @@ await test('Register: invalid credential_lookup_key -> 400', async () => {
 await test('Register: invalid public_key -> 400', async () => {
   const { status } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: 'garbage', wrapped_data_key: 'x' }),
+    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: 'garbage', wrapped_data_key: 'x', app: DEFAULT_APP_ID }),
   });
   assert(status === 400, `Expected 400, got ${status}`);
 });
@@ -148,7 +153,7 @@ await test('Register: missing wrapped_data_key -> 400', async () => {
 
   const { status } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: pub }),
+    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: pub, app: DEFAULT_APP_ID }),
   });
   assert(status === 400, `Expected 400, got ${status}`);
 });
@@ -166,7 +171,7 @@ await test('Login: full happy path', async () => {
   // Register
   const { json: regJson } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
   const dlk = regJson.data_lookup_key;
 
@@ -211,7 +216,7 @@ await test('Verify: wrong signature -> 401', async () => {
   // Register
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
 
   // Challenge
@@ -239,7 +244,7 @@ await test('Verify: nonce replay -> 401', async () => {
   // Register
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
 
   // Challenge
@@ -277,11 +282,11 @@ await test('Verify: nonce for different credential_lookup_key -> 401', async () 
   // Register both
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk1, public_key: pub1, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk1, public_key: pub1, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk2, public_key: pub2, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk2, public_key: pub2, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
 
   // Get challenge for clk1
@@ -312,7 +317,7 @@ async function registerAndLogin() {
 
   const { json: regJson } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
   });
 
   const { json: cJson } = await fetchJSON('/api/v1/auth/challenge', {

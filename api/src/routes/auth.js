@@ -72,7 +72,18 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, public_key, wrapped_data_key } = body;
+  const { credential_lookup_key, public_key, wrapped_data_key, app } = body;
+
+  // Validate app — must be a registered app
+  if (!app || typeof app !== 'string') {
+    return errorResponse('app is required', 400, cors);
+  }
+  const registeredApp = await env.DB.prepare(
+    'SELECT 1 FROM apps WHERE app_id = ?1'
+  ).bind(app).first();
+  if (!registeredApp) {
+    return errorResponse('Unregistered app: ' + app, 400, cors);
+  }
 
   // Validate credential_lookup_key
   if (!isValidHex64(credential_lookup_key)) {
@@ -115,10 +126,10 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('Failed to generate unique data_lookup_key', 500, cors);
   }
 
-  // Insert account
+  // Insert account (rules_json NULL = DENY until app sets rules)
   await env.DB.prepare(
-    'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5)'
-  ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, Date.now()).run();
+    'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)'
+  ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now()).run();
 
   // Persist credential mapping to Arweave (non-blocking)
   persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key);
@@ -201,12 +212,12 @@ export async function handleVerify(request, env, cors) {
   let jwtPayload;
 
   const account = await env.DB.prepare(
-    'SELECT data_lookup_key, public_key FROM accounts WHERE credential_lookup_key = ?1'
+    'SELECT data_lookup_key, public_key, app FROM accounts WHERE credential_lookup_key = ?1'
   ).bind(credential_lookup_key).first();
 
   if (account) {
     publicKeyBase64 = account.public_key;
-    jwtPayload = { sub: account.data_lookup_key, role: 'user' };
+    jwtPayload = { sub: account.data_lookup_key, role: 'user', app: account.app };
   } else {
     const app = await env.DB.prepare(
       'SELECT app_id, public_key FROM apps WHERE app_id = ?1'
@@ -281,9 +292,9 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('new_credential_lookup_key already in use', 409, cors);
   }
 
-  // Read current account (need rules_json to preserve it)
+  // Read current account (need rules_json and app to preserve them)
   const current = await env.DB.prepare(
-    'SELECT credential_lookup_key, rules_json FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT credential_lookup_key, rules_json, app FROM accounts WHERE data_lookup_key = ?1'
   ).bind(auth.data_lookup_key).first();
   if (!current) {
     return errorResponse('Account not found', 404, cors);
@@ -293,8 +304,8 @@ export async function handleCredentialChange(request, env, ctx, cors) {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM accounts WHERE credential_lookup_key = ?1').bind(current.credential_lookup_key),
     env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)'
-    ).bind(new_credential_lookup_key, new_public_key, auth.data_lookup_key, new_wrapped_data_key, current.rules_json, Date.now()),
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)'
+    ).bind(new_credential_lookup_key, new_public_key, auth.data_lookup_key, new_wrapped_data_key, current.app, current.rules_json, Date.now()),
   ]);
 
   // Persist new credential mapping to Arweave (non-blocking)
