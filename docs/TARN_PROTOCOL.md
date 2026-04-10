@@ -496,7 +496,34 @@ Accounts table:
 
 Full self-healing. All fields are present in the Arweave credential mapping (public_key is in the blob body, not a secret). No re-registration flow needed.
 
-### 9. Set user write rules (app -> API)
+### 9. Delete account
+
+Client-initiated, irreversible (at the API layer).
+
+```
+CLIENT -> API:
+  1. DELETE /api/v1/auth  [JWT]
+
+API:
+  2. Verify JWT
+  3. Write tombstone to Arweave:
+     Tags: { Type: 'cred', Op: 'tombstone', Ref: <credential mapping txid>, Lk: credential_lookup_key, V }
+  4. Delete account row from D1 (or mark as deleted)
+  5. API stops serving entries for this data_lookup_key from cache
+  6. Return: OK
+```
+
+Data entries remain on Arweave permanently (encrypted, immutable). With the credential mapping tombstoned:
+- Login rejected — no account to authenticate against
+- Writes rejected — no valid JWT can be issued
+- API cache stops serving entries for this data_lookup_key
+- Data is effectively crypto-shredded: `data_encryption_key` is unrecoverable through the API
+
+Note: the user still knows their email+password and could re-derive keys to find old credential mappings directly on Arweave (pre-tombstone). Deletion is enforced by the API, not by cryptography. This is consistent with all Tarn deletions — tombstones are API-level resolution, not Arweave-level erasure.
+
+For GDPR: encrypted data where the access path has been destroyed is generally accepted as erasure.
+
+### 10. Set user write rules (app -> API)
 
 ```
 APP -> API:
@@ -548,6 +575,11 @@ PUT /api/v1/auth
   Auth: JWT
   Returns: 200 OK
   Errors: 401, 409 (new credential_lookup_key in use)
+
+DELETE /api/v1/auth
+  Auth: JWT
+  Returns: 200 OK
+  Errors: 401
 ```
 
 ### App endpoints
