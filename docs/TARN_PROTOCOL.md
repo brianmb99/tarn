@@ -150,6 +150,117 @@ Storing the credential mapping unencrypted:
 
 ---
 
+## App Identity
+
+Apps are first-class Tarn identities. An app registers with Tarn using the same ECDSA signing key model as users. App identities allow apps to manage user write rules (e.g., subscription tiers) via authenticated API calls.
+
+### App registration
+
+App registration is a privileged operation (initially manual, eventually a developer portal):
+
+```
+App generates ECDSA P-256 key pair
+Tarn operator registers: { app_id, public_key, role: 'app' }
+Stored in D1 and on Arweave: Type: 'app-reg', Lk: app_id
+```
+
+### App authentication
+
+Same challenge-response protocol as users:
+
+```
+POST /api/v1/auth/challenge  { credential_lookup_key: <app_id> }
+POST /api/v1/auth/verify     { credential_lookup_key: <app_id>, nonce, signature }
+-> JWT with { sub: <app_id>, role: 'app' }
+```
+
+### App wallets for Arweave storage
+
+Each app has its own Arweave/Turbo wallet for paying storage costs. The wallet private key is stored as a secret in the Tarn API environment (Cloudflare Worker secret). When the API forwards data to Turbo/Arweave, it uses the wallet associated with the `App` tag.
+
+- Wallet setup is manual (part of app registration)
+- Balance must be monitored and topped up — this is an operational concern, not a protocol concern
+- For Turbo: data items under 100KB are currently free, so for apps that keep entries small, the wallet may not need frequent funding
+
+---
+
+## Write Authorization Rules
+
+Write access is controlled by a **rules** array on each user account. At write time, the API evaluates all rules — **every rule must pass** for the write to be allowed. Unknown rule types **fail closed** (deny).
+
+Rules are set by authenticated app identities (see App Identity). The entire rules array is **replaced** on each update (no merging). The app owns the subscription/payment state and sends the complete rule set each time.
+
+### Rule types (v1)
+
+**`max_entries`** — user has fewer than N entries matching the filters
+
+```json
+{
+  "type": "max_entries",
+  "limit": 1000,
+  "since": "2026-04-01T00:00:00Z",
+  "app": "bookish",
+  "entry_type": "entry"
+}
+```
+
+All filter fields (`since`, `app`, `entry_type`) are optional. Omitted = not filtered.
+
+Tarn evaluates: `SELECT COUNT(*) FROM entries WHERE lookup_key = ? AND app = ? AND type = ? AND cached_at > ?`
+
+**`max_bytes`** — this individual entry is smaller than N bytes
+
+```json
+{
+  "type": "max_bytes",
+  "limit": 102400
+}
+```
+
+Tarn evaluates: `payload.byteLength <= limit` (checked before forwarding to Arweave).
+
+Note: Turbo currently provides free uploads under 100KB. Apps that want to avoid Arweave payment costs should set `max_bytes` to 102400 (100KB).
+
+**`expires`** — the current time is before this timestamp
+
+```json
+{
+  "type": "expires",
+  "at": "2027-04-01T00:00:00Z"
+}
+```
+
+Tarn evaluates: `Date.now() < at`
+
+### Rule evaluation at write time
+
+```
+For each rule in account.rules:
+  if rule.type is unknown -> DENY (fail closed)
+  if rule evaluates to false -> DENY
+If all rules pass -> ALLOW
+If no rules exist -> ALLOW (default: unrestricted)
+```
+
+### Rules on Arweave
+
+When an app sets rules for a user, Tarn persists to Arweave:
+
+```
+Tags: { Type: 'app-config', Lk: data_lookup_key, App: <app_id>, V }
+Body: { rules: [...], set_by: <app_id>, timestamp: <ISO 8601> }
+```
+
+Not encrypted — rules are not sensitive (entry counts and expiry dates). This enables full D1 recovery: scan Arweave for `Type=app-config`, latest per `data_lookup_key + app_id` wins.
+
+### Future rule types (not v1, but the model supports them)
+
+- **`rate_limit`** — max N writes per time window
+- **`allowed_types`** — restrict which `Type` values the user can write
+- **`requires_tag`** — entry must carry a specific tag
+
+---
+
 ## API State
 
 The API (Cloudflare Worker + D1) maintains:
@@ -160,6 +271,14 @@ credential_lookup_key TEXT PRIMARY KEY,
 public_key TEXT NOT NULL,             -- ECDSA P-256 public key, base64
 data_lookup_key TEXT NOT NULL UNIQUE,
 wrapped_data_key TEXT NOT NULL,       -- base64-encoded encrypted data_encryption_key
+rules_json TEXT,                      -- JSON array of write authorization rules (NULL = unrestricted)
+created_at INTEGER NOT NULL
+```
+
+**D1 `apps` table:**
+```sql
+app_id TEXT PRIMARY KEY,              -- e.g., 'bookish'
+public_key TEXT NOT NULL,             -- ECDSA P-256 public key, base64
 created_at INTEGER NOT NULL
 ```
 
@@ -179,7 +298,8 @@ cached_at INTEGER
 
 **Rebuild from Arweave:**
 - `entries`: Fully rebuildable from Arweave GraphQL queries (scan by `App` + `Type` tags)
-- `accounts`: Fully rebuildable from `Type=cred` blobs on Arweave. `credential_lookup_key` from `Lk` tag; `data_lookup_key`, `wrapped_data_key`, and `public_key` from blob body. No user action required.
+- `accounts`: Fully rebuildable from `Type=cred` blobs. `credential_lookup_key` from `Lk` tag; `data_lookup_key`, `wrapped_data_key`, and `public_key` from blob body. `rules_json` rebuilt from `Type=app-config` blobs. No user action required.
+- `apps`: Fully rebuildable from `Type=app-reg` blobs on Arweave.
 
 ---
 
@@ -260,10 +380,12 @@ CLIENT -> API:
 API:
   5. Verify JWT
   6. Check Lk tag matches JWT subject (data_lookup_key)
-  7. Forward to Arweave (via Turbo bundler)
-  8. Write-through to D1 cache
-  9. Track pending tx
-  10. Return: { txid, status: 'pending' }
+  7. Evaluate write authorization rules (see Write Authorization Rules)
+     -> 403 if any rule fails
+  8. Forward to Arweave (via Turbo bundler, using app's wallet)
+  9. Write-through to D1 cache
+  10. Track pending tx
+  11. Return: { txid, status: 'pending' }
 ```
 
 ### 4. Retrieve data
@@ -374,6 +496,28 @@ Accounts table:
 
 Full self-healing. All fields are present in the Arweave credential mapping (public_key is in the blob body, not a secret). No re-registration flow needed.
 
+### 9. Set user write rules (app -> API)
+
+```
+APP -> API:
+  1. App authenticates via challenge/verify (same as user login)
+     -> JWT with { sub: <app_id>, role: 'app' }
+
+  2. PUT /api/v1/accounts/{data_lookup_key}/rules  [JWT with role: 'app']
+     Body: { rules: [...] }
+
+API:
+  3. Verify JWT has role: 'app'
+  4. Verify user has entries tagged with this app_id (they're the app's user)
+  5. Replace rules_json in D1 accounts table
+  6. Persist to Arweave:
+     Tags: { Type: 'app-config', Lk: data_lookup_key, App: <app_id>, V }
+     Body: { rules: [...], set_by: <app_id>, timestamp }
+  7. Return: OK
+```
+
+Rules replace in full. The app sends the complete rule set every time.
+
 ---
 
 ## Client <-> API Summary
@@ -404,6 +548,16 @@ PUT /api/v1/auth
   Auth: JWT
   Returns: 200 OK
   Errors: 401, 409 (new credential_lookup_key in use)
+```
+
+### App endpoints
+
+```
+PUT /api/v1/accounts/{data_lookup_key}/rules
+  Body: { rules: [...] }
+  Auth: JWT with role: 'app'
+  Returns: 200 OK
+  Errors: 401, 403 (not an app JWT, or user has no entries for this app)
 ```
 
 ### Data endpoints
@@ -472,4 +626,4 @@ The `App` tag is set by the client app. Tarn treats it as an opaque string for f
 
 4. **Multiple credential mappings after changes:** After credential changes, multiple `Type=cred` blobs exist on Arweave with different `Lk` values, all pointing to the same `data_lookup_key`. On cache rebuild, latest (highest `block_timestamp`) wins. Old credential mappings remain on Arweave permanently — this is a minor information leak (reveals credential change history via shared `data_lookup_key`). Acceptable for v1.
 
-5. **Subscription integration:** Write endpoints will need a subscription check (free tier book count or valid subscription). The `data_lookup_key` is the natural key for the subscriptions table. Spec deferred to Issue #70.
+5. **App wallet monitoring:** Each app's Arweave/Turbo wallet needs balance monitoring and top-up. This is an operational concern — alerting, thresholds, who tops up. Not a protocol question, but needs operational tooling.
