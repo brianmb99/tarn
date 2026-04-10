@@ -67,7 +67,13 @@ export async function handleEntries(url, env, ctx, cors, request) {
   }, 200, cors);
 }
 
-export async function handleEntryById(txid, url, env, ctx, cors) {
+export async function handleEntryById(txid, url, env, ctx, cors, request) {
+  // IP rate limit (shares bucket with list endpoint)
+  const { allowed } = await checkReadRateLimit(env, request);
+  if (!allowed) {
+    return errorResponse('Rate limit exceeded', 429, cors);
+  }
+
   const key = url.searchParams.get('key') || null;
 
   const entry = await getEntryByTxid(env.DB, txid);
@@ -75,7 +81,9 @@ export async function handleEntryById(txid, url, env, ctx, cors) {
     return errorResponse('Entry not found', 404, cors);
   }
 
-  // If key provided, verify ownership
+  // If key provided, verify ownership. Without key, returns metadata for any txid.
+  // This is intentional: entry tags are public on Arweave (only the blob body is encrypted).
+  // Restricting metadata here would be security theater — it's already on-chain.
   if (key && entry.lookup_key && entry.lookup_key !== key) {
     return errorResponse('Entry not found', 404, cors);
   }

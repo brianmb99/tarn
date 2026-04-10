@@ -5,12 +5,39 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { isValidHex64 } from '../crypto.js';
 
-// GET /api/v1/sync/status?key=<data_lookup_key> — no auth required
-export async function handleSyncStatus(url, env, cors) {
+const MAX_SYNC_READS_PER_HOUR = 300;
+
+async function checkSyncRateLimit(env, request) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const data = new TextEncoder().encode(ip + '-tarn-sync-salt');
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const ipHash = Array.from(new Uint8Array(hash)).slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
+  const hour = new Date().toISOString().slice(0, 13);
+  const key = `sync:${ipHash}:${hour}`;
+  const count = parseInt(await env.RATE_KV.get(key) || '0');
+  if (count >= MAX_SYNC_READS_PER_HOUR) {
+    return { allowed: false };
+  }
+  await env.RATE_KV.put(key, String(count + 1), { expirationTtl: 3600 });
+  return { allowed: true };
+}
+
+// GET /api/v1/sync/status?key=<data_lookup_key> — no auth required, IP rate-limited
+export async function handleSyncStatus(url, env, cors, request) {
+  // IP rate limit
+  const { allowed } = await checkSyncRateLimit(env, request);
+  if (!allowed) {
+    return errorResponse('Rate limit exceeded', 429, cors);
+  }
+
   const key = url.searchParams.get('key');
   if (!key || !isValidHex64(key)) {
     return errorResponse('Missing or invalid key parameter (64-char hex)', 400, cors);
   }
+
+  // Opportunistic cleanup: purge rows older than 48 hours
+  env.DB.prepare("DELETE FROM pending_txs WHERE created_at < datetime('now', '-48 hours')")
+    .run().catch(() => {});
 
   const result = await env.DB.prepare(
     `SELECT txid FROM pending_txs

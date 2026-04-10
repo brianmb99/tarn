@@ -323,7 +323,12 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('Account not found', 404, cors);
   }
 
-  // PK change: delete old row + insert new (SQLite doesn't support UPDATE of PK)
+  // PK change: delete old row + insert new (SQLite doesn't support UPDATE of PK).
+  // NOTE: There is a small race window here. A concurrent handleChallenge using the old
+  // credential_lookup_key could receive a nonce, but by the time handleVerify runs, the
+  // row is gone and the user gets a 401. This is acceptable — the user simply re-logs in
+  // with the new credentials. The probability is very low (requires two devices changing
+  // credentials and logging in within the same D1 batch window).
   await env.DB.batch([
     env.DB.prepare('DELETE FROM accounts WHERE credential_lookup_key = ?1').bind(current.credential_lookup_key),
     env.DB.prepare(

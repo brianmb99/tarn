@@ -4,6 +4,11 @@
 //
 // Each TarnClient instance is scoped to one app. Same email+password with
 // different app IDs produces completely isolated accounts.
+//
+// NOTE: Protocol version ('0.4.0') is hardcoded in tag construction below.
+// When the protocol version bumps, update the V tag values here. This is
+// intentionally not imported from the server — the client library is
+// independently distributable and should not depend on server internals.
 
 import {
   deriveAllKeys,

@@ -34,6 +34,9 @@ function concat(...arrays) {
 
 // ============ AVRO TAG SERIALIZATION (ANS-104 spec) ============
 
+// NOTE: Uses 32-bit signed shift for zigzag encoding. Correct for n < 2^30 (~1GB).
+// For n >= 2^30 the encoding silently produces wrong results due to JS 32-bit bitwise ops.
+// This is safe in Tarn because MAX_UPLOAD_BYTES = 100KB, so n never approaches this limit.
 function avroLong(n) {
   let z = (n << 1) ^ (n >> 31);
   const buf = [];

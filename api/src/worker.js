@@ -89,7 +89,7 @@ export default {
       if (path.startsWith('/api/v1/entries/') && method === 'GET') {
         const txid = path.slice('/api/v1/entries/'.length);
         if (txid && !txid.includes('/')) {
-          return await handleEntryById(txid, url, env, ctx, cors);
+          return await handleEntryById(txid, url, env, ctx, cors, request);
         }
       }
 
@@ -112,7 +112,7 @@ export default {
 
       // Sync
       if (path === '/api/v1/sync/status' && method === 'GET') {
-        return await handleSyncStatus(url, env, cors);
+        return await handleSyncStatus(url, env, cors, request);
       }
       if (path === '/api/v1/sync/ack' && method === 'POST') {
         return await handleSyncAck(request, env, cors);
