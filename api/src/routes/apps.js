@@ -4,7 +4,7 @@
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { upsertWriteThrough } from '../cache.js';
-import { forwardToTurbo } from '../turbo.js';
+import { uploadToArweave } from '../turbo.js';
 
 const PROTOCOL_VERSION = '0.3.0';
 
@@ -83,8 +83,13 @@ export async function handleSetRules(dataLookupKey, request, env, ctx, cors) {
 
   ctx.waitUntil((async () => {
     try {
+      const signingKey = env.APP_SIGNING_KEY;
+      if (!signingKey) {
+        console.warn('[tarn-api] APP_SIGNING_KEY not set — skipping app-config upload');
+        return;
+      }
       const blobBytes = new TextEncoder().encode(configBody);
-      const turbo = await forwardToTurbo(blobBytes);
+      const turbo = await uploadToArweave(blobBytes, tags, signingKey);
       if (turbo.ok && turbo.txid) {
         await upsertWriteThrough(env.DB, turbo.txid, tags);
         console.log(`[tarn-api] App-config uploaded: ${turbo.txid}`);

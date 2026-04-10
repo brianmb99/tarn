@@ -6,7 +6,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { checkWriteRateLimit } from '../rate_limit.js';
 import { upsertWriteThrough, trackPendingTx, getEntryByTxid } from '../cache.js';
 import { evaluateRules } from '../rules.js';
-import { forwardToTurbo, TURBO_GATEWAY } from '../turbo.js';
+import { uploadToArweave, forwardToTurbo, TURBO_GATEWAY } from '../turbo.js';
 import { MAX_UPLOAD_BYTES } from '../constants.js';
 
 // ============ HELPERS ============
@@ -95,8 +95,13 @@ export async function handleCreateEntry(request, env, ctx, cors) {
     );
   }
 
-  // Forward to Turbo
-  const turbo = await forwardToTurbo(body);
+  // Sign DataItem server-side and upload to Turbo
+  const signingKey = env.APP_SIGNING_KEY;
+  if (!signingKey) {
+    return errorResponse('Server signing key not configured', 500, cors);
+  }
+
+  const turbo = await uploadToArweave(new Uint8Array(body), tags, signingKey);
   if (!turbo.ok) {
     return jsonResponse(
       { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },
@@ -183,8 +188,8 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     );
   }
 
-  // Forward to Turbo
-  const turbo = await forwardToTurbo(body);
+  // Sign DataItem server-side and upload to Turbo
+  const turbo = await uploadToArweave(new Uint8Array(body), tags, env.APP_SIGNING_KEY);
   if (!turbo.ok) {
     return jsonResponse(
       { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },
@@ -271,8 +276,8 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     );
   }
 
-  // Forward to Turbo
-  const turbo = await forwardToTurbo(body);
+  // Sign DataItem server-side and upload to Turbo
+  const turbo = await uploadToArweave(new Uint8Array(body), tags, env.APP_SIGNING_KEY);
   if (!turbo.ok) {
     return jsonResponse(
       { error: 'Turbo upload failed', turboStatus: turbo.status, detail: turbo.body },

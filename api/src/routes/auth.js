@@ -5,7 +5,7 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { generateChallenge, storeNonce, consumeNonce, signJWT } from '../auth.js';
 import { importPublicKey, verifySignature, isValidHex64 } from '../crypto.js';
 import { requireAuth } from '../middleware/auth.js';
-import { forwardToTurbo } from '../turbo.js';
+import { uploadToArweave } from '../turbo.js';
 import { upsertWriteThrough } from '../cache.js';
 
 const PROTOCOL_VERSION = '0.3.0';
@@ -41,8 +41,13 @@ function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wra
 
   ctx.waitUntil((async () => {
     try {
+      const signingKey = env.APP_SIGNING_KEY;
+      if (!signingKey) {
+        console.warn('[tarn-api] APP_SIGNING_KEY not set — skipping Arweave upload');
+        return;
+      }
       const blobBytes = new TextEncoder().encode(blobBody);
-      const turbo = await forwardToTurbo(blobBytes);
+      const turbo = await uploadToArweave(blobBytes, tags, signingKey);
       if (turbo.ok && turbo.txid) {
         await upsertWriteThrough(env.DB, turbo.txid, tags);
         console.log(`[tarn-api] Credential blob uploaded: ${turbo.txid}`);
@@ -332,8 +337,13 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
 
     ctx.waitUntil((async () => {
       try {
+        const signingKey = env.APP_SIGNING_KEY;
+        if (!signingKey) {
+          console.warn('[tarn-api] APP_SIGNING_KEY not set — skipping tombstone upload');
+          return;
+        }
         const tombstoneBody = new TextEncoder().encode(JSON.stringify({ tombstone: true }));
-        const turbo = await forwardToTurbo(tombstoneBody);
+        const turbo = await uploadToArweave(tombstoneBody, tombstoneTags, signingKey);
         if (turbo.ok && turbo.txid) {
           await upsertWriteThrough(env.DB, turbo.txid, tombstoneTags);
           console.log(`[tarn-api] Account tombstone uploaded: ${turbo.txid}`);
