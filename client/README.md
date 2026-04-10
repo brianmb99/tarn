@@ -1,21 +1,181 @@
 # Tarn Client
 
-JavaScript client library for the Tarn protocol. Handles key derivation, encryption, and API interaction.
+JavaScript client library for [Tarn](https://github.com/brianmb99/tarn) — permanent, encrypted, user-owned data on Arweave.
+
+Zero dependencies. Pure WebCrypto. Works in browsers and Node.js 15+.
+
+## Quick Start
 
 ```javascript
-import { TarnClient } from './src/tarn.js';
+import { TarnClient } from 'tarn-client';
 
-const tarn = new TarnClient('https://api.tarn.dev');
+const tarn = new TarnClient('https://api.tarn.dev', 'your-app-id');
 
-// Register
-await tarn.register('user@example.com', 'password');
+// Register a new user
+const { dataLookupKey } = await tarn.register('user@example.com', 'password');
 
-// Login (on another device)
+// Login (any device, same email+password)
 await tarn.login('user@example.com', 'password');
 
-// CRUD
-await tarn.createEntry('myapp', 'note', { title: 'Hello', body: 'World' });
-const entries = await tarn.getEntries('myapp', 'note');
+// Create encrypted data
+await tarn.createEntry('note', { title: 'Hello', body: 'World' });
+
+// Read + decrypt
+const entries = await tarn.getEntries('note');
+console.log(entries[0].data); // { title: 'Hello', body: 'World' }
+
+// Update
+await tarn.updateEntry(entries[0].txid, 'note', { title: 'Updated', body: 'Content' });
+
+// Delete
+await tarn.deleteEntry(entries[0].txid, 'note');
 ```
 
-See `docs/TARN_PROTOCOL.md` for the protocol spec.
+## App Setup
+
+Before users can register, your app must be registered with Tarn.
+
+### 1. Generate an app key pair
+
+```bash
+node tools/generate-app-key.mjs your-app-id
+```
+
+This prints:
+- **Private key** (hex) — save this securely. You'll need it to manage user subscriptions.
+- **Public key** (base64) — registered in Tarn's database.
+- **D1 seed SQL** — run this to register your app.
+
+**Save the private key in your password manager.** It is printed once and not stored.
+
+### 2. Register the app in Tarn
+
+Run the D1 seed command printed by the key generator:
+
+```bash
+# Local development
+cd api && npx wrangler d1 execute tarn-api-cache --local --command "<printed SQL>"
+
+# Production
+cd api && npx wrangler d1 execute tarn-api-cache --remote --command "<printed SQL>"
+```
+
+### 3. Set the app key as an environment variable
+
+```bash
+# Local: add to api/.dev.vars
+TARN_APP_KEY_YOURAPP=<private key hex>
+
+# Production: Cloudflare Worker secret
+wrangler secret put TARN_APP_KEY_YOURAPP
+```
+
+## Managing User Subscriptions
+
+After a user registers, their account has no write rules (writes are denied by default). Your app must set rules to enable writes.
+
+### Using the CLI tool
+
+```bash
+# Free tier (5 entries, 100KB max per entry)
+node tools/set-rules.mjs \
+  --api https://api.tarn.dev \
+  --app your-app-id \
+  --key <private key hex> \
+  --dlk <user's data_lookup_key> \
+  --plan free
+
+# Annual subscription (1000 entries, expires in 1 year)
+node tools/set-rules.mjs \
+  --api https://api.tarn.dev \
+  --app your-app-id \
+  --key <private key hex> \
+  --dlk <user's data_lookup_key> \
+  --plan annual
+
+# Custom rules
+node tools/set-rules.mjs \
+  --api https://api.tarn.dev \
+  --app your-app-id \
+  --key <private key hex> \
+  --dlk <user's data_lookup_key> \
+  --rules '[{"type":"max_entries","limit":50},{"type":"max_bytes","limit":102400}]'
+
+# Unrestricted (empty rules = allow all)
+node tools/set-rules.mjs ... --plan clear
+
+# Deny all writes
+node tools/set-rules.mjs ... --plan deny
+```
+
+### Available rule types
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `max_entries` | `limit`, `since?`, `app?`, `entry_type?` | Max number of entries matching filters |
+| `max_bytes` | `limit` | Max payload size per entry (bytes) |
+| `expires` | `at` (ISO 8601) | Deny writes after this timestamp |
+
+Rules are AND logic — all must pass. Unknown rule types fail closed (deny).
+
+## Per-App Isolation
+
+Each `TarnClient` is scoped to one app. The same email+password with different app IDs produces completely independent accounts — different keys, different data, no cross-app visibility.
+
+```javascript
+const bookish = new TarnClient('https://api.tarn.dev', 'bookish');
+const cellar = new TarnClient('https://api.tarn.dev', 'cellar');
+
+// Same user, completely isolated data
+await bookish.register('user@example.com', 'password');
+await cellar.register('user@example.com', 'password');
+// These are two separate accounts with separate encryption keys
+```
+
+## Credential Management
+
+```javascript
+// Change email and/or password (requires active session)
+await tarn.changeCredentials('new@example.com', 'new-password');
+
+// Delete account permanently
+await tarn.deleteAccount();
+```
+
+Credential changes re-wrap the data encryption key. All existing data remains decryptable. The old credentials stop working immediately.
+
+## Security Model
+
+- **Client-side encryption.** All data is AES-256-GCM encrypted before leaving the client. The server never sees plaintext.
+- **PBKDF2 key derivation.** 600K iterations, SHA-256. Keys derived via HKDF-Expand (RFC 5869).
+- **ECDSA P-256 auth.** Challenge-response signing. No passwords transmitted. Server stores only the public key.
+- **AES-KW key wrapping.** Data encryption key wrapped per RFC 3394. Self-wrapping at registration for uniform login code path.
+- **Arweave permanence.** Data stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.
+
+See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specification.
+
+## API
+
+### `new TarnClient(apiBaseUrl, appId)`
+
+### `tarn.register(email, password)` → `{ dataLookupKey }`
+
+### `tarn.login(email, password)` → `{ dataLookupKey }`
+
+### `tarn.createEntry(type, plaintext, extraTags?)` → `{ txid }`
+
+### `tarn.getEntries(type)` → `[{ txid, data, tags }]`
+
+### `tarn.updateEntry(priorTxid, type, plaintext)` → `{ txid }`
+
+### `tarn.deleteEntry(targetTxid, type)` → `{ txid }`
+
+### `tarn.changeCredentials(newEmail, newPassword)`
+
+### `tarn.deleteAccount()`
+
+### `tarn.dataLookupKey` — the user's data lookup key (available after register/login)
+
+### `tarn.appId` — the app this client is scoped to
+
+### `tarn.isAuthenticated` — whether a valid JWT exists
