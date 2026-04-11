@@ -17,24 +17,41 @@ Tarn is NOT an app. It is infrastructure. Apps are clients of Tarn. The first ap
 
 - `docs/TARN_PROTOCOL.md` — The complete protocol spec: key hierarchy, auth flows, data CRUD, Arweave tag scheme. **Read this first** when working on any Tarn issue.
 
-## Repo Structure
-
-- `api/` — Cloudflare Worker API (D1 cache + Arweave write proxy)
-- `client/` — JavaScript client library (not yet implemented)
-- `docs/` — Protocol spec and design documents
-- `tests/` — Test suites
-
 ## Git Workflow
 
 - **Two branches:** `main` (stable) and `dev` (all development work).
 - All work goes on `dev`. **Never push to `main`** — merging is a human decision.
 - Do not create feature branches.
 
+## Repo Structure
+
+- `api/` — Cloudflare Worker API (D1 cache + Arweave write proxy)
+- `client/` — JavaScript client library (see `client/README.md` for usage)
+- `docs/` — Protocol spec and design documents
+- `tools/` — CLI tools (app key generation, subscription management)
+- `tests/` — Test suites (unit, integration, E2E, security, deployment)
+
 ## Development
 
-- API local dev: `cd api && wrangler dev`
-- API tests: `cd api && node test.mjs`
-- API deployment: `cd api && wrangler deploy` (Cloudflare Workers)
+- API local dev: `cd api && npx wrangler dev --port 8787`
+- Unit tests: `node --test tests/unit/*.test.js`
+- Integration tests: `node tests/test-auth.mjs http://localhost:8787` (and test-e2e, test-apps-e2e, test-security, test-client)
+- All local tests require wrangler dev running and D1 migrations applied (`cd api && npx wrangler d1 migrations apply bookish-api-cache --local`)
+
+## Deployment
+
+- Deploy: `cd api && npx wrangler deploy`
+- Apply remote migrations: `cd api && npx wrangler d1 migrations apply bookish-api-cache --remote`
+- **After every deploy, run the post-deployment smoke test:**
+  ```
+  node tests/test-deployed.mjs https://api.tarn.dev bookish <TARN_APP_KEY_BOOKISH>
+  ```
+  This tests the full lifecycle (health, register, app auth, set rules, login, write, read, Turbo gateway, status, delete) against the live API. Do not consider a deploy complete until this passes.
+- The bookish app private key (`TARN_APP_KEY_BOOKISH`) is in `api/.dev.vars` (local) and Cloudflare Worker secrets (production).
+
+## D1 Database
+
+The Cloudflare D1 database is named `bookish-api-cache` (legacy name — Cloudflare doesn't support renaming D1 databases). The `database_id` in wrangler.toml is what the Worker binding actually uses. All CLI commands (`wrangler d1 execute`, `wrangler d1 migrations apply`) must use `bookish-api-cache` as the database name.
 
 ## Issue Workflow
 
