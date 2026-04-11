@@ -111,7 +111,7 @@ await test('User with empty rules array (app set []): write is ALLOWED', async (
   // Set empty rules via D1 (simulating app setting rules)
   const { execSync } = await import('child_process');
   execSync(
-    `npx wrangler d1 execute tarn-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+    `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
     { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
   );
 
@@ -146,7 +146,7 @@ await test('App sets rules for user with zero entries: succeeds', async () => {
   const appPub64 = btoa(String.fromCharCode(...new Uint8Array(appPubDer)));
   const { execSync } = await import('child_process');
   execSync(
-    `npx wrangler d1 execute tarn-api-cache --local --command "INSERT OR REPLACE INTO apps (app_id, public_key, created_at) VALUES ('${DEFAULT_APP_ID}', '${appPub64}', ${Date.now()})"`,
+    `npx wrangler d1 execute bookish-api-cache --local --command "INSERT OR REPLACE INTO apps (app_id, public_key, created_at) VALUES ('${DEFAULT_APP_ID}', '${appPub64}', ${Date.now()})"`,
     { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
   );
 
@@ -188,7 +188,7 @@ await test('Write with mismatched App tag: DENIED', async () => {
   // Set rules so the user can write
   const { execSync } = await import('child_process');
   execSync(
-    `npx wrangler d1 execute tarn-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+    `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
     { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
   );
 
@@ -219,7 +219,7 @@ await test('Write with correct App tag: ALLOWED', async () => {
 
   const { execSync } = await import('child_process');
   execSync(
-    `npx wrangler d1 execute tarn-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+    `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
     { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
   );
 

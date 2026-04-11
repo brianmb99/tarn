@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "node test.mjs",
-    "migrate": "wrangler d1 migrations apply tarn-api-cache"
+    "migrate": "wrangler d1 migrations apply bookish-api-cache"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0",

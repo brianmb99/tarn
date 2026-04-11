@@ -99,7 +99,7 @@ async function setupApp() {
     const { execSync } = await import('child_process');
     const sql = `INSERT OR REPLACE INTO apps (app_id, public_key, created_at) VALUES ('${APP_ID}', '${appPublicKeyBase64}', ${Date.now()})`;
     execSync(
-      `cd api && npx wrangler d1 execute tarn-api-cache --local --command "${sql}"`,
+      `cd api && npx wrangler d1 execute bookish-api-cache --local --command "${sql}"`,
       { cwd: process.cwd().replace(/\/tests$/, ''), stdio: 'pipe', timeout: 15000 }
     );
     console.log('  App seeded in D1.\n');
@@ -176,7 +176,7 @@ async function registerUser() {
   const { execSync } = await import('child_process');
   try {
     execSync(
-      `npx wrangler d1 execute tarn-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
+      `npx wrangler d1 execute bookish-api-cache --local --command "UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'"`,
       { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 10000 }
     );
   } catch {}
