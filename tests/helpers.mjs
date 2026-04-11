@@ -20,7 +20,7 @@ export async function seedTestApp(appId = DEFAULT_APP_ID) {
     const { execSync } = await import('child_process');
     const sql = `INSERT OR REPLACE INTO apps (app_id, public_key, created_at) VALUES ('${appId}', '${pubBase64}', ${Date.now()})`;
     execSync(
-      `npx wrangler d1 execute bookish-api-cache --local --command "${sql}"`,
+      `npx wrangler d1 execute tarn-api --local --command "${sql}"`,
       { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 15000 }
     );
     return { keyPair, pubBase64 };

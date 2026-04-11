@@ -15,8 +15,8 @@ enabled = true
 # D1 Database (entries cache)
 [[d1_databases]]
 binding = "DB"
-database_name = "bookish-api-cache"  # Legacy name in Cloudflare — cannot rename D1 databases. The database_id is what matters.
-database_id = "46d5b598-19a3-4751-b4ce-70e903c5d4bf"
+database_name = "tarn-api"
+database_id = "c09eeae0-04e4-444a-88e5-bf8f7ce91dbd"
 
 # KV Namespace (IP rate limiting + write rate limiting)
 [[kv_namespaces]]

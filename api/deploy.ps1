@@ -52,7 +52,7 @@ try {
 }
 
 Write-Info "Applying D1 migrations..."
-wrangler d1 migrations apply bookish-api-cache --remote
+wrangler d1 migrations apply tarn-api --remote
 if ($LASTEXITCODE -ne 0) {
   Write-Err "Migration failed"
   exit 1

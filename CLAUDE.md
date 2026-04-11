@@ -36,12 +36,12 @@ Tarn is NOT an app. It is infrastructure. Apps are clients of Tarn. The first ap
 - API local dev: `cd api && npx wrangler dev --port 8787`
 - Unit tests: `node --test tests/unit/*.test.js`
 - Integration tests: `node tests/test-auth.mjs http://localhost:8787` (and test-e2e, test-apps-e2e, test-security, test-client)
-- All local tests require wrangler dev running and D1 migrations applied (`cd api && npx wrangler d1 migrations apply bookish-api-cache --local`)
+- All local tests require wrangler dev running and D1 migrations applied (`cd api && npx wrangler d1 migrations apply tarn-api --local`)
 
 ## Deployment
 
 - Deploy: `cd api && npx wrangler deploy`
-- Apply remote migrations: `cd api && npx wrangler d1 migrations apply bookish-api-cache --remote`
+- Apply remote migrations: `cd api && npx wrangler d1 migrations apply tarn-api --remote`
 - **After every deploy, run the post-deployment smoke test:**
   ```
   node tests/test-deployed.mjs https://api.tarn.dev bookish <TARN_APP_KEY_BOOKISH>
@@ -51,7 +51,11 @@ Tarn is NOT an app. It is infrastructure. Apps are clients of Tarn. The first ap
 
 ## D1 Database
 
-The Cloudflare D1 database is named `bookish-api-cache` (legacy name — Cloudflare doesn't support renaming D1 databases). The `database_id` in wrangler.toml is what the Worker binding actually uses. All CLI commands (`wrangler d1 execute`, `wrangler d1 migrations apply`) must use `bookish-api-cache` as the database name.
+The Cloudflare D1 database is named `tarn-api`. All CLI commands use this name:
+```
+cd api && npx wrangler d1 execute tarn-api --remote --command "SELECT ..."
+cd api && npx wrangler d1 migrations apply tarn-api --remote
+```
 
 ## Issue Workflow
 

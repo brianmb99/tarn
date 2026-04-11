@@ -54,10 +54,10 @@ console.log(`=== D1 Seed Commands ===\n`);
 const sql = `INSERT OR REPLACE INTO apps (app_id, public_key, created_at) VALUES ('${appId}', '${publicKeyBase64}', ${Date.now()})`;
 
 console.log(`Local dev:`);
-console.log(`  cd api && npx wrangler d1 execute bookish-api-cache --local --command "${sql}"\n`);
+console.log(`  cd api && npx wrangler d1 execute tarn-api --local --command "${sql}"\n`);
 
 console.log(`Production:`);
-console.log(`  cd api && npx wrangler d1 execute bookish-api-cache --remote --command "${sql}"\n`);
+console.log(`  cd api && npx wrangler d1 execute tarn-api --remote --command "${sql}"\n`);
 
 console.log(`=== Environment Variable ===\n`);
 console.log(`Add to .dev.vars (local) or wrangler secret (production):`);
