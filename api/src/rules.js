@@ -11,7 +11,8 @@
  * @param {string} context.data_lookup_key - The user's data lookup key
  * @param {string} context.app - App identifier from tags
  * @param {string} context.type - Entry type from tags
- * @param {number} context.payloadBytes - Size of the encrypted payload in bytes
+ * @param {number} context.payloadBytes - Size of the encrypted payload in bytes (largest in batch)
+ * @param {number} [context.batchSize=1] - Number of entries being written (for batch imports)
  * @returns {Promise<{allowed: boolean, failedRule?: string}>}
  */
 export async function evaluateRules(db, rulesJson, context) {
@@ -99,9 +100,10 @@ async function evaluateMaxEntries(db, rule, context) {
   const stmt = db.prepare(sql);
   const result = await stmt.bind(...bindings).first();
   const count = result?.count ?? 0;
+  const batchSize = context.batchSize || 1;
 
-  if (count >= rule.limit) {
-    return { allowed: false, failedRule: `max_entries: limit ${rule.limit} reached (${count} entries)` };
+  if (count + batchSize > rule.limit) {
+    return { allowed: false, failedRule: `max_entries: limit ${rule.limit} would be exceeded (${count} existing + ${batchSize} new)` };
   }
 
   return { allowed: true };

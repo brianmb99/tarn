@@ -468,6 +468,14 @@ POST /api/v1/entries
   Returns: { txid, status: 'pending' }
   Errors: 401, 403 (Lk/App mismatch or rules deny), 413
 
+POST /api/v1/entries/batch
+  Body: { entries: [{ data: "<base64 encrypted bytes>", tags: [...] }, ...] }
+  Auth: JWT
+  Returns: { entries: [{ txid, gateway }], count, status: 'pending' }
+  Errors: 401, 403, 413
+  Max 100 entries per batch. Counts as 1 rate-limit hit.
+  Rules evaluated once for the entire batch (max_entries checks count + batchSize).
+
 GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}
   Auth: none (IP rate-limited)
   Returns: { entries: [{ txid, tags }], total }

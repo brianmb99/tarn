@@ -145,6 +145,139 @@ export async function handleCreateEntry(request, env, ctx, cors) {
   }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
 }
 
+// ============ POST /api/v1/entries/batch — Bulk Import ============
+
+const MAX_BATCH_SIZE = 100;
+
+export async function handleBatchCreate(request, env, ctx, cors) {
+  // Auth
+  const auth = await requireAuth(request, env);
+  if (!auth) return errorResponse('Unauthorized', 401, cors);
+
+  // Rate limit (batch counts as 1 rate-limit hit)
+  const { allowed, remaining } = await checkWriteRateLimit(env, auth.data_lookup_key);
+  if (!allowed) {
+    return jsonResponse(
+      { error: 'Rate limit exceeded', retryAfter: 3600 },
+      429, { ...cors, 'Retry-After': '3600' }
+    );
+  }
+
+  // Parse JSON body
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, cors);
+  }
+
+  const { entries } = body;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return errorResponse('entries[] is required and must be non-empty', 400, cors);
+  }
+  if (entries.length > MAX_BATCH_SIZE) {
+    return errorResponse(`entries[] max ${MAX_BATCH_SIZE} items`, 400, cors);
+  }
+
+  // Validate all entries upfront
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!entry.data || typeof entry.data !== 'string') {
+      return errorResponse(`entries[${i}]: data is required (base64-encoded bytes)`, 400, cors);
+    }
+    if (!Array.isArray(entry.tags)) {
+      return errorResponse(`entries[${i}]: tags[] is required`, 400, cors);
+    }
+
+    // Validate Lk tag
+    const lk = tagValue(entry.tags, 'Lk');
+    if (!lk || lk !== auth.data_lookup_key) {
+      return errorResponse(`entries[${i}]: Lk tag does not match authenticated identity`, 403, cors);
+    }
+
+    // Validate App tag
+    const app = tagValue(entry.tags, 'App') || '';
+    if (!auth.app || app !== auth.app) {
+      return errorResponse(`entries[${i}]: App tag does not match authenticated app`, 403, cors);
+    }
+
+    // Decode and check size
+    let dataBytes;
+    try {
+      dataBytes = Uint8Array.from(atob(entry.data), c => c.charCodeAt(0));
+    } catch {
+      return errorResponse(`entries[${i}]: invalid base64 data`, 400, cors);
+    }
+    if (dataBytes.length === 0) {
+      return errorResponse(`entries[${i}]: empty data`, 400, cors);
+    }
+    if (dataBytes.length > MAX_UPLOAD_BYTES) {
+      return errorResponse(`entries[${i}]: data exceeds ${MAX_UPLOAD_BYTES} bytes`, 413, cors);
+    }
+
+    // Stash decoded bytes for processing
+    entry._dataBytes = dataBytes;
+  }
+
+  // Evaluate rules with batch size
+  const firstEntry = entries[0];
+  const app = tagValue(firstEntry.tags, 'App') || '';
+  const type = tagValue(firstEntry.tags, 'Type') || '';
+
+  const rulesJson = await getAccountRules(env.DB, auth.data_lookup_key);
+  const ruleResult = await evaluateRules(env.DB, rulesJson, {
+    data_lookup_key: auth.data_lookup_key,
+    app,
+    type,
+    payloadBytes: Math.max(...entries.map(e => e._dataBytes.length)),
+    batchSize: entries.length,
+  });
+
+  if (!ruleResult.allowed) {
+    return jsonResponse(
+      { error: 'Write denied by authorization rules', detail: ruleResult.failedRule },
+      403, cors
+    );
+  }
+
+  // Signing key check
+  const signingKey = env.APP_SIGNING_KEY;
+  if (!signingKey) {
+    return errorResponse('Server signing key not configured', 500, cors);
+  }
+
+  // Process all entries: sign, cache, upload in background
+  const results = [];
+
+  for (const entry of entries) {
+    const { signedDataItem, txid } = await buildSignedDataItem(entry._dataBytes, entry.tags, signingKey);
+    const entryApp = tagValue(entry.tags, 'App') || '';
+    const entryType = tagValue(entry.tags, 'Type') || '';
+
+    // Cache in D1 immediately
+    await upsertWriteThrough(env.DB, txid, entry.tags);
+    await trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType);
+
+    // Upload to Turbo in background
+    ctx.waitUntil((async () => {
+      const result = await uploadSignedDataItem(signedDataItem);
+      if (result.ok) {
+        console.log(`[tarn-api] Batch Turbo upload OK: ${txid}`);
+      } else {
+        console.warn(`[tarn-api] Batch Turbo upload failed for ${txid}: ${result.status} ${result.body}`);
+      }
+    })());
+
+    results.push({ txid, gateway: `${TURBO_GATEWAY}/${txid}` });
+  }
+
+  return jsonResponse({
+    entries: results,
+    count: results.length,
+    status: 'pending',
+  }, 200, cors);
+}
+
 // ============ PUT /api/v1/entries/:id — Edit ============
 
 export async function handleEditEntry(priorTxid, request, env, ctx, cors) {

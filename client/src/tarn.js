@@ -214,6 +214,52 @@ export class TarnClient {
   }
 
   /**
+   * Bulk import multiple entries in one request.
+   * Counts as 1 rate-limit hit regardless of batch size. Max 100 entries per batch.
+   * @param {string} type - Entry type for all entries
+   * @param {Array<Object>} items - Array of JSON-serializable payloads
+   * @returns {Promise<Array<{txid: string}>>}
+   */
+  async batchCreate(type, items) {
+    this.#requireAuth();
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('items must be a non-empty array');
+    }
+    if (items.length > 100) {
+      throw new Error('items max 100 per batch');
+    }
+
+    // Encrypt each item and build the batch payload
+    const entries = [];
+    for (const item of items) {
+      const encrypted = await encrypt(this.#dataEncryptionKey, item);
+      const tags = [
+        { name: 'App', value: this.#appId },
+        { name: 'Type', value: type },
+        { name: 'Lk', value: this.#dataLookupKey },
+        { name: 'Enc', value: 'aes-256-gcm' },
+        { name: 'V', value: '0.4.0' },
+      ];
+      // Base64-encode the encrypted bytes for JSON transport
+      const data = btoa(String.fromCharCode(...encrypted));
+      entries.push({ data, tags });
+    }
+
+    const res = await this.#fetch('/api/v1/entries/batch', {
+      method: 'POST',
+      auth: true,
+      body: { entries },
+    });
+
+    if (res.status !== 200) {
+      throw new Error(`Batch create failed: ${res.json?.error || res.status}`);
+    }
+
+    return res.json.entries;
+  }
+
+  /**
    * Retrieve and decrypt entries.
    * @param {string} type - Entry type
    * @returns {Promise<Array<{txid: string, data: Object, tags: Array}>>}

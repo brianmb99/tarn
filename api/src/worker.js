@@ -5,7 +5,7 @@ import { handleHealth } from './routes/info.js';
 import { handleEntries, handleEntryById } from './routes/entries.js';
 import { handleLookup } from './routes/lookup.js';
 import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
-import { handleCreateEntry, handleEditEntry, handleDeleteEntry } from './routes/write.js';
+import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules } from './routes/apps.js';
 import { handleStatus } from './routes/status.js';
@@ -96,6 +96,9 @@ export default {
       // Entries — writes (authenticated)
       if (path === '/api/v1/entries' && method === 'POST') {
         return await handleCreateEntry(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/entries/batch' && method === 'POST') {
+        return await handleBatchCreate(request, env, ctx, cors);
       }
       if (path.startsWith('/api/v1/entries/') && method === 'PUT') {
         const txid = path.slice('/api/v1/entries/'.length);
