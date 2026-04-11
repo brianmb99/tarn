@@ -164,6 +164,19 @@ See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specifica
 
 ### `tarn.createEntry(type, plaintext, extraTags?)` → `{ txid }`
 
+### `tarn.batchCreate(type, items)` → `[{ txid, gateway }]`
+
+Bulk import up to 100 entries in one request. Counts as 1 rate-limit hit. Each item is encrypted individually and gets its own txid on Arweave.
+
+```javascript
+const results = await tarn.batchCreate('entry', [
+  { title: 'Book 1', author: 'Author 1' },
+  { title: 'Book 2', author: 'Author 2' },
+  // ... up to 100 items
+]);
+// results: [{ txid: '...', gateway: 'https://...' }, ...]
+```
+
 ### `tarn.getEntries(type)` → `[{ txid, data, tags }]`
 
 ### `tarn.updateEntry(priorTxid, type, plaintext)` → `{ txid }`
