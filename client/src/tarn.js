@@ -126,7 +126,7 @@ export class TarnClient {
    * @param {string} newPassword
    */
   async changeCredentials(newEmail, newPassword) {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
@@ -157,7 +157,7 @@ export class TarnClient {
    * Delete the account permanently.
    */
   async deleteAccount() {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     const res = await this.#fetch('/api/v1/auth', { method: 'DELETE', auth: true });
 
@@ -183,7 +183,7 @@ export class TarnClient {
    * @returns {Promise<{txid: string}>}
    */
   async createEntry(type, plaintext, extraTags = []) {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     const encrypted = await encrypt(this.#dataEncryptionKey, plaintext);
     const tags = [
@@ -221,7 +221,7 @@ export class TarnClient {
    * @returns {Promise<Array<{txid: string}>>}
    */
   async batchCreate(type, items) {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     if (!Array.isArray(items) || items.length === 0) {
       throw new Error('items must be a non-empty array');
@@ -265,7 +265,7 @@ export class TarnClient {
    * @returns {Promise<Array<{txid: string, data: Object, tags: Array}>>}
    */
   async getEntries(type) {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     // Paginate through all entries (API returns up to 500 per page)
     const allRawEntries = [];
@@ -313,7 +313,7 @@ export class TarnClient {
    * @returns {Promise<{txid: string}>}
    */
   async updateEntry(priorTxid, type, plaintext) {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     const encrypted = await encrypt(this.#dataEncryptionKey, plaintext);
     const tags = [
@@ -350,7 +350,7 @@ export class TarnClient {
    * @returns {Promise<{txid: string}>}
    */
   async deleteEntry(targetTxid, type) {
-    this.#requireAuth();
+    await this.#requireAuth();
 
     const encrypted = await encrypt(this.#dataEncryptionKey, { tombstone: true, ref: targetTxid });
     const tags = [
@@ -385,24 +385,42 @@ export class TarnClient {
 
   get dataLookupKey() { return this.#dataLookupKey; }
   get appId() { return this.#appId; }
-  get isAuthenticated() { return !!this.#jwt; }
+  /** True if the client has a session (JWT may auto-refresh transparently). */
+  get isAuthenticated() { return !!(this.#jwt || this.#signingKeyPair); }
 
   // ============ PRIVATE ============
 
-  #requireAuth() {
-    if (!this.#jwt) throw new Error('Not authenticated — call register() or login() first');
-    // Check JWT expiry (decode payload without verification — just for timing)
-    try {
-      const parts = this.#jwt.split('.');
-      const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-      if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-        this.#jwt = null; // Clear expired token
-        throw new Error('JWT expired — call login() to re-authenticate');
-      }
-    } catch (e) {
-      if (e.message.includes('expired')) throw e;
-      // If decoding fails, let the server reject it
+  /**
+   * Ensure we have a valid JWT. If expired but we have signing keys,
+   * silently re-authenticate via challenge-response. If never logged in, throw.
+   */
+  async #requireAuth() {
+    if (!this.#jwt && !this.#signingKeyPair) {
+      throw new Error('Not authenticated — call register() or login() first');
     }
+
+    // Check JWT expiry
+    if (this.#jwt) {
+      try {
+        const parts = this.#jwt.split('.');
+        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        // Refresh 30 seconds before expiry to avoid edge-case failures
+        if (!payload.exp || payload.exp > Math.floor(Date.now() / 1000) + 30) {
+          return; // JWT is still valid
+        }
+      } catch {
+        // If decoding fails, try to refresh
+      }
+    }
+
+    // JWT is missing or expired — re-authenticate if we have signing keys
+    if (this.#signingKeyPair && this.#credentialLookupKey) {
+      this.#jwt = null;
+      await this.#authenticate();
+      return;
+    }
+
+    throw new Error('JWT expired and no signing keys available — call login() to re-authenticate');
   }
 
   async #authenticate() {
