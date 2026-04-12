@@ -267,14 +267,31 @@ export class TarnClient {
   async getEntries(type) {
     this.#requireAuth();
 
-    const res = await this.#fetch(`/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}`);
+    // Paginate through all entries (API returns up to 500 per page)
+    const allRawEntries = [];
+    let cursor = null;
 
-    if (res.status !== 200) {
-      throw new Error(`Get entries failed: ${res.json?.error || res.status}`);
+    for (let page = 0; page < 50; page++) { // safety limit: 50 pages × 500 = 25,000 entries
+      let url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&limit=500`;
+      if (cursor) url += `&cursor=${cursor}`;
+
+      const res = await this.#fetch(url);
+
+      if (res.status !== 200) {
+        throw new Error(`Get entries failed: ${res.json?.error || res.status}`);
+      }
+
+      const pageEntries = res.json.entries || [];
+      allRawEntries.push(...pageEntries);
+
+      if (!res.json.pagination?.hasMore) break;
+      cursor = res.json.pagination.cursor;
+      if (!cursor) break;
     }
 
+    // Fetch and decrypt all entries
     const entries = [];
-    for (const entry of res.json.entries || []) {
+    for (const entry of allRawEntries) {
       try {
         const blobBytes = await this.#fetchBlob(entry.txid);
         if (!blobBytes) continue;
