@@ -226,8 +226,8 @@ export class TarnClient {
     if (!Array.isArray(items) || items.length === 0) {
       throw new Error('items must be a non-empty array');
     }
-    if (items.length > 45) {
-      throw new Error('items max 45 per batch (Cloudflare Workers subrequest limit)');
+    if (items.length > 25) {
+      throw new Error('items max 25 per batch');
     }
 
     // Encrypt each item and build the batch payload

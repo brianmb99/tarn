@@ -150,7 +150,7 @@ export async function handleCreateEntry(request, env, ctx, cors) {
 
 // Cloudflare Workers limit: 50 subrequests per invocation.
 // Each batch entry = 1 Turbo upload = 1 subrequest.
-const MAX_BATCH_SIZE = 45; // Leave headroom for auth, D1, and other subrequests
+const MAX_BATCH_SIZE = 25; // Conservative headroom for auth, D1, rate limits, etc.
 
 export async function handleBatchCreate(request, env, ctx, cors) {
   // Auth
