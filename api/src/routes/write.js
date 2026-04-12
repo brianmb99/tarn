@@ -1,8 +1,8 @@
 // Write endpoints: POST/PUT/DELETE entries
 // Auth via ECDSA P-256 JWT, write authorization via rules engine.
-// Pattern: build + sign DataItem → compute txid locally → cache in D1 → upload to Turbo in background.
-// This means D1 cache is immediately populated and reads work instantly.
-// Turbo upload is best-effort (background). If it fails, data is in D1 but not yet on Arweave.
+// Pattern: build + sign DataItem → upload to Turbo SYNCHRONOUSLY → cache in D1.
+// The client only gets a success response after Turbo has accepted the DataItem.
+// This guarantees data reaches Arweave — no silent data loss.
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
@@ -38,35 +38,36 @@ async function getAccountRules(db, dataLookupKey) {
 }
 
 /**
- * Common write flow: build DataItem, cache in D1, upload to Turbo in background.
- * Returns the txid (computed locally from DataItem signature).
+ * Common write flow: build DataItem, upload to Turbo synchronously, then cache in D1.
+ * The client only gets a success response after Turbo has accepted the DataItem.
+ * This guarantees data reaches Arweave — no silent data loss.
  */
-async function signCacheAndUpload(body, tags, env, ctx, auth) {
+async function signAndUpload(body, tags, env, ctx, auth) {
   const signingKey = env.APP_SIGNING_KEY;
   if (!signingKey) {
     return { error: 'Server signing key not configured', status: 500 };
   }
 
-  // Build and sign DataItem, compute txid locally
+  // Build and sign DataItem
   const { signedDataItem, txid } = await buildSignedDataItem(new Uint8Array(body), tags, signingKey);
+
+  // Upload to Turbo SYNCHRONOUSLY — must succeed before we return success to client
+  const turboResult = await uploadSignedDataItem(signedDataItem);
+  if (!turboResult.ok) {
+    return {
+      error: `Arweave upload failed: ${turboResult.body || turboResult.status}`,
+      status: 502,
+    };
+  }
 
   const app = tagValue(tags, 'App') || '';
   const type = tagValue(tags, 'Type') || '';
 
-  // Write to D1 cache immediately (synchronous)
-  await upsertWriteThrough(env.DB, txid, tags);
-  await trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type);
-
-  // Upload to Turbo in background (non-blocking)
-  ctx.waitUntil((async () => {
-    const result = await uploadSignedDataItem(signedDataItem);
-    if (result.ok) {
-      console.log(`[tarn-api] Turbo upload OK: ${txid}`);
-    } else {
-      console.warn(`[tarn-api] Turbo upload failed for ${txid}: ${result.status} ${result.body}`);
-      // Data is still in D1 cache. Will sync to Arweave on retry or backfill.
-    }
-  })());
+  // Cache in D1 AFTER Turbo confirms (non-blocking — D1 is just a cache)
+  ctx.waitUntil(Promise.all([
+    upsertWriteThrough(env.DB, txid, tags),
+    trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
+  ]));
 
   return { txid };
 }
@@ -133,7 +134,7 @@ export async function handleCreateEntry(request, env, ctx, cors) {
   }
 
   // Sign, cache, upload
-  const result = await signCacheAndUpload(body, tags, env, ctx, auth);
+  const result = await signAndUpload(body, tags, env, ctx, auth);
   if (result.error) {
     return errorResponse(result.error, result.status, cors);
   }
@@ -246,27 +247,33 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     return errorResponse('Server signing key not configured', 500, cors);
   }
 
-  // Process all entries: sign, cache, upload in background
+  // Process all entries: sign, upload to Turbo synchronously, then cache
   const results = [];
 
   for (const entry of entries) {
     const { signedDataItem, txid } = await buildSignedDataItem(entry._dataBytes, entry.tags, signingKey);
+
+    // Upload to Turbo SYNCHRONOUSLY — must succeed before we confirm to client
+    const turboResult = await uploadSignedDataItem(signedDataItem);
+    if (!turboResult.ok) {
+      // Return partial results — tell client which succeeded and where it stopped
+      return jsonResponse({
+        error: `Arweave upload failed at entry ${results.length}: ${turboResult.body || turboResult.status}`,
+        entries: results,
+        failedAt: results.length,
+        count: results.length,
+        status: 'partial',
+      }, 502, cors);
+    }
+
     const entryApp = tagValue(entry.tags, 'App') || '';
     const entryType = tagValue(entry.tags, 'Type') || '';
 
-    // Cache in D1 immediately
-    await upsertWriteThrough(env.DB, txid, entry.tags);
-    await trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType);
-
-    // Upload to Turbo in background
-    ctx.waitUntil((async () => {
-      const result = await uploadSignedDataItem(signedDataItem);
-      if (result.ok) {
-        console.log(`[tarn-api] Batch Turbo upload OK: ${txid}`);
-      } else {
-        console.warn(`[tarn-api] Batch Turbo upload failed for ${txid}: ${result.status} ${result.body}`);
-      }
-    })());
+    // Cache in D1 AFTER Turbo confirms
+    ctx.waitUntil(Promise.all([
+      upsertWriteThrough(env.DB, txid, entry.tags),
+      trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType),
+    ]));
 
     results.push({ txid, gateway: `${TURBO_GATEWAY}/${txid}` });
   }
@@ -344,7 +351,7 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
   }
 
   // Sign, cache, upload
-  const result = await signCacheAndUpload(body, tags, env, ctx, auth);
+  const result = await signAndUpload(body, tags, env, ctx, auth);
   if (result.error) {
     return errorResponse(result.error, result.status, cors);
   }
@@ -423,7 +430,7 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
   }
 
   // Sign, cache, upload
-  const result = await signCacheAndUpload(body, tags, env, ctx, auth);
+  const result = await signAndUpload(body, tags, env, ctx, auth);
   if (result.error) {
     return errorResponse(result.error, result.status, cors);
   }
