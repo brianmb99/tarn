@@ -289,24 +289,45 @@ export class TarnClient {
       if (!cursor) break;
     }
 
-    // Fetch and decrypt all entries in parallel (20 concurrent)
-    const CONCURRENCY = 20;
+    // Decrypt all entries — use inline blob data from API when available,
+    // fall back to gateway fetch only for entries without cached blobs
     const entries = [];
+    const needsFetch = [];
 
-    for (let i = 0; i < allRawEntries.length; i += CONCURRENCY) {
-      const batch = allRawEntries.slice(i, i + CONCURRENCY);
-      const results = await Promise.allSettled(batch.map(async (entry) => {
-        const blobBytes = await this.#fetchBlob(entry.txid);
-        if (!blobBytes) return null;
-        const data = await decrypt(this.#dataEncryptionKey, blobBytes);
-        return { txid: entry.txid, data, tags: entry.tags };
-      }));
+    for (const entry of allRawEntries) {
+      if (entry.data) {
+        // Blob data returned inline from API (base64) — decrypt directly
+        try {
+          const blobBytes = base64ToBytes(entry.data);
+          const data = await decrypt(this.#dataEncryptionKey, blobBytes);
+          entries.push({ txid: entry.txid, data, tags: entry.tags });
+        } catch (err) {
+          console.warn(`Failed to decrypt inline entry ${entry.txid}:`, err.message);
+        }
+      } else {
+        // No inline data — need to fetch from Arweave gateway (backfill not yet done)
+        needsFetch.push(entry);
+      }
+    }
 
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) {
-          entries.push(result.value);
-        } else if (result.status === 'rejected') {
-          console.warn(`Failed to decrypt entry:`, result.reason?.message);
+    // Fetch remaining entries from gateways in parallel
+    if (needsFetch.length > 0) {
+      const CONCURRENCY = 20;
+      for (let i = 0; i < needsFetch.length; i += CONCURRENCY) {
+        const batch = needsFetch.slice(i, i + CONCURRENCY);
+        const results = await Promise.allSettled(batch.map(async (entry) => {
+          const blobBytes = await this.#fetchBlob(entry.txid);
+          if (!blobBytes) return null;
+          const data = await decrypt(this.#dataEncryptionKey, blobBytes);
+          return { txid: entry.txid, data, tags: entry.tags };
+        }));
+
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value) {
+            entries.push(result.value);
+          } else if (result.status === 'rejected') {
+            console.warn(`Failed to decrypt entry:`, result.reason?.message);
+          }
         }
       }
     }

@@ -200,6 +200,10 @@ export async function refreshCache(env, ctx, app, type, dataLookupKey) {
     if (!error) {
       await setCacheMeta(env.DB, cacheKey, { refreshedAt: Date.now() });
     }
+
+    // Backfill blob data for entries that don't have it yet
+    // (migrated entries or entries from before blob caching was added)
+    await backfillBlobs(env.DB, dataLookupKey, app, type);
   };
 
   if (meta) {
@@ -243,19 +247,68 @@ export async function refreshLookupCache(env, ctx, app, type, lookupKey) {
   await doRefresh();
 }
 
+// ============ BLOB BACKFILL ============
+
+const TURBO_GW = 'https://turbo-gateway.com';
+const ARWEAVE_GW = 'https://arweave.net';
+const BACKFILL_BATCH_SIZE = 10; // Stay well under Workers subrequest limit
+
+/**
+ * Backfill blob_data for entries that don't have it yet.
+ * Fetches from Arweave gateways and stores in D1.
+ * Limited to BACKFILL_BATCH_SIZE entries per call to avoid subrequest limits.
+ */
+async function backfillBlobs(db, lookupKey, app, type) {
+  const missing = await db.prepare(
+    'SELECT txid FROM entries WHERE lookup_key = ?1 AND app = ?2 AND type = ?3 AND blob_data IS NULL AND is_tombstone = 0 LIMIT ?4'
+  ).bind(lookupKey, app, type, BACKFILL_BATCH_SIZE).all();
+
+  const txids = (missing.results || []).map(r => r.txid);
+  if (txids.length === 0) return;
+
+  console.log(`[tarn-api] Backfilling ${txids.length} blobs for ${lookupKey.slice(0, 12)}...`);
+
+  for (const txid of txids) {
+    try {
+      // Try Turbo first, then Arweave L1
+      let blobData = null;
+      for (const gw of [TURBO_GW, ARWEAVE_GW]) {
+        try {
+          const res = await fetch(`${gw}/${txid}`, { signal: AbortSignal.timeout(10000) });
+          if (res.ok) {
+            blobData = new Uint8Array(await res.arrayBuffer());
+            break;
+          }
+        } catch {}
+      }
+
+      if (blobData) {
+        await db.prepare('UPDATE entries SET blob_data = ?1 WHERE txid = ?2')
+          .bind(blobData, txid).run();
+      }
+    } catch (err) {
+      console.warn(`[tarn-api] Backfill failed for ${txid}: ${err.message}`);
+    }
+  }
+}
+
 // ============ WRITE-THROUGH ============
 
 /**
  * Insert a newly uploaded entry into D1 immediately (write-through).
- * Distinct from upsertEntries() which takes Arweave GraphQL edges.
- * block_timestamp is NULL — entry is pending/unconfirmed.
+ * Includes the encrypted blob data so reads can be served entirely from D1.
+ * block_timestamp is NULL — entry is pending/unconfirmed on Arweave.
+ * @param {Object} db - D1 database
+ * @param {string} txid - DataItem transaction ID
+ * @param {Array} tags - Arweave tags
+ * @param {Uint8Array|null} blobData - Encrypted blob bytes (null for tombstones/metadata)
  */
-export async function upsertWriteThrough(db, txid, tags) {
+export async function upsertWriteThrough(db, txid, tags, blobData = null) {
   const tagValue = (name) => tags.find(t => t.name === name)?.value || null;
   await db.prepare(`
     INSERT INTO entries (txid, app, type, wallet_addr, lookup_key, eid, prev_txid,
-                         is_tombstone, tombstone_ref, block_timestamp, tags_json, cached_at)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)
+                         is_tombstone, tombstone_ref, block_timestamp, tags_json, cached_at, blob_data)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)
     ON CONFLICT(txid) DO NOTHING
   `).bind(
     txid,
@@ -268,7 +321,8 @@ export async function upsertWriteThrough(db, txid, tags) {
     tagValue('Op') === 'tombstone' ? 1 : 0,
     tagValue('Ref') || null,
     JSON.stringify(tags),
-    Date.now()
+    Date.now(),
+    blobData || null
   ).run();
 }
 

@@ -3,6 +3,15 @@
 import { jsonResponse, errorResponse } from '../worker.js';
 import { getResolvedEntries, getEntryByTxid, refreshCache } from '../cache.js';
 
+// Convert blob_data from D1 (ArrayBuffer/Uint8Array) to base64 for JSON transport
+function blobToBase64(blob) {
+  if (!blob) return null;
+  const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
 const MAX_READS_PER_HOUR = 300;
 
 async function checkReadRateLimit(env, request) {
@@ -53,6 +62,7 @@ export async function handleEntries(url, env, ctx, cors, request) {
       tags: e.tags_json ? JSON.parse(e.tags_json) : [],
       confirmed: e.block_timestamp != null,
       cachedAt: e.cached_at,
+      data: blobToBase64(e.blob_data),
       gatewayUrl: `https://arweave.net/${e.txid}`,
     })),
     pagination: {
@@ -96,6 +106,7 @@ export async function handleEntryById(txid, url, env, ctx, cors, request) {
     tags: entry.tags_json ? JSON.parse(entry.tags_json) : [],
     confirmed: entry.block_timestamp != null,
     cachedAt: entry.cached_at,
+    data: blobToBase64(entry.blob_data),
     gatewayUrl: `https://arweave.net/${entry.txid}`,
   }, 200, cors);
 }

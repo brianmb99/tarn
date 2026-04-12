@@ -63,9 +63,10 @@ async function signAndUpload(body, tags, env, ctx, auth) {
   const app = tagValue(tags, 'App') || '';
   const type = tagValue(tags, 'Type') || '';
 
-  // Cache in D1 AFTER Turbo confirms (non-blocking — D1 is just a cache)
+  // Cache in D1 AFTER Turbo confirms — includes blob data for fast reads
+  const blobData = new Uint8Array(body);
   ctx.waitUntil(Promise.all([
-    upsertWriteThrough(env.DB, txid, tags),
+    upsertWriteThrough(env.DB, txid, tags, blobData),
     trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
   ]));
 
@@ -271,9 +272,9 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     const entryApp = tagValue(entry.tags, 'App') || '';
     const entryType = tagValue(entry.tags, 'Type') || '';
 
-    // Cache in D1 AFTER Turbo confirms
+    // Cache in D1 AFTER Turbo confirms — includes blob data
     ctx.waitUntil(Promise.all([
-      upsertWriteThrough(env.DB, txid, entry.tags),
+      upsertWriteThrough(env.DB, txid, entry.tags, entry._dataBytes),
       trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType),
     ]));
 
