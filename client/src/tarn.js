@@ -289,16 +289,25 @@ export class TarnClient {
       if (!cursor) break;
     }
 
-    // Fetch and decrypt all entries
+    // Fetch and decrypt all entries in parallel (20 concurrent)
+    const CONCURRENCY = 20;
     const entries = [];
-    for (const entry of allRawEntries) {
-      try {
+
+    for (let i = 0; i < allRawEntries.length; i += CONCURRENCY) {
+      const batch = allRawEntries.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(async (entry) => {
         const blobBytes = await this.#fetchBlob(entry.txid);
-        if (!blobBytes) continue;
+        if (!blobBytes) return null;
         const data = await decrypt(this.#dataEncryptionKey, blobBytes);
-        entries.push({ txid: entry.txid, data, tags: entry.tags });
-      } catch (err) {
-        console.warn(`Failed to decrypt entry ${entry.txid}:`, err.message);
+        return { txid: entry.txid, data, tags: entry.tags };
+      }));
+
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) {
+          entries.push(result.value);
+        } else if (result.status === 'rejected') {
+          console.warn(`Failed to decrypt entry:`, result.reason?.message);
+        }
       }
     }
 
