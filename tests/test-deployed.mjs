@@ -167,6 +167,40 @@ await test('Create entry', async () => {
   console.log(`    Txid: ${txid.slice(0, 20)}...`);
 });
 
+await test('Idempotent write: retry with same X-Idempotency-Key returns same txid (issue #8)', async () => {
+  // Low-level test: send two raw POSTs with the same X-Idempotency-Key and
+  // assert the second returns the txid from the first — the server short-
+  // circuits on the cached response instead of signing a new DataItem.
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testEmail, testPassword);
+
+  // Server doesn't decrypt the body, it just signs + caches. Any bytes work.
+  const payload = new TextEncoder().encode(JSON.stringify({ _: 'idempotency-test', t: Date.now() }));
+  const tags = [
+    { name: 'App', value: APP_ID },
+    { name: 'Type', value: 'entry' },
+    { name: 'Lk', value: testDlk },
+    { name: 'Enc', value: 'aes-256-gcm' },
+    { name: 'V', value: '0.4.0' },
+  ];
+  const key = crypto.randomUUID();
+  const headers = {
+    'Authorization': `Bearer ${tarn._testJwt()}`,
+    'X-Arweave-Tags': JSON.stringify(tags),
+    'X-Idempotency-Key': key,
+    'Content-Type': 'application/octet-stream',
+  };
+
+  const res1 = await fetch(`${API_BASE}/api/v1/entries`, { method: 'POST', headers, body: payload });
+  const json1 = await res1.json();
+  assert(res1.status === 200, `First write failed: ${res1.status} ${JSON.stringify(json1)}`);
+
+  const res2 = await fetch(`${API_BASE}/api/v1/entries`, { method: 'POST', headers, body: payload });
+  const json2 = await res2.json();
+  assert(res2.status === 200, `Second write failed: ${res2.status}`);
+  assert(json1.id === json2.id, `Idempotency failed: different txids (${json1.id} vs ${json2.id})`);
+});
+
 await test('Read entry from D1 cache', async () => {
   await sleep(500); // Brief wait for write-through
   const res = await fetch(`${API_BASE}/api/v1/entries?app=${APP_ID}&type=entry&key=${testDlk}`);

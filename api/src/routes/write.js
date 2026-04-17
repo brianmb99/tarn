@@ -11,6 +11,7 @@ import { upsertWriteThrough, trackPendingTx, getEntryByTxid, markDataBootstrappe
 import { evaluateRules } from '../rules.js';
 import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../turbo.js';
 import { MAX_UPLOAD_BYTES } from '../constants.js';
+import { resolveIdempotency, storeIdempotentResponse } from '../idempotency.js';
 
 // ============ HELPERS ============
 
@@ -105,6 +106,13 @@ export async function handleCreateEntry(request, env, ctx, cors) {
     );
   }
 
+  // Idempotency: if client sent X-Idempotency-Key and we have a prior response
+  // for it, short-circuit before signing anything. Prevents duplicate DataItems
+  // on Arweave when a client retries after a 5xx-after-commit.
+  const idem = await resolveIdempotency(request, env.DB, auth.data_lookup_key);
+  if (idem.error) return errorResponse(idem.error, 400, cors);
+  if (idem.cached) return jsonResponse(idem.cached.body, idem.cached.status, cors);
+
   // Read body
   const body = await request.arrayBuffer();
   if (!body || body.byteLength === 0) {
@@ -155,11 +163,15 @@ export async function handleCreateEntry(request, env, ctx, cors) {
     return errorResponse(result.error, result.status, cors);
   }
 
-  return jsonResponse({
+  const responseBody = {
     id: result.txid,
     gateway: `${TURBO_GATEWAY}/${result.txid}`,
     status: 'pending',
-  }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
+  };
+  if (idem.key) {
+    await storeIdempotentResponse(env.DB, auth.data_lookup_key, idem.key, 200, responseBody);
+  }
+  return jsonResponse(responseBody, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
 }
 
 // ============ POST /api/v1/entries/batch — Bulk Import ============
@@ -181,6 +193,12 @@ export async function handleBatchCreate(request, env, ctx, cors) {
       429, { ...cors, 'Retry-After': '3600' }
     );
   }
+
+  // Idempotency short-circuit — one key for the whole batch. Server stores the
+  // full response (list of txids) against it; retry returns the same list.
+  const idem = await resolveIdempotency(request, env.DB, auth.data_lookup_key);
+  if (idem.error) return errorResponse(idem.error, 400, cors);
+  if (idem.cached) return jsonResponse(idem.cached.body, idem.cached.status, cors);
 
   // Parse JSON body
   let body;
@@ -308,11 +326,15 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     results.push({ txid, gateway: `${TURBO_GATEWAY}/${txid}` });
   }
 
-  return jsonResponse({
+  const responseBody = {
     entries: results,
     count: results.length,
     status: 'pending',
-  }, 200, cors);
+  };
+  if (idem.key) {
+    await storeIdempotentResponse(env.DB, auth.data_lookup_key, idem.key, 200, responseBody);
+  }
+  return jsonResponse(responseBody, 200, cors);
 }
 
 // ============ PUT /api/v1/entries/:id — Edit ============
@@ -330,6 +352,11 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
       429, { ...cors, 'Retry-After': '3600' }
     );
   }
+
+  // Idempotency short-circuit (see handleCreateEntry).
+  const idem = await resolveIdempotency(request, env.DB, auth.data_lookup_key);
+  if (idem.error) return errorResponse(idem.error, 400, cors);
+  if (idem.cached) return jsonResponse(idem.cached.body, idem.cached.status, cors);
 
   // Validate prior entry exists and belongs to this user
   const prior = await getEntryByTxid(env.DB, priorTxid);
@@ -386,12 +413,16 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
     return errorResponse(result.error, result.status, cors);
   }
 
-  return jsonResponse({
+  const responseBody = {
     id: result.txid,
     gateway: `${TURBO_GATEWAY}/${result.txid}`,
     prevTxid: priorTxid,
     status: 'pending',
-  }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
+  };
+  if (idem.key) {
+    await storeIdempotentResponse(env.DB, auth.data_lookup_key, idem.key, 200, responseBody);
+  }
+  return jsonResponse(responseBody, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
 }
 
 // ============ DELETE /api/v1/entries/:id — Tombstone ============
@@ -409,6 +440,11 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
       429, { ...cors, 'Retry-After': '3600' }
     );
   }
+
+  // Idempotency short-circuit (see handleCreateEntry).
+  const idem = await resolveIdempotency(request, env.DB, auth.data_lookup_key);
+  if (idem.error) return errorResponse(idem.error, 400, cors);
+  if (idem.cached) return jsonResponse(idem.cached.body, idem.cached.status, cors);
 
   // Validate target entry exists and belongs to this user
   const target = await getEntryByTxid(env.DB, targetTxid);
@@ -465,10 +501,14 @@ export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
     return errorResponse(result.error, result.status, cors);
   }
 
-  return jsonResponse({
+  const responseBody = {
     id: result.txid,
     gateway: `${TURBO_GATEWAY}/${result.txid}`,
     tombstoneRef: targetTxid,
     status: 'pending',
-  }, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
+  };
+  if (idem.key) {
+    await storeIdempotentResponse(env.DB, auth.data_lookup_key, idem.key, 200, responseBody);
+  }
+  return jsonResponse(responseBody, 200, { ...cors, 'X-RateLimit-Remaining': String(remaining) });
 }

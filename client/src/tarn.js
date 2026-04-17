@@ -202,10 +202,11 @@ export class TarnClient {
       headers: {
         'Authorization': `Bearer ${this.#jwt}`,
         'X-Arweave-Tags': JSON.stringify(tags),
+        'X-Idempotency-Key': generateIdempotencyKey(), // retry-safe (#8)
         'Content-Type': 'application/octet-stream',
       },
       body: encrypted,
-    });
+    }, { retry: true });
 
     const json = await res.json().catch(() => null);
     if (res.status !== 200) {
@@ -248,17 +249,34 @@ export class TarnClient {
       entries.push({ data, tags });
     }
 
-    const res = await this.#fetch('/api/v1/entries/batch', {
-      method: 'POST',
-      auth: true,
-      body: { entries },
-    });
+    // Batch idempotency: one key for the whole batch. Server stores the full
+    // list of txids against it; retry returns the same list (#8).
+    const idempotencyKey = generateIdempotencyKey();
+    const res = await this.#fetchBatch(entries, idempotencyKey);
 
     if (res.status !== 200) {
       throw new Error(`Batch create failed: ${res.json?.error || res.status}`);
     }
 
     return res.json.entries;
+  }
+
+  async #fetchBatch(entries, idempotencyKey) {
+    // Batch posts can't use #fetch because we need the custom header. Inline
+    // the request setup here to keep the fetch-with-retry path.
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.#jwt}`,
+      'X-Idempotency-Key': idempotencyKey,
+    };
+    const raw = await this.#fetchRaw('/api/v1/entries/batch', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ entries }),
+    }, { retry: true });
+    const text = await raw.text();
+    let json; try { json = JSON.parse(text); } catch { json = null; }
+    return { status: raw.status, json, text };
   }
 
   /**
@@ -362,10 +380,11 @@ export class TarnClient {
       headers: {
         'Authorization': `Bearer ${this.#jwt}`,
         'X-Arweave-Tags': JSON.stringify(tags),
+        'X-Idempotency-Key': generateIdempotencyKey(), // retry-safe (#8)
         'Content-Type': 'application/octet-stream',
       },
       body: encrypted,
-    });
+    }, { retry: true });
 
     const json = await res.json().catch(() => null);
     if (res.status !== 200) {
@@ -400,10 +419,11 @@ export class TarnClient {
       headers: {
         'Authorization': `Bearer ${this.#jwt}`,
         'X-Arweave-Tags': JSON.stringify(tags),
+        'X-Idempotency-Key': generateIdempotencyKey(), // retry-safe (#8)
         'Content-Type': 'application/octet-stream',
       },
       body: encrypted,
-    });
+    }, { retry: true });
 
     const json = await res.json().catch(() => null);
     if (res.status !== 200) {
@@ -419,6 +439,13 @@ export class TarnClient {
   get appId() { return this.#appId; }
   /** True if the client has a session (JWT may auto-refresh transparently). */
   get isAuthenticated() { return !!(this.#jwt || this.#signingKeyPair); }
+
+  /**
+   * Test-only: expose the current JWT for deployed smoke tests that need to
+   * hand-craft raw requests (e.g., idempotency testing). Do not use in
+   * production code; call the public methods instead.
+   */
+  _testJwt() { return this.#jwt; }
 
   // ============ PRIVATE ============
 
@@ -514,12 +541,12 @@ export class TarnClient {
    * Retry is enabled by default for idempotent operations:
    *   - Any GET
    *   - POSTs explicitly marked retry-safe by the caller (retry: true)
-   *     e.g. /auth/register (idempotent since tarn #6), /auth/challenge (fresh
-   *     nonce per call).
+   *     e.g. /auth/register (idempotent since #6), /auth/challenge (fresh nonce
+   *     per call), or writes that set an X-Idempotency-Key (see #8).
    *
-   * Retry is disabled for side-effectful operations (writes, /auth/verify,
-   * credential change, account delete) where a retry could produce duplicate
-   * state or consume a now-invalid nonce.
+   * Retry is disabled for side-effectful operations without idempotency support
+   * (/auth/verify, credential change, account delete) where a retry could
+   * consume a now-invalid nonce or produce duplicate destructive effects.
    */
   async #fetch(path, { method = 'GET', body = null, auth = false, retry = method === 'GET' } = {}) {
     const headers = { 'Content-Type': 'application/json' };
@@ -528,26 +555,32 @@ export class TarnClient {
     const opts = { method, headers };
     if (body) opts.body = JSON.stringify(body);
 
-    return this.#fetchWithRetry(`${this.#apiBase}${path}`, opts, retry);
+    const res = await this.#executeFetch(`${this.#apiBase}${path}`, opts, retry);
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = null; }
+    return { status: res.status, json, text };
   }
 
-  async #fetchWithRetry(url, opts, allowRetry) {
+  async #fetchRaw(path, opts, { retry = opts?.method === 'GET' } = {}) {
+    return await this.#executeFetch(`${this.#apiBase}${path}`, opts, retry);
+  }
+
+  async #executeFetch(url, opts, allowRetry) {
     const MAX_ATTEMPTS = allowRetry ? 3 : 1;
     let lastErr;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
         const res = await fetch(url, opts);
-        const text = await res.text();
-        let json;
-        try { json = JSON.parse(text); } catch { json = null; }
-
         const isTransient = res.status >= 500 || res.status === 429;
         if (!isTransient || attempt === MAX_ATTEMPTS - 1) {
-          return { status: res.status, json, text };
+          return res;
         }
 
-        // Transient: honor Retry-After if present, else exponential backoff with jitter.
+        // Drain body before retry so the underlying connection can be reused.
+        try { await res.body?.cancel(); } catch {}
+
         const retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
         const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : backoffMs(attempt);
         console.warn(`[TarnClient] ${res.status} on ${url} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
@@ -563,13 +596,20 @@ export class TarnClient {
     }
     throw lastErr; // unreachable
   }
-
-  async #fetchRaw(path, opts) {
-    return await fetch(`${this.#apiBase}${path}`, opts);
-  }
 }
 
-// ============ Retry helpers ============
+// ============ Retry + idempotency helpers ============
+
+/**
+ * Generate a fresh idempotency key for a write. Clients include this in the
+ * X-Idempotency-Key header; the server returns the original response on any
+ * retry with the same key, preventing duplicate DataItems on Arweave.
+ * See tarn #8.
+ */
+function generateIdempotencyKey() {
+  // crypto.randomUUID is available in modern browsers and Node 15+.
+  return crypto.randomUUID();
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

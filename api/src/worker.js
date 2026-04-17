@@ -26,7 +26,7 @@ function getCorsHeaders(request) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Arweave-Tags',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Arweave-Tags, X-Idempotency-Key',
   };
 }
 
