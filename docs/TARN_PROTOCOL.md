@@ -274,7 +274,7 @@ public_key TEXT NOT NULL,
 created_at INTEGER NOT NULL
 ```
 
-**D1 `entries` table** (cache of Arweave data):
+**D1 `entries` table** (authoritative store for live state; see "D1 authority" below):
 ```sql
 txid TEXT PRIMARY KEY,
 app TEXT, type TEXT,
@@ -283,7 +283,16 @@ prev_txid TEXT, is_tombstone INTEGER, tombstone_ref TEXT,
 block_timestamp INTEGER, tags_json TEXT, cached_at INTEGER
 ```
 
-**Rebuild from Arweave:** All tables fully rebuildable from Arweave blob scans.
+### D1 authority
+
+Tarn is the sole write path for any data associated with a (`data_lookup_key`, `app`, `type`) tuple. Every successful write synchronously upserts into D1 before returning success to the client. As a consequence:
+
+- **D1 is authoritative for live state.** Once a tuple has been bootstrapped, reads are served entirely from D1. Tarn does not periodically re-scan Arweave — there is no other writer to reconcile against.
+- **Bootstrap markers** (stored in `cache_meta`) record that a tuple has been ingested. Set by the write path on first write, or by the read path on first read if no marker exists.
+- **Arweave GraphQL is consulted only on cold bootstrap:** a first read for a tuple Tarn has never processed. After bootstrap, the marker short-circuits all subsequent queries.
+- **`block_timestamp` / confirmation status** is set at write time (NULL = pending) and no longer updates once the marker is set. Clients that need Arweave confirmation status can check Turbo directly for a given txid.
+
+**Rebuild from Arweave:** All tables fully rebuildable from Arweave blob scans. After rebuild, `cache_meta` markers are cleared so the next read for each tuple re-bootstraps from the restored `entries` rows.
 
 ---
 

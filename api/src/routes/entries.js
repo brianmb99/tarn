@@ -47,8 +47,9 @@ export async function handleEntries(url, env, ctx, cors, request) {
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10), 500);
   const cursor = url.searchParams.get('cursor') || null;
 
-  // Check cache freshness and refresh if needed
-  const cacheStatus = await refreshCache(env, ctx, app, type, key);
+  // One-time Arweave bootstrap for this (dlk, app, type). After the marker is
+  // set (here or on first write), subsequent reads skip Arweave entirely.
+  await refreshCache(env, ctx, app, type, key);
 
   // Resolve live entries (tombstone + Prev-chain + Eid filtering)
   const { entries, total } = await getResolvedEntries(env.DB, app, type, key, { limit, cursor });
@@ -69,10 +70,6 @@ export async function handleEntries(url, env, ctx, cors, request) {
       count: entries.length,
       hasMore: entries.length === limit,
       cursor: entries.length === limit ? entries[entries.length - 1].txid : null,
-    },
-    cache: {
-      lastRefresh: cacheStatus.lastRefresh,
-      stale: cacheStatus.stale,
     },
   }, 200, cors);
 }

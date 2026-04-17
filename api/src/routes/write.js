@@ -7,7 +7,7 @@
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { checkWriteRateLimit } from '../rate_limit.js';
-import { upsertWriteThrough, trackPendingTx, getEntryByTxid } from '../cache.js';
+import { upsertWriteThrough, trackPendingTx, getEntryByTxid, markDataBootstrapped } from '../cache.js';
 import { evaluateRules } from '../rules.js';
 import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../turbo.js';
 import { MAX_UPLOAD_BYTES } from '../constants.js';
@@ -75,6 +75,11 @@ async function signAndUpload(body, tags, env, ctx, auth) {
     console.error('[tarn-api] D1 write-through failed after Turbo accept:', txid, err.message);
     return { error: 'Write persisted to Arweave but failed to cache — retry read to recover', status: 500 };
   }
+
+  // Mark this (dlk, app, type) as bootstrapped so the next read does not
+  // trigger a redundant GraphQL query against Arweave. Tarn's write-through
+  // means D1 is already authoritative for everything this user has written.
+  await markDataBootstrapped(env.DB, auth.data_lookup_key, app, type);
 
   // trackPendingTx is non-authoritative — just a liveness hint for confirmation
   // tracking. Safe to run in background.
@@ -295,6 +300,8 @@ export async function handleBatchCreate(request, env, ctx, cors) {
         status: 'partial',
       }, 500, cors);
     }
+
+    await markDataBootstrapped(env.DB, auth.data_lookup_key, entryApp, entryType);
 
     ctx.waitUntil(trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType));
 

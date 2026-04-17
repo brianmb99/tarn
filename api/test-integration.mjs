@@ -127,10 +127,6 @@ await test('empty wallet returns correct response shape', async () => {
   assert(body.pagination.count === 0, 'count should be 0');
   assert(body.pagination.hasMore === false, 'hasMore should be false');
 
-  // cache
-  assert(body.cache != null, 'missing cache');
-  assertType(body.cache.lastRefresh, 'number', 'cache.lastRefresh');
-  assertType(body.cache.stale, 'boolean', 'cache.stale');
 });
 
 await test('limit param is respected (capped at 500)', async () => {
@@ -150,25 +146,26 @@ await test('cursor param accepted without error', async () => {
 });
 
 // ============================================================================
-// 4. Entries — cache behavior (stale-while-revalidate)
+// 4. Entries — bootstrap behavior (D1 authoritative after first read)
 // ============================================================================
-console.log('\n4. Entries \u2014 Cache Behavior:');
+console.log('\n4. Entries \u2014 Bootstrap Behavior:');
 
-await test('second request within 60s is fresh (not stale)', async () => {
-  // First request populates cache
+await test('second request for same scope succeeds (D1-served)', async () => {
+  // First request bootstraps from Arweave
   await fetchJSON(`/api/v1/entries?app=bookish&type=entry&addr=${ZERO_ADDR}`);
-  // Second request should be fresh
-  const { body } = await fetchJSON(`/api/v1/entries?app=bookish&type=entry&addr=${ZERO_ADDR}`);
-  assert(body.cache.stale === false, 'expected fresh cache on second request');
+  // Second request should be served entirely from D1, no Arweave call
+  const { status, body } = await fetchJSON(`/api/v1/entries?app=bookish&type=entry&addr=${ZERO_ADDR}`);
+  assert(status === 200, `status ${status}`);
+  assert(Array.isArray(body.entries), 'entries not array');
 });
 
-await test('different addr gets independent cache', async () => {
+await test('different addr gets independent bootstrap', async () => {
   const altAddr = '0x0000000000000000000000000000000000000001';
-  const { body } = await fetchJSON(
+  const { status, body } = await fetchJSON(
     `/api/v1/entries?app=bookish&type=entry&addr=${altAddr}`
   );
-  // This is a cold cache hit — should populate fine
-  assert(body.cache.lastRefresh > 0, 'should have refresh timestamp');
+  assert(status === 200, `status ${status}`);
+  assert(Array.isArray(body.entries), 'entries not array');
 });
 
 // ============================================================================

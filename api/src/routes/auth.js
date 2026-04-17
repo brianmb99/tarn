@@ -6,7 +6,7 @@ import { generateChallenge, storeNonce, consumeNonce, signJWT } from '../auth.js
 import { importPublicKey, verifySignature, isValidHex64 } from '../crypto.js';
 import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
-import { upsertWriteThrough } from '../cache.js';
+import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
 
@@ -49,6 +49,10 @@ function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wra
       const blobBytes = new TextEncoder().encode(blobBody);
       const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
       await upsertWriteThrough(env.DB, txid, tags);
+      // Mark the credential lookup tuple as bootstrapped so post-register
+      // lookups don't fall back to a redundant Arweave GraphQL query.
+      // Tags on credential entries use App='tarn', Type='cred' (see buildCredentialTags).
+      await markLookupBootstrapped(env.DB, credentialLookupKey, 'tarn', 'cred');
       console.log(`[tarn-api] Credential blob cached: ${txid}`);
       const turbo = await uploadSignedDataItem(signedDataItem);
       if (turbo.ok) {

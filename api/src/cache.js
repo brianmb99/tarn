@@ -1,10 +1,16 @@
-// D1 cache layer — upsert, resolution, stale-while-revalidate
-// All entries stored as rows including tombstones and edits.
-// Resolution happens at read time.
+// D1 cache layer — upsert, resolution, one-shot Arweave bootstrap.
+//
+// Invariant: Tarn is the sole write path. Once a (dlk, app, type) tuple has been
+// bootstrapped (either by a successful write through Tarn or a one-time GraphQL
+// backfill on first read), D1 is authoritative for that tuple's live state.
+// We do not periodically re-scan Arweave — there is nothing to reconcile against.
+//
+// Arweave is consulted only for cold bootstrap: the first read for a (dlk, app,
+// type) where Tarn has no record of having processed any writes. This is a rare,
+// one-shot operation per tuple (usually zero, since the write path sets the
+// bootstrap marker directly).
 
-import { fetchAllPages, searchEntriesByLookupKey } from './arweave.js';
-
-const CACHE_FRESH_MS = 60_000; // 60 seconds
+import { searchEntriesByLookupKey } from './arweave.js';
 
 // ============ TAG HELPERS ============
 
@@ -160,94 +166,96 @@ export async function getEntryByLookupKey(db, lookupKey) {
   return live[0] || null;
 }
 
-// ============ CACHE FRESHNESS ============
+// ============ BOOTSTRAP MARKERS ============
 
-async function getCacheMeta(db, key) {
-  const row = await db.prepare('SELECT * FROM cache_meta WHERE key = ?1').bind(key).first();
-  if (!row) return null;
-  try {
-    return { ...JSON.parse(row.value), updated_at: row.updated_at };
-  } catch {
-    return null;
-  }
+// Bootstrap markers live in the cache_meta table, keyed by scope.
+// Presence of a marker means: "Tarn has verified there is nothing on Arweave
+// for this scope that isn't in D1 — D1 is authoritative."
+const DATA_BOOTSTRAP_KEY = (dlk, app, type) => `bootstrap:data:${dlk}:${app}:${type}`;
+const LOOKUP_BOOTSTRAP_KEY = (lookupKey, app, type) => `bootstrap:lookup:${lookupKey}:${app}:${type}`;
+
+async function hasBootstrap(db, key) {
+  const row = await db.prepare('SELECT 1 FROM cache_meta WHERE key = ?1').bind(key).first();
+  return !!row;
 }
 
-async function setCacheMeta(db, key, value) {
+async function setBootstrap(db, key) {
   await db.prepare(
-    'INSERT INTO cache_meta (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3'
-  ).bind(key, JSON.stringify(value), Date.now()).run();
+    'INSERT INTO cache_meta (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO NOTHING'
+  ).bind(key, '{}', Date.now()).run();
 }
 
 /**
- * Refresh cache for data entries by data_lookup_key. Stale-while-revalidate pattern.
- * Queries Arweave by Lk tag, upserts into D1.
+ * Mark a (dlk, app, type) tuple as bootstrapped. Called from the write path
+ * after a successful write-through, so the next read for this tuple does not
+ * trigger a redundant GraphQL bootstrap.
+ */
+export async function markDataBootstrapped(db, dataLookupKey, app, type) {
+  await setBootstrap(db, DATA_BOOTSTRAP_KEY(dataLookupKey, app, type));
+}
+
+/**
+ * Mark a (lookupKey, app, type) tuple as bootstrapped for lookup queries.
+ * Called after a credential blob is persisted to D1, so subsequent lookups
+ * don't re-query Arweave for data we already have.
+ */
+export async function markLookupBootstrapped(db, lookupKey, app, type) {
+  await setBootstrap(db, LOOKUP_BOOTSTRAP_KEY(lookupKey, app, type));
+}
+
+/**
+ * Ensure the (dlk, app, type) tuple is bootstrapped. If a marker already exists,
+ * returns immediately — D1 is authoritative. Otherwise runs a one-time GraphQL
+ * query against Arweave to ingest any pre-existing on-chain entries, backfills
+ * their blob_data, then sets the marker.
+ *
+ * This replaces the previous stale-while-revalidate refresh loop, which fired
+ * a GraphQL query every 60s per polling tuple and added no safety benefit.
  */
 export async function refreshCache(env, ctx, app, type, dataLookupKey) {
-  const cacheKey = `refresh:${dataLookupKey}:${app}:${type}`;
-  const meta = await getCacheMeta(env.DB, cacheKey);
-  const now = Date.now();
+  const cacheKey = DATA_BOOTSTRAP_KEY(dataLookupKey, app, type);
 
-  if (meta && (now - meta.updated_at) < CACHE_FRESH_MS) {
-    return { lastRefresh: meta.updated_at, stale: false };
+  if (await hasBootstrap(env.DB, cacheKey)) {
+    return { bootstrapped: true };
   }
 
-  const doRefreshMeta = async () => {
-    // Use lookup key search (Lk tag) for data entries
-    const { edges, error } = await searchEntriesByLookupKey(dataLookupKey, { app, type });
-    if (edges.length > 0) {
-      await upsertEntries(env.DB, edges);
-    }
-    if (!error) {
-      await setCacheMeta(env.DB, cacheKey, { refreshedAt: Date.now() });
-    }
-  };
-
-  // Blob backfill is opportunistic — it fetches from Arweave gateways which can be
-  // slow. Never block the response on it. Running it synchronously on cold cache was
-  // causing wall-time timeouts (CF returns edge 503 when a worker exceeds 30s).
-  const doBackfill = () => backfillBlobs(env.DB, dataLookupKey, app, type);
-
-  if (meta) {
-    // Stale: serve from cache, refresh in background
-    ctx.waitUntil(Promise.all([doRefreshMeta(), doBackfill()]));
-    return { lastRefresh: meta.updated_at, stale: true };
+  const { edges, error } = await searchEntriesByLookupKey(dataLookupKey, { app, type });
+  if (edges.length > 0) {
+    await upsertEntries(env.DB, edges);
+    // Backfill blobs for what we just ingested. Cold bootstrap only — this path
+    // runs at most once per (dlk, app, type), so the subrequest cost is bounded
+    // and acceptable.
+    await backfillBlobs(env.DB, dataLookupKey, app, type);
   }
 
-  // Cold cache: block on GraphQL refresh so the response reflects current index,
-  // but run the blob backfill in the background.
-  await doRefreshMeta();
-  ctx.waitUntil(doBackfill());
-  return { lastRefresh: Date.now(), stale: false };
+  // Only set the marker if GraphQL succeeded — a transient Arweave error should
+  // not latch us into a "D1 is authoritative" state for a scope we never queried.
+  if (!error) {
+    await setBootstrap(env.DB, cacheKey);
+  }
+
+  return { bootstrapped: !error };
 }
 
 /**
- * Refresh cache for lookup-key-addressed entries (credentials, account metadata).
+ * Bootstrap variant for lookup-key-addressed entries (credentials, account
+ * metadata resolved by a deterministic lookup key rather than by dlk).
  */
 export async function refreshLookupCache(env, ctx, app, type, lookupKey) {
-  const cacheKey = `lookup:${lookupKey}:${app}:${type}`;
-  const meta = await getCacheMeta(env.DB, cacheKey);
-  const now = Date.now();
+  const cacheKey = LOOKUP_BOOTSTRAP_KEY(lookupKey, app, type);
 
-  if (meta && (now - meta.updated_at) < CACHE_FRESH_MS) {
+  if (await hasBootstrap(env.DB, cacheKey)) {
     return;
   }
 
-  const doRefresh = async () => {
-    const { edges, error } = await searchEntriesByLookupKey(lookupKey, { app, type });
-    if (edges.length > 0) {
-      await upsertEntries(env.DB, edges);
-    }
-    if (!error) {
-      await setCacheMeta(env.DB, cacheKey, { refreshedAt: Date.now() });
-    }
-  };
-
-  if (meta) {
-    ctx.waitUntil(doRefresh());
-    return;
+  const { edges, error } = await searchEntriesByLookupKey(lookupKey, { app, type });
+  if (edges.length > 0) {
+    await upsertEntries(env.DB, edges);
   }
 
-  await doRefresh();
+  if (!error) {
+    await setBootstrap(env.DB, cacheKey);
+  }
 }
 
 // ============ BLOB BACKFILL ============
@@ -257,9 +265,11 @@ const ARWEAVE_GW = 'https://arweave.net';
 const BACKFILL_BATCH_SIZE = 10; // Stay well under Workers subrequest limit
 
 /**
- * Backfill blob_data for entries that don't have it yet.
- * Fetches from Arweave gateways and stores in D1.
- * Limited to BACKFILL_BATCH_SIZE entries per call to avoid subrequest limits.
+ * Backfill blob_data for entries that don't have it yet. Called only from the
+ * cold bootstrap path in refreshCache (one-shot per dlk/app/type). For larger
+ * migrations (D1 wipe, new Tarn instance with pre-existing Arweave data),
+ * use tools/backfill-blobs.mjs from the operator's workstation — the runtime
+ * path caps at BACKFILL_BATCH_SIZE to stay under the Workers subrequest limit.
  */
 async function backfillBlobs(db, lookupKey, app, type) {
   const missing = await db.prepare(
