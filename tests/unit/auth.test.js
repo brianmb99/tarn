@@ -187,6 +187,30 @@ describe('JWT', () => {
     assert.equal(await verifyJWT('just-a-string', TEST_SECRET), null);
   });
 
+  it('should re-import HMAC key when the secret rotates', async () => {
+    const secretA = TEST_SECRET;
+    const secretB = btoa(String.fromCharCode(...new Uint8Array(32).fill(77)));
+
+    // Prime cache with secret A and sign a token
+    const tokenA = await signJWT({ sub: 'pre-rotation' }, secretA);
+    assert.ok(await verifyJWT(tokenA, secretA), 'tokenA should verify under secretA');
+
+    // Rotate: subsequent calls pass the new secret. Cache must re-import,
+    // NOT silently reuse the stale key from secretA.
+    const tokenB = await signJWT({ sub: 'post-rotation' }, secretB);
+
+    // tokenB must verify under secretB (proves we signed with the new key)
+    const verifiedB = await verifyJWT(tokenB, secretB);
+    assert.ok(verifiedB, 'tokenB should verify under secretB after rotation');
+    assert.equal(verifiedB.sub, 'post-rotation');
+
+    // tokenA (signed with secretA) must NOT verify under secretB
+    assert.equal(await verifyJWT(tokenA, secretB), null, 'tokenA must not verify under secretB');
+
+    // And rotating back to secretA should still work — verifies symmetric behavior
+    assert.ok(await verifyJWT(tokenA, secretA), 'tokenA should still verify under secretA after rotation back');
+  });
+
   it('should reject an expired JWT', async () => {
     // Sign with a payload that's already expired
     // We can't easily mock Date.now, so we test by checking the exp claim logic

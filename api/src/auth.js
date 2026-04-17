@@ -58,13 +58,15 @@ export async function consumeNonce(env, nonce) {
 // ============ JWT (WebCrypto HMAC-SHA256) ============
 
 let _hmacKey = null;
+let _cachedSecret = null;
 
 async function getHMACKey(secret) {
-  if (_hmacKey) return _hmacKey;
+  if (_hmacKey && _cachedSecret === secret) return _hmacKey;
   const keyData = Uint8Array.from(atob(secret), c => c.charCodeAt(0));
   _hmacKey = await crypto.subtle.importKey(
     'raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
   );
+  _cachedSecret = secret;
   return _hmacKey;
 }
 
@@ -133,4 +135,5 @@ export async function verifyJWT(token, secret) {
  */
 export function _resetHMACKey() {
   _hmacKey = null;
+  _cachedSecret = null;
 }
