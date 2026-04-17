@@ -56,6 +56,7 @@ export class TarnClient {
 
     const res = await this.#fetch('/api/v1/auth/register', {
       method: 'POST',
+      retry: true, // idempotent since tarn #6
       body: {
         credential_lookup_key: keys.credentialLookupKey,
         public_key: publicKeyBase64,
@@ -95,6 +96,7 @@ export class TarnClient {
     // Challenge
     const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
+      retry: true, // generates a fresh nonce per call — safe to retry
       body: { credential_lookup_key: keys.credentialLookupKey },
     });
 
@@ -456,6 +458,7 @@ export class TarnClient {
   async #authenticate() {
     const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
+      retry: true, // fresh nonce per call — safe to retry
       body: { credential_lookup_key: this.#credentialLookupKey },
     });
 
@@ -500,21 +503,99 @@ export class TarnClient {
     return null;
   }
 
-  async #fetch(path, { method = 'GET', body = null, auth = false } = {}) {
+  /**
+   * Internal fetch wrapper with transparent retry on transient failures.
+   *
+   * Retry policy:
+   *   - 5xx or 429 responses → retry (honoring Retry-After on 429)
+   *   - Network errors (fetch throws) → retry
+   *   - 4xx → do not retry (permanent answers: validation, auth, conflict, etc.)
+   *
+   * Retry is enabled by default for idempotent operations:
+   *   - Any GET
+   *   - POSTs explicitly marked retry-safe by the caller (retry: true)
+   *     e.g. /auth/register (idempotent since tarn #6), /auth/challenge (fresh
+   *     nonce per call).
+   *
+   * Retry is disabled for side-effectful operations (writes, /auth/verify,
+   * credential change, account delete) where a retry could produce duplicate
+   * state or consume a now-invalid nonce.
+   */
+  async #fetch(path, { method = 'GET', body = null, auth = false, retry = method === 'GET' } = {}) {
     const headers = { 'Content-Type': 'application/json' };
     if (auth && this.#jwt) headers['Authorization'] = `Bearer ${this.#jwt}`;
 
     const opts = { method, headers };
     if (body) opts.body = JSON.stringify(body);
 
-    const res = await fetch(`${this.#apiBase}${path}`, opts);
-    const text = await res.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = null; }
-    return { status: res.status, json, text };
+    return this.#fetchWithRetry(`${this.#apiBase}${path}`, opts, retry);
+  }
+
+  async #fetchWithRetry(url, opts, allowRetry) {
+    const MAX_ATTEMPTS = allowRetry ? 3 : 1;
+    let lastErr;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        const res = await fetch(url, opts);
+        const text = await res.text();
+        let json;
+        try { json = JSON.parse(text); } catch { json = null; }
+
+        const isTransient = res.status >= 500 || res.status === 429;
+        if (!isTransient || attempt === MAX_ATTEMPTS - 1) {
+          return { status: res.status, json, text };
+        }
+
+        // Transient: honor Retry-After if present, else exponential backoff with jitter.
+        const retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
+        const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : backoffMs(attempt);
+        console.warn(`[TarnClient] ${res.status} on ${url} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+        await sleep(waitMs);
+      } catch (err) {
+        // Network error (fetch threw: DNS, TLS, connection reset, etc).
+        lastErr = err;
+        if (attempt === MAX_ATTEMPTS - 1) throw err;
+        const waitMs = backoffMs(attempt);
+        console.warn(`[TarnClient] network error on ${url} (${err.message}) — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+        await sleep(waitMs);
+      }
+    }
+    throw lastErr; // unreachable
   }
 
   async #fetchRaw(path, opts) {
     return await fetch(`${this.#apiBase}${path}`, opts);
   }
+}
+
+// ============ Retry helpers ============
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Exponential backoff with ±25% jitter.
+ * Attempt 0 → ~500ms, attempt 1 → ~1500ms.
+ */
+function backoffMs(attempt) {
+  const base = 500 * Math.pow(3, attempt);
+  const jitter = base * (Math.random() * 0.5 - 0.25);
+  return base + jitter;
+}
+
+/**
+ * Parse Retry-After header value. Returns seconds (number) or null if absent/invalid.
+ * Supports both the delta-seconds form (e.g., "60") and the HTTP-date form.
+ */
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const n = parseInt(value, 10);
+  if (!isNaN(n) && n >= 0) return n;
+  const date = Date.parse(value);
+  if (!isNaN(date)) {
+    return Math.max(0, Math.floor((date - Date.now()) / 1000));
+  }
+  return null;
 }
