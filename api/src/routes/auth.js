@@ -129,12 +129,31 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('wrapped_data_key is required', 400, cors);
   }
 
-  // Check credential_lookup_key uniqueness
+  // Idempotency: if an account already exists for this credential_lookup_key,
+  // check whether this is a retry of a previous successful register (same payload)
+  // or a real conflict (different credentials claiming the same lookup key).
+  //
+  // A retry sending identical bytes is expected when the client got a 503-after-commit:
+  // the D1 INSERT succeeded but the response was lost (wall-time exceeded, edge drop,
+  // etc). Without idempotency, the user is permanently stuck — the account exists
+  // but every retry returns 409. See issue #6.
   const existing = await env.DB.prepare(
-    'SELECT 1 FROM accounts WHERE credential_lookup_key = ?1'
+    'SELECT data_lookup_key, public_key, wrapped_data_key, app FROM accounts WHERE credential_lookup_key = ?1'
   ).bind(credential_lookup_key).first();
   if (existing) {
-    return errorResponse('credential_lookup_key already in use', 409, cors);
+    const sameCreds =
+      existing.public_key === public_key &&
+      existing.wrapped_data_key === wrapped_data_key &&
+      existing.app === app;
+    if (sameCreds) {
+      // Same payload — treat as idempotent success. The client can proceed as if
+      // the original register succeeded (which it did, at the D1 layer).
+      // Return 201 (not 200) to match the status code of a fresh register. The
+      // deployed client strictly checks `status === 201`; a 200 would look like
+      // failure to it. Payload is identical.
+      return jsonResponse({ data_lookup_key: existing.data_lookup_key }, 201, cors);
+    }
+    return errorResponse('credential_lookup_key already in use with different credentials', 409, cors);
   }
 
   // Generate unique data_lookup_key
@@ -153,10 +172,30 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('Failed to generate unique data_lookup_key', 500, cors);
   }
 
-  // Insert account (rules_json NULL = DENY until app sets rules)
-  await env.DB.prepare(
-    'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)'
-  ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now()).run();
+  // Insert account (rules_json NULL = DENY until app sets rules).
+  // If a concurrent retry raced us between the uniqueness check and the INSERT,
+  // the UNIQUE constraint will fire. Catch it and re-run the idempotency check
+  // so concurrent retries also converge to the same success response.
+  try {
+    await env.DB.prepare(
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)'
+    ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now()).run();
+  } catch (err) {
+    // UNIQUE constraint on credential_lookup_key — concurrent retry won the race.
+    if (/UNIQUE/i.test(err.message || '')) {
+      const raced = await env.DB.prepare(
+        'SELECT data_lookup_key, public_key, wrapped_data_key, app FROM accounts WHERE credential_lookup_key = ?1'
+      ).bind(credential_lookup_key).first();
+      if (raced &&
+          raced.public_key === public_key &&
+          raced.wrapped_data_key === wrapped_data_key &&
+          raced.app === app) {
+        return jsonResponse({ data_lookup_key: raced.data_lookup_key }, 201, cors);
+      }
+      return errorResponse('credential_lookup_key already in use with different credentials', 409, cors);
+    }
+    throw err;
+  }
 
   // Persist credential mapping to Arweave (non-blocking)
   persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app);

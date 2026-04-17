@@ -86,6 +86,14 @@ await test('Register new user', async () => {
   console.log(`    DLK: ${testDlk.slice(0, 16)}...`);
 });
 
+await test('Re-register with same credentials is idempotent (issue #6)', async () => {
+  // Simulates the 503-after-commit case: client retries with an identical
+  // payload. Server should return 201 with the same DLK, not 409.
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  const { dataLookupKey } = await tarn.register(testEmail, testPassword);
+  assert(dataLookupKey === testDlk, `DLK changed on retry: ${dataLookupKey} vs ${testDlk}`);
+});
+
 // ============ 3. APP AUTH + SET RULES ============
 
 console.log('\n=== 3. App Auth + Set Rules ===');
