@@ -63,12 +63,22 @@ async function signAndUpload(body, tags, env, ctx, auth) {
   const app = tagValue(tags, 'App') || '';
   const type = tagValue(tags, 'Type') || '';
 
-  // Cache in D1 AFTER Turbo confirms — includes blob data for fast reads
+  // D1 write-through must be synchronous and authoritative. If Turbo accepted the
+  // DataItem but we can't persist it to D1, we must fail the request — Tarn's D1
+  // is the source of truth for live state (see issue #4). Returning success with
+  // a split-brain D1 is worse than returning failure: the client thinks the write
+  // landed, but no other client will see it until a manual rebuild from Arweave.
   const blobData = new Uint8Array(body);
-  ctx.waitUntil(Promise.all([
-    upsertWriteThrough(env.DB, txid, tags, blobData),
-    trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type),
-  ]));
+  try {
+    await upsertWriteThrough(env.DB, txid, tags, blobData);
+  } catch (err) {
+    console.error('[tarn-api] D1 write-through failed after Turbo accept:', txid, err.message);
+    return { error: 'Write persisted to Arweave but failed to cache — retry read to recover', status: 500 };
+  }
+
+  // trackPendingTx is non-authoritative — just a liveness hint for confirmation
+  // tracking. Safe to run in background.
+  ctx.waitUntil(trackPendingTx(env.DB, txid, auth.data_lookup_key, app, type));
 
   return { txid };
 }
@@ -272,11 +282,21 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     const entryApp = tagValue(entry.tags, 'App') || '';
     const entryType = tagValue(entry.tags, 'Type') || '';
 
-    // Cache in D1 AFTER Turbo confirms — includes blob data
-    ctx.waitUntil(Promise.all([
-      upsertWriteThrough(env.DB, txid, entry.tags, entry._dataBytes),
-      trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType),
-    ]));
+    // D1 write-through must be synchronous — see signAndUpload for rationale.
+    try {
+      await upsertWriteThrough(env.DB, txid, entry.tags, entry._dataBytes);
+    } catch (err) {
+      console.error('[tarn-api] D1 write-through failed after Turbo accept (batch):', txid, err.message);
+      return jsonResponse({
+        error: `Arweave upload succeeded but D1 cache failed at entry ${results.length}: ${err.message}`,
+        entries: results,
+        failedAt: results.length,
+        count: results.length,
+        status: 'partial',
+      }, 500, cors);
+    }
+
+    ctx.waitUntil(trackPendingTx(env.DB, txid, auth.data_lookup_key, entryApp, entryType));
 
     results.push({ txid, gateway: `${TURBO_GATEWAY}/${txid}` });
   }
