@@ -191,7 +191,7 @@ export async function refreshCache(env, ctx, app, type, dataLookupKey) {
     return { lastRefresh: meta.updated_at, stale: false };
   }
 
-  const doRefresh = async () => {
+  const doRefreshMeta = async () => {
     // Use lookup key search (Lk tag) for data entries
     const { edges, error } = await searchEntriesByLookupKey(dataLookupKey, { app, type });
     if (edges.length > 0) {
@@ -200,20 +200,23 @@ export async function refreshCache(env, ctx, app, type, dataLookupKey) {
     if (!error) {
       await setCacheMeta(env.DB, cacheKey, { refreshedAt: Date.now() });
     }
-
-    // Backfill blob data for entries that don't have it yet
-    // (migrated entries or entries from before blob caching was added)
-    await backfillBlobs(env.DB, dataLookupKey, app, type);
   };
+
+  // Blob backfill is opportunistic — it fetches from Arweave gateways which can be
+  // slow. Never block the response on it. Running it synchronously on cold cache was
+  // causing wall-time timeouts (CF returns edge 503 when a worker exceeds 30s).
+  const doBackfill = () => backfillBlobs(env.DB, dataLookupKey, app, type);
 
   if (meta) {
     // Stale: serve from cache, refresh in background
-    ctx.waitUntil(doRefresh());
+    ctx.waitUntil(Promise.all([doRefreshMeta(), doBackfill()]));
     return { lastRefresh: meta.updated_at, stale: true };
   }
 
-  // Cold cache: block and refresh
-  await doRefresh();
+  // Cold cache: block on GraphQL refresh so the response reflects current index,
+  // but run the blob backfill in the background.
+  await doRefreshMeta();
+  ctx.waitUntil(doBackfill());
   return { lastRefresh: Date.now(), stale: false };
 }
 

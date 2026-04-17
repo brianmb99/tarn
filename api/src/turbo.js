@@ -41,11 +41,16 @@ export async function buildSignedDataItem(payload, tags, signingKey) {
  */
 export async function uploadSignedDataItem(signedDataItem) {
   try {
+    // 20s ceiling (not 30s): Cloudflare Workers have a 30s wall-time limit on
+    // the initial response. A 30s Turbo timeout would consume the entire budget
+    // and leave no room for us to return an error response with CORS headers —
+    // the CF edge would return a headerless 503 instead, which the browser
+    // surfaces as a CORS error.
     const res = await fetch(TURBO_UPLOAD_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream' },
       body: signedDataItem,
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(20000),
     });
 
     const text = await res.text();
