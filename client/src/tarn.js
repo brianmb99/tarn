@@ -14,10 +14,15 @@ import {
   deriveAllKeys,
   exportPublicKey,
   wrapDataKeyEnvelope,
-  unwrapDataKeyEnvelope,
+  wrapDataKeyChainEnvelope,
+  unwrapDataKeyChain,
   signChallenge,
   encrypt,
   decrypt,
+  encryptWithCEK,
+  decryptWithCEK,
+  hasTarnBlobMagic,
+  generateRandomDataKey,
   base64ToBytes,
   KDF_V1_PBKDF2,
   KDF_V2_ARGON2ID,
@@ -29,7 +34,6 @@ export class TarnClient {
   #appId;
   #jwt = null;
   #dataLookupKey = null;
-  #dataEncryptionKey = null;
   #credentialLookupKey = null;
   #credentialEncryptionKey = null;
   #signingKeyPair = null;
@@ -38,6 +42,15 @@ export class TarnClient {
   // Used by changeCredentials() to preserve the original KDF — automatic
   // upgrade from PBKDF2 to Argon2id is intentionally out of scope.
   #kdfVersion = null;
+
+  // DEK chain (issue #11). Always populated on a successful login/register,
+  // even for legacy single-key (v1/v2) envelopes — those become a one-entry
+  // chain at gen=1. Keys are {gcmKey, kwKey} pairs holding two WebCrypto
+  // handles for the same 32 raw bytes (AES-GCM for direct legacy decryption,
+  // AES-KW for wrapping per-content CEKs).
+  #dekByGen = null;          // Map<gen:number, {gcmKey, kwKey}>
+  #currentGen = null;        // number — gen used for new writes
+  #envelopeVersion = null;   // 1 (bare base64), 2 (single), 3 (chain)
 
   /**
    * @param {string} apiBaseUrl - Tarn API base URL (e.g., 'https://api.tarn.dev')
@@ -53,6 +66,12 @@ export class TarnClient {
 
   /**
    * Register a new account for this app.
+   *
+   * Generates a fresh random 32-byte DEK at generation 1 (issue #11) — no
+   * more self-wrapping. The DEK is wrapped under the credential_encryption_key
+   * via AES-KW and packaged into a v3 envelope (`{v:3, dek_chain: [...]}`).
+   * The envelope is opaque to the API (passes the existing length/type check).
+   *
    * @param {string} email
    * @param {string} password
    * @returns {Promise<{dataLookupKey: string}>}
@@ -63,10 +82,12 @@ export class TarnClient {
     const kdfVersion = KDF_DEFAULT;
     const keys = await deriveAllKeys(email, password, this.#appId, kdfVersion);
     const publicKeyBase64 = await exportPublicKey(keys.signingKeyPair.publicKey);
-    const wrappedDataKey = await wrapDataKeyEnvelope(
-      keys.credentialEncryptionKey.gcmKey,
+
+    // Random DEK at generation 1. Wrap under credential_encryption_key.
+    const dek = await generateRandomDataKey();
+    const wrappedDataKey = await wrapDataKeyChainEnvelope(
+      [{ gen: 1, key: dek.gcmKey }],
       keys.credentialEncryptionKey.kwKey,
-      kdfVersion,
     );
 
     const res = await this.#fetch('/api/v1/auth/register', {
@@ -88,7 +109,9 @@ export class TarnClient {
     this.#credentialEncryptionKey = keys.credentialEncryptionKey;
     this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = res.json.data_lookup_key;
-    this.#dataEncryptionKey = keys.credentialEncryptionKey.gcmKey; // AES-GCM for data
+    this.#dekByGen = new Map([[1, { gcmKey: dek.gcmKey, kwKey: dek.kwKey }]]);
+    this.#currentGen = 1;
+    this.#envelopeVersion = 3;
     this.#kdfVersion = kdfVersion;
 
     await this.#authenticate();
@@ -138,11 +161,12 @@ export class TarnClient {
     this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = challengeRes.json.data_lookup_key;
 
-    // Unwrap data encryption key — handles both legacy bare-base64 (v1) and
-    // versioned envelopes (v2+). The envelope's kdfVersion is a sanity check:
-    // an Argon2id-derived key wrapping a v1 envelope (or vice versa) would
-    // indicate either tampering or a server-side mix-up.
-    const unwrapped = await unwrapDataKeyEnvelope(
+    // Unwrap data encryption key chain — handles legacy bare-base64 (v1),
+    // single-key v2 envelopes, and v3 chain envelopes uniformly. The
+    // envelope's kdfVersion is a sanity check: an Argon2id-derived key
+    // wrapping a v1 envelope (or vice versa) would indicate either tampering
+    // or a server-side mix-up.
+    const unwrapped = await unwrapDataKeyChain(
       challengeRes.json.wrapped_data_key,
       keys.credentialEncryptionKey.kwKey,
     );
@@ -151,7 +175,9 @@ export class TarnClient {
         `KDF mismatch: derived with v${keys.kdfVersion} but credential blob declares v${unwrapped.kdfVersion}`,
       );
     }
-    this.#dataEncryptionKey = unwrapped.dataKey;
+    this.#dekByGen = unwrapped.dekByGen;
+    this.#currentGen = unwrapped.currentGen;
+    this.#envelopeVersion = unwrapped.envelopeVersion;
     this.#kdfVersion = keys.kdfVersion;
 
     // Verify
@@ -161,8 +187,19 @@ export class TarnClient {
   }
 
   /**
-   * Change credentials (email and/or password).
-   * Requires an active session.
+   * Change credentials (email and/or password). Requires an active session.
+   *
+   * Forward-secret DEK rotation (issue #11): on every credential change for
+   * an Argon2id account, mint a fresh random DEK at gen N+1 and append to
+   * the chain. Existing gens stay accessible (re-wrapped under the new
+   * credential_encryption_key) so prior data is still readable. Future
+   * writes use the new gen, so an attacker who later compromises the OLD
+   * credentials cannot decrypt data encrypted under gen N+1.
+   *
+   * For PBKDF2 (KDF v1) accounts the rotation upgrade is intentionally not
+   * applied — they stay on the legacy single-key envelope (issue #11 is
+   * scoped to Argon2id accounts; legacy KDF migration is a separate concern).
+   *
    * @param {string} newEmail
    * @param {string} newPassword
    */
@@ -174,11 +211,48 @@ export class TarnClient {
     const kdfVersion = this.#kdfVersion ?? KDF_DEFAULT;
     const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-    const newWrappedDataKey = await wrapDataKeyEnvelope(
-      this.#dataEncryptionKey,
-      newKeys.credentialEncryptionKey.kwKey,
-      kdfVersion,
-    );
+
+    let newWrappedDataKey;
+    let newDekByGen;
+    let newCurrentGen;
+    let newEnvelopeVersion;
+
+    if (kdfVersion === KDF_V1_PBKDF2) {
+      // Legacy PBKDF2 path — keep the existing single-key envelope shape.
+      // No forward-secret rotation for v1 accounts in this issue.
+      const existing = this.#dekByGen.get(this.#currentGen);
+      newWrappedDataKey = await wrapDataKeyEnvelope(
+        existing.gcmKey,
+        newKeys.credentialEncryptionKey.kwKey,
+        KDF_V1_PBKDF2,
+      );
+      newDekByGen = this.#dekByGen;
+      newCurrentGen = this.#currentGen;
+      newEnvelopeVersion = 1;
+    } else {
+      // Argon2id path — append a new DEK at gen N+1 and re-wrap the whole
+      // chain under the new credential_encryption_key. v2 envelopes (single
+      // self-wrapped DEK, pre-issue-#11) are upgraded in place to v3 here:
+      // the existing DEK becomes gen 1, the fresh random DEK becomes gen 2.
+      const nextGen = this.#currentGen + 1;
+      const newDek = await generateRandomDataKey();
+
+      const chain = [];
+      for (const [gen, pair] of this.#dekByGen) {
+        chain.push({ gen, key: pair.gcmKey });
+      }
+      chain.push({ gen: nextGen, key: newDek.gcmKey });
+
+      newWrappedDataKey = await wrapDataKeyChainEnvelope(
+        chain,
+        newKeys.credentialEncryptionKey.kwKey,
+      );
+
+      newDekByGen = new Map(this.#dekByGen);
+      newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
+      newCurrentGen = nextGen;
+      newEnvelopeVersion = 3;
+    }
 
     const res = await this.#fetch('/api/v1/auth', {
       method: 'PUT',
@@ -197,6 +271,9 @@ export class TarnClient {
     this.#credentialLookupKey = newKeys.credentialLookupKey;
     this.#credentialEncryptionKey = newKeys.credentialEncryptionKey;
     this.#signingKeyPair = newKeys.signingKeyPair;
+    this.#dekByGen = newDekByGen;
+    this.#currentGen = newCurrentGen;
+    this.#envelopeVersion = newEnvelopeVersion;
 
     await this.#authenticate();
   }
@@ -215,7 +292,9 @@ export class TarnClient {
 
     this.#jwt = null;
     this.#dataLookupKey = null;
-    this.#dataEncryptionKey = null;
+    this.#dekByGen = null;
+    this.#currentGen = null;
+    this.#envelopeVersion = null;
     this.#credentialLookupKey = null;
     this.#credentialEncryptionKey = null;
     this.#signingKeyPair = null;
@@ -234,12 +313,12 @@ export class TarnClient {
   async createEntry(type, plaintext, extraTags = []) {
     await this.#requireAuth();
 
-    const encrypted = await encrypt(this.#dataEncryptionKey, plaintext);
+    const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(plaintext);
     const tags = [
       { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
       { name: 'Lk', value: this.#dataLookupKey },
-      { name: 'Enc', value: 'aes-256-gcm' },
+      ...cryptoTags,
       { name: 'V', value: '0.4.0' },
       ...extraTags,
     ];
@@ -283,12 +362,12 @@ export class TarnClient {
     // Encrypt each item and build the batch payload
     const entries = [];
     for (const item of items) {
-      const encrypted = await encrypt(this.#dataEncryptionKey, item);
+      const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(item);
       const tags = [
         { name: 'App', value: this.#appId },
         { name: 'Type', value: type },
         { name: 'Lk', value: this.#dataLookupKey },
-        { name: 'Enc', value: 'aes-256-gcm' },
+        ...cryptoTags,
         { name: 'V', value: '0.4.0' },
       ];
       // Base64-encode the encrypted bytes for JSON transport
@@ -366,7 +445,7 @@ export class TarnClient {
         // Blob data returned inline from API (base64) — decrypt directly
         try {
           const blobBytes = base64ToBytes(entry.data);
-          const data = await decrypt(this.#dataEncryptionKey, blobBytes);
+          const data = await this.#decryptBlob(blobBytes, entry.tags);
           entries.push({ txid: entry.txid, data, tags: entry.tags });
         } catch (err) {
           console.warn(`Failed to decrypt inline entry ${entry.txid}:`, err.message);
@@ -385,7 +464,7 @@ export class TarnClient {
         const results = await Promise.allSettled(batch.map(async (entry) => {
           const blobBytes = await this.#fetchBlob(entry.txid);
           if (!blobBytes) return null;
-          const data = await decrypt(this.#dataEncryptionKey, blobBytes);
+          const data = await this.#decryptBlob(blobBytes, entry.tags);
           return { txid: entry.txid, data, tags: entry.tags };
         }));
 
@@ -412,13 +491,13 @@ export class TarnClient {
   async updateEntry(priorTxid, type, plaintext) {
     await this.#requireAuth();
 
-    const encrypted = await encrypt(this.#dataEncryptionKey, plaintext);
+    const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(plaintext);
     const tags = [
       { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
       { name: 'Lk', value: this.#dataLookupKey },
       { name: 'Prev', value: priorTxid },
-      { name: 'Enc', value: 'aes-256-gcm' },
+      ...cryptoTags,
       { name: 'V', value: '0.4.0' },
     ];
 
@@ -450,14 +529,17 @@ export class TarnClient {
   async deleteEntry(targetTxid, type) {
     await this.#requireAuth();
 
-    const encrypted = await encrypt(this.#dataEncryptionKey, { tombstone: true, ref: targetTxid });
+    const { encrypted, tags: cryptoTags } = await this.#encryptForWrite({
+      tombstone: true,
+      ref: targetTxid,
+    });
     const tags = [
       { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
       { name: 'Lk', value: this.#dataLookupKey },
       { name: 'Op', value: 'tombstone' },
       { name: 'Ref', value: targetTxid },
-      { name: 'Enc', value: 'aes-256-gcm' },
+      ...cryptoTags,
       { name: 'V', value: '0.4.0' },
     ];
 
@@ -495,6 +577,77 @@ export class TarnClient {
   _testJwt() { return this.#jwt; }
 
   // ============ PRIVATE ============
+
+  /**
+   * Encrypt a payload for an outgoing write (issue #11).
+   *
+   * Per-content CEK pattern when the account has a v3 envelope: produces a
+   * blob prefixed with the TARN magic, with a fresh CEK wrapped under the
+   * current generation's DEK. The generation indicator travels alongside as
+   * the Arweave `Gen` tag — keeping the blob byte-layout from the design doc
+   * unchanged so a future recipient (Section 5) can skip bytes 5..44 without
+   * parsing tags.
+   *
+   * For legacy single-key envelopes (v1/v2) the write stays in legacy format:
+   * direct AES-GCM with the gen-1 DEK and `Enc: aes-256-gcm` tag, no `Gen`
+   * tag, no magic prefix. v2 accounts upgrade to v3 on next changeCredentials.
+   *
+   * @param {Object} plaintext - JSON-serializable payload
+   * @returns {Promise<{ encrypted: Uint8Array, tags: Array<{name:string, value:string}> }>}
+   */
+  async #encryptForWrite(plaintext) {
+    const dek = this.#dekByGen.get(this.#currentGen);
+    if (!dek) {
+      throw new Error(`Internal: no DEK for gen ${this.#currentGen}`);
+    }
+
+    if (this.#envelopeVersion === 3) {
+      const encrypted = await encryptWithCEK(dek.kwKey, plaintext);
+      return {
+        encrypted,
+        tags: [
+          { name: 'Enc', value: 'tarn-cek-1' },
+          { name: 'Gen', value: String(this.#currentGen) },
+        ],
+      };
+    }
+
+    // Legacy v1/v2 envelope path — direct AES-GCM with the (only) DEK.
+    const encrypted = await encrypt(dek.gcmKey, plaintext);
+    return {
+      encrypted,
+      tags: [{ name: 'Enc', value: 'aes-256-gcm' }],
+    };
+  }
+
+  /**
+   * Decrypt a blob from a read. Dispatches on the 5-byte TARN magic prefix
+   * (issue #11): new-format blobs use the per-content CEK path with the
+   * generation indicated by the `Gen` tag; legacy blobs use direct AES-GCM
+   * with the gen-1 DEK.
+   *
+   * @param {Uint8Array} blobBytes
+   * @param {Array<{name: string, value: string}>} tags
+   * @returns {Promise<Object>}
+   */
+  async #decryptBlob(blobBytes, tags) {
+    if (hasTarnBlobMagic(blobBytes)) {
+      const gen = readGenTag(tags) ?? 1;
+      const dek = this.#dekByGen.get(gen);
+      if (!dek) {
+        throw new Error(`No DEK for blob generation ${gen} — chain has gens [${[...this.#dekByGen.keys()].join(', ')}]`);
+      }
+      return await decryptWithCEK(dek.kwKey, blobBytes);
+    }
+
+    // Legacy blob — decrypt directly with the gen-1 DEK. For v3 accounts that
+    // were upgraded from v2, gen 1 holds the original (pre-issue-#11) DEK.
+    const legacy = this.#dekByGen.get(1);
+    if (!legacy) {
+      throw new Error('No gen-1 DEK available for legacy blob decryption');
+    }
+    return await decrypt(legacy.gcmKey, blobBytes);
+  }
 
   /**
    * Ensure we have a valid JWT. If expired but we have signing keys,
@@ -643,6 +796,24 @@ export class TarnClient {
     }
     throw lastErr; // unreachable
   }
+}
+
+// ============ Tag helpers ============
+
+/**
+ * Read the integer value of a `Gen` tag from an Arweave tag list (issue #11).
+ * Returns null if the tag is absent or malformed.
+ *
+ * @param {Array<{name: string, value: string}>|undefined} tags
+ * @returns {number|null}
+ */
+function readGenTag(tags) {
+  if (!Array.isArray(tags)) return null;
+  const tag = tags.find(t => t && t.name === 'Gen');
+  if (!tag || typeof tag.value !== 'string') return null;
+  const n = parseInt(tag.value, 10);
+  if (!Number.isInteger(n) || n < 1) return null;
+  return n;
 }
 
 // ============ Retry + idempotency helpers ============

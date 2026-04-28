@@ -135,7 +135,7 @@ describe('TarnClient.login — KDF dispatch', () => {
     assert.equal(challengeCalls().length, 2, 'should try both KDFs before giving up');
   });
 
-  it('register uses Argon2id (v2) and produces a JSON envelope wrapped_data_key', async () => {
+  it('register uses Argon2id (KDF v2) and produces a v3 envelope with a single-entry DEK chain (issue #11)', async () => {
     mockFetch([
       // /auth/register — 201 success.
       { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
@@ -152,11 +152,15 @@ describe('TarnClient.login — KDF dispatch', () => {
     assert.ok(registerCall, 'register should hit /auth/register');
     const body = JSON.parse(registerCall.body);
 
-    // wrapped_data_key should be a v2 JSON envelope.
-    assert.equal(body.wrapped_data_key[0], '{', 'register should send v2 envelope');
+    // wrapped_data_key should be a v3 JSON envelope (chain) for new accounts.
+    assert.equal(body.wrapped_data_key[0], '{', 'register should send a JSON envelope');
     const env = JSON.parse(body.wrapped_data_key);
-    assert.equal(env.v, 2);
+    assert.equal(env.v, 3);
     assert.equal(env.kdf, 'argon2id');
+    assert.ok(Array.isArray(env.dek_chain));
+    assert.equal(env.dek_chain.length, 1);
+    assert.equal(env.dek_chain[0].gen, 1);
+    assert.equal(typeof env.dek_chain[0].wrapped, 'string');
 
     // credential_lookup_key should match the Argon2id-derived one.
     const v2Keys = await deriveAllKeys(EMAIL, PASSWORD, APP, KDF_V2_ARGON2ID);

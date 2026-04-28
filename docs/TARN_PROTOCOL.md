@@ -70,7 +70,7 @@ Import as PKCS#8 DER → export public key as SPKI → send SPKI to API.
 
 ### Wrapped Data Key
 
-The `data_encryption_key` is wrapped using **AES-KW** (RFC 3394, Key Wrap):
+The `data_encryption_key` (DEK) is wrapped using **AES-KW** (RFC 3394, Key Wrap):
 
 ```
 wrapped_bytes = AES-KW-Wrap(data_encryption_key, credential_encryption_key)
@@ -79,21 +79,31 @@ wrapped_bytes = AES-KW-Wrap(data_encryption_key, credential_encryption_key)
 
 AES-KW is deterministic (no IV), purpose-built for key wrapping, and available in WebCrypto via `crypto.subtle.wrapKey('raw', key, wrappingKey, 'AES-KW')`.
 
-At account creation, payload and wrapping key are the same key — self-wrapping, redundant but intentional. The client always performs the same operation on login:
+At registration the DEK is generated as 32 fresh random bytes (issue #11) — no more self-wrapping. The DEK is then wrapped under the `credential_encryption_key` and packaged into a v3 envelope (see below).
 
-```
-data_encryption_key = AES-KW-Unwrap(wrapped_bytes, credential_encryption_key)
-```
-
-No branching for "first login" vs. "post-credential-change login." Uniform code path.
-
-After a credential change, `wrapped_bytes` becomes `AES-KW-Wrap(ORIGINAL_data_encryption_key, NEW_credential_encryption_key)`. The client unwraps with the new credential key and recovers the original data encryption key. All existing data remains decryptable.
+After a credential change, the wrap is regenerated under the new `credential_encryption_key`. Argon2id accounts also get a fresh DEK appended to the chain at the next-highest generation (forward-secret rotation) — see [Forward-secret DEK rotation](#forward-secret-dek-rotation) below.
 
 #### Wire format (`wrapped_data_key` field)
 
-The API stores `wrapped_data_key` as opaque text. The string carries a KDF version indicator so the client can verify which master-key KDF the account was registered under.
+The API stores `wrapped_data_key` as opaque text. The string carries a version indicator so the client knows the structure and a KDF indicator so the client can verify which master-key KDF the account was registered under.
 
-**v2 (current — Argon2id accounts):** JSON envelope.
+**v3 (current default — Argon2id accounts after issue #11):** JSON envelope with a DEK chain.
+
+```json
+{
+  "v": 3,
+  "kdf": "argon2id",
+  "kdf_params": { "m_kib": 65536, "t": 3, "p": 1 },
+  "dek_chain": [
+    { "gen": 1, "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" },
+    { "gen": 2, "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" }
+  ]
+}
+```
+
+The chain is appended only — every credential change adds an entry at gen N+1. The current generation (used for new writes) is the entry with the highest `gen`. Old gens stay in the chain so older content blobs remain decryptable.
+
+**v2 (legacy Argon2id accounts):** JSON envelope with a single wrapped DEK.
 
 ```json
 {
@@ -104,11 +114,19 @@ The API stores `wrapped_data_key` as opaque text. The string carries a KDF versi
 }
 ```
 
-**v1 (legacy — PBKDF2 accounts):** the bare base64 AES-KW ciphertext, no envelope.
+v2 accounts upgrade to v3 on next credential change: the existing DEK is preserved as gen 1 (re-wrapped under the new KEK) and a fresh random DEK is minted as gen 2.
 
-Detection rule: if `wrapped_data_key[0] === '{'`, parse as a v2 envelope; otherwise treat as v1 bare base64. The base64 alphabet `[A-Za-z0-9+/=]` never starts with `{`, so the prefix check is unambiguous.
+**v1 (legacy PBKDF2 accounts):** the bare base64 AES-KW ciphertext, no envelope. PBKDF2 accounts stay on the legacy single-key path on credential change — issue #11's forward-secret rotation is scoped to Argon2id accounts; v1 → v3 migration is a separate concern.
 
-Both forms are byte-stable for the same `(email, password, app)` inputs (AES-KW is deterministic; JSON.stringify is insertion-ordered). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
+Detection rule: if `wrapped_data_key[0] === '{'`, parse as JSON and dispatch on `v`; otherwise treat as v1 bare base64. The base64 alphabet `[A-Za-z0-9+/=]` never starts with `{`, so the prefix check is unambiguous.
+
+All envelope shapes are byte-stable for the same `(email, password, app)` inputs (AES-KW is deterministic; JSON.stringify is insertion-ordered; chain entries are written in generation order). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
+
+#### Forward-secret DEK rotation
+
+On every credential change for an Argon2id account, the client mints a fresh random DEK at gen N+1 and appends it to the chain. Subsequent writes use the new gen; old gens remain in the chain so prior data is still readable. An attacker who later compromises the OLD `credential_encryption_key` cannot decrypt content written after the rotation (the new gen DEK is not derivable from old credentials).
+
+This is the only forward-secrecy property Tarn provides today. Old credential blobs on Arweave remain unwrappable by anyone who held the old credentials, but the DEK they yield is bound to data written before the rotation.
 
 ### Data lookup key
 
@@ -122,16 +140,22 @@ Generated by the API at registration. Random, unique, opaque 64-char hex string.
 
 Tarn assumes credentials are never compromised. Credential changes are a convenience feature (e.g., new email address), not a security remediation tool. All encrypted data is publicly visible on Arweave — security depends entirely on password entropy + PBKDF2 cost.
 
-### No forward secrecy on credential change
+### Forward secrecy on credential change (Argon2id accounts)
 
-Changing credentials does NOT provide forward secrecy. Old credential mappings persist on Arweave (immutable). An attacker with old credentials can always:
+Issue #11 added forward-secret DEK rotation for Argon2id accounts. On every credential change a fresh random DEK is appended to the chain at gen N+1; future writes go to gen N+1. An attacker who later compromises old credentials can:
 
 1. Derive the old `credential_lookup_key`
 2. Find the old credential mapping blob on Arweave
-3. Unwrap the old `wrapped_data_key` with the old `credential_encryption_key`
-4. Decrypt all data (past and future — `data_encryption_key` never changes)
+3. Unwrap the OLD `wrapped_data_key` with the old `credential_encryption_key`
+4. Recover DEKs at gens 1..N (the chain entries that existed at the time of the old credential blob)
 
-This is inherent to immutable storage.
+What they CANNOT do: decrypt content written under gen N+1 (or later). Those CEKs are wrapped under the new DEK, which is not derivable from old credentials. The old credential blob does not contain the new DEK — it predates it.
+
+What's still inherent to immutable storage: the old credential blob itself stays on Arweave forever, so an attacker who compromised the old credentials at any point retains permanent access to data written before the rotation. Tarn cannot revoke past leaks.
+
+### Legacy PBKDF2 accounts have no forward secrecy
+
+PBKDF2 (KDF v1) accounts are out of scope for issue #11's rotation. Their DEK is rewrapped under new credentials on every change but never replaced — old credentials still unwrap the same DEK and decrypt all data, past and future.
 
 ### Password requirements
 
@@ -194,36 +218,62 @@ User accounts are per-app. Registration requires a valid `app` parameter referen
 
 All blobs on Arweave carry these tags:
 
-| Tag  | Meaning                    | Example                   |
-|------|---------------------------|---------------------------|
-| App  | App identifier             | `bookish`, `winelist`     |
-| Type | Blob type                  | `cred`, `entry`, `acct`   |
-| Lk   | Lookup key (64-char hex)   | `a3f8...`                 |
-| Enc  | Encryption method          | `aes-256-gcm`             |
-| V    | Protocol version           | `0.4.0`                   |
+| Tag  | Meaning                    | Example                            |
+|------|---------------------------|-------------------------------------|
+| App  | App identifier             | `bookish`, `winelist`              |
+| Type | Blob type                  | `cred`, `entry`, `acct`            |
+| Lk   | Lookup key (64-char hex)   | `a3f8...`                          |
+| Enc  | Encryption method          | `aes-256-gcm` or `tarn-cek-1`      |
+| V    | Protocol version           | `0.4.0`                            |
 
 For credential blobs: `Lk` = `credential_lookup_key`.
 For data blobs: `Lk` = `data_lookup_key`.
 
-Additional tags for versioning (data blobs only):
+Additional tags for versioning and key rotation (data blobs only):
 
-| Tag  | Meaning                          |
-|------|----------------------------------|
-| Prev | Txid of prior version (edits)    |
-| Op   | Operation flag (`tombstone`)     |
-| Ref  | Txid referenced by tombstone     |
+| Tag  | Meaning                                                       |
+|------|---------------------------------------------------------------|
+| Prev | Txid of prior version (edits)                                 |
+| Op   | Operation flag (`tombstone`)                                  |
+| Ref  | Txid referenced by tombstone                                  |
+| Gen  | DEK generation that wrapped the per-content CEK (issue #11)   |
+
+The `Gen` tag is present on new-format (`Enc: tarn-cek-1`) blobs; it carries the integer generation number (e.g. `1`, `2`) that selects which DEK from the user's chain unwraps the blob's CEK. Legacy `aes-256-gcm` blobs carry no `Gen` tag and decrypt with the gen-1 DEK directly.
 
 ---
 
 ## Blob Format
 
-All data blobs are AES-256-GCM encrypted by the client. Wire format:
+Two formats coexist; the SDK detects which by inspecting the first 5 bytes.
+
+### New format — per-content CEK (issue #11, default for v3 accounts)
+
+```
+[magic: 5 bytes][wrapped_CEK: 40 bytes][IV: 12 bytes][ciphertext + GCM tag: N+16 bytes]
+```
+
+- `magic = 0x54 0x41 0x52 0x4e 0x02` — ASCII `"TARN"` followed by version byte `0x02`. The trailing byte is the format version; future revisions reuse the `0x54 0x41 0x52 0x4e` prefix and increment.
+- `CEK` is generated fresh per blob (`crypto.getRandomValues(32)`). `wrapped_CEK = AES-KW(CEK, DEK[currentGen])` — 40 bytes (32-byte CEK + 8-byte AES-KW overhead).
+- `IV` is 12 random bytes per encryption.
+- Ciphertext is AES-256-GCM with the per-blob CEK over UTF-8-JSON plaintext.
+
+Per-blob fixed overhead: 73 bytes (5 + 40 + 12 + 16).
+
+The generation indicator does not live in the blob bytes — it travels alongside as the Arweave `Gen` tag (e.g. `Gen: 1`, `Gen: 2`). This keeps the byte layout stable so a recipient who only has the CEK (sharing protocol, future Section 5 work) can skip bytes 5..44 and decrypt bytes 45..end without parsing tags.
+
+**Reading.** The owner reads bytes 5..44 (`wrapped_CEK`), unwraps it with `DEK[gen]` (gen from the `Gen` tag, default 1 if absent), and decrypts bytes 45..end with that CEK. A recipient with a CEK from a share log skips the wrapped portion and decrypts directly.
+
+The `Enc` tag for new-format blobs is `tarn-cek-1`.
+
+### Legacy format
 
 ```
 [IV: 12 bytes] [ciphertext + GCM tag: N bytes]
 ```
 
-GCM tag is 16 bytes, appended by WebCrypto. Plaintext is UTF-8 encoded JSON. IV must be randomly generated (12 bytes) for each encryption operation.
+Direct AES-256-GCM with the user's DEK. No magic prefix. `Enc: aes-256-gcm`. Pre-issue-#11 blobs and writes by accounts that haven't yet upgraded to v3 envelopes.
+
+**Detection.** SDK reads the first 5 bytes. Match against `0x54 0x41 0x52 0x4e 0x02` → new format; otherwise legacy. Legacy blobs continue to decrypt indefinitely — no migration is performed.
 
 ---
 
@@ -333,11 +383,13 @@ Tarn is the sole write path for any data associated with a (`data_lookup_key`, `
 
 ```
 CLIENT (local):
-  1. Derive master_key from email + password (PBKDF2)
+  1. Derive master_key from email + password (Argon2id v2; PBKDF2 v1 legacy only)
   2. Derive credential_lookup_key, credential_encryption_key, signing_key_pair
      (all include app_id in HKDF info)
-  3. data_encryption_key = credential_encryption_key (same key at creation)
-  4. wrapped_data_key = AES-KW-Wrap(data_encryption_key, credential_encryption_key)
+  3. data_encryption_key (DEK) = crypto.getRandomValues(32)   // issue #11
+  4. wrapped_data_key = v3 envelope:
+       { v: 3, kdf, kdf_params,
+         dek_chain: [{ gen: 1, wrapped: AES-KW-Wrap(DEK, credential_encryption_key) }] }
 
 CLIENT -> API:
   5. POST /api/v1/auth/register
@@ -416,15 +468,23 @@ Tags include Op: tombstone, Ref: target_txid. Entry hidden by resolution.
 ### 7. Change credentials
 
 ```
-CLIENT (authenticated with old credentials):
-  1. Derive NEW keys from new email + password (same app_id)
-  2. new_wrapped_data_key = AES-KW-Wrap(data_encryption_key, new_credential_encryption_key)
+CLIENT (authenticated with old credentials, holds DEK chain DEK[1..N]):
+  1. Derive NEW keys from new email + password (same app_id, same KDF version)
+  2. Argon2id (v3 envelope) accounts — forward-secret rotation:
+       - Mint DEK[N+1] = crypto.getRandomValues(32)
+       - new_wrapped_data_key = v3 envelope with chain entries:
+           [ { gen: i, wrapped: AES-KW(DEK[i], new_credential_encryption_key) }
+             for i in 1..N+1 ]
+       - Future writes use Gen=N+1
+  3. PBKDF2 (v1 legacy) accounts — single-key rewrap, no rotation:
+       - new_wrapped_data_key = bare base64 AES-KW(DEK[1], new_credential_encryption_key)
 
 CLIENT -> API:
   PUT /api/v1/auth [JWT from old credentials]
   Body: { new_credential_lookup_key, new_public_key, new_wrapped_data_key }
 
-data_lookup_key unchanged. All data untouched. Only credential wrapping changes.
+data_lookup_key unchanged. Existing data untouched. Old gens stay readable;
+new writes go to the new gen.
 ```
 
 ### 8. D1 Recovery
@@ -551,8 +611,14 @@ New accounts have `rules_json = NULL`, which means DENY. The app must explicitly
 ### Why reads are unauthenticated
 Data is on Arweave permanently (encrypted). Auth on reads only protects the cache layer. A permanent, auditable, API-independent data export page must be possible.
 
-### Why self-wrapping at registration
-`AES-KW-Wrap(key, key)` at registration is redundant but keeps the login code path uniform: always unwrap, never branch on credential history.
+### Why a fresh random DEK at registration (issue #11)
+Earlier versions of Tarn self-wrapped the credential_encryption_key as the DEK at registration, redundantly but uniformly. Issue #11 replaced this with a fresh `crypto.getRandomValues(32)` DEK at gen 1. This is a prerequisite for forward-secret DEK rotation (different gens must be independent random keys, not derived from credentials) and for the planned recovery-phrase factor (different KDFs must be able to wrap the *same* DEK independently).
+
+### Why per-content CEKs (issue #11)
+Each blob is encrypted with its own freshly-generated 32-byte CEK; the CEK is wrapped under the current generation's DEK and prepended to the blob. This adds 73 bytes per blob but enables granular access control for the future sharing protocol (a CEK can be shared to another user without exposing the DEK), per-content rotation on revocation, and simpler capability delegation. The 5-byte magic prefix `0x54 0x41 0x52 0x4e 0x02` makes the format unambiguously distinguishable from legacy direct-DEK blobs.
+
+### Why the generation tag lives in Arweave tags, not in the blob
+Section 5 (sharing protocol) requires that a recipient holding only a CEK can decrypt the content portion of a blob without knowing or parsing the owner-side wrapped CEK header. Encoding the generation in the blob bytes would shift the content offset and break that invariant. Putting the generation in an Arweave `Gen` tag keeps bytes 5..44 reserved for the wrapped CEK and bytes 45..end as CEK-only-decryptable content — independent of who's reading.
 
 ---
 

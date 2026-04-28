@@ -142,14 +142,14 @@ await tarn.changeCredentials('new@example.com', 'new-password');
 await tarn.deleteAccount();
 ```
 
-Credential changes re-wrap the data encryption key. All existing data remains decryptable. The old credentials stop working immediately.
+Credential changes re-wrap the existing data encryption keys under the new credentials and (for Argon2id accounts) append a fresh DEK at the next generation. Future writes use the new generation; existing data stays decryptable. The old credentials stop working immediately.
 
 ## Security Model
 
 - **Client-side encryption.** All data is AES-256-GCM encrypted before leaving the client. The server never sees plaintext.
 - **Argon2id key derivation.** Memory-hard KDF (m=64 MiB, t=3, p=1) for the password→master-key step. Sub-keys derived via HKDF-Expand (RFC 5869). Legacy accounts on PBKDF2-SHA256 (600K iters) continue to log in via a fallback path.
 - **ECDSA P-256 auth.** Challenge-response signing. No passwords transmitted. Server stores only the public key.
-- **AES-KW key wrapping.** Data encryption key wrapped per RFC 3394. Self-wrapping at registration for uniform login code path.
+- **Per-content CEK + forward-secret DEK rotation.** Each blob is encrypted with its own random CEK, wrapped under a generation-indexed DEK chain (RFC 3394 AES-KW). Credential changes append a fresh DEK to the chain so post-rotation writes are not decryptable by an attacker holding the old credentials.
 - **Arweave permanence.** Data stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.
 
 See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specification.

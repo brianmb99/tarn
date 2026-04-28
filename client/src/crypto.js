@@ -52,6 +52,22 @@ const PKCS8_P256_PREFIX = new Uint8Array([
   0x04, 0x27, 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
 ]);
 
+// Per-content CEK pattern (issue #11):
+// New content blobs are prefixed with a 5-byte magic so the format is
+// unambiguously detectable without consulting tags.
+//   magic = "TARN" || version_byte (0x02)
+// Layout: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag(N+16).
+// Generation indicator lives in the Arweave `Gen` tag — keeps the byte
+// offsets stable so a recipient (Section 5 work) can skip bytes 5..44
+// without parsing tags.
+export const TARN_BLOB_MAGIC = new Uint8Array([0x54, 0x41, 0x52, 0x4e, 0x02]);
+const WRAPPED_CEK_LEN = 40; // 32-byte CEK + 8-byte AES-KW overhead
+const CEK_LEN_BYTES = 32;
+const IV_LEN_BYTES = 12;
+const GCM_TAG_LEN_BYTES = 16;
+const MIN_NEW_FORMAT_LEN =
+  TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN + IV_LEN_BYTES + GCM_TAG_LEN_BYTES;
+
 // ============ EMAIL NORMALIZATION ============
 
 export function normalizeEmail(email) {
@@ -268,6 +284,107 @@ export async function decrypt(key, blob) {
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
 
+// ============ PER-CONTENT CEK BLOB FORMAT (issue #11) ============
+
+/**
+ * Detect whether a blob is in the new per-content CEK format.
+ * Cheap O(1) prefix check; safe on legacy blobs (legacy AES-GCM IVs are random
+ * 12-byte values — collision with the 5-byte magic has probability 2^-40).
+ *
+ * @param {Uint8Array} blob
+ * @returns {boolean}
+ */
+export function hasTarnBlobMagic(blob) {
+  if (!(blob instanceof Uint8Array) || blob.length < TARN_BLOB_MAGIC.length) {
+    return false;
+  }
+  for (let i = 0; i < TARN_BLOB_MAGIC.length; i++) {
+    if (blob[i] !== TARN_BLOB_MAGIC[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Encrypt JSON payload with a fresh random CEK; produce a v3-magic blob.
+ *
+ * The CEK is wrapped under the supplied DEK (AES-KW). The generation indicator
+ * is NOT embedded in the blob — it travels alongside as the Arweave `Gen` tag.
+ * This keeps the byte layout from the design doc unchanged so a recipient
+ * who only has the CEK can skip bytes 5..44 without parsing tags.
+ *
+ * @param {CryptoKey} dek - AES-KW wrapping key for the current generation
+ * @param {Object} plaintext - JSON-serializable payload
+ * @returns {Promise<Uint8Array>} Wire format: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag
+ */
+export async function encryptWithCEK(dek, plaintext) {
+  // Generate a fresh CEK and import into both AES-GCM (for content) and AES-KW
+  // (so it can be wrapped). Same raw bytes, two WebCrypto handles.
+  const cekBytes = crypto.getRandomValues(new Uint8Array(CEK_LEN_BYTES));
+  const [cekGcm, cekKw] = await Promise.all([
+    crypto.subtle.importKey('raw', cekBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', cekBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+  ]);
+
+  const wrappedCEK = new Uint8Array(
+    await crypto.subtle.wrapKey('raw', cekKw, dek, 'AES-KW')
+  );
+  if (wrappedCEK.length !== WRAPPED_CEK_LEN) {
+    throw new Error(`wrapped_CEK length ${wrappedCEK.length} != ${WRAPPED_CEK_LEN}`);
+  }
+
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LEN_BYTES));
+  const data = new TextEncoder().encode(JSON.stringify(plaintext));
+  const ciphertextAndTag = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cekGcm, data)
+  );
+
+  const out = new Uint8Array(
+    TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN + IV_LEN_BYTES + ciphertextAndTag.length
+  );
+  let off = 0;
+  out.set(TARN_BLOB_MAGIC, off); off += TARN_BLOB_MAGIC.length;
+  out.set(wrappedCEK, off); off += WRAPPED_CEK_LEN;
+  out.set(iv, off); off += IV_LEN_BYTES;
+  out.set(ciphertextAndTag, off);
+  return out;
+}
+
+/**
+ * Decrypt a per-content CEK blob using a DEK from the chain.
+ *
+ * Layout: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag
+ *
+ * @param {CryptoKey} dek - AES-KW unwrapping key for the blob's generation
+ * @param {Uint8Array} blob
+ * @returns {Promise<Object>}
+ */
+export async function decryptWithCEK(dek, blob) {
+  if (!hasTarnBlobMagic(blob)) {
+    throw new Error('Blob does not have TARN magic prefix');
+  }
+  if (blob.length < MIN_NEW_FORMAT_LEN) {
+    throw new Error(`Blob too short for new format: ${blob.length} < ${MIN_NEW_FORMAT_LEN}`);
+  }
+
+  const wrappedCEK = blob.slice(
+    TARN_BLOB_MAGIC.length,
+    TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN,
+  );
+  const ivStart = TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN;
+  const iv = blob.slice(ivStart, ivStart + IV_LEN_BYTES);
+  const ciphertextAndTag = blob.slice(ivStart + IV_LEN_BYTES);
+
+  const cekGcm = await crypto.subtle.unwrapKey(
+    'raw', wrappedCEK, dek, 'AES-KW',
+    { name: 'AES-GCM' }, false, ['decrypt'],
+  );
+
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv }, cekGcm, ciphertextAndTag,
+  );
+  return JSON.parse(new TextDecoder().decode(decrypted));
+}
+
 // ============ AES-KW KEY WRAPPING (RFC 3394) ============
 
 /**
@@ -305,13 +422,22 @@ export async function unwrapDataKey(wrappedBase64, unwrappingKey) {
 // credential mapping blob embeds the same string.
 //
 // v1 (legacy) — bare base64 of the AES-KW ciphertext. Implies PBKDF2 master_key.
-// v2 (current) — JSON envelope: { v, kdf, kdf_params, wrapped }.
+// v2 — JSON envelope with a single wrapped DEK: { v, kdf, kdf_params, wrapped }.
+//      DEK == credential_encryption_key (self-wrapping). Pre-issue-#11.
+// v3 (current default for new accounts) — JSON envelope with a DEK chain:
+//      { v: 3, kdf, kdf_params, dek_chain: [{gen, wrapped}, ...] }.
+//      Each entry's `wrapped` is AES-KW(DEK_at_gen, credential_encryption_key).
+//      Forward-secret rotation works by appending a fresh DEK at gen N+1 on
+//      every credential change; old gens stay accessible for past data.
 //
-// Detection: if the string parses as JSON and has v >= 2, it's an envelope;
-// otherwise it's legacy v1 (bare base64).
+// Detection: if the string parses as JSON, dispatch on `v`; otherwise legacy v1.
 
 /**
  * Wrap the data encryption key and pack into the wire format for the given KDF.
+ * Produces the legacy single-key shape (envelope v1 for PBKDF2, envelope v2
+ * for Argon2id). For new accounts after issue #11, prefer
+ * {@link wrapDataKeyChainEnvelope} which produces a v3 chain envelope.
+ *
  * @param {CryptoKey} dataKey
  * @param {CryptoKey} wrappingKey
  * @param {number} kdfVersion - KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
@@ -337,9 +463,40 @@ export async function wrapDataKeyEnvelope(dataKey, wrappingKey, kdfVersion) {
 }
 
 /**
+ * Generate a fresh random 32-byte DEK and import it as both an AES-GCM key
+ * (for legacy/direct content encryption — and as a fallback when the chain
+ * has only one entry) and an AES-KW key (for wrapping per-content CEKs).
+ *
+ * @returns {Promise<{gcmKey: CryptoKey, kwKey: CryptoKey, rawBytes: Uint8Array}>}
+ */
+export async function generateRandomDataKey() {
+  const rawBytes = crypto.getRandomValues(new Uint8Array(KEY_LENGTH_BYTES));
+  const [gcmKey, kwKey] = await Promise.all([
+    crypto.subtle.importKey('raw', rawBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', rawBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+  ]);
+  return { gcmKey, kwKey, rawBytes };
+}
+
+/**
  * Inspect a wire-format `wrapped_data_key` without unwrapping.
+ *
+ * Returns a normalized shape regardless of envelope version:
+ *   - `kdfVersion`     — KDF used to derive master_key (v1 or v2)
+ *   - `envelopeVersion` — 1 (bare base64), 2 (single wrapped), or 3 (DEK chain)
+ *   - `dekChain`       — `[{gen, wrappedBase64}, ...]` (length 1 for v1/v2)
+ *   - `wrappedBase64`  — convenience: the wrapped bytes for v1/v2 envelopes,
+ *                        or the highest-gen entry for v3 (current generation)
+ *   - `kdfParams`      — KDF-side params copy (or null for v1)
+ *
  * @param {string} wireValue
- * @returns {{ kdfVersion: number, wrappedBase64: string, kdfParams: object|null }}
+ * @returns {{
+ *   kdfVersion: number,
+ *   envelopeVersion: number,
+ *   dekChain: Array<{gen: number, wrappedBase64: string}>,
+ *   wrappedBase64: string,
+ *   kdfParams: object|null,
+ * }}
  */
 export function parseWrappedDataKey(wireValue) {
   if (typeof wireValue !== 'string' || wireValue.length === 0) {
@@ -350,7 +507,13 @@ export function parseWrappedDataKey(wireValue) {
   // with '{' (base64 alphabet is [A-Za-z0-9+/=]), so this prefix check is
   // a safe, allocation-free dispatch before attempting JSON.parse.
   if (wireValue[0] !== '{') {
-    return { kdfVersion: KDF_V1_PBKDF2, wrappedBase64: wireValue, kdfParams: null };
+    return {
+      kdfVersion: KDF_V1_PBKDF2,
+      envelopeVersion: 1,
+      dekChain: [{ gen: 1, wrappedBase64: wireValue }],
+      wrappedBase64: wireValue,
+      kdfParams: null,
+    };
   }
 
   let parsed;
@@ -360,19 +523,69 @@ export function parseWrappedDataKey(wireValue) {
     throw new Error('wrapped_data_key looks like an envelope but is not valid JSON');
   }
 
-  if (!parsed || typeof parsed !== 'object' || typeof parsed.wrapped !== 'string') {
+  if (!parsed || typeof parsed !== 'object') {
     throw new Error('wrapped_data_key envelope is missing required fields');
   }
 
   if (parsed.v === 2 && parsed.kdf === 'argon2id') {
-    return { kdfVersion: KDF_V2_ARGON2ID, wrappedBase64: parsed.wrapped, kdfParams: parsed.kdf_params || null };
+    if (typeof parsed.wrapped !== 'string') {
+      throw new Error('wrapped_data_key envelope is missing required fields');
+    }
+    return {
+      kdfVersion: KDF_V2_ARGON2ID,
+      envelopeVersion: 2,
+      dekChain: [{ gen: 1, wrappedBase64: parsed.wrapped }],
+      wrappedBase64: parsed.wrapped,
+      kdfParams: parsed.kdf_params || null,
+    };
+  }
+
+  if (parsed.v === 3 && parsed.kdf === 'argon2id') {
+    if (!Array.isArray(parsed.dek_chain) || parsed.dek_chain.length === 0) {
+      throw new Error('v3 wrapped_data_key envelope must have a non-empty dek_chain');
+    }
+    const chain = parsed.dek_chain.map((entry, idx) => {
+      if (
+        !entry ||
+        typeof entry !== 'object' ||
+        typeof entry.gen !== 'number' ||
+        !Number.isInteger(entry.gen) ||
+        entry.gen < 1 ||
+        typeof entry.wrapped !== 'string'
+      ) {
+        throw new Error(`v3 wrapped_data_key envelope dek_chain[${idx}] is malformed`);
+      }
+      return { gen: entry.gen, wrappedBase64: entry.wrapped };
+    });
+    // The current generation is the entry with the highest `gen`. We don't
+    // require chain order to be strictly ascending, but reject duplicates.
+    const seen = new Set();
+    for (const e of chain) {
+      if (seen.has(e.gen)) {
+        throw new Error(`v3 wrapped_data_key envelope has duplicate gen: ${e.gen}`);
+      }
+      seen.add(e.gen);
+    }
+    chain.sort((a, b) => a.gen - b.gen);
+    return {
+      kdfVersion: KDF_V2_ARGON2ID,
+      envelopeVersion: 3,
+      dekChain: chain,
+      wrappedBase64: chain[chain.length - 1].wrappedBase64,
+      kdfParams: parsed.kdf_params || null,
+    };
   }
 
   throw new Error(`Unsupported wrapped_data_key envelope version: v=${parsed.v} kdf=${parsed.kdf}`);
 }
 
 /**
- * Unwrap the data encryption key from the wire format.
+ * Unwrap the data encryption key from the wire format. For backward compat
+ * with the v1/v2 single-key shape, returns the highest-gen DEK as `dataKey`.
+ *
+ * For v3 envelopes, prefer {@link unwrapDataKeyChain} which returns the full
+ * generation map needed to read older blobs.
+ *
  * @param {string} wireValue
  * @param {CryptoKey} unwrappingKey
  * @returns {Promise<{ dataKey: CryptoKey, kdfVersion: number, kdfParams: object|null }>}
@@ -381,6 +594,101 @@ export async function unwrapDataKeyEnvelope(wireValue, unwrappingKey) {
   const parsed = parseWrappedDataKey(wireValue);
   const dataKey = await unwrapDataKey(parsed.wrappedBase64, unwrappingKey);
   return { dataKey, kdfVersion: parsed.kdfVersion, kdfParams: parsed.kdfParams };
+}
+
+/**
+ * Unwrap every DEK in the chain. Returns a Map keyed by generation plus the
+ * current (highest) generation number. Always returns a Map even for legacy
+ * single-key envelopes — the caller can treat them as a one-entry chain.
+ *
+ * Each value is a pair of WebCrypto handles for the same 32-byte DEK:
+ *   - `gcmKey`: AES-GCM, extractable (used for legacy direct-DEK decryption,
+ *               and as the key passed to AES-KW wrapKey on credential change)
+ *   - `kwKey`:  AES-KW, used to wrap/unwrap per-content CEKs
+ *
+ * @param {string} wireValue
+ * @param {CryptoKey} unwrappingKey
+ * @returns {Promise<{
+ *   dekByGen: Map<number, {gcmKey: CryptoKey, kwKey: CryptoKey}>,
+ *   currentGen: number,
+ *   envelopeVersion: number,
+ *   kdfVersion: number,
+ *   kdfParams: object|null,
+ * }>}
+ */
+export async function unwrapDataKeyChain(wireValue, unwrappingKey) {
+  const parsed = parseWrappedDataKey(wireValue);
+  const dekByGen = new Map();
+  for (const entry of parsed.dekChain) {
+    const wrapped = base64ToBytes(entry.wrappedBase64);
+    const [gcmKey, kwKey] = await Promise.all([
+      crypto.subtle.unwrapKey(
+        'raw', wrapped, unwrappingKey, 'AES-KW',
+        { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
+      ),
+      crypto.subtle.unwrapKey(
+        'raw', wrapped, unwrappingKey, 'AES-KW',
+        'AES-KW', false, ['wrapKey', 'unwrapKey'],
+      ),
+    ]);
+    dekByGen.set(entry.gen, { gcmKey, kwKey });
+  }
+  const currentGen = parsed.dekChain[parsed.dekChain.length - 1].gen;
+  return {
+    dekByGen,
+    currentGen,
+    envelopeVersion: parsed.envelopeVersion,
+    kdfVersion: parsed.kdfVersion,
+    kdfParams: parsed.kdfParams,
+  };
+}
+
+/**
+ * Build a v3 envelope from a chain of (gen, raw_wrapped_base64) pairs.
+ * Used when the chain has already been re-wrapped (e.g., after credential
+ * change) and the wrapped bytes need to be packaged as a single envelope.
+ *
+ * @param {Array<{gen: number, wrappedBase64: string}>} chain
+ * @returns {string}
+ */
+export function buildV3Envelope(chain) {
+  if (!Array.isArray(chain) || chain.length === 0) {
+    throw new Error('chain must be a non-empty array');
+  }
+  const sorted = chain.slice().sort((a, b) => a.gen - b.gen);
+  return JSON.stringify({
+    v: 3,
+    kdf: 'argon2id',
+    kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
+    dek_chain: sorted.map(e => ({ gen: e.gen, wrapped: e.wrappedBase64 })),
+  });
+}
+
+/**
+ * Wrap an array of DEK CryptoKeys (one per generation) under the given
+ * wrapping key and pack into a v3 envelope.
+ *
+ * Each chain entry is `{gen, key}` where `key` is an extractable CryptoKey
+ * holding the DEK bytes (any algorithm — AES-GCM or AES-KW handle both work,
+ * since AES-KW wrapKey operates on raw bytes).
+ *
+ * @param {Array<{gen: number, key: CryptoKey}>} chain
+ * @param {CryptoKey} wrappingKey
+ * @returns {Promise<string>} The `wrapped_data_key` wire value (v3 envelope).
+ */
+export async function wrapDataKeyChainEnvelope(chain, wrappingKey) {
+  if (!Array.isArray(chain) || chain.length === 0) {
+    throw new Error('chain must be a non-empty array');
+  }
+  const wrapped = [];
+  for (const entry of chain) {
+    if (!entry || typeof entry.gen !== 'number' || !entry.key) {
+      throw new Error('chain entries must be {gen: number, key: CryptoKey}');
+    }
+    const wrappedBase64 = await wrapDataKey(entry.key, wrappingKey);
+    wrapped.push({ gen: entry.gen, wrappedBase64 });
+  }
+  return buildV3Envelope(wrapped);
 }
 
 // ============ CHALLENGE SIGNING ============
