@@ -32,7 +32,9 @@ sub_key = HMAC-SHA256(master_key, info)
 
 ```
 email + password (user input, never leaves client)
-  -> master_key                  PBKDF2-SHA256(password, SHA-256(normalizedEmail), 600K iterations)
+  -> master_key                  KDF(password, SHA-256(normalizedEmail))
+                                   v2: Argon2id (m=64MiB, t=3, p=1)  — current default
+                                   v1: PBKDF2-SHA256, 600K iterations — legacy
 
 master_key + app_id:
   -> credential_lookup_key       HMAC-SHA256(master_key, "tarn" || "lookup"  || app_id || "1" || 0x01)
@@ -42,6 +44,14 @@ master_key + app_id:
        -> public_key             sent to API, stored in D1 and on Arweave
        -> private_key            never leaves client
 ```
+
+### Master-key KDF versioning
+
+The KDF version is encoded in the `wrapped_data_key` field of the credential mapping blob (see [Wrapped Data Key](#wrapped-data-key) below for wire format). New accounts always use Argon2id (v2). Existing PBKDF2 (v1) accounts continue to log in via a legacy path; migration to Argon2id is intentionally out of scope and will be addressed separately.
+
+Login dispatch — because `credential_lookup_key` depends on `master_key` which depends on the KDF, the client cannot know which KDF an account uses before looking it up. The client tries the current default KDF (Argon2id) first; on a 404 it falls back to PBKDF2 with a freshly-derived `credential_lookup_key`. New accounts pay only the Argon2id cost; legacy accounts pay both KDFs once per login (~2s worst case on a representative slow device).
+
+Argon2id parameters were chosen against a ~2s slow-device login budget: 64 MiB memory + 3 iterations + 1-way parallelism (single-threaded; aligns with browser realities). The memory-hard property neutralizes GPU/ASIC parallelism that defeats PBKDF2 — the primary reason for the change.
 
 **Per-app isolation:** Every derived key includes `app_id`. The same email+password produces completely independent identities per app. Different credential_lookup_key, different encryption_key, different signing key. A Bookish user and a Cellar user with the same email+password cannot see each other's data, share sessions, or even detect each other's existence.
 
@@ -63,8 +73,8 @@ Import as PKCS#8 DER → export public key as SPKI → send SPKI to API.
 The `data_encryption_key` is wrapped using **AES-KW** (RFC 3394, Key Wrap):
 
 ```
-wrapped_data_key = AES-KW-Wrap(data_encryption_key, credential_encryption_key)
-                               ^^^^ payload            ^^^^ wrapping key
+wrapped_bytes = AES-KW-Wrap(data_encryption_key, credential_encryption_key)
+                            ^^^^ payload            ^^^^ wrapping key
 ```
 
 AES-KW is deterministic (no IV), purpose-built for key wrapping, and available in WebCrypto via `crypto.subtle.wrapKey('raw', key, wrappingKey, 'AES-KW')`.
@@ -72,12 +82,33 @@ AES-KW is deterministic (no IV), purpose-built for key wrapping, and available i
 At account creation, payload and wrapping key are the same key — self-wrapping, redundant but intentional. The client always performs the same operation on login:
 
 ```
-data_encryption_key = AES-KW-Unwrap(wrapped_data_key, credential_encryption_key)
+data_encryption_key = AES-KW-Unwrap(wrapped_bytes, credential_encryption_key)
 ```
 
 No branching for "first login" vs. "post-credential-change login." Uniform code path.
 
-After a credential change, `wrapped_data_key` becomes `AES-KW-Wrap(ORIGINAL_data_encryption_key, NEW_credential_encryption_key)`. The client unwraps with the new credential key and recovers the original data encryption key. All existing data remains decryptable.
+After a credential change, `wrapped_bytes` becomes `AES-KW-Wrap(ORIGINAL_data_encryption_key, NEW_credential_encryption_key)`. The client unwraps with the new credential key and recovers the original data encryption key. All existing data remains decryptable.
+
+#### Wire format (`wrapped_data_key` field)
+
+The API stores `wrapped_data_key` as opaque text. The string carries a KDF version indicator so the client can verify which master-key KDF the account was registered under.
+
+**v2 (current — Argon2id accounts):** JSON envelope.
+
+```json
+{
+  "v": 2,
+  "kdf": "argon2id",
+  "kdf_params": { "m_kib": 65536, "t": 3, "p": 1 },
+  "wrapped": "<base64 AES-KW ciphertext (40 bytes)>"
+}
+```
+
+**v1 (legacy — PBKDF2 accounts):** the bare base64 AES-KW ciphertext, no envelope.
+
+Detection rule: if `wrapped_data_key[0] === '{'`, parse as a v2 envelope; otherwise treat as v1 bare base64. The base64 alphabet `[A-Za-z0-9+/=]` never starts with `{`, so the prefix check is unambiguous.
+
+Both forms are byte-stable for the same `(email, password, app)` inputs (AES-KW is deterministic; JSON.stringify is insertion-ordered). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
 
 ### Data lookup key
 

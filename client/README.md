@@ -2,7 +2,7 @@
 
 JavaScript client library for [Tarn](https://github.com/brianmb99/tarn) — permanent, encrypted, user-owned data on Arweave.
 
-Zero dependencies. Pure WebCrypto. Works in browsers and Node.js 15+.
+WebCrypto for everything except the password→master-key KDF, which uses Argon2id via [`hash-wasm`](https://www.npmjs.com/package/hash-wasm) (~29 KB minified, lazy-loaded WASM). Works in browsers and Node.js 15+.
 
 ## Quick Start
 
@@ -147,7 +147,7 @@ Credential changes re-wrap the data encryption key. All existing data remains de
 ## Security Model
 
 - **Client-side encryption.** All data is AES-256-GCM encrypted before leaving the client. The server never sees plaintext.
-- **PBKDF2 key derivation.** 600K iterations, SHA-256. Keys derived via HKDF-Expand (RFC 5869).
+- **Argon2id key derivation.** Memory-hard KDF (m=64 MiB, t=3, p=1) for the password→master-key step. Sub-keys derived via HKDF-Expand (RFC 5869). Legacy accounts on PBKDF2-SHA256 (600K iters) continue to log in via a fallback path.
 - **ECDSA P-256 auth.** Challenge-response signing. No passwords transmitted. Server stores only the public key.
 - **AES-KW key wrapping.** Data encryption key wrapped per RFC 3394. Self-wrapping at registration for uniform login code path.
 - **Arweave permanence.** Data stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.

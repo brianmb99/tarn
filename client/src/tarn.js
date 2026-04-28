@@ -13,12 +13,15 @@
 import {
   deriveAllKeys,
   exportPublicKey,
-  wrapDataKey,
-  unwrapDataKey,
+  wrapDataKeyEnvelope,
+  unwrapDataKeyEnvelope,
   signChallenge,
   encrypt,
   decrypt,
   base64ToBytes,
+  KDF_V1_PBKDF2,
+  KDF_V2_ARGON2ID,
+  KDF_DEFAULT,
 } from './crypto.js';
 
 export class TarnClient {
@@ -30,6 +33,11 @@ export class TarnClient {
   #credentialLookupKey = null;
   #credentialEncryptionKey = null;
   #signingKeyPair = null;
+  // KDF version this account was registered/logged in under. Set on register
+  // (always KDF_DEFAULT for new accounts) and login (whichever path succeeded).
+  // Used by changeCredentials() to preserve the original KDF — automatic
+  // upgrade from PBKDF2 to Argon2id is intentionally out of scope.
+  #kdfVersion = null;
 
   /**
    * @param {string} apiBaseUrl - Tarn API base URL (e.g., 'https://api.tarn.dev')
@@ -50,9 +58,16 @@ export class TarnClient {
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async register(email, password) {
-    const keys = await deriveAllKeys(email, password, this.#appId);
+    // New accounts always use the current default KDF (Argon2id v2). Existing
+    // PBKDF2 accounts continue working via the login fallback path.
+    const kdfVersion = KDF_DEFAULT;
+    const keys = await deriveAllKeys(email, password, this.#appId, kdfVersion);
     const publicKeyBase64 = await exportPublicKey(keys.signingKeyPair.publicKey);
-    const wrappedDataKey = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
+    const wrappedDataKey = await wrapDataKeyEnvelope(
+      keys.credentialEncryptionKey.gcmKey,
+      keys.credentialEncryptionKey.kwKey,
+      kdfVersion,
+    );
 
     const res = await this.#fetch('/api/v1/auth/register', {
       method: 'POST',
@@ -74,6 +89,7 @@ export class TarnClient {
     this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = res.json.data_lookup_key;
     this.#dataEncryptionKey = keys.credentialEncryptionKey.gcmKey; // AES-GCM for data
+    this.#kdfVersion = kdfVersion;
 
     await this.#authenticate();
 
@@ -87,33 +103,56 @@ export class TarnClient {
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async login(email, password) {
-    const keys = await deriveAllKeys(email, password, this.#appId);
-
-    this.#credentialLookupKey = keys.credentialLookupKey;
-    this.#credentialEncryptionKey = keys.credentialEncryptionKey;
-    this.#signingKeyPair = keys.signingKeyPair;
-
-    // Challenge
-    const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+    // KDF dispatch — chicken-and-egg problem: credential_lookup_key depends on
+    // master_key, which depends on the KDF, which we don't know until we find
+    // the account. Strategy: try the current default KDF (Argon2id v2) first;
+    // on 404, fall back to legacy PBKDF2 (v1). New accounts pay only the v2
+    // cost; legacy accounts pay v2 + v1 once per login (~2s worst case on a
+    // representative slow device, well under acceptance bar).
+    let keys = await deriveAllKeys(email, password, this.#appId, KDF_V2_ARGON2ID);
+    let challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
       retry: true, // generates a fresh nonce per call — safe to retry
       body: { credential_lookup_key: keys.credentialLookupKey },
     });
 
     if (challengeRes.status === 404) {
-      throw new Error('Account not found');
+      // Fall back to legacy PBKDF2 path.
+      keys = await deriveAllKeys(email, password, this.#appId, KDF_V1_PBKDF2);
+      challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+        method: 'POST',
+        retry: true,
+        body: { credential_lookup_key: keys.credentialLookupKey },
+      });
+      if (challengeRes.status === 404) {
+        throw new Error('Account not found');
+      }
     }
+
     if (challengeRes.status !== 200) {
       throw new Error(`Challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
     }
 
+    this.#credentialLookupKey = keys.credentialLookupKey;
+    this.#credentialEncryptionKey = keys.credentialEncryptionKey;
+    this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = challengeRes.json.data_lookup_key;
 
-    // Unwrap data encryption key (AES-KW)
-    this.#dataEncryptionKey = await unwrapDataKey(
+    // Unwrap data encryption key — handles both legacy bare-base64 (v1) and
+    // versioned envelopes (v2+). The envelope's kdfVersion is a sanity check:
+    // an Argon2id-derived key wrapping a v1 envelope (or vice versa) would
+    // indicate either tampering or a server-side mix-up.
+    const unwrapped = await unwrapDataKeyEnvelope(
       challengeRes.json.wrapped_data_key,
-      keys.credentialEncryptionKey.kwKey
+      keys.credentialEncryptionKey.kwKey,
     );
+    if (unwrapped.kdfVersion !== keys.kdfVersion) {
+      throw new Error(
+        `KDF mismatch: derived with v${keys.kdfVersion} but credential blob declares v${unwrapped.kdfVersion}`,
+      );
+    }
+    this.#dataEncryptionKey = unwrapped.dataKey;
+    this.#kdfVersion = keys.kdfVersion;
 
     // Verify
     await this.#verifyChallenge(challengeRes.json.nonce);
@@ -130,9 +169,16 @@ export class TarnClient {
   async changeCredentials(newEmail, newPassword) {
     await this.#requireAuth();
 
-    const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId);
+    // Preserve the original KDF — silent upgrade from PBKDF2 to Argon2id is
+    // out of scope for this issue (would be a separate migration concern).
+    const kdfVersion = this.#kdfVersion ?? KDF_DEFAULT;
+    const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-    const newWrappedDataKey = await wrapDataKey(this.#dataEncryptionKey, newKeys.credentialEncryptionKey.kwKey);
+    const newWrappedDataKey = await wrapDataKeyEnvelope(
+      this.#dataEncryptionKey,
+      newKeys.credentialEncryptionKey.kwKey,
+      kdfVersion,
+    );
 
     const res = await this.#fetch('/api/v1/auth', {
       method: 'PUT',
@@ -173,6 +219,7 @@ export class TarnClient {
     this.#credentialLookupKey = null;
     this.#credentialEncryptionKey = null;
     this.#signingKeyPair = null;
+    this.#kdfVersion = null;
   }
 
   // ============ DATA CRUD ============

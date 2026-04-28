@@ -1,15 +1,39 @@
 // Tarn Client Crypto — key derivation, encryption, signing
-// Pure WebCrypto — works in browsers and Node.js 15+.
+// WebCrypto for everything except the password→master_key KDF.
+// The KDF uses Argon2id (via hash-wasm) for new accounts; legacy accounts
+// continue to use PBKDF2-SHA256 for backward compatibility.
 //
 // Key derivation uses HKDF-Expand (RFC 5869) with structured info strings.
 // Key wrapping uses AES-KW (RFC 3394).
 // All sub-keys include app_id for per-app isolation.
+//
+// Works in browsers and Node.js 15+ (WebAssembly required for Argon2id).
+
+import { argon2id as argon2idHash } from 'hash-wasm';
 
 // ============ CONSTANTS ============
 
+// KDF versions for the master_key derivation step.
+// v1 — PBKDF2-SHA256, 600k iterations (legacy, accounts created before Argon2id rollout).
+// v2 — Argon2id, m=64 MiB, t=3, p=1 (current default for new accounts).
+//
+// Argon2id parameters chosen to keep login latency near ~200ms on a recent
+// laptop, ~1–1.5s on a 3-year-old phone — well under the ~2s acceptance bar.
+// Memory-hard params neutralize GPU/ASIC parallelism on a leaked Arweave
+// credential blob, in line with the OWASP Argon2id recommendation.
+export const KDF_V1_PBKDF2 = 1;
+export const KDF_V2_ARGON2ID = 2;
+export const KDF_DEFAULT = KDF_V2_ARGON2ID;
+
 const PBKDF2_ITERATIONS = 600000;
 const PBKDF2_HASH = 'SHA-256';
+
+const ARGON2ID_MEMORY_KIB = 64 * 1024; // 64 MiB
+const ARGON2ID_ITERATIONS = 3;
+const ARGON2ID_PARALLELISM = 1;
+
 const KEY_LENGTH_BITS = 256;
+const KEY_LENGTH_BYTES = 32;
 
 // Structured HKDF info: protocol || purpose || app_id || version || counter
 const PROTOCOL_ID = 'tarn';
@@ -68,32 +92,56 @@ async function hkdfExpand(prk, purpose, appId, counter = 1) {
 // ============ KEY DERIVATION ============
 
 /**
- * Derive master_key from email + password via PBKDF2-SHA256.
+ * Derive master_key from email + password.
  * The master_key is app-independent — app isolation happens in sub-key derivation.
+ *
+ * KDF dispatch:
+ *   v2 (default) — Argon2id over UTF-8 password, salt = SHA-256(normalizedEmail)
+ *   v1 (legacy)  — PBKDF2-SHA256 600k iters, same salt
+ *
+ * Both KDFs use SHA-256(normalizedEmail) as the salt so an account's salt is
+ * stable across logins regardless of which KDF was originally used.
+ *
  * @param {string} email
  * @param {string} password
+ * @param {number} [kdfVersion=KDF_DEFAULT] — KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
  * @returns {Promise<Uint8Array>} 32-byte master key
  */
-export async function deriveMasterKey(email, password) {
+export async function deriveMasterKey(email, password, kdfVersion = KDF_DEFAULT) {
   if (!email || !password) throw new Error('Email and password are required');
 
   const normalizedEmail = normalizeEmail(email);
   const encoder = new TextEncoder();
 
-  // Salt = SHA-256(normalizedEmail)
+  // Salt = SHA-256(normalizedEmail) — same for both KDFs.
   const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(normalizedEmail)));
 
-  const passwordKey = await crypto.subtle.importKey(
-    'raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']
-  );
+  if (kdfVersion === KDF_V2_ARGON2ID) {
+    const out = await argon2idHash({
+      password: encoder.encode(password),
+      salt,
+      parallelism: ARGON2ID_PARALLELISM,
+      iterations: ARGON2ID_ITERATIONS,
+      memorySize: ARGON2ID_MEMORY_KIB,
+      hashLength: KEY_LENGTH_BYTES,
+      outputType: 'binary',
+    });
+    return out instanceof Uint8Array ? out : new Uint8Array(out);
+  }
 
-  const masterKeyBits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: PBKDF2_HASH },
-    passwordKey,
-    KEY_LENGTH_BITS
-  );
+  if (kdfVersion === KDF_V1_PBKDF2) {
+    const passwordKey = await crypto.subtle.importKey(
+      'raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    const masterKeyBits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: PBKDF2_HASH },
+      passwordKey,
+      KEY_LENGTH_BITS
+    );
+    return new Uint8Array(masterKeyBits);
+  }
 
-  return new Uint8Array(masterKeyBits);
+  throw new Error(`Unknown KDF version: ${kdfVersion}`);
 }
 
 /**
@@ -223,9 +271,8 @@ export async function decrypt(key, blob) {
 // ============ AES-KW KEY WRAPPING (RFC 3394) ============
 
 /**
- * Wrap data_encryption_key using AES-KW.
- * At registration: self-wrap (key wraps itself).
- * After credential change: old key wrapped with new key.
+ * Wrap data_encryption_key using AES-KW (raw bytes only — no envelope metadata).
+ * Use {@link wrapDataKeyEnvelope} for the wire format that includes KDF version.
  * @param {CryptoKey} dataKey - Key to wrap
  * @param {CryptoKey} wrappingKey - Key to wrap with (credential_encryption_key)
  * @returns {Promise<string>} Base64-encoded AES-KW ciphertext (40 bytes: 32 key + 8 overhead)
@@ -236,7 +283,8 @@ export async function wrapDataKey(dataKey, wrappingKey) {
 }
 
 /**
- * Unwrap data_encryption_key using AES-KW.
+ * Unwrap data_encryption_key from raw AES-KW ciphertext (no envelope handling).
+ * Use {@link unwrapDataKeyEnvelope} for the wire format.
  * @param {string} wrappedBase64 - Base64-encoded AES-KW ciphertext
  * @param {CryptoKey} unwrappingKey - credential_encryption_key
  * @returns {Promise<CryptoKey>} Unwrapped AES-256-GCM data encryption key
@@ -247,6 +295,92 @@ export async function unwrapDataKey(wrappedBase64, unwrappingKey) {
     'raw', wrapped, unwrappingKey, 'AES-KW',
     { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
   );
+}
+
+// ============ WRAPPED-DATA-KEY WIRE FORMAT (KDF-versioned envelope) ============
+//
+// The `wrapped_data_key` field stored on the API/Arweave is opaque to the
+// server but carries a KDF version indicator so the client can verify which
+// KDF was used at registration. The API column is plain TEXT; the Arweave
+// credential mapping blob embeds the same string.
+//
+// v1 (legacy) — bare base64 of the AES-KW ciphertext. Implies PBKDF2 master_key.
+// v2 (current) — JSON envelope: { v, kdf, kdf_params, wrapped }.
+//
+// Detection: if the string parses as JSON and has v >= 2, it's an envelope;
+// otherwise it's legacy v1 (bare base64).
+
+/**
+ * Wrap the data encryption key and pack into the wire format for the given KDF.
+ * @param {CryptoKey} dataKey
+ * @param {CryptoKey} wrappingKey
+ * @param {number} kdfVersion - KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
+ * @returns {Promise<string>} The `wrapped_data_key` value to send to the API
+ */
+export async function wrapDataKeyEnvelope(dataKey, wrappingKey, kdfVersion) {
+  const wrappedBase64 = await wrapDataKey(dataKey, wrappingKey);
+
+  if (kdfVersion === KDF_V1_PBKDF2) {
+    return wrappedBase64;
+  }
+
+  if (kdfVersion === KDF_V2_ARGON2ID) {
+    return JSON.stringify({
+      v: 2,
+      kdf: 'argon2id',
+      kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
+      wrapped: wrappedBase64,
+    });
+  }
+
+  throw new Error(`Unknown KDF version: ${kdfVersion}`);
+}
+
+/**
+ * Inspect a wire-format `wrapped_data_key` without unwrapping.
+ * @param {string} wireValue
+ * @returns {{ kdfVersion: number, wrappedBase64: string, kdfParams: object|null }}
+ */
+export function parseWrappedDataKey(wireValue) {
+  if (typeof wireValue !== 'string' || wireValue.length === 0) {
+    throw new Error('wrapped_data_key must be a non-empty string');
+  }
+
+  // v2+ envelopes are JSON objects starting with '{'. Bare base64 never starts
+  // with '{' (base64 alphabet is [A-Za-z0-9+/=]), so this prefix check is
+  // a safe, allocation-free dispatch before attempting JSON.parse.
+  if (wireValue[0] !== '{') {
+    return { kdfVersion: KDF_V1_PBKDF2, wrappedBase64: wireValue, kdfParams: null };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(wireValue);
+  } catch {
+    throw new Error('wrapped_data_key looks like an envelope but is not valid JSON');
+  }
+
+  if (!parsed || typeof parsed !== 'object' || typeof parsed.wrapped !== 'string') {
+    throw new Error('wrapped_data_key envelope is missing required fields');
+  }
+
+  if (parsed.v === 2 && parsed.kdf === 'argon2id') {
+    return { kdfVersion: KDF_V2_ARGON2ID, wrappedBase64: parsed.wrapped, kdfParams: parsed.kdf_params || null };
+  }
+
+  throw new Error(`Unsupported wrapped_data_key envelope version: v=${parsed.v} kdf=${parsed.kdf}`);
+}
+
+/**
+ * Unwrap the data encryption key from the wire format.
+ * @param {string} wireValue
+ * @param {CryptoKey} unwrappingKey
+ * @returns {Promise<{ dataKey: CryptoKey, kdfVersion: number, kdfParams: object|null }>}
+ */
+export async function unwrapDataKeyEnvelope(wireValue, unwrappingKey) {
+  const parsed = parseWrappedDataKey(wireValue);
+  const dataKey = await unwrapDataKey(parsed.wrappedBase64, unwrappingKey);
+  return { dataKey, kdfVersion: parsed.kdfVersion, kdfParams: parsed.kdfParams };
 }
 
 // ============ CHALLENGE SIGNING ============
@@ -272,17 +406,18 @@ export async function signChallenge(privateKey, nonceHex) {
  * @param {string} email
  * @param {string} password
  * @param {string} appId - Registered app identifier
- * @returns {Promise<{masterKey, credentialLookupKey, credentialEncryptionKey: {gcmKey, kwKey, rawBytes}, signingKeyPair}>}
+ * @param {number} [kdfVersion=KDF_DEFAULT] — KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
+ * @returns {Promise<{masterKey, credentialLookupKey, credentialEncryptionKey: {gcmKey, kwKey, rawBytes}, signingKeyPair, kdfVersion}>}
  */
-export async function deriveAllKeys(email, password, appId) {
+export async function deriveAllKeys(email, password, appId, kdfVersion = KDF_DEFAULT) {
   if (!appId) throw new Error('appId is required');
-  const masterKey = await deriveMasterKey(email, password);
+  const masterKey = await deriveMasterKey(email, password, kdfVersion);
   const [credentialLookupKey, credentialEncryptionKey, signingKeyPair] = await Promise.all([
     deriveCredentialLookupKey(masterKey, appId),
     deriveCredentialEncryptionKey(masterKey, appId),
     deriveSigningKeyPair(masterKey, appId),
   ]);
-  return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair };
+  return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair, kdfVersion };
 }
 
 // ============ ENCODING HELPERS ============
