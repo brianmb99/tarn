@@ -29,7 +29,14 @@ binding = "AUTH_KV"
 id = "f93f7550a0ed496eb2e4fd1c2e9bc75d"
 
 # Secrets (set via wrangler secret put <NAME> --name tarn-api):
-#   JWT_SECRET       - Base64-encoded 256-bit HMAC key for JWT signing
-#   APP_SIGNING_KEY  - Hex-encoded Ethereum-compatible private key for signing Arweave DataItems
-#                      This wallet must have Turbo balance for uploads > 100KB.
-#                      Generate: openssl rand -hex 32
+#   JWT_SECRET                - Base64-encoded 256-bit HMAC key for JWT signing
+#   APP_SIGNING_KEY           - Hex-encoded Ethereum-compatible private key for signing Arweave DataItems
+#                                This wallet must have Turbo balance for uploads > 100KB.
+#                                Generate: openssl rand -hex 32
+#   TARN_APP_KEY_BOOKISH      - Hex-encoded ECDSA P-256 private key for the bookish app role.
+#   EMAIL_FORWARDER_API_KEY   - Resend API key (re_...) for the recovery PDF email
+#                                forwarder (issue #12). If unset, /api/v1/recovery/email
+#                                returns 503; apps can still let users download the PDF
+#                                client-side (emailRecoveryKit: false on register).
+#   EMAIL_FORWARDER_FROM      - Verified sender address for the relay,
+#                                e.g. "Tarn <recovery@tarn.dev>".

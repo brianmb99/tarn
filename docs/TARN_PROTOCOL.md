@@ -87,7 +87,35 @@ After a credential change, the wrap is regenerated under the new `credential_enc
 
 The API stores `wrapped_data_key` as opaque text. The string carries a version indicator so the client knows the structure and a KDF indicator so the client can verify which master-key KDF the account was registered under.
 
-**v3 (current default — Argon2id accounts after issue #11):** JSON envelope with a DEK chain.
+**v4 (current default — Argon2id accounts after issue #12):** JSON envelope with a multi-factor DEK chain. Each chain entry is wrapped under one or more factors; any factor's KEK independently unwraps the DEK. New v4 accounts always carry both `password` and `recovery_phrase` factors.
+
+```json
+{
+  "v": 4,
+  "kdf": "argon2id",
+  "kdf_params": { "m_kib": 65536, "t": 3, "p": 1 },
+  "recovery": {
+    "kdf": "argon2id",
+    "kdf_params": { "m_kib": 65536, "t": 3, "p": 1 },
+    "salt": "<base64 16-byte per-account random salt>"
+  },
+  "dek_chain": [
+    { "gen": 1, "wrappings": [
+      { "factor": "password",        "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" },
+      { "factor": "recovery_phrase", "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" }
+    ]},
+    { "gen": 2, "wrappings": [
+      { "factor": "password",        "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" }
+    ]}
+  ]
+}
+```
+
+- `recovery` block is the recovery factor's derivation metadata (Argon2id params + per-account salt). Absent → no recovery factor enrolled (treat as v3-equivalent for read).
+- Each `dek_chain` entry's `wrappings` array carries the same DEK wrapped under each factor's KEK. AES-KW is deterministic, so the same (DEK, KEK) pair always produces the same ciphertext bytes — preserving register-retry idempotency.
+- When `changeCredentials` runs without the recovery phrase: old gens preserve their existing recovery wrappings verbatim (re-wrapping under the same KEK is byte-identical anyway), and the new gen N+1 has only a `password` wrapping. The gap is closed by `recoverAccount` or `regenerateRecoveryKit`, which re-wrap every gen under the recovery factor.
+
+**v3 (legacy single-factor chain — issue #11 accounts pre-issue-#12):** JSON envelope with a single-factor DEK chain.
 
 ```json
 {
@@ -101,7 +129,7 @@ The API stores `wrapped_data_key` as opaque text. The string carries a version i
 }
 ```
 
-The chain is appended only — every credential change adds an entry at gen N+1. The current generation (used for new writes) is the entry with the highest `gen`. Old gens stay in the chain so older content blobs remain decryptable.
+The chain is appended only — every credential change adds an entry at gen N+1. The current generation (used for new writes) is the entry with the highest `gen`. Old gens stay in the chain so older content blobs remain decryptable. v3 envelopes are read as a single-factor (`password`) v4 chain with no recovery metadata.
 
 **v2 (legacy Argon2id accounts):** JSON envelope with a single wrapped DEK.
 
@@ -127,6 +155,25 @@ All envelope shapes are byte-stable for the same `(email, password, app)` inputs
 On every credential change for an Argon2id account, the client mints a fresh random DEK at gen N+1 and appends it to the chain. Subsequent writes use the new gen; old gens remain in the chain so prior data is still readable. An attacker who later compromises the OLD `credential_encryption_key` cannot decrypt content written after the rotation (the new gen DEK is not derivable from old credentials).
 
 This is the only forward-secrecy property Tarn provides today. Old credential blobs on Arweave remain unwrappable by anyone who held the old credentials, but the DEK they yield is bound to data written before the rotation.
+
+### Recovery factor (issue #12)
+
+v4 accounts publish a `recovery_lookup_key` and `recovery_public_key` alongside the password-derived `credential_lookup_key` / `public_key`. Both are derived from the user's BIP39 recovery phrase (24-word, 256-bit entropy) and let the user authenticate to the API for credential rotation when they have lost their password.
+
+Derivation:
+
+```
+phrase_entropy           = BIP39 entropy bytes (32 for 24-word phrase)
+recovery_lookup_key      = HMAC-SHA256(phrase_entropy, "tarn" || "recovery-lookup" || app_id || "1" || 0x01)
+recovery_signing_seed    = HMAC-SHA256(phrase_entropy, "tarn" || "recovery-sign"   || app_id || "1" || 0x01)
+recovery_signing_key     = ECDSA P-256 from recovery_signing_seed (same retry rule as the password-derived signing seed)
+recovery_KEK             = Argon2id(phrase, recovery_salt, m=64MiB, t=3, p=1)
+                           (recovery_salt is per-account random, lives in the v4 envelope's `recovery.salt`)
+```
+
+`recovery_lookup_key` and `recovery_signing_key` derive from the raw phrase entropy directly (no salt), so they are stable across credential changes — the phrase remains the same secret regardless of how many times the password rotates. The `recovery_KEK` derives via Argon2id with the per-account salt, providing the slow-brute-force defense at unwrap time.
+
+The recovery phrase is **mandatory at signup** (the SDK enforces this with a synchronous `recoveryAcknowledged: true` flag on `register()`) and is also optionally emailed to the user via the [Recovery email forwarder](#recovery-email-forwarder-issue-12).
 
 ### Data lookup key
 
@@ -284,11 +331,15 @@ The credential mapping blob is **not encrypted**. It contains:
 ```json
 {
   "data_lookup_key": "<64-char hex>",
-  "wrapped_data_key": "<base64-encoded AES-KW ciphertext>",
+  "wrapped_data_key": "<base64-encoded AES-KW ciphertext or v3/v4 envelope JSON>",
   "public_key": "<base64-encoded ECDSA P-256 SPKI public key>",
-  "app": "<app_id>"
+  "app": "<app_id>",
+  "recovery_lookup_key": "<64-char hex>",
+  "recovery_public_key": "<base64-encoded ECDSA P-256 SPKI public key>"
 }
 ```
+
+The `recovery_lookup_key` and `recovery_public_key` fields (issue #12) are written when the account has a recovery factor enrolled and omitted otherwise (pre-v4 accounts). On rebuild from Arweave, missing fields decode as NULL.
 
 No value here is secret. Storing unencrypted enables:
 - Single API call for registration (no second client round-trip)
@@ -345,7 +396,9 @@ data_lookup_key TEXT NOT NULL UNIQUE,
 wrapped_data_key TEXT NOT NULL,
 app TEXT NOT NULL,
 rules_json TEXT,
-created_at INTEGER NOT NULL
+created_at INTEGER NOT NULL,
+recovery_lookup_key TEXT,    -- nullable; UNIQUE when present (issue #12)
+recovery_public_key TEXT     -- nullable (issue #12)
 ```
 
 **D1 `apps` table:**
@@ -487,6 +540,48 @@ data_lookup_key unchanged. Existing data untouched. Old gens stay readable;
 new writes go to the new gen.
 ```
 
+### 7a. Account recovery (via recovery phrase) — issue #12
+
+When the user has lost their password (or wants a security-grade reset, per the design-doc positioning of recovery as the response to suspected compromise):
+
+```
+CLIENT (local — only the recovery phrase + new credentials):
+  1. phrase_entropy = BIP39.mnemonicToEntropy(phrase)
+  2. recovery_lookup_key  = HMAC(phrase_entropy, "tarn" || "recovery-lookup" || app_id || "1" || 0x01)
+  3. recovery_signing_key = ECDSA P-256 from HMAC(phrase_entropy, "tarn" || "recovery-sign" || app_id || "1" || 0x01)
+
+CLIENT -> API:
+  4. POST /api/v1/auth/challenge { recovery_lookup_key }
+     Returns: { nonce, data_lookup_key, wrapped_data_key }   (the existing v4 envelope)
+
+CLIENT (local):
+  5. Parse v4 envelope → recovery_salt + KDF params
+  6. recovery_KEK = Argon2id(phrase, recovery_salt, params)
+  7. Unwrap DEK chain via FACTOR_RECOVERY_PHRASE
+  8. Sign nonce with recovery_signing_key.privateKey
+
+CLIENT -> API:
+  9. POST /api/v1/auth/verify { recovery_lookup_key, nonce, signature }
+     Returns: { jwt }   (JWT carries via_recovery: true)
+
+CLIENT (local):
+  10. Derive new password keys from (newEmail, newPassword)
+  11. Re-wrap entire DEK chain under {new_password_KEK, recovery_KEK} factors
+      (preserving the existing recovery salt; recovery wrappings are byte-identical
+       to the originals by AES-KW determinism)
+  12. Build v4 envelope from re-wrapped chain
+
+CLIENT -> API:
+  13. PUT /api/v1/auth { new_credential_lookup_key, new_public_key,
+                         new_wrapped_data_key,
+                         new_recovery_lookup_key,
+                         new_recovery_public_key }
+     (recovery_lookup_key + recovery_public_key are unchanged by recovery — phrase is the same;
+      we re-send them so a corrupted server-side row would self-heal.)
+
+data_lookup_key unchanged. All pre-recovery data is decryptable under the new credentials.
+```
+
 ### 8. D1 Recovery
 
 All tables fully rebuildable from Arweave. Entries self-heal on cache miss. Accounts rebuilt from `Type=cred` blobs. Apps rebuilt from `Type=app-reg` blobs.
@@ -522,27 +617,54 @@ POST /api/v1/auth/register
 
 POST /api/v1/auth/challenge
   Body: { credential_lookup_key }
+     OR { recovery_lookup_key }   (issue #12 — recovery flow)
   Auth: none
   Returns: { nonce, data_lookup_key, wrapped_data_key }
-  Errors: 404 (unknown credential_lookup_key)
+  Errors: 404 (unknown lookup key)
 
 POST /api/v1/auth/verify
   Body: { credential_lookup_key, nonce, signature }
-  Auth: none (signature IS the auth)
-  Returns: { jwt }
+     OR { recovery_lookup_key, nonce, signature }   (issue #12 — recovery flow)
+  Auth: none (signature IS the auth — verified against the public key matching the lookup key type)
+  Returns: { jwt }   (JWT carries via_recovery: true when the recovery_lookup_key path is used)
   Errors: 401 (invalid/expired nonce, bad signature)
 
 PUT /api/v1/auth
-  Body: { new_credential_lookup_key, new_public_key, new_wrapped_data_key }
-  Auth: JWT
+  Body: { new_credential_lookup_key, new_public_key, new_wrapped_data_key,
+          new_recovery_lookup_key?, new_recovery_public_key? }   (recovery fields optional, issue #12)
+  Auth: JWT (works with both regular login JWTs and via_recovery: true JWTs)
   Returns: 200 OK
-  Errors: 401, 409 (new credential_lookup_key in use)
+  Errors: 401, 409 (new credential_lookup_key OR new_recovery_lookup_key already in use)
 
 DELETE /api/v1/auth
   Auth: JWT
   Returns: 200 OK
   Errors: 401
+
+POST /api/v1/recovery/email                                       # issue #12
+  Body: { recipient_email, pdf_base64, app_name?, subject? }
+  Auth: JWT (user)
+  Returns: { ok: true }
+  Errors: 400 (validation), 401, 413 (PDF too large), 429 (5/hour/account),
+          502 (relay rejected), 503 (relay not configured)
 ```
+
+#### Recovery email forwarder (issue #12)
+
+`POST /api/v1/recovery/email` forwards a client-rendered recovery PDF (containing the user's BIP39 phrase) to the named recipient via the configured email relay (Resend by default).
+
+**No-storage guarantee, brief in-memory visibility.** The Tarn API holds the PDF bytes in memory only for the duration of the relay request and discards them on response. No D1 row, no KV entry, no Arweave write. The honest framing is "no storage, brief in-memory visibility during the forward" — Tarn briefly sees the bytes because forwarding requires it; persistence does not happen.
+
+**Configuration.** Two Cloudflare Worker secrets must be set on the API:
+
+```
+EMAIL_FORWARDER_API_KEY   # Resend API key (re_...)
+EMAIL_FORWARDER_FROM      # Verified sender, e.g. "Tarn <recovery@tarn.dev>"
+```
+
+If either is missing the endpoint returns 503 with `{error: "Email forwarder not configured"}`. Apps can opt out of email delivery at registration (`emailRecoveryKit: false`) and let the user save the PDF locally instead.
+
+**Rate limit.** 5 sends/hour per `data_lookup_key`, enforced via the `write_rate_limits` D1 table with the key prefix `recovery-email:`.
 
 ### App endpoints
 

@@ -88,7 +88,7 @@ describe('TarnClient.createEntry — new blob format (issue #11)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(EMAIL, PASSWORD);
+    await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
     await client.createEntry('entry', { title: 'Hello' });
 
     const writeCall = fetchCalls.find(c =>
@@ -128,7 +128,7 @@ describe('TarnClient.createEntry — new blob format (issue #11)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(EMAIL, PASSWORD);
+    await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
     await client.changeCredentials('rotated@example.com', 'new-password');
     await client.createEntry('entry', { title: 'After rotation' });
 
@@ -153,7 +153,7 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(EMAIL, PASSWORD);
+    await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     // Reach into the client's gen-1 DEK by snapshotting the registered
     // wrapped_data_key and unwrapping with derived keys. We don't expose the
@@ -198,7 +198,7 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(EMAIL, PASSWORD);
+    await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     // Encrypt a payload through createEntry to obtain the wrapped CEK.
     // Then build a parallel LEGACY-format blob using the gen-1 DEK by
@@ -263,7 +263,7 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(EMAIL, PASSWORD);
+    await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     // Write a gen-1 blob
     mockFetch([{ status: 200, body: JSON.stringify({ id: 'tx-1' }) }]);

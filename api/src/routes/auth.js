@@ -18,8 +18,14 @@ function generateDataLookupKey() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app) {
-  return JSON.stringify({ data_lookup_key: dataLookupKey, wrapped_data_key: wrappedDataKey, public_key: publicKey, app });
+function buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app, recoveryLookupKey, recoveryPublicKey) {
+  // Optional recovery fields (issue #12) are written when present so that a
+  // pure-Arweave rebuild can repopulate the new D1 columns. Pre-v4 (recovery-
+  // less) blobs omit them; the rebuild path treats absent fields as NULL.
+  const blob = { data_lookup_key: dataLookupKey, wrapped_data_key: wrappedDataKey, public_key: publicKey, app };
+  if (recoveryLookupKey) blob.recovery_lookup_key = recoveryLookupKey;
+  if (recoveryPublicKey) blob.recovery_public_key = recoveryPublicKey;
+  return JSON.stringify(blob);
 }
 
 function buildCredentialTags(credentialLookupKey) {
@@ -35,8 +41,8 @@ function buildCredentialTags(credentialLookupKey) {
  * Persist a credential mapping blob to Arweave (non-blocking).
  * Returns immediately — upload runs in ctx.waitUntil.
  */
-function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey, app) {
-  const blobBody = buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app);
+function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey, app, recoveryLookupKey, recoveryPublicKey) {
+  const blobBody = buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app, recoveryLookupKey, recoveryPublicKey);
   const tags = buildCredentialTags(credentialLookupKey);
 
   ctx.waitUntil((async () => {
@@ -99,7 +105,7 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, public_key, wrapped_data_key, app } = body;
+  const { credential_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key } = body;
 
   // Validate app — must be a registered app
   if (!app || typeof app !== 'string') {
@@ -129,6 +135,26 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('wrapped_data_key is required', 400, cors);
   }
 
+  // Optional recovery factor (issue #12). Both must be present together (or
+  // both absent — pre-v4 accounts). recovery_lookup_key is hex64 like the
+  // credential lookup key; recovery_public_key is a base64 SPKI P-256.
+  if ((recovery_lookup_key == null) !== (recovery_public_key == null)) {
+    return errorResponse('recovery_lookup_key and recovery_public_key must be provided together', 400, cors);
+  }
+  if (recovery_lookup_key != null) {
+    if (!isValidHex64(recovery_lookup_key)) {
+      return errorResponse('Invalid recovery_lookup_key: must be 64-char lowercase hex', 400, cors);
+    }
+    if (recovery_lookup_key === credential_lookup_key) {
+      return errorResponse('recovery_lookup_key must differ from credential_lookup_key', 400, cors);
+    }
+    try {
+      await importPublicKey(recovery_public_key);
+    } catch {
+      return errorResponse('Invalid recovery_public_key: must be base64-encoded SPKI P-256 public key', 400, cors);
+    }
+  }
+
   // Idempotency: if an account already exists for this credential_lookup_key,
   // check whether this is a retry of a previous successful register (same payload)
   // or a real conflict (different credentials claiming the same lookup key).
@@ -138,13 +164,15 @@ export async function handleRegister(request, env, ctx, cors) {
   // etc). Without idempotency, the user is permanently stuck — the account exists
   // but every retry returns 409. See issue #6.
   const existing = await env.DB.prepare(
-    'SELECT data_lookup_key, public_key, wrapped_data_key, app FROM accounts WHERE credential_lookup_key = ?1'
+    'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key FROM accounts WHERE credential_lookup_key = ?1'
   ).bind(credential_lookup_key).first();
   if (existing) {
     const sameCreds =
       existing.public_key === public_key &&
       existing.wrapped_data_key === wrapped_data_key &&
-      existing.app === app;
+      existing.app === app &&
+      (existing.recovery_lookup_key ?? null) === (recovery_lookup_key ?? null) &&
+      (existing.recovery_public_key ?? null) === (recovery_public_key ?? null);
     if (sameCreds) {
       // Same payload — treat as idempotent success. The client can proceed as if
       // the original register succeeded (which it did, at the D1 layer).
@@ -154,6 +182,18 @@ export async function handleRegister(request, env, ctx, cors) {
       return jsonResponse({ data_lookup_key: existing.data_lookup_key }, 201, cors);
     }
     return errorResponse('credential_lookup_key already in use with different credentials', 409, cors);
+  }
+
+  // Reject up-front if the supplied recovery_lookup_key is already taken by a
+  // DIFFERENT account. This avoids the more expensive UNIQUE-failure path
+  // below for the common case of an honest collision detection.
+  if (recovery_lookup_key) {
+    const recoveryConflict = await env.DB.prepare(
+      'SELECT 1 FROM accounts WHERE recovery_lookup_key = ?1'
+    ).bind(recovery_lookup_key).first();
+    if (recoveryConflict) {
+      return errorResponse('recovery_lookup_key already in use', 409, cors);
+    }
   }
 
   // Generate unique data_lookup_key
@@ -178,19 +218,32 @@ export async function handleRegister(request, env, ctx, cors) {
   // so concurrent retries also converge to the same success response.
   try {
     await env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)'
-    ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now()).run();
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)'
+    ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now(), recovery_lookup_key ?? null, recovery_public_key ?? null).run();
   } catch (err) {
-    // UNIQUE constraint on credential_lookup_key — concurrent retry won the race.
+    // UNIQUE constraint on credential_lookup_key OR recovery_lookup_key —
+    // concurrent retry won the race (or recovery key collision).
     if (/UNIQUE/i.test(err.message || '')) {
       const raced = await env.DB.prepare(
-        'SELECT data_lookup_key, public_key, wrapped_data_key, app FROM accounts WHERE credential_lookup_key = ?1'
+        'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key FROM accounts WHERE credential_lookup_key = ?1'
       ).bind(credential_lookup_key).first();
       if (raced &&
           raced.public_key === public_key &&
           raced.wrapped_data_key === wrapped_data_key &&
-          raced.app === app) {
+          raced.app === app &&
+          (raced.recovery_lookup_key ?? null) === (recovery_lookup_key ?? null) &&
+          (raced.recovery_public_key ?? null) === (recovery_public_key ?? null)) {
         return jsonResponse({ data_lookup_key: raced.data_lookup_key }, 201, cors);
+      }
+      // Distinguish the two unique-constraint paths so the client gets a
+      // useful error message.
+      if (recovery_lookup_key) {
+        const recoveryRow = await env.DB.prepare(
+          'SELECT 1 FROM accounts WHERE recovery_lookup_key = ?1'
+        ).bind(recovery_lookup_key).first();
+        if (recoveryRow) {
+          return errorResponse('recovery_lookup_key already in use', 409, cors);
+        }
       }
       return errorResponse('credential_lookup_key already in use with different credentials', 409, cors);
     }
@@ -198,7 +251,7 @@ export async function handleRegister(request, env, ctx, cors) {
   }
 
   // Persist credential mapping to Arweave (non-blocking)
-  persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app);
+  persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app, recovery_lookup_key, recovery_public_key);
 
   return jsonResponse({ data_lookup_key }, 201, cors);
 }
@@ -213,7 +266,33 @@ export async function handleChallenge(request, env, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key } = body;
+  const { credential_lookup_key, recovery_lookup_key } = body;
+
+  // Recovery-flow challenge (issue #12): the body carries recovery_lookup_key
+  // instead of credential_lookup_key. Find the account by its recovery column,
+  // return the same shape (nonce + data_lookup_key + wrapped_data_key) so the
+  // client can derive the recovery KEK from the envelope salt and unwrap the
+  // DEK chain. The nonce is scoped to recovery_lookup_key so verify uses the
+  // recovery_public_key for signature verification.
+  if (recovery_lookup_key && !credential_lookup_key) {
+    if (typeof recovery_lookup_key !== 'string' || !/^[a-f0-9]{64}$/.test(recovery_lookup_key)) {
+      return errorResponse('Invalid recovery_lookup_key', 400, cors);
+    }
+    const recoveryAccount = await env.DB.prepare(
+      'SELECT data_lookup_key, wrapped_data_key FROM accounts WHERE recovery_lookup_key = ?1'
+    ).bind(recovery_lookup_key).first();
+    if (!recoveryAccount) {
+      return errorResponse('Unknown recovery_lookup_key', 404, cors);
+    }
+    const nonce = generateChallenge();
+    await storeNonce(env, nonce, recovery_lookup_key);
+    return jsonResponse({
+      nonce,
+      data_lookup_key: recoveryAccount.data_lookup_key,
+      wrapped_data_key: recoveryAccount.wrapped_data_key,
+    }, 200, cors);
+  }
+
   if (!credential_lookup_key || typeof credential_lookup_key !== 'string') {
     return errorResponse('credential_lookup_key is required', 400, cors);
   }
@@ -257,9 +336,10 @@ export async function handleVerify(request, env, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, nonce, signature } = body;
-  if (!credential_lookup_key || !nonce || !signature) {
-    return errorResponse('credential_lookup_key, nonce, and signature are required', 400, cors);
+  const { credential_lookup_key, recovery_lookup_key, nonce, signature } = body;
+  const lookupKey = credential_lookup_key || recovery_lookup_key;
+  if (!lookupKey || !nonce || !signature) {
+    return errorResponse('lookup_key, nonce, and signature are required', 400, cors);
   }
 
   // Consume nonce (single-use)
@@ -268,30 +348,48 @@ export async function handleVerify(request, env, cors) {
     return errorResponse('Invalid or expired nonce', 401, cors);
   }
 
-  // Verify nonce was issued for this credential_lookup_key
-  if (nonceData.credentialLookupKey !== credential_lookup_key) {
+  // Verify nonce was issued for this lookup key (the challenge handler stores
+  // the same lookup key the client sent — credential or recovery).
+  if (nonceData.credentialLookupKey !== lookupKey) {
     return errorResponse('Nonce credential mismatch', 401, cors);
   }
 
-  // Look up public key (accounts first, then apps)
+  // Look up public key. Recovery-flow auth uses recovery_public_key and emits
+  // a JWT carrying via_recovery: true so downstream credential-change knows to
+  // skip the password-side authorization checks.
   let publicKeyBase64;
   let jwtPayload;
 
-  const account = await env.DB.prepare(
-    'SELECT data_lookup_key, public_key, app FROM accounts WHERE credential_lookup_key = ?1'
-  ).bind(credential_lookup_key).first();
-
-  if (account) {
-    publicKeyBase64 = account.public_key;
-    jwtPayload = { sub: account.data_lookup_key, role: 'user', app: account.app };
+  if (recovery_lookup_key) {
+    const recoveryAccount = await env.DB.prepare(
+      'SELECT data_lookup_key, recovery_public_key, app FROM accounts WHERE recovery_lookup_key = ?1'
+    ).bind(recovery_lookup_key).first();
+    if (recoveryAccount && recoveryAccount.recovery_public_key) {
+      publicKeyBase64 = recoveryAccount.recovery_public_key;
+      jwtPayload = {
+        sub: recoveryAccount.data_lookup_key,
+        role: 'user',
+        app: recoveryAccount.app,
+        via_recovery: true,
+      };
+    }
   } else {
-    const app = await env.DB.prepare(
-      'SELECT app_id, public_key FROM apps WHERE app_id = ?1'
+    const account = await env.DB.prepare(
+      'SELECT data_lookup_key, public_key, app FROM accounts WHERE credential_lookup_key = ?1'
     ).bind(credential_lookup_key).first();
 
-    if (app) {
-      publicKeyBase64 = app.public_key;
-      jwtPayload = { sub: app.app_id, role: 'app' };
+    if (account) {
+      publicKeyBase64 = account.public_key;
+      jwtPayload = { sub: account.data_lookup_key, role: 'user', app: account.app };
+    } else {
+      const app = await env.DB.prepare(
+        'SELECT app_id, public_key FROM apps WHERE app_id = ?1'
+      ).bind(credential_lookup_key).first();
+
+      if (app) {
+        publicKeyBase64 = app.public_key;
+        jwtPayload = { sub: app.app_id, role: 'app' };
+      }
     }
   }
 
@@ -331,7 +429,13 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { new_credential_lookup_key, new_public_key, new_wrapped_data_key } = body;
+  const {
+    new_credential_lookup_key,
+    new_public_key,
+    new_wrapped_data_key,
+    new_recovery_lookup_key,
+    new_recovery_public_key,
+  } = body;
 
   // Validate new credential_lookup_key
   if (!isValidHex64(new_credential_lookup_key)) {
@@ -350,6 +454,26 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('new_wrapped_data_key is required', 400, cors);
   }
 
+  // Optional new recovery factor (issue #12). If supplied, must be both fields
+  // together; recovery_lookup_key must be unique across the table (excluding
+  // the row we're about to update).
+  if ((new_recovery_lookup_key == null) !== (new_recovery_public_key == null)) {
+    return errorResponse('new_recovery_lookup_key and new_recovery_public_key must be provided together', 400, cors);
+  }
+  if (new_recovery_lookup_key != null) {
+    if (!isValidHex64(new_recovery_lookup_key)) {
+      return errorResponse('Invalid new_recovery_lookup_key: must be 64-char lowercase hex', 400, cors);
+    }
+    if (new_recovery_lookup_key === new_credential_lookup_key) {
+      return errorResponse('new_recovery_lookup_key must differ from new_credential_lookup_key', 400, cors);
+    }
+    try {
+      await importPublicKey(new_recovery_public_key);
+    } catch {
+      return errorResponse('Invalid new_recovery_public_key: must be base64-encoded SPKI P-256 public key', 400, cors);
+    }
+  }
+
   // Check new_credential_lookup_key not already in use
   const conflict = await env.DB.prepare(
     'SELECT 1 FROM accounts WHERE credential_lookup_key = ?1'
@@ -358,12 +482,31 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('new_credential_lookup_key already in use', 409, cors);
   }
 
-  // Read current account (need rules_json and app to preserve them)
+  // Read current account (need rules_json, app, and existing recovery fields
+  // to preserve them when the caller doesn't supply replacements).
   const current = await env.DB.prepare(
-    'SELECT credential_lookup_key, rules_json, app FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT credential_lookup_key, rules_json, app, recovery_lookup_key, recovery_public_key FROM accounts WHERE data_lookup_key = ?1'
   ).bind(auth.data_lookup_key).first();
   if (!current) {
     return errorResponse('Account not found', 404, cors);
+  }
+
+  // Recovery factor: caller-supplied values win; otherwise preserve existing.
+  const finalRecoveryLookupKey = new_recovery_lookup_key ?? current.recovery_lookup_key ?? null;
+  const finalRecoveryPublicKey = new_recovery_public_key ?? current.recovery_public_key ?? null;
+
+  // If the caller supplied a new recovery_lookup_key that differs from the
+  // existing one, check uniqueness.
+  if (
+    new_recovery_lookup_key != null &&
+    new_recovery_lookup_key !== current.recovery_lookup_key
+  ) {
+    const recoveryConflict = await env.DB.prepare(
+      'SELECT 1 FROM accounts WHERE recovery_lookup_key = ?1'
+    ).bind(new_recovery_lookup_key).first();
+    if (recoveryConflict) {
+      return errorResponse('new_recovery_lookup_key already in use', 409, cors);
+    }
   }
 
   // PK change: delete old row + insert new (SQLite doesn't support UPDATE of PK).
@@ -375,12 +518,26 @@ export async function handleCredentialChange(request, env, ctx, cors) {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM accounts WHERE credential_lookup_key = ?1').bind(current.credential_lookup_key),
     env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)'
-    ).bind(new_credential_lookup_key, new_public_key, auth.data_lookup_key, new_wrapped_data_key, current.app, current.rules_json, Date.now()),
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)'
+    ).bind(
+      new_credential_lookup_key,
+      new_public_key,
+      auth.data_lookup_key,
+      new_wrapped_data_key,
+      current.app,
+      current.rules_json,
+      Date.now(),
+      finalRecoveryLookupKey,
+      finalRecoveryPublicKey,
+    ),
   ]);
 
   // Persist new credential mapping to Arweave (non-blocking)
-  persistCredentialBlob(ctx, env, new_credential_lookup_key, auth.data_lookup_key, new_wrapped_data_key, new_public_key, current.app);
+  persistCredentialBlob(
+    ctx, env,
+    new_credential_lookup_key, auth.data_lookup_key, new_wrapped_data_key, new_public_key, current.app,
+    finalRecoveryLookupKey, finalRecoveryPublicKey,
+  );
 
   return jsonResponse({ ok: true }, 200, cors);
 }

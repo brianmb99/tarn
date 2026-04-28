@@ -49,6 +49,17 @@ Tarn is NOT an app. It is infrastructure. Apps are clients of Tarn. The first ap
   This tests the full lifecycle (health, register, app auth, set rules, login, write, read, Turbo gateway, status, delete) against the live API. Do not consider a deploy complete until this passes.
 - The bookish app private key (`TARN_APP_KEY_BOOKISH`) is in `api/.dev.vars` (local) and Cloudflare Worker secrets (production).
 
+### Worker secrets (issue #12 — recovery email forwarder)
+
+The `POST /api/v1/recovery/email` endpoint forwards client-rendered recovery PDFs through Resend. Two Worker secrets must be set in production:
+
+```
+npx wrangler secret put EMAIL_FORWARDER_API_KEY  # Resend API key (re_...)
+npx wrangler secret put EMAIL_FORWARDER_FROM     # e.g. "Tarn <recovery@tarn.dev>"
+```
+
+If either is missing the endpoint returns 503 (apps can still let the user download the PDF locally — the `emailRecoveryKit: false` SDK path skips the network call entirely). The endpoint never persists the PDF; it only forwards.
+
 ## D1 Database
 
 The Cloudflare D1 database is named `tarn-api`. All CLI commands use this name:

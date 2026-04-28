@@ -505,7 +505,7 @@ await test('Change credentials: existing entries still readable', async () => {
 
   // Register + login via TarnClient
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(oldEmail, oldPassword);
+  await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
   const dlk = client.dataLookupKey;
 
   // Set rules (TarnClient register doesn't set rules — app must do it)

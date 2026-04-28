@@ -78,16 +78,20 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD);
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     // Snapshot the wrapped_data_key sent at registration so we can compare gen 1.
+    // Issue #12: new accounts register with v4 multi-factor envelopes.
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
     const registerBody = JSON.parse(registerCall.body);
     const registeredEnvelope = JSON.parse(registerBody.wrapped_data_key);
-    assert.equal(registeredEnvelope.v, 3);
+    assert.equal(registeredEnvelope.v, 4);
     assert.equal(registeredEnvelope.dek_chain.length, 1);
     assert.equal(registeredEnvelope.dek_chain[0].gen, 1);
-    const gen1WrappedAtRegister = registeredEnvelope.dek_chain[0].wrapped;
+    const gen1PasswordWrapAtRegister =
+      registeredEnvelope.dek_chain[0].wrappings.find(w => w.factor === 'password').wrapped;
+    const gen1RecoveryWrapAtRegister =
+      registeredEnvelope.dek_chain[0].wrappings.find(w => w.factor === 'recovery_phrase').wrapped;
 
     await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD);
 
@@ -95,21 +99,34 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     assert.ok(putCall, 'changeCredentials should send PUT /api/v1/auth');
     const putBody = JSON.parse(putCall.body);
 
-    // New envelope is v3 with TWO entries — gen 1 (re-wrapped) + gen 2 (fresh).
+    // New envelope is v4 with TWO entries — gen 1 (re-wrapped) + gen 2 (fresh).
     const newEnvelope = JSON.parse(putBody.new_wrapped_data_key);
-    assert.equal(newEnvelope.v, 3);
+    assert.equal(newEnvelope.v, 4);
     assert.equal(newEnvelope.kdf, 'argon2id');
     assert.equal(newEnvelope.dek_chain.length, 2);
     assert.deepEqual(newEnvelope.dek_chain.map(e => e.gen), [1, 2]);
 
-    // Gen 1's wrapped bytes MUST differ from registration: it's now wrapped
-    // under the NEW credential_encryption_key. (Same DEK bytes inside, but
-    // AES-KW is deterministic per (key, plaintext) — different KEK → different
-    // ciphertext.)
-    assert.notEqual(newEnvelope.dek_chain[0].wrapped, gen1WrappedAtRegister);
+    // Gen 1's password wrapping bytes MUST differ from registration: it's
+    // now wrapped under the NEW credential_encryption_key. (Same DEK bytes
+    // inside, but AES-KW is deterministic per (key, plaintext) — different
+    // KEK → different ciphertext.)
+    const gen1PasswordWrapNow =
+      newEnvelope.dek_chain[0].wrappings.find(w => w.factor === 'password').wrapped;
+    assert.notEqual(gen1PasswordWrapNow, gen1PasswordWrapAtRegister);
 
-    // Gen 2's wrapped bytes are a fresh DEK — definitely not equal to gen 1.
-    assert.notEqual(newEnvelope.dek_chain[1].wrapped, newEnvelope.dek_chain[0].wrapped);
+    // Gen 1's recovery wrapping is preserved verbatim — changeCredentials
+    // doesn't have the phrase, so it can't re-wrap; AES-KW determinism means
+    // the same KEK + same plaintext produces the same bytes anyway.
+    const gen1RecoveryWrapNow =
+      newEnvelope.dek_chain[0].wrappings.find(w => w.factor === 'recovery_phrase').wrapped;
+    assert.equal(gen1RecoveryWrapNow, gen1RecoveryWrapAtRegister);
+
+    // Gen 2 has a password wrapping (always) but NO recovery wrapping
+    // (caller didn't pass `phrase`). This is the documented gap that
+    // recoverAccount/regenerateRecoveryKit closes.
+    const gen2Wrappings = newEnvelope.dek_chain[1].wrappings;
+    assert.equal(gen2Wrappings.length, 1);
+    assert.equal(gen2Wrappings[0].factor, 'password');
 
     // The new envelope MUST be unwrappable with the NEW credential_encryption_key.
     const newKeys = await deriveAllKeys(NEW_EMAIL, NEW_PASSWORD, APP, KDF_V2_ARGON2ID);
@@ -140,7 +157,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD);
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     // Capture the gen 1 DEK as wrapped under the OLD credential_encryption_key.
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
@@ -190,7 +207,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     mockFetch(responses);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD);
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     await client.changeCredentials('e1@x.com', 'p1');
     await client.changeCredentials('e2@x.com', 'p2');
@@ -201,7 +218,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
 
     // The final envelope is the most recent PUT body.
     const finalEnvelope = JSON.parse(JSON.parse(putCalls[2].body).new_wrapped_data_key);
-    assert.equal(finalEnvelope.v, 3);
+    assert.equal(finalEnvelope.v, 4);
     assert.deepEqual(finalEnvelope.dek_chain.map(e => e.gen), [1, 2, 3, 4]);
 
     // Final envelope unwraps with the final credentials and exposes 4 DEKs.
@@ -225,13 +242,13 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD);
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
     await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD);
 
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');
     const newWdk = JSON.parse(putCall.body).new_wrapped_data_key;
     const parsed = parseWrappedDataKey(newWdk);
-    assert.equal(parsed.envelopeVersion, 3);
+    assert.equal(parsed.envelopeVersion, 4);
     assert.equal(parsed.kdfVersion, KDF_V2_ARGON2ID);
     assert.equal(parsed.dekChain.length, 2);
   });

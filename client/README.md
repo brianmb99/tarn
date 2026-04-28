@@ -11,8 +11,16 @@ import { TarnClient } from 'tarn-client';
 
 const tarn = new TarnClient('https://api.tarn.dev', 'your-app-id');
 
-// Register a new user
-const { dataLookupKey } = await tarn.register('user@example.com', 'password');
+// Register a new user. recoveryAcknowledged: true is required — the SDK
+// generates a 24-word BIP39 recovery phrase and (by default) emails the
+// rendered PDF to the user. Returns the phrase + PDF bytes so the caller
+// can also offer a download or display.
+const { dataLookupKey, recoveryPhrase, pdfBytes, emailDelivered } =
+  await tarn.register('user@example.com', 'password', {
+    recoveryAcknowledged: true,
+    emailRecoveryKit: true,    // default
+    appName: 'Bookish',        // optional, used in PDF + email branding
+  });
 
 // Login (any device, same email+password)
 await tarn.login('user@example.com', 'password');
@@ -135,8 +143,11 @@ await cellar.register('user@example.com', 'password');
 ## Credential Management
 
 ```javascript
-// Change email and/or password (requires active session)
-await tarn.changeCredentials('new@example.com', 'new-password');
+// Change email and/or password (requires active session — for routine reasons
+// like email change). Optionally pass `phrase` to extend the recovery factor
+// to the new generation; without it, the new generation is password-only and
+// recovery for that gen requires running recoverAccount or regenerateRecoveryKit.
+await tarn.changeCredentials('new@example.com', 'new-password', { phrase });
 
 // Delete account permanently
 await tarn.deleteAccount();
@@ -144,12 +155,43 @@ await tarn.deleteAccount();
 
 Credential changes re-wrap the existing data encryption keys under the new credentials and (for Argon2id accounts) append a fresh DEK at the next generation. Future writes use the new generation; existing data stays decryptable. The old credentials stop working immediately.
 
+## Account Recovery
+
+For users who have lost their password (or want a security-grade reset). Requires only the recovery phrase. Issues a JWT via the recovery factor's signing key, re-wraps the entire DEK chain under the new password + the same recovery factor, and publishes a fresh credential blob. All pre-recovery data is decryptable under the new credentials.
+
+```javascript
+// User-typed phrase + new credentials
+const { dataLookupKey } = await tarn.recoverAccount({
+  phrase: '24 words ...',
+  newEmail: 'me@example.com',
+  newPassword: 'fresh-password',
+});
+
+// Re-render the PDF for the same phrase (e.g., user lost the original)
+const { pdfBytes, emailDelivered } = await tarn.regenerateRecoveryKit({
+  phrase: '24 words ...',
+  emailRecoveryKit: true,
+  recipientEmail: 'me@example.com',
+  appName: 'Bookish',
+});
+
+// Forward an already-rendered PDF (e.g., from registration) by email
+await tarn.sendRecoveryKitEmail({
+  recipientEmail: 'me@example.com',
+  pdfBytes,
+  appName: 'Bookish',
+});
+```
+
+**Trust framing.** Tarn never persists the recovery phrase or the PDF. The API briefly sees the PDF in memory during the email-forwarder request (necessary to relay it). The honest claim is "no storage, brief in-memory visibility during forward" — not "Tarn never sees the bytes."
+
 ## Security Model
 
 - **Client-side encryption.** All data is AES-256-GCM encrypted before leaving the client. The server never sees plaintext.
 - **Argon2id key derivation.** Memory-hard KDF (m=64 MiB, t=3, p=1) for the password→master-key step. Sub-keys derived via HKDF-Expand (RFC 5869). Legacy accounts on PBKDF2-SHA256 (600K iters) continue to log in via a fallback path.
 - **ECDSA P-256 auth.** Challenge-response signing. No passwords transmitted. Server stores only the public key.
 - **Per-content CEK + forward-secret DEK rotation.** Each blob is encrypted with its own random CEK, wrapped under a generation-indexed DEK chain (RFC 3394 AES-KW). Credential changes append a fresh DEK to the chain so post-rotation writes are not decryptable by an attacker holding the old credentials.
+- **Multi-factor DEK chain (v4 envelope).** Each chain entry is wrapped twice: once under a password-derived KEK, once under a phrase-derived KEK (Argon2id over the BIP39 recovery phrase). Either factor independently unwraps the DEK — recovery via phrase works without the password.
 - **Arweave permanence.** Data stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.
 
 See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specification.
@@ -158,9 +200,17 @@ See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specifica
 
 ### `new TarnClient(apiBaseUrl, appId)`
 
-### `tarn.register(email, password)` → `{ dataLookupKey }`
+### `tarn.register(email, password, opts)` → `{ dataLookupKey, recoveryPhrase, pdfBytes, emailDelivered }`
+
+`opts` is required and must include `recoveryAcknowledged: true` (the SDK enforces the design-doc requirement that recovery is mandatory at signup). Other fields: `emailRecoveryKit` (default `true`), `recipientEmail` (defaults to `email`), `appName` (PDF + email branding).
 
 ### `tarn.login(email, password)` → `{ dataLookupKey }`
+
+### `tarn.recoverAccount({ phrase, newEmail, newPassword })` → `{ dataLookupKey }`
+
+### `tarn.regenerateRecoveryKit({ phrase, emailRecoveryKit?, recipientEmail?, appName? })` → `{ pdfBytes, emailDelivered }`
+
+### `tarn.sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName?, subject? })` → `void`
 
 ### `tarn.createEntry(type, plaintext, extraTags?)` → `{ txid }`
 
@@ -183,7 +233,9 @@ const results = await tarn.batchCreate('entry', [
 
 ### `tarn.deleteEntry(targetTxid, type)` → `{ txid }`
 
-### `tarn.changeCredentials(newEmail, newPassword)`
+### `tarn.changeCredentials(newEmail, newPassword, opts?)`
+
+`opts.phrase` (optional) extends the recovery factor to the new generation.
 
 ### `tarn.deleteAccount()`
 

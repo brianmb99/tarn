@@ -146,24 +146,39 @@ describe('TarnClient.login — KDF dispatch', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(EMAIL, PASSWORD);
+    await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
     assert.ok(registerCall, 'register should hit /auth/register');
     const body = JSON.parse(registerCall.body);
 
-    // wrapped_data_key should be a v3 JSON envelope (chain) for new accounts.
+    // wrapped_data_key should be a v4 multi-factor envelope (chain) for new
+    // accounts (issue #12). Each entry carries password + recovery_phrase
+    // wrappings; the recovery block holds the Argon2id salt + params used
+    // for the recovery KEK.
     assert.equal(body.wrapped_data_key[0], '{', 'register should send a JSON envelope');
     const env = JSON.parse(body.wrapped_data_key);
-    assert.equal(env.v, 3);
+    assert.equal(env.v, 4);
     assert.equal(env.kdf, 'argon2id');
+    assert.ok(env.recovery, 'v4 envelope should carry recovery metadata');
+    assert.equal(env.recovery.kdf, 'argon2id');
+    assert.equal(typeof env.recovery.salt, 'string');
     assert.ok(Array.isArray(env.dek_chain));
     assert.equal(env.dek_chain.length, 1);
     assert.equal(env.dek_chain[0].gen, 1);
-    assert.equal(typeof env.dek_chain[0].wrapped, 'string');
+    assert.ok(Array.isArray(env.dek_chain[0].wrappings));
+    assert.equal(env.dek_chain[0].wrappings.length, 2);
+    const factors = env.dek_chain[0].wrappings.map(w => w.factor).sort();
+    assert.deepEqual(factors, ['password', 'recovery_phrase']);
 
     // credential_lookup_key should match the Argon2id-derived one.
     const v2Keys = await deriveAllKeys(EMAIL, PASSWORD, APP, KDF_V2_ARGON2ID);
     assert.equal(body.credential_lookup_key, v2Keys.credentialLookupKey);
+
+    // recovery_lookup_key should be present and distinct from credential_lookup_key
+    assert.ok(body.recovery_lookup_key, 'register should send recovery_lookup_key');
+    assert.notEqual(body.recovery_lookup_key, body.credential_lookup_key);
+    assert.ok(/^[a-f0-9]{64}$/.test(body.recovery_lookup_key));
+    assert.ok(body.recovery_public_key, 'register should send recovery_public_key');
   });
 });

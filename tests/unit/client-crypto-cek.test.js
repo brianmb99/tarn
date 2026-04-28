@@ -104,9 +104,15 @@ describe('v3 envelope', () => {
     assert.equal(parsed.kdfVersion, KDF_V2_ARGON2ID);
     assert.equal(parsed.envelopeVersion, 3);
     assert.equal(parsed.dekChain.length, 2);
-    assert.deepEqual(parsed.dekChain[0], { gen: 1, wrappedBase64: 'AAAA' });
-    assert.deepEqual(parsed.dekChain[1], { gen: 2, wrappedBase64: 'BBBB' });
-    // wrappedBase64 returns the highest-gen entry as a convenience
+    // v3 envelopes are normalized to the v4-shaped multi-factor chain with a
+    // single synthetic `password` wrapping per entry (issue #12).
+    assert.deepEqual(parsed.dekChain[0], {
+      gen: 1, wrappings: [{ factor: 'password', wrappedBase64: 'AAAA' }],
+    });
+    assert.deepEqual(parsed.dekChain[1], {
+      gen: 2, wrappings: [{ factor: 'password', wrappedBase64: 'BBBB' }],
+    });
+    // wrappedBase64 returns the highest-gen entry's password wrapping as a convenience
     assert.equal(parsed.wrappedBase64, 'BBBB');
   });
 
@@ -126,7 +132,9 @@ describe('v3 envelope', () => {
     const parsed = parseWrappedDataKey(wire);
     assert.equal(parsed.envelopeVersion, 2);
     assert.equal(parsed.dekChain.length, 1);
-    assert.deepEqual(parsed.dekChain[0], { gen: 1, wrappedBase64: 'CCCC' });
+    assert.deepEqual(parsed.dekChain[0], {
+      gen: 1, wrappings: [{ factor: 'password', wrappedBase64: 'CCCC' }],
+    });
   });
 
   it('parseWrappedDataKey rejects v3 with empty chain', () => {

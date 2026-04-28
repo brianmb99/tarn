@@ -45,7 +45,7 @@ console.log('\n=== Registration ===');
 await test('Register: happy path', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
-  const { dataLookupKey } = await client.register(email, 'test-password-123');
+  const { dataLookupKey } = await client.register(email, 'test-password-123', { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   assert(dataLookupKey, 'Should return dataLookupKey');
   assert(dataLookupKey.length === 64, 'dataLookupKey should be 64-char hex');
@@ -55,11 +55,11 @@ await test('Register: happy path', async () => {
 await test('Register: duplicate email produces 409', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
-  await client.register(email, 'password');
+  await client.register(email, 'password', { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
-    await client2.register(email, 'password');
+    await client2.register(email, 'password', { recoveryAcknowledged: true, emailRecoveryKit: false });
     assert(false, 'Should have thrown');
   } catch (err) {
     assert(err.message.includes('409') || err.message.includes('already'), `Expected 409 error, got: ${err.message}`);
@@ -76,7 +76,7 @@ await test('Login: happy path', async () => {
 
   // Register first
   const client1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await client1.register(email, password);
+  const { dataLookupKey } = await client1.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   // Login from "another device"
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
@@ -89,7 +89,7 @@ await test('Login: happy path', async () => {
 await test('Login: wrong password fails', async () => {
   const email = randomEmail();
   const client1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client1.register(email, 'correct-password');
+  await client1.register(email, 'correct-password', { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
@@ -172,7 +172,7 @@ await test('Change credentials: new login works, old fails', async () => {
 
   // Register + login
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await client.register(oldEmail, oldPassword);
+  const { dataLookupKey } = await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   // Change credentials
   await client.changeCredentials(newEmail, newPassword);
@@ -203,7 +203,7 @@ await test('Delete account: login fails after', async () => {
   const password = 'delete-me';
 
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, password);
+  await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
   assert(client.isAuthenticated, 'Should be authenticated');
 
   await client.deleteAccount();

@@ -78,7 +78,7 @@ console.log('\n=== 2. Registration ===');
 
 await test('Register new user', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  const { dataLookupKey } = await tarn.register(testEmail, testPassword);
+  const { dataLookupKey } = await tarn.register(testEmail, testPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
   assert(dataLookupKey, 'No dataLookupKey');
   assert(dataLookupKey.length === 64, 'Bad dataLookupKey length');
   assert(tarn.isAuthenticated, 'Not authenticated');
@@ -90,7 +90,7 @@ await test('Re-register with same credentials is idempotent (issue #6)', async (
   // Simulates the 503-after-commit case: client retries with an identical
   // payload. Server should return 201 with the same DLK, not 409.
   const tarn = new TarnClient(API_BASE, APP_ID);
-  const { dataLookupKey } = await tarn.register(testEmail, testPassword);
+  const { dataLookupKey } = await tarn.register(testEmail, testPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
   assert(dataLookupKey === testDlk, `DLK changed on retry: ${dataLookupKey} vs ${testDlk}`);
 });
 

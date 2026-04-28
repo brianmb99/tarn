@@ -5,6 +5,7 @@ import { handleHealth } from './routes/info.js';
 import { handleEntries, handleEntryById } from './routes/entries.js';
 import { handleLookup } from './routes/lookup.js';
 import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
+import { handleRecoveryEmail } from './routes/recovery.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules } from './routes/apps.js';
@@ -75,6 +76,11 @@ export default {
       }
       if (path === '/api/v1/auth' && method === 'DELETE') {
         return await handleDeleteAccount(request, env, ctx, cors);
+      }
+
+      // Recovery (issue #12) — email forwarder
+      if (path === '/api/v1/recovery/email' && method === 'POST') {
+        return await handleRecoveryEmail(request, env, cors);
       }
 
       // Info (public)

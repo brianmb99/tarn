@@ -12,9 +12,14 @@
 
 import {
   deriveAllKeys,
+  deriveRecoveryKey,
+  deriveRecoveryLookupKey,
+  deriveRecoverySigningKeyPair,
   exportPublicKey,
   wrapDataKeyEnvelope,
   wrapDataKeyChainEnvelope,
+  wrapDataKeyChainEnvelopeV4,
+  buildV4Envelope,
   unwrapDataKeyChain,
   signChallenge,
   encrypt,
@@ -23,11 +28,26 @@ import {
   decryptWithCEK,
   hasTarnBlobMagic,
   generateRandomDataKey,
+  generateRecoverySalt,
+  parseWrappedDataKey,
   base64ToBytes,
+  bytesToBase64,
   KDF_V1_PBKDF2,
   KDF_V2_ARGON2ID,
   KDF_DEFAULT,
+  FACTOR_PASSWORD,
+  FACTOR_RECOVERY_PHRASE,
 } from './crypto.js';
+import {
+  generateRecoveryPhrase,
+  validateRecoveryPhrase,
+  recoveryPhraseToEntropy,
+  renderRecoveryPDF,
+} from './recovery.js';
+
+// Re-export the recovery-side surface so consumers can import them directly
+// from the package root without reaching into ./recovery (private path).
+export { generateRecoveryPhrase, validateRecoveryPhrase, renderRecoveryPDF };
 
 export class TarnClient {
   #apiBase;
@@ -50,7 +70,16 @@ export class TarnClient {
   // AES-KW for wrapping per-content CEKs).
   #dekByGen = null;          // Map<gen:number, {gcmKey, kwKey}>
   #currentGen = null;        // number — gen used for new writes
-  #envelopeVersion = null;   // 1 (bare base64), 2 (single), 3 (chain)
+  #envelopeVersion = null;   // 1 (bare base64), 2 (single), 3 (chain), 4 (multi-factor chain)
+
+  // v4 recovery-factor state (issue #12). Holds enough information to preserve
+  // existing recovery wrappings across a credential change without requiring
+  // the user to re-enter the phrase: the per-account salt + KDF params (so a
+  // future write that DOES have the phrase can re-derive the same KEK), and
+  // a snapshot of the existing wrapped recovery bytes per gen (so we can
+  // re-emit them verbatim). Null for v1/v2/v3 accounts.
+  #recoveryFactorMeta = null; // { salt: Uint8Array, kdfParams, wrappingsByGen: Map<gen, base64> } | null
+  #recoveryLookupKey = null;  // 64-char hex (server-side) — populated on register/recover; null otherwise
 
   /**
    * @param {string} apiBaseUrl - Tarn API base URL (e.g., 'https://api.tarn.dev')
@@ -65,39 +94,89 @@ export class TarnClient {
   // ============ AUTH ============
 
   /**
-   * Register a new account for this app.
+   * Register a new account for this app (issue #12 — v4 envelope with
+   * mandatory recovery factor).
    *
-   * Generates a fresh random 32-byte DEK at generation 1 (issue #11) — no
-   * more self-wrapping. The DEK is wrapped under the credential_encryption_key
-   * via AES-KW and packaged into a v3 envelope (`{v:3, dek_chain: [...]}`).
+   * Generates a fresh random 32-byte DEK at gen 1 (issue #11) and a 24-word
+   * BIP39 recovery phrase. The DEK is wrapped twice into a v4 envelope:
+   *   - under the password-derived KEK (factor: "password")
+   *   - under a phrase-derived KEK (factor: "recovery_phrase")
    * The envelope is opaque to the API (passes the existing length/type check).
+   *
+   * The caller MUST pass `recoveryAcknowledged: true` — without it, register
+   * fails synchronously with no network call. This is the SDK enforcement of
+   * the design-doc requirement that recovery is mandatory at signup.
+   *
+   * The phrase is returned to the caller in the result payload alongside the
+   * rendered PDF bytes. The TarnClient instance does NOT cache the phrase —
+   * the caller is responsible for handing it to the user (PDF download or
+   * email forward) and dropping the in-memory copy promptly. Re-rendering a
+   * fresh PDF later requires the user to provide the phrase again.
    *
    * @param {string} email
    * @param {string} password
-   * @returns {Promise<{dataLookupKey: string}>}
+   * @param {{
+   *   recoveryAcknowledged: boolean,
+   *   emailRecoveryKit?: boolean,         // default true
+   *   recipientEmail?: string,            // defaults to email param
+   *   appName?: string,                   // PDF + email branding
+   * }} [opts]
+   * @returns {Promise<{
+   *   dataLookupKey: string,
+   *   recoveryPhrase: string,
+   *   pdfBytes: Uint8Array,
+   *   emailDelivered: boolean,
+   * }>}
    */
-  async register(email, password) {
-    // New accounts always use the current default KDF (Argon2id v2). Existing
-    // PBKDF2 accounts continue working via the login fallback path.
-    const kdfVersion = KDF_DEFAULT;
-    const keys = await deriveAllKeys(email, password, this.#appId, kdfVersion);
-    const publicKeyBase64 = await exportPublicKey(keys.signingKeyPair.publicKey);
+  async register(email, password, opts = {}) {
+    if (!opts || opts.recoveryAcknowledged !== true) {
+      throw new Error('register(): recoveryAcknowledged: true is required (issue #12)');
+    }
+    const emailRecoveryKit = opts.emailRecoveryKit !== false;
+    const recipientEmail = opts.recipientEmail || email;
+    const appName = opts.appName;
 
-    // Random DEK at generation 1. Wrap under credential_encryption_key.
+    const kdfVersion = KDF_DEFAULT; // New accounts always use Argon2id (v2).
+
+    // Derive password-side keys + recovery-phrase-side keys in parallel —
+    // both Argon2id calls dominate registration latency, so overlap them.
+    const phrase = generateRecoveryPhrase();
+    const phraseEntropy = recoveryPhraseToEntropy(phrase);
+    const recoverySalt = generateRecoverySalt();
+
+    const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair] = await Promise.all([
+      deriveAllKeys(email, password, this.#appId, kdfVersion),
+      deriveRecoveryKey(phrase, recoverySalt),
+      deriveRecoveryLookupKey(phraseEntropy, this.#appId),
+      deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
+    ]);
+
+    const [publicKeyBase64, recoveryPublicKeyBase64] = await Promise.all([
+      exportPublicKey(keys.signingKeyPair.publicKey),
+      exportPublicKey(recoverySigningKeyPair.publicKey),
+    ]);
+
+    // Random DEK at generation 1. Wrap under both password + recovery factors.
     const dek = await generateRandomDataKey();
-    const wrappedDataKey = await wrapDataKeyChainEnvelope(
+    const wrappedDataKey = await wrapDataKeyChainEnvelopeV4(
       [{ gen: 1, key: dek.gcmKey }],
-      keys.credentialEncryptionKey.kwKey,
+      [
+        { name: FACTOR_PASSWORD,        wrappingKey: keys.credentialEncryptionKey.kwKey },
+        { name: FACTOR_RECOVERY_PHRASE, wrappingKey: recoveryKEK.kwKey },
+      ],
+      { salt: recoverySalt },
     );
 
     const res = await this.#fetch('/api/v1/auth/register', {
       method: 'POST',
-      retry: true, // idempotent since tarn #6
+      retry: true, // idempotent since tarn #6 (envelope is byte-stable)
       body: {
         credential_lookup_key: keys.credentialLookupKey,
         public_key: publicKeyBase64,
         wrapped_data_key: wrappedDataKey,
         app: this.#appId,
+        recovery_lookup_key: recoveryLookupKey,
+        recovery_public_key: recoveryPublicKeyBase64,
       },
     });
 
@@ -111,9 +190,257 @@ export class TarnClient {
     this.#dataLookupKey = res.json.data_lookup_key;
     this.#dekByGen = new Map([[1, { gcmKey: dek.gcmKey, kwKey: dek.kwKey }]]);
     this.#currentGen = 1;
-    this.#envelopeVersion = 3;
+    this.#envelopeVersion = 4;
     this.#kdfVersion = kdfVersion;
+    // Snapshot the recovery wrapping bytes for the freshly-registered chain
+    // so a subsequent changeCredentials() can preserve them without needing
+    // the phrase. Re-parse the envelope (cheap — local JSON) to capture the
+    // exact wire bytes after wrap.
+    {
+      const re = parseWrappedDataKey(wrappedDataKey);
+      const wrappingsByGen = new Map();
+      for (const entry of re.dekChain) {
+        const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
+        if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
+      }
+      this.#recoveryFactorMeta = re.recovery
+        ? { salt: re.recovery.salt, kdfParams: re.recovery.kdfParams, wrappingsByGen }
+        : null;
+    }
+    this.#recoveryLookupKey = recoveryLookupKey;
 
+    await this.#authenticate();
+
+    // Render the PDF after auth so the JWT is ready in case the caller wants
+    // us to email it. PDF rendering is synchronous and cheap.
+    const pdfBytes = renderRecoveryPDF({ phrase, appName });
+
+    let emailDelivered = false;
+    if (emailRecoveryKit) {
+      try {
+        await this.sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName });
+        emailDelivered = true;
+      } catch (err) {
+        // Surface but don't fail register: the caller still has phrase + PDF
+        // bytes and can retry the email send later. The user has already
+        // acknowledged saving the phrase, which is the gating requirement.
+        console.warn(`[TarnClient] register: recovery email delivery failed: ${err.message}`);
+      }
+    }
+
+    return {
+      dataLookupKey: this.#dataLookupKey,
+      recoveryPhrase: phrase,
+      pdfBytes,
+      emailDelivered,
+    };
+  }
+
+  /**
+   * Render a fresh recovery PDF for the same phrase the user already holds,
+   * and (optionally) email it. The phrase is unchanged — Tarn does not store
+   * it, so the caller must provide it.
+   *
+   * Requires an authenticated session if `emailRecoveryKit` is true (the
+   * email forwarder endpoint is JWT-gated). Pure rendering (no email) does
+   * not require a session.
+   *
+   * @param {{
+   *   phrase: string,
+   *   emailRecoveryKit?: boolean,        // default true
+   *   recipientEmail?: string,           // required if emailRecoveryKit is true
+   *   appName?: string,
+   * }} opts
+   * @returns {Promise<{ pdfBytes: Uint8Array, emailDelivered: boolean }>}
+   */
+  async regenerateRecoveryKit(opts = {}) {
+    const { phrase, recipientEmail, appName } = opts;
+    const emailRecoveryKit = opts.emailRecoveryKit !== false;
+
+    const validation = validateRecoveryPhrase(phrase);
+    if (!validation.valid) {
+      throw new Error(`regenerateRecoveryKit(): ${validation.reason}`);
+    }
+    if (emailRecoveryKit && !recipientEmail) {
+      throw new Error('regenerateRecoveryKit(): recipientEmail is required when emailRecoveryKit is true');
+    }
+
+    const pdfBytes = renderRecoveryPDF({ phrase: validation.normalized, appName });
+
+    let emailDelivered = false;
+    if (emailRecoveryKit) {
+      await this.#requireAuth();
+      await this.sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName });
+      emailDelivered = true;
+    }
+    return { pdfBytes, emailDelivered };
+  }
+
+  /**
+   * Forward an already-rendered PDF to the named recipient via the Tarn
+   * email-forwarder endpoint. Requires an authenticated session.
+   *
+   * @param {{ recipientEmail: string, pdfBytes: Uint8Array, appName?: string, subject?: string }} opts
+   * @returns {Promise<void>}
+   */
+  async sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName, subject }) {
+    if (!recipientEmail) throw new Error('recipientEmail is required');
+    if (!(pdfBytes instanceof Uint8Array) || pdfBytes.length === 0) {
+      throw new Error('pdfBytes must be a non-empty Uint8Array');
+    }
+    await this.#requireAuth();
+    const res = await this.#fetch('/api/v1/recovery/email', {
+      method: 'POST',
+      auth: true,
+      body: {
+        recipient_email: recipientEmail,
+        pdf_base64: bytesToBase64(pdfBytes),
+        ...(appName ? { app_name: appName } : {}),
+        ...(subject ? { subject } : {}),
+      },
+    });
+    if (res.status !== 200) {
+      throw new Error(`Recovery email send failed: ${res.json?.error || res.status}`);
+    }
+  }
+
+  /**
+   * Recover an account using only the recovery phrase + new credentials.
+   * Used when the user has lost their password (or wants a security-grade
+   * reset that the design-doc positions as "the response to suspected
+   * compromise").
+   *
+   * Flow:
+   *   1. Derive recovery_lookup_key + recovery signing key from the phrase
+   *   2. POST /auth/challenge { recovery_lookup_key } → get the existing
+   *      credential blob's wrapped_data_key + a nonce
+   *   3. Parse the v4 envelope, extract the recovery salt, derive recovery KEK
+   *   4. Unwrap the DEK chain via the recovery factor
+   *   5. Sign the nonce with the recovery signing private key → JWT (the API
+   *      verifies against the stored recovery_public_key)
+   *   6. Derive new password KEK from (newEmail, newPassword)
+   *   7. Re-wrap the DEK chain under both new password KEK + (kept) recovery
+   *      KEK and PUT /auth to publish the new credential blob
+   *
+   * On success the client is authenticated under the new credentials and
+   * holds the full DEK chain — old data is still readable.
+   *
+   * @param {{ phrase: string, newEmail: string, newPassword: string }} opts
+   * @returns {Promise<{dataLookupKey: string}>}
+   */
+  async recoverAccount({ phrase, newEmail, newPassword }) {
+    const validation = validateRecoveryPhrase(phrase);
+    if (!validation.valid) {
+      throw new Error(`recoverAccount(): ${validation.reason}`);
+    }
+    if (!newEmail || !newPassword) {
+      throw new Error('recoverAccount(): newEmail and newPassword are required');
+    }
+
+    const phraseEntropy = recoveryPhraseToEntropy(validation.normalized);
+    const [recoveryLookupKey, recoverySigningKeyPair] = await Promise.all([
+      deriveRecoveryLookupKey(phraseEntropy, this.#appId),
+      deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
+    ]);
+
+    // Step 2: ask for a challenge keyed by recovery_lookup_key.
+    const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+      method: 'POST',
+      retry: true, // fresh nonce per call
+      body: { recovery_lookup_key: recoveryLookupKey },
+    });
+    if (challengeRes.status === 404) {
+      throw new Error('recoverAccount(): no account found for this recovery phrase + app');
+    }
+    if (challengeRes.status !== 200) {
+      throw new Error(`recoverAccount(): challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
+    }
+    const { nonce, data_lookup_key, wrapped_data_key } = challengeRes.json;
+
+    // Steps 3-4: derive recovery KEK from the envelope salt + phrase, then
+    // unwrap the DEK chain via the recovery factor.
+    // Two-pass: parse envelope to get the recovery salt + params, derive
+    // the recovery KEK, then unwrap. The flow is explicit (rather than baked
+    // into unwrapDataKeyChain) because the salt + params live in the envelope
+    // and the KEK derivation is the slow Argon2id step.
+    const parsed = parseWrappedDataKey(wrapped_data_key);
+    if (parsed.envelopeVersion !== 4 || !parsed.recovery) {
+      throw new Error('recoverAccount(): account is not v4 (no recovery factor enrolled)');
+    }
+    const recoveryKEK = await deriveRecoveryKey(
+      validation.normalized,
+      parsed.recovery.salt,
+      parsed.recovery.kdfParams,
+    );
+    const unwrapped = await unwrapDataKeyChain(
+      wrapped_data_key,
+      recoveryKEK.kwKey,
+      FACTOR_RECOVERY_PHRASE,
+    );
+
+    // Step 5: sign nonce with recovery signing key to obtain a JWT.
+    const signature = await signChallenge(recoverySigningKeyPair.privateKey, nonce);
+    const verifyRes = await this.#fetch('/api/v1/auth/verify', {
+      method: 'POST',
+      body: { recovery_lookup_key: recoveryLookupKey, nonce, signature },
+    });
+    if (verifyRes.status !== 200) {
+      throw new Error(`recoverAccount(): verify failed: ${verifyRes.json?.error || verifyRes.status}`);
+    }
+    this.#jwt = verifyRes.json.jwt;
+    this.#dataLookupKey = data_lookup_key;
+    // We do NOT yet have the password-side identity — those are derived next.
+
+    // Steps 6-7: derive new password keys, re-wrap DEK chain under both
+    // factors, publish via PUT /auth.
+    const kdfVersion = KDF_DEFAULT;
+    const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion);
+    const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
+
+    const chain = [];
+    for (const [gen, pair] of unwrapped.dekByGen) {
+      chain.push({ gen, key: pair.gcmKey });
+    }
+    chain.sort((a, b) => a.gen - b.gen);
+
+    const newWrappedDataKey = await wrapDataKeyChainEnvelopeV4(
+      chain,
+      [
+        { name: FACTOR_PASSWORD,        wrappingKey: newKeys.credentialEncryptionKey.kwKey },
+        { name: FACTOR_RECOVERY_PHRASE, wrappingKey: recoveryKEK.kwKey },
+      ],
+      { salt: parsed.recovery.salt, kdfParams: parsed.recovery.kdfParams },
+    );
+
+    // recovery_lookup_key + recovery_public_key are derived purely from the
+    // phrase and don't change across recovery — but we re-send them anyway
+    // so a corrupted server-side row gets healed on the next credential
+    // change. This is also what register sends.
+    const recoveryPublicKey = await exportPublicKey(recoverySigningKeyPair.publicKey);
+    const putRes = await this.#fetch('/api/v1/auth', {
+      method: 'PUT',
+      auth: true,
+      body: {
+        new_credential_lookup_key: newKeys.credentialLookupKey,
+        new_public_key: newPublicKey,
+        new_wrapped_data_key: newWrappedDataKey,
+        new_recovery_lookup_key: recoveryLookupKey,
+        new_recovery_public_key: recoveryPublicKey,
+      },
+    });
+    if (putRes.status !== 200) {
+      throw new Error(`recoverAccount(): credential change failed: ${putRes.json?.error || putRes.status}`);
+    }
+
+    // Update local state to the new identity.
+    this.#credentialLookupKey = newKeys.credentialLookupKey;
+    this.#credentialEncryptionKey = newKeys.credentialEncryptionKey;
+    this.#signingKeyPair = newKeys.signingKeyPair;
+    this.#dekByGen = unwrapped.dekByGen;
+    this.#currentGen = unwrapped.currentGen;
+    this.#envelopeVersion = 4;
+    this.#kdfVersion = kdfVersion;
+    this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
     return { dataLookupKey: this.#dataLookupKey };
@@ -179,6 +506,28 @@ export class TarnClient {
     this.#currentGen = unwrapped.currentGen;
     this.#envelopeVersion = unwrapped.envelopeVersion;
     this.#kdfVersion = keys.kdfVersion;
+    // Capture the recovery-factor metadata (v4 only) so a subsequent
+    // changeCredentials() can preserve existing recovery wrappings without
+    // requiring the user to re-enter the phrase. Login does NOT reveal the
+    // recovery_lookup_key (the server doesn't return it on the password-side
+    // challenge); recoveryLookupKey stays null until the next register or
+    // recoverAccount call repopulates it.
+    if (unwrapped.recovery) {
+      const reparsed = parseWrappedDataKey(challengeRes.json.wrapped_data_key);
+      const wrappingsByGen = new Map();
+      for (const entry of reparsed.dekChain) {
+        const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
+        if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
+      }
+      this.#recoveryFactorMeta = {
+        salt: unwrapped.recovery.salt,
+        kdfParams: unwrapped.recovery.kdfParams,
+        wrappingsByGen,
+      };
+    } else {
+      this.#recoveryFactorMeta = null;
+    }
+    this.#recoveryLookupKey = null;
 
     // Verify
     await this.#verifyChallenge(challengeRes.json.nonce);
@@ -192,9 +541,18 @@ export class TarnClient {
    * Forward-secret DEK rotation (issue #11): on every credential change for
    * an Argon2id account, mint a fresh random DEK at gen N+1 and append to
    * the chain. Existing gens stay accessible (re-wrapped under the new
-   * credential_encryption_key) so prior data is still readable. Future
-   * writes use the new gen, so an attacker who later compromises the OLD
-   * credentials cannot decrypt data encrypted under gen N+1.
+   * credential_encryption_key) so prior data is still readable.
+   *
+   * Recovery factor handling (issue #12, v4 accounts):
+   * - Old gens' recovery wrappings are PRESERVED verbatim — we don't have the
+   *   recovery KEK in this code path (user is logged in via password), so we
+   *   can't re-wrap. AES-KW is deterministic anyway: re-wrapping the same DEK
+   *   under the same recovery KEK would produce identical bytes, so preserving
+   *   is byte-equivalent.
+   * - The NEW gen (N+1) only gets a recovery wrapping if the caller passes
+   *   `phrase`. Without it, the new gen has only a password wrapping, and
+   *   recovery for that gen is not possible until the user runs
+   *   `regenerateRecoveryKit` or `recoverAccount` to repair the gap.
    *
    * For PBKDF2 (KDF v1) accounts the rotation upgrade is intentionally not
    * applied — they stay on the legacy single-key envelope (issue #11 is
@@ -202,8 +560,10 @@ export class TarnClient {
    *
    * @param {string} newEmail
    * @param {string} newPassword
+   * @param {{ phrase?: string }} [opts] - optional phrase to extend the
+   *   recovery wrapping to gen N+1 (v4 accounts only)
    */
-  async changeCredentials(newEmail, newPassword) {
+  async changeCredentials(newEmail, newPassword, opts = {}) {
     await this.#requireAuth();
 
     // Preserve the original KDF — silent upgrade from PBKDF2 to Argon2id is
@@ -216,6 +576,7 @@ export class TarnClient {
     let newDekByGen;
     let newCurrentGen;
     let newEnvelopeVersion;
+    let newRecoveryFactorMeta = this.#recoveryFactorMeta;
 
     if (kdfVersion === KDF_V1_PBKDF2) {
       // Legacy PBKDF2 path — keep the existing single-key envelope shape.
@@ -229,11 +590,89 @@ export class TarnClient {
       newDekByGen = this.#dekByGen;
       newCurrentGen = this.#currentGen;
       newEnvelopeVersion = 1;
+    } else if (this.#envelopeVersion === 4) {
+      // v4 path — multi-factor envelope. Re-wrap the entire chain under the
+      // new password KEK; preserve recovery wrappings verbatim (we don't have
+      // the recovery KEK without the phrase). New gen N+1 gets a password
+      // wrapping always, and a recovery wrapping iff the caller supplied the
+      // phrase (allowing recovery to remain complete after the change).
+      const nextGen = this.#currentGen + 1;
+      const newDek = await generateRandomDataKey();
+
+      // Build chain of {gen, key} for password-side re-wrap.
+      const chain = [];
+      for (const [gen, pair] of this.#dekByGen) {
+        chain.push({ gen, key: pair.gcmKey });
+      }
+      chain.push({ gen: nextGen, key: newDek.gcmKey });
+      chain.sort((a, b) => a.gen - b.gen);
+
+      // Re-wrap each chain entry under the new password KEK.
+      const reWrappedPassword = new Map();
+      for (const entry of chain) {
+        const wrappedBase64 = await this.#wrapDekRaw(entry.key, newKeys.credentialEncryptionKey.kwKey);
+        reWrappedPassword.set(entry.gen, wrappedBase64);
+      }
+
+      // Recovery wrappings: preserve existing per-gen bytes; optionally derive
+      // a fresh wrapping for the new gen if a phrase was supplied.
+      const recoveryWrappingsByGen = new Map();
+      if (this.#recoveryFactorMeta) {
+        for (const [gen, b64] of this.#recoveryFactorMeta.wrappingsByGen) {
+          recoveryWrappingsByGen.set(gen, b64);
+        }
+      }
+      if (opts.phrase && this.#recoveryFactorMeta) {
+        const validation = validateRecoveryPhrase(opts.phrase);
+        if (!validation.valid) {
+          throw new Error(`changeCredentials(): invalid phrase: ${validation.reason}`);
+        }
+        const recKEK = await deriveRecoveryKey(
+          validation.normalized,
+          this.#recoveryFactorMeta.salt,
+          this.#recoveryFactorMeta.kdfParams,
+        );
+        const wrappedNewGen = await this.#wrapDekRaw(newDek.gcmKey, recKEK.kwKey);
+        recoveryWrappingsByGen.set(nextGen, wrappedNewGen);
+      }
+
+      // Stitch the wire-format chain together.
+      const wireChain = chain.map(({ gen }) => {
+        const wrappings = [{ factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen) }];
+        if (recoveryWrappingsByGen.has(gen)) {
+          wrappings.push({
+            factor: FACTOR_RECOVERY_PHRASE,
+            wrappedBase64: recoveryWrappingsByGen.get(gen),
+          });
+        }
+        return { gen, wrappings };
+      });
+
+      // buildV4Envelope is in crypto.js; call via a thin wrapper to avoid the
+      // direct dependency on the build helper from this file.
+      newWrappedDataKey = this.#buildV4FromWireChain(
+        wireChain,
+        this.#recoveryFactorMeta
+          ? { salt: this.#recoveryFactorMeta.salt, kdfParams: this.#recoveryFactorMeta.kdfParams }
+          : null,
+      );
+
+      newDekByGen = new Map(this.#dekByGen);
+      newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
+      newCurrentGen = nextGen;
+      newEnvelopeVersion = 4;
+      if (this.#recoveryFactorMeta) {
+        newRecoveryFactorMeta = {
+          salt: this.#recoveryFactorMeta.salt,
+          kdfParams: this.#recoveryFactorMeta.kdfParams,
+          wrappingsByGen: recoveryWrappingsByGen,
+        };
+      }
     } else {
-      // Argon2id path — append a new DEK at gen N+1 and re-wrap the whole
-      // chain under the new credential_encryption_key. v2 envelopes (single
-      // self-wrapped DEK, pre-issue-#11) are upgraded in place to v3 here:
-      // the existing DEK becomes gen 1, the fresh random DEK becomes gen 2.
+      // v2/v3 Argon2id path — single-factor chain envelope (issue #11).
+      // v2 envelopes (single self-wrapped DEK, pre-issue-#11) are upgraded in
+      // place to v3 here: the existing DEK becomes gen 1, the fresh random
+      // DEK becomes gen 2.
       const nextGen = this.#currentGen + 1;
       const newDek = await generateRandomDataKey();
 
@@ -274,8 +713,29 @@ export class TarnClient {
     this.#dekByGen = newDekByGen;
     this.#currentGen = newCurrentGen;
     this.#envelopeVersion = newEnvelopeVersion;
+    this.#recoveryFactorMeta = newRecoveryFactorMeta;
 
     await this.#authenticate();
+  }
+
+  /**
+   * Wrap a single DEK CryptoKey under an AES-KW wrapping key, returning the
+   * raw base64 ciphertext. Thin convenience used by the v4 changeCredentials
+   * path so we can build wrappings imperatively without the higher-level
+   * envelope helpers.
+   */
+  async #wrapDekRaw(dekGcmKey, wrappingKey) {
+    const wrapped = await crypto.subtle.wrapKey('raw', dekGcmKey, wrappingKey, 'AES-KW');
+    return bytesToBase64(new Uint8Array(wrapped));
+  }
+
+  /**
+   * Build a v4 envelope JSON string from a wire-shaped chain (each entry
+   * already carrying base64-wrapped factor bytes). Defers to crypto.js's
+   * buildV4Envelope to keep the JSON shape in one place.
+   */
+  #buildV4FromWireChain(wireChain, recovery) {
+    return buildV4Envelope(wireChain, recovery);
   }
 
   /**
@@ -299,6 +759,8 @@ export class TarnClient {
     this.#credentialEncryptionKey = null;
     this.#signingKeyPair = null;
     this.#kdfVersion = null;
+    this.#recoveryFactorMeta = null;
+    this.#recoveryLookupKey = null;
   }
 
   // ============ DATA CRUD ============
@@ -601,7 +1063,10 @@ export class TarnClient {
       throw new Error(`Internal: no DEK for gen ${this.#currentGen}`);
     }
 
-    if (this.#envelopeVersion === 3) {
+    // v3 and v4 use the per-content CEK format with the same `Enc: tarn-cek-1`
+    // tag and `Gen: N` indicator. The two versions differ only in the credential
+    // envelope's wrapping shape — the on-the-wire blob layout is identical.
+    if (this.#envelopeVersion === 3 || this.#envelopeVersion === 4) {
       const encrypted = await encryptWithCEK(dek.kwKey, plaintext);
       return {
         encrypted,

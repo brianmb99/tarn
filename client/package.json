@@ -1,13 +1,15 @@
 {
   "name": "tarn-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "main": "src/tarn.js",
   "exports": {
     ".": "./src/tarn.js",
-    "./crypto": "./src/crypto.js"
+    "./crypto": "./src/crypto.js",
+    "./recovery": "./src/recovery.js"
   },
   "dependencies": {
+    "@scure/bip39": "^2.0.1",
     "hash-wasm": "^4.12.0"
   }
 }
