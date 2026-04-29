@@ -229,6 +229,50 @@ await test('Entry available on Turbo gateway', async () => {
   // Pass regardless — the D1 cache test above proves the write worked
 });
 
+// ============ 5b. SESSION PERSISTENCE (Section 7, issue #19) ============
+
+console.log('\n=== 5b. Session Persistence ===');
+
+await test('serializeSession + resumeSession round-trips against deployed API', async () => {
+  // Browser-only path: serializeSession touches IndexedDB. Skipping when
+  // no `indexedDB` global is present (e.g., raw Node without a shim).
+  if (typeof globalThis.indexedDB === 'undefined') {
+    console.log('    skip: no IndexedDB in this runtime');
+    return;
+  }
+
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testEmail, testPassword);
+
+  const blob = await tarn.serializeSession();
+  assert(typeof blob === 'string' && blob.length > 0, 'serializeSession returned non-empty string');
+
+  const resumed = await TarnClient.resumeSession(API_BASE, APP_ID, blob);
+  assert(resumed instanceof TarnClient, 'resumeSession returned a TarnClient');
+  assert(resumed.isAuthenticated, 'resumed client is authenticated');
+  assert(resumed.dataLookupKey === testDlk, 'resumed dataLookupKey matches');
+
+  // Re-auth via the resumed signing key by dropping the JWT and reading.
+  resumed._testInvalidateJwt();
+  const entries = await resumed.getEntries('entry');
+  assert(Array.isArray(entries), 'resumed client can fetch entries (re-auth via signing key)');
+});
+
+await test('resumeSession returns null on tampered blob', async () => {
+  if (typeof globalThis.indexedDB === 'undefined') {
+    console.log('    skip: no IndexedDB in this runtime');
+    return;
+  }
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testEmail, testPassword);
+  const blob = await tarn.serializeSession();
+  const idx = Math.floor(blob.length / 2);
+  const flip = blob[idx] === 'A' ? 'B' : 'A';
+  const tampered = blob.slice(0, idx) + flip + blob.slice(idx + 1);
+  const result = await TarnClient.resumeSession(API_BASE, APP_ID, tampered);
+  assert(result === null, 'tampered blob must resume to null');
+});
+
 // ============ 6. STATUS ============
 
 console.log('\n=== 6. Status ===');

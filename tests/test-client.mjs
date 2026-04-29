@@ -2,9 +2,60 @@
 // Run: node tests/test-client.mjs [apiBaseUrl]
 // Requires: wrangler dev running (cd api && npx wrangler dev --port 8787)
 
+// Minimal in-memory IndexedDB shim for the Section 7 session-persistence path.
+// Node has no IndexedDB; the production runtime is the browser. We polyfill
+// just the surface session-persistence.js touches: open + objectStore +
+// readonly/readwrite get/put/delete on a single store named "keys". This is
+// a test-time shim, not a runtime dep — the production code path is browser.
+if (typeof globalThis.indexedDB === 'undefined') {
+  const stores = new Map(); // dbName -> Map<storeName, Map<id, value>>
+  function makeReq(resultFn) {
+    const req = { onsuccess: null, onerror: null, result: undefined, error: null };
+    queueMicrotask(() => {
+      try { req.result = resultFn(); req.onsuccess?.({ target: req }); }
+      catch (err) { req.error = err; req.onerror?.({ target: req }); }
+    });
+    return req;
+  }
+  globalThis.indexedDB = {
+    open(dbName /*, version*/) {
+      const req = { onupgradeneeded: null, onsuccess: null, onerror: null, result: null };
+      const isFirst = !stores.has(dbName);
+      queueMicrotask(() => {
+        if (!stores.has(dbName)) stores.set(dbName, new Map());
+        const dbStores = stores.get(dbName);
+        const db = {
+          objectStoreNames: { contains: (name) => dbStores.has(name) },
+          createObjectStore(name) { if (!dbStores.has(name)) dbStores.set(name, new Map()); return {}; },
+          transaction(name /*, mode*/) {
+            return {
+              objectStore: () => {
+                const store = dbStores.get(name);
+                return {
+                  get: (id) => makeReq(() => store.get(id)),
+                  put: (value, id) => makeReq(() => { store.set(id, value); return undefined; }),
+                  delete: (id) => makeReq(() => { store.delete(id); return undefined; }),
+                };
+              },
+            };
+          },
+          close() {},
+        };
+        req.result = db;
+        // Fire onupgradeneeded only on first open of this dbName, mirroring
+        // real IndexedDB which fires it only on version bumps.
+        if (isFirst && req.onupgradeneeded) req.onupgradeneeded({ target: req });
+        req.onsuccess?.({ target: req });
+      });
+      return req;
+    },
+  };
+}
+
 import { TarnClient } from '../client/src/tarn.js';
 import { deriveAllKeys, exportPublicKey, wrapDataKey } from '../client/src/crypto.js';
-import { seedTestApp, DEFAULT_APP_ID } from './helpers.mjs';
+import { clearWrappingKey } from '../client/src/session-persistence.js';
+import { seedTestApp, DEFAULT_APP_ID, forceAllowRulesForAccount } from './helpers.mjs';
 
 const API_BASE = process.argv[2] || 'http://localhost:8787';
 
@@ -219,6 +270,195 @@ await test('Delete account: login fails after', async () => {
     assert(err.message.includes('not found') || err.message.includes('404'),
       `Expected 'not found', got: ${err.message}`);
   }
+});
+
+// ============ SESSION PERSISTENCE (Section 7, issue #19) ============
+
+console.log('\n=== Session Persistence ===');
+
+await test('serializeSession + resumeSession: end-to-end without re-prompting password', async () => {
+  // Each test owns the wrapping-key state to avoid cross-test interference.
+  await clearWrappingKey();
+
+  const email = randomEmail();
+  const password = 'session-persist-1';
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  const { dataLookupKey } = await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  // Allow reads locally without an app JWT — same pattern as test-e2e.
+  await forceAllowRulesForAccount(dataLookupKey);
+
+  const blob = await client.serializeSession();
+  assert(typeof blob === 'string' && blob.length > 0, 'serializeSession returns a non-empty string');
+
+  // Resume into a fresh client — no password supplied.
+  const resumed = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob);
+  assert(resumed instanceof TarnClient, 'resumeSession should return a TarnClient');
+  assert(resumed.isAuthenticated, 'resumed client should be authenticated');
+  assert(resumed.dataLookupKey === client.dataLookupKey, 'dataLookupKey should match');
+
+  // Force the JWT to null so the next API call triggers re-auth via the
+  // resumed signing key — this proves the signing keypair round-tripped
+  // correctly through the persisted PKCS#8 export.
+  resumed._testInvalidateJwt();
+  const entries = await resumed.getEntries('entry');
+  assert(Array.isArray(entries), 'resumed client should fetch entries (re-auth via signing key)');
+
+  await resumed.deleteAccount();
+});
+
+await test('resumeSession: tampered blob returns null', async () => {
+  await clearWrappingKey();
+
+  const email = randomEmail();
+  const password = 'session-persist-tamper';
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+
+  const blob = await client.serializeSession();
+  // Flip one base64url char somewhere past the IV region.
+  const idx = Math.floor(blob.length / 2);
+  const flipChar = blob[idx] === 'A' ? 'B' : 'A';
+  const tampered = blob.slice(0, idx) + flipChar + blob.slice(idx + 1);
+
+  const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, tampered);
+  assert(result === null, 'tampered blob must resume to null');
+
+  await client.deleteAccount();
+});
+
+await test('resumeSession: malformed (non-base64url) blob returns null', async () => {
+  await clearWrappingKey();
+  // Force the wrapping key to exist so the failure path is JSON, not key.
+  const email = randomEmail();
+  const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await c.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c.serializeSession();
+
+  // A short random string that decodes to a too-short blob.
+  const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, 'aaaa');
+  assert(result === null, 'short malformed blob must resume to null');
+
+  await c.deleteAccount();
+});
+
+await test('resumeSession: schema-mismatch (v != 1) returns null', async () => {
+  await clearWrappingKey();
+  const email = randomEmail();
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+
+  // Hand-build a blob with v: 2 by encrypting under the same wrapping key.
+  const { encryptSessionBlob, getOrCreateWrappingKey } = await import('../client/src/session-persistence.js');
+  const { bytesToBase64Url } = await import('../client/src/crypto.js');
+  const fake = { v: 2, expiresAt: Math.floor(Date.now() / 1000) + 1000 };
+  const pt = new TextEncoder().encode(JSON.stringify(fake));
+  const key = await getOrCreateWrappingKey();
+  const ct = await encryptSessionBlob(pt, key);
+  const blob = bytesToBase64Url(ct);
+
+  const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob);
+  assert(result === null, 'v != 1 must resume to null');
+
+  await client.deleteAccount();
+});
+
+await test('resumeSession: missing required field returns null', async () => {
+  await clearWrappingKey();
+  const email = randomEmail();
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+
+  const { encryptSessionBlob, getOrCreateWrappingKey } = await import('../client/src/session-persistence.js');
+  const { bytesToBase64Url } = await import('../client/src/crypto.js');
+  const fake = { v: 1, createdAt: 1, expiresAt: Math.floor(Date.now() / 1000) + 1000, apiBase: API_BASE.replace(/\/$/, ''), appId: DEFAULT_APP_ID };
+  const pt = new TextEncoder().encode(JSON.stringify(fake));
+  const key = await getOrCreateWrappingKey();
+  const ct = await encryptSessionBlob(pt, key);
+  const blob = bytesToBase64Url(ct);
+
+  const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob);
+  assert(result === null, 'missing required fields must resume to null');
+
+  await client.deleteAccount();
+});
+
+await test('resumeSession: wrong appId / apiBase returns null', async () => {
+  await clearWrappingKey();
+  const email = randomEmail();
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const blob = await client.serializeSession();
+
+  const wrongApp = await TarnClient.resumeSession(API_BASE, 'some-other-app', blob);
+  assert(wrongApp === null, 'wrong appId must resume to null');
+  const wrongApi = await TarnClient.resumeSession('http://nope.invalid', DEFAULT_APP_ID, blob);
+  assert(wrongApi === null, 'wrong apiBase must resume to null');
+
+  await client.deleteAccount();
+});
+
+await test('resumeSession: expired blob (via _nowSeconds) returns null', async () => {
+  await clearWrappingKey();
+  const email = randomEmail();
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const blob = await client.serializeSession();
+
+  // Pretend it's 8 days from now — past the 7-day cap baked into expiresAt.
+  const future = Math.floor(Date.now() / 1000) + 8 * 24 * 60 * 60;
+  const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob, { _nowSeconds: future });
+  assert(result === null, 'expired blob must resume to null');
+
+  // Sanity: fresh _nowSeconds should still resume.
+  const freshNow = Math.floor(Date.now() / 1000);
+  const ok = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob, { _nowSeconds: freshNow });
+  assert(ok instanceof TarnClient, 'fresh _nowSeconds should still resume');
+
+  await client.deleteAccount();
+});
+
+await test('resumeSession: wrong wrapping key (clearSession between) returns null', async () => {
+  await clearWrappingKey();
+  const email = randomEmail();
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const blob = await client.serializeSession();
+
+  // Resume works first.
+  const ok = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob);
+  assert(ok instanceof TarnClient, 'fresh resume should succeed');
+
+  // Now wipe the wrapping key — getOrCreateWrappingKey will mint a new one,
+  // and the old blob's auth-tag check will fail under it.
+  await client.clearSession();
+  const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob);
+  assert(result === null, 'after clearSession the prior blob must resume to null');
+
+  await client.deleteAccount();
+});
+
+await test('changeCredentials: prior blob resumes as null; fresh blob after change resumes successfully', async () => {
+  await clearWrappingKey();
+  const email = randomEmail();
+  const password = 'pre-change';
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  const { recoveryPhrase } = await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+
+  const oldBlob = await client.serializeSession();
+
+  await client.changeCredentials(email, 'post-change', { phrase: recoveryPhrase });
+
+  // Old blob is now unreadable on this origin (clearSession side-effect).
+  const old = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, oldBlob);
+  assert(old === null, 'old blob should resume to null after changeCredentials');
+
+  // A fresh blob emitted post-change should round-trip cleanly.
+  const newBlob = await client.serializeSession();
+  const resumed = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, newBlob);
+  assert(resumed instanceof TarnClient, 'fresh post-change blob should resume');
+  assert(resumed.isAuthenticated, 'resumed client should be authenticated');
+
+  await resumed.deleteAccount();
 });
 
 // ============ SUMMARY ============
