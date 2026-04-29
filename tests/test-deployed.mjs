@@ -17,7 +17,10 @@
  */
 
 import { TarnClient } from '../client/src/tarn.js';
-import { deriveAllKeys, exportPublicKey, wrapDataKey, signChallenge } from '../client/src/crypto.js';
+import {
+  deriveAllKeys, exportPublicKey, wrapDataKey, signChallenge,
+  encodeSharePub, deriveShareLookupKey,
+} from '../client/src/crypto.js';
 
 const API_BASE = process.argv[2];
 const APP_ID = process.argv[3];
@@ -259,9 +262,41 @@ await test('Status endpoint returns operational data', async () => {
   console.log(`    Users: ${status.users.total}, Entries: ${status.entries.total}`);
 });
 
-// ============ 7. CLEANUP ============
+// ============ 7. SHARING KEYPAIR (issue #13) ============
 
-console.log('\n=== 7. Cleanup ===');
+console.log('\n=== 7. Sharing keypair lookup ===');
+
+await test('getRecipientShareKey returns the published share_pub', async () => {
+  const expected = encodeSharePub(
+    (await deriveAllKeys(testEmail, testPassword, APP_ID)).sharingKeyPair.publicKey,
+  );
+  const stranger = new TarnClient(API_BASE, APP_ID);
+  const { sharePubBase64Url, discoverable, sharePub } = await stranger.getRecipientShareKey(testEmail);
+  assert(discoverable === true, `expected discoverable=true, got ${discoverable}`);
+  assert(sharePubBase64Url === expected, `share_pub mismatch:\n  got:  ${sharePubBase64Url}\n  want: ${expected}`);
+  assert(sharePub instanceof Uint8Array && sharePub.length === 32, 'sharePub should decode to 32 raw bytes');
+});
+
+await test('getRecipientShareKey for unknown email returns null + discoverable=false', async () => {
+  const stranger = new TarnClient(API_BASE, APP_ID);
+  const { sharePub, discoverable } = await stranger.getRecipientShareKey(`nobody-${Date.now()}@nowhere.test`);
+  assert(sharePub === null, 'unknown email should return null sharePub');
+  assert(discoverable === false, 'unknown email should be opaque');
+});
+
+await test('share_lookup_key is per-app isolated (cross-app probe misses)', async () => {
+  // Use a different app_id (the smoke test only seeds bookish on the deployed
+  // API, so this lookup will miss for two reasons — different app + different
+  // share_lookup_key — both consistent with the design).
+  const wrongApp = new TarnClient(API_BASE, 'definitely-not-a-real-app');
+  const { sharePub, discoverable } = await wrongApp.getRecipientShareKey(testEmail);
+  assert(sharePub === null, 'cross-app lookup should miss');
+  assert(discoverable === false, 'cross-app lookup should be opaque');
+});
+
+// ============ 8. CLEANUP ============
+
+console.log('\n=== 8. Cleanup ===');
 
 await test('Delete test account', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);

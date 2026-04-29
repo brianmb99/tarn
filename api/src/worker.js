@@ -4,6 +4,7 @@
 import { handleHealth } from './routes/info.js';
 import { handleEntries, handleEntryById } from './routes/entries.js';
 import { handleLookup } from './routes/lookup.js';
+import { handleShareLookup } from './routes/share.js';
 import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
 import { handleRecoveryEmail } from './routes/recovery.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
@@ -130,6 +131,11 @@ export default {
       // Lookup (credentials, account metadata)
       if (path === '/api/v1/lookup' && method === 'GET') {
         return await handleLookup(url, request, env, ctx, cors);
+      }
+
+      // Share keypair lookup (issue #13) — returns share_pub by email-only key
+      if (path === '/api/v1/share/lookup' && method === 'GET') {
+        return await handleShareLookup(url, request, env, cors);
       }
 
       // Status (authenticated — app or user)

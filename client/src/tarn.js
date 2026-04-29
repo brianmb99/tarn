@@ -15,7 +15,10 @@ import {
   deriveRecoveryKey,
   deriveRecoveryLookupKey,
   deriveRecoverySigningKeyPair,
+  deriveShareLookupKey,
   exportPublicKey,
+  encodeSharePub,
+  decodeSharePub,
   wrapDataKeyEnvelope,
   wrapDataKeyChainEnvelope,
   wrapDataKeyChainEnvelopeV4,
@@ -135,26 +138,34 @@ export class TarnClient {
     const emailRecoveryKit = opts.emailRecoveryKit !== false;
     const recipientEmail = opts.recipientEmail || email;
     const appName = opts.appName;
+    // Sharing keypair publication (issue #13). Defaults to discoverable so a
+    // new social-app user can be friended by email out of the box. Apps that
+    // want a "private by default" stance can pass `shareDiscoverable: false`.
+    const shareDiscoverable = opts.shareDiscoverable !== false;
 
     const kdfVersion = KDF_DEFAULT; // New accounts always use Argon2id (v2).
 
-    // Derive password-side keys + recovery-phrase-side keys in parallel —
-    // both Argon2id calls dominate registration latency, so overlap them.
+    // Derive password-side keys + recovery-phrase-side keys + share-lookup
+    // key in parallel — Argon2id calls dominate registration latency, so
+    // overlap them. share_lookup_key is HKDF over SHA-256(email), independent
+    // of the password.
     const phrase = generateRecoveryPhrase();
     const phraseEntropy = recoveryPhraseToEntropy(phrase);
     const recoverySalt = generateRecoverySalt();
 
-    const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair] = await Promise.all([
+    const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair, shareLookupKey] = await Promise.all([
       deriveAllKeys(email, password, this.#appId, kdfVersion),
       deriveRecoveryKey(phrase, recoverySalt),
       deriveRecoveryLookupKey(phraseEntropy, this.#appId),
       deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
+      deriveShareLookupKey(email, this.#appId),
     ]);
 
     const [publicKeyBase64, recoveryPublicKeyBase64] = await Promise.all([
       exportPublicKey(keys.signingKeyPair.publicKey),
       exportPublicKey(recoverySigningKeyPair.publicKey),
     ]);
+    const sharePub = encodeSharePub(keys.sharingKeyPair.publicKey);
 
     // Random DEK at generation 1. Wrap under both password + recovery factors.
     const dek = await generateRandomDataKey();
@@ -177,6 +188,9 @@ export class TarnClient {
         app: this.#appId,
         recovery_lookup_key: recoveryLookupKey,
         recovery_public_key: recoveryPublicKeyBase64,
+        share_pub: sharePub,
+        share_discoverable: shareDiscoverable,
+        share_lookup_key: shareLookupKey,
       },
     });
 
@@ -392,10 +406,17 @@ export class TarnClient {
     // We do NOT yet have the password-side identity — those are derived next.
 
     // Steps 6-7: derive new password keys, re-wrap DEK chain under both
-    // factors, publish via PUT /auth.
+    // factors, publish via PUT /auth. The sharing keypair (issue #13) and
+    // share_lookup_key are also rederived under the new credentials so the
+    // recovered account stays discoverable post-recovery (or non-discoverable,
+    // if the caller passed `shareDiscoverable: false`).
     const kdfVersion = KDF_DEFAULT;
-    const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion);
+    const [newKeys, newShareLookupKey] = await Promise.all([
+      deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion),
+      deriveShareLookupKey(newEmail, this.#appId),
+    ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
+    const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
 
     const chain = [];
     for (const [gen, pair] of unwrapped.dekByGen) {
@@ -426,6 +447,8 @@ export class TarnClient {
         new_wrapped_data_key: newWrappedDataKey,
         new_recovery_lookup_key: recoveryLookupKey,
         new_recovery_public_key: recoveryPublicKey,
+        new_share_pub: newSharePub,
+        new_share_lookup_key: newShareLookupKey,
       },
     });
     if (putRes.status !== 200) {
@@ -569,8 +592,16 @@ export class TarnClient {
     // Preserve the original KDF — silent upgrade from PBKDF2 to Argon2id is
     // out of scope for this issue (would be a separate migration concern).
     const kdfVersion = this.#kdfVersion ?? KDF_DEFAULT;
-    const newKeys = await deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion);
+    const [newKeys, newShareLookupKey] = await Promise.all([
+      deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion),
+      deriveShareLookupKey(newEmail, this.#appId),
+    ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
+    // Sharing keypair (issue #13) rotates with master_key (depends on both
+    // email and password). The discoverability flag is preserved by the API
+    // when omitted; let `opts.shareDiscoverable` override it for callers that
+    // also want to flip it as part of the credential change.
+    const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
 
     let newWrappedDataKey;
     let newDekByGen;
@@ -700,6 +731,11 @@ export class TarnClient {
         new_credential_lookup_key: newKeys.credentialLookupKey,
         new_public_key: newPublicKey,
         new_wrapped_data_key: newWrappedDataKey,
+        new_share_pub: newSharePub,
+        new_share_lookup_key: newShareLookupKey,
+        ...(opts.shareDiscoverable != null
+          ? { new_share_discoverable: opts.shareDiscoverable !== false }
+          : {}),
       },
     });
 
@@ -1022,6 +1058,58 @@ export class TarnClient {
     }
 
     return { txid: json.id };
+  }
+
+  // ============ SHARING (issue #13) ============
+
+  /**
+   * Look up a recipient's published X25519 sharing public key by email + this
+   * client's app_id. Used by the friend-handshake bootstrap (Section 5 work)
+   * to encrypt-to-pubkey before any pairwise shared secret has been
+   * established.
+   *
+   * Returns null in three cases — the caller cannot distinguish them, by
+   * design (sharing §11):
+   *   - The recipient does not have an account in this app.
+   *   - The recipient's account predates issue #13 and has not republished.
+   *   - The recipient has set `share_discoverable=false`.
+   *
+   * The lookup is unauthenticated and IP rate-limited at the API. Per-email
+   * leakage ("Alice queried Bob's share key") is an accepted residual leak
+   * (sharing §11.5) — once the handshake completes, all subsequent traffic is
+   * unlinkable.
+   *
+   * @param {string} email
+   * @returns {Promise<{
+   *   sharePub: Uint8Array | null,
+   *   sharePubBase64Url: string | null,
+   *   discoverable: boolean,
+   * }>}
+   */
+  async getRecipientShareKey(email) {
+    if (!email) throw new Error('email is required');
+    const shareLookupKey = await deriveShareLookupKey(email, this.#appId);
+    const url = `/api/v1/share/lookup?app=${encodeURIComponent(this.#appId)}&key=${shareLookupKey}`;
+    const res = await this.#fetch(url);
+    if (res.status !== 200) {
+      throw new Error(`getRecipientShareKey(): lookup failed: ${res.json?.error || res.status}`);
+    }
+    const sharePubBase64Url = res.json?.share_pub ?? null;
+    let sharePub = null;
+    if (sharePubBase64Url) {
+      // Defensive: the server validates the encoding, but a stale/buggy row
+      // shouldn't crash the client. Fall back to null on decode failure.
+      try {
+        sharePub = decodeSharePub(sharePubBase64Url);
+      } catch {
+        sharePub = null;
+      }
+    }
+    return {
+      sharePub,
+      sharePubBase64Url,
+      discoverable: !!res.json?.share_discoverable,
+    };
   }
 
   // ============ ACCESSORS ============

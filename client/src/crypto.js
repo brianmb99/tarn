@@ -10,6 +10,7 @@
 // Works in browsers and Node.js 15+ (WebAssembly required for Argon2id).
 
 import { argon2id as argon2idHash } from 'hash-wasm';
+import { x25519 } from '@noble/curves/ed25519';
 
 // ============ CONSTANTS ============
 
@@ -64,6 +65,11 @@ const PKCS8_P256_PREFIX = new Uint8Array([
 // recovery KEK. 128 bits is sufficient — the phrase itself is 256 bits of
 // entropy, the salt's role is only to prevent cross-user precomputation.
 const RECOVERY_SALT_LEN = 16;
+
+// Sharing keypair (issue #13). X25519 keys are 32 bytes for both private and
+// public — public key is base64url-encoded into the credential blob's
+// `share_pub` field for friend handshake bootstrap (Section 5 work).
+const X25519_KEY_LEN = 32;
 
 // Per-content CEK pattern (issue #11):
 // New content blobs are prefixed with a 5-byte magic so the format is
@@ -389,6 +395,104 @@ export async function deriveSigningKeyPair(masterKey, appId) {
 export async function exportPublicKey(publicKey) {
   const der = await crypto.subtle.exportKey('spki', publicKey);
   return bytesToBase64(new Uint8Array(der));
+}
+
+// ============ SHARING KEYPAIR (issue #13) ============
+
+/**
+ * Derive an email-only `share_lookup_key` for the friend-handshake bootstrap
+ * (issue #13). This is the index Tarn uses to find a recipient's `share_pub`
+ * when the requester knows only the recipient's email + app — i.e., before any
+ * handshake has happened, when no shared secret exists yet.
+ *
+ * Derivation does NOT use master_key — it uses the SHA-256 of the normalized
+ * email (already the salt for `master_key`) as the HKDF PRK. Anyone who knows
+ * the recipient's email can compute this value and check whether the recipient
+ * is registered. That's the inherent semantics of "look up Bob by email" and
+ * is documented as an accepted residual leak (sharing §11.5).
+ *
+ * Per-app isolated via the same HKDF info pattern as every other sub-key, so
+ * the same email registered to Bookish and Cellar produces distinct lookup
+ * keys.
+ *
+ * @param {string} email
+ * @param {string} appId
+ * @returns {Promise<string>} 64-char lowercase hex
+ */
+export async function deriveShareLookupKey(email, appId) {
+  if (!email) throw new Error('email is required');
+  if (!appId) throw new Error('appId is required');
+  const normalized = normalizeEmail(email);
+  const encoder = new TextEncoder();
+  const emailHash = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', encoder.encode(normalized)),
+  );
+  const out = await hkdfExpand(emailHash, 'share-lookup', appId);
+  return bytesToHex(out);
+}
+
+
+/**
+ * Derive the per-app X25519 sharing keypair from `master_key` (sharing design
+ * §4.1).
+ *
+ * The seed is HKDF-Expand(master_key, "tarn"||"share"||app_id||"1"||0x01) —
+ * same single-block info pattern as the existing `lookup`/`encrypt`/`sign`
+ * sub-keys. Per-app isolation is preserved: the same email+password registered
+ * to Bookish vs. Cellar produces distinct sharing keypairs.
+ *
+ * X25519 private keys are arbitrary 32-byte values; the standard "clamping"
+ * (clearing the low 3 bits and the high bit, setting bit 254) is performed by
+ * the underlying x25519 implementation when scalar-multiplying. The raw seed is
+ * stored as-is so re-derivation on a fresh login produces the same keypair.
+ *
+ * @param {Uint8Array} masterKey
+ * @param {string} appId
+ * @returns {Promise<{privateKey: Uint8Array, publicKey: Uint8Array}>}
+ *   - `privateKey` — 32-byte X25519 scalar (the HKDF output, pre-clamping)
+ *   - `publicKey` — 32-byte X25519 group element (clamped Curve25519 base * priv)
+ */
+export async function deriveSharingKeyPair(masterKey, appId) {
+  if (!appId) throw new Error('appId is required');
+  const seed = await hkdfExpand(masterKey, 'share', appId);
+  if (seed.length !== X25519_KEY_LEN) {
+    throw new Error(`sharing seed length ${seed.length} != ${X25519_KEY_LEN}`);
+  }
+  const publicKey = x25519.getPublicKey(seed);
+  return { privateKey: seed, publicKey };
+}
+
+/**
+ * Encode an X25519 public key (32 raw bytes) for transport in a credential
+ * blob's `share_pub` field. Base64url, no padding (sharing design notation
+ * `B(...)`).
+ *
+ * @param {Uint8Array} publicKey
+ * @returns {string}
+ */
+export function encodeSharePub(publicKey) {
+  if (!(publicKey instanceof Uint8Array) || publicKey.length !== X25519_KEY_LEN) {
+    throw new Error(`share_pub must be a Uint8Array of length ${X25519_KEY_LEN}`);
+  }
+  return bytesToBase64Url(publicKey);
+}
+
+/**
+ * Decode a base64url `share_pub` string back to 32 raw bytes. Throws if the
+ * input is the wrong length, so callers don't have to length-check after.
+ *
+ * @param {string} encoded
+ * @returns {Uint8Array}
+ */
+export function decodeSharePub(encoded) {
+  if (typeof encoded !== 'string' || encoded.length === 0) {
+    throw new Error('share_pub must be a non-empty string');
+  }
+  const bytes = base64UrlToBytes(encoded);
+  if (bytes.length !== X25519_KEY_LEN) {
+    throw new Error(`share_pub must decode to ${X25519_KEY_LEN} bytes, got ${bytes.length}`);
+  }
+  return bytes;
 }
 
 // ============ AES-256-GCM ENCRYPTION (data blobs) ============
@@ -1107,21 +1211,35 @@ export async function signChallenge(privateKey, nonceHex) {
 
 /**
  * Derive all keys from email + password + app in one call.
+ *
+ * Also derives the sharing keypair (issue #13) so callers that need to publish
+ * a `share_pub` (register, changeCredentials) get it without an extra HKDF
+ * call. The keypair is per-app — `share_pub` for the same email+password
+ * differs across `app_id` values, just like the existing sub-keys.
+ *
  * @param {string} email
  * @param {string} password
  * @param {string} appId - Registered app identifier
  * @param {number} [kdfVersion=KDF_DEFAULT] — KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
- * @returns {Promise<{masterKey, credentialLookupKey, credentialEncryptionKey: {gcmKey, kwKey, rawBytes}, signingKeyPair, kdfVersion}>}
+ * @returns {Promise<{
+ *   masterKey: Uint8Array,
+ *   credentialLookupKey: string,
+ *   credentialEncryptionKey: {gcmKey, kwKey, rawBytes},
+ *   signingKeyPair: {privateKey: CryptoKey, publicKey: CryptoKey},
+ *   sharingKeyPair: {privateKey: Uint8Array, publicKey: Uint8Array},
+ *   kdfVersion: number,
+ * }>}
  */
 export async function deriveAllKeys(email, password, appId, kdfVersion = KDF_DEFAULT) {
   if (!appId) throw new Error('appId is required');
   const masterKey = await deriveMasterKey(email, password, kdfVersion);
-  const [credentialLookupKey, credentialEncryptionKey, signingKeyPair] = await Promise.all([
+  const [credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair] = await Promise.all([
     deriveCredentialLookupKey(masterKey, appId),
     deriveCredentialEncryptionKey(masterKey, appId),
     deriveSigningKeyPair(masterKey, appId),
+    deriveSharingKeyPair(masterKey, appId),
   ]);
-  return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair, kdfVersion };
+  return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair, kdfVersion };
 }
 
 // ============ ENCODING HELPERS ============
@@ -1158,4 +1276,17 @@ export function base64ToBytes(base64) {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
+}
+
+// Base64url (RFC 4648 §5) — `+` → `-`, `/` → `_`, no padding. Used by the
+// sharing design's `B(x)` notation (sharing §2) for `share_pub` and other
+// share-log values where URL/tag safety matters.
+export function bytesToBase64Url(bytes) {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function base64UrlToBytes(b64url) {
+  const padded = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const padLen = (4 - (padded.length % 4)) % 4;
+  return base64ToBytes(padded + '='.repeat(padLen));
 }

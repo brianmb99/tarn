@@ -18,13 +18,22 @@ function generateDataLookupKey() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app, recoveryLookupKey, recoveryPublicKey) {
+function buildCredentialBlob(
+  dataLookupKey, wrappedDataKey, publicKey, app,
+  recoveryLookupKey, recoveryPublicKey,
+  sharePub, shareDiscoverable, shareLookupKey,
+) {
   // Optional recovery fields (issue #12) are written when present so that a
   // pure-Arweave rebuild can repopulate the new D1 columns. Pre-v4 (recovery-
   // less) blobs omit them; the rebuild path treats absent fields as NULL.
+  // Sharing fields (issue #13) follow the same opt-in pattern: pre-#13 blobs
+  // omit them and the rebuild path treats absent share_pub as null.
   const blob = { data_lookup_key: dataLookupKey, wrapped_data_key: wrappedDataKey, public_key: publicKey, app };
   if (recoveryLookupKey) blob.recovery_lookup_key = recoveryLookupKey;
   if (recoveryPublicKey) blob.recovery_public_key = recoveryPublicKey;
+  if (sharePub) blob.share_pub = sharePub;
+  if (sharePub) blob.share_discoverable = !!shareDiscoverable;
+  if (shareLookupKey) blob.share_lookup_key = shareLookupKey;
   return JSON.stringify(blob);
 }
 
@@ -41,8 +50,16 @@ function buildCredentialTags(credentialLookupKey) {
  * Persist a credential mapping blob to Arweave (non-blocking).
  * Returns immediately — upload runs in ctx.waitUntil.
  */
-function persistCredentialBlob(ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey, app, recoveryLookupKey, recoveryPublicKey) {
-  const blobBody = buildCredentialBlob(dataLookupKey, wrappedDataKey, publicKey, app, recoveryLookupKey, recoveryPublicKey);
+function persistCredentialBlob(
+  ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey, app,
+  recoveryLookupKey, recoveryPublicKey,
+  sharePub, shareDiscoverable, shareLookupKey,
+) {
+  const blobBody = buildCredentialBlob(
+    dataLookupKey, wrappedDataKey, publicKey, app,
+    recoveryLookupKey, recoveryPublicKey,
+    sharePub, shareDiscoverable, shareLookupKey,
+  );
   const tags = buildCredentialTags(credentialLookupKey);
 
   ctx.waitUntil((async () => {
@@ -105,7 +122,11 @@ export async function handleRegister(request, env, ctx, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key } = body;
+  const {
+    credential_lookup_key, public_key, wrapped_data_key, app,
+    recovery_lookup_key, recovery_public_key,
+    share_pub, share_discoverable, share_lookup_key,
+  } = body;
 
   // Validate app — must be a registered app
   if (!app || typeof app !== 'string') {
@@ -155,6 +176,31 @@ export async function handleRegister(request, env, ctx, cors) {
     }
   }
 
+  // Optional sharing fields (issue #13). All three are required together —
+  // share_pub (43-char base64url X25519 pubkey), share_lookup_key (64-char
+  // hex, derivable from email alone), share_discoverable (bool, default true).
+  // Pre-#13 clients omit them entirely; the rebuild path treats absent fields
+  // as null in D1 (no share keypair published).
+  const shareFieldsCount =
+    (share_pub != null ? 1 : 0) +
+    (share_lookup_key != null ? 1 : 0);
+  if (shareFieldsCount !== 0 && shareFieldsCount !== 2) {
+    return errorResponse('share_pub and share_lookup_key must be provided together', 400, cors);
+  }
+  let shareDiscoverableInt = null;
+  if (share_pub != null) {
+    if (typeof share_pub !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(share_pub)) {
+      return errorResponse('Invalid share_pub: must be 43-char base64url (32 raw bytes)', 400, cors);
+    }
+    if (!isValidHex64(share_lookup_key)) {
+      return errorResponse('Invalid share_lookup_key: must be 64-char lowercase hex', 400, cors);
+    }
+    if (share_discoverable != null && typeof share_discoverable !== 'boolean') {
+      return errorResponse('share_discoverable must be a boolean', 400, cors);
+    }
+    shareDiscoverableInt = share_discoverable === false ? 0 : 1;
+  }
+
   // Idempotency: if an account already exists for this credential_lookup_key,
   // check whether this is a retry of a previous successful register (same payload)
   // or a real conflict (different credentials claiming the same lookup key).
@@ -164,7 +210,7 @@ export async function handleRegister(request, env, ctx, cors) {
   // etc). Without idempotency, the user is permanently stuck — the account exists
   // but every retry returns 409. See issue #6.
   const existing = await env.DB.prepare(
-    'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key FROM accounts WHERE credential_lookup_key = ?1'
+    'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key FROM accounts WHERE credential_lookup_key = ?1'
   ).bind(credential_lookup_key).first();
   if (existing) {
     const sameCreds =
@@ -172,7 +218,10 @@ export async function handleRegister(request, env, ctx, cors) {
       existing.wrapped_data_key === wrapped_data_key &&
       existing.app === app &&
       (existing.recovery_lookup_key ?? null) === (recovery_lookup_key ?? null) &&
-      (existing.recovery_public_key ?? null) === (recovery_public_key ?? null);
+      (existing.recovery_public_key ?? null) === (recovery_public_key ?? null) &&
+      (existing.share_pub ?? null) === (share_pub ?? null) &&
+      (existing.share_discoverable ?? null) === (shareDiscoverableInt ?? null) &&
+      (existing.share_lookup_key ?? null) === (share_lookup_key ?? null);
     if (sameCreds) {
       // Same payload — treat as idempotent success. The client can proceed as if
       // the original register succeeded (which it did, at the D1 layer).
@@ -193,6 +242,18 @@ export async function handleRegister(request, env, ctx, cors) {
     ).bind(recovery_lookup_key).first();
     if (recoveryConflict) {
       return errorResponse('recovery_lookup_key already in use', 409, cors);
+    }
+  }
+
+  // Same up-front check for share_lookup_key. The collision means a different
+  // account in the same app has already registered with this email — the
+  // client should surface that as "email already in use" to the user.
+  if (share_lookup_key) {
+    const shareConflict = await env.DB.prepare(
+      'SELECT 1 FROM accounts WHERE share_lookup_key = ?1'
+    ).bind(share_lookup_key).first();
+    if (shareConflict) {
+      return errorResponse('share_lookup_key already in use', 409, cors);
     }
   }
 
@@ -218,25 +279,34 @@ export async function handleRegister(request, env, ctx, cors) {
   // so concurrent retries also converge to the same success response.
   try {
     await env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)'
-    ).bind(credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now(), recovery_lookup_key ?? null, recovery_public_key ?? null).run();
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)'
+    ).bind(
+      credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now(),
+      recovery_lookup_key ?? null, recovery_public_key ?? null,
+      share_pub ?? null,
+      shareDiscoverableInt ?? 1,
+      share_lookup_key ?? null,
+    ).run();
   } catch (err) {
-    // UNIQUE constraint on credential_lookup_key OR recovery_lookup_key —
-    // concurrent retry won the race (or recovery key collision).
+    // UNIQUE constraint on credential_lookup_key, recovery_lookup_key, or
+    // share_lookup_key — concurrent retry won the race (or unique collision).
     if (/UNIQUE/i.test(err.message || '')) {
       const raced = await env.DB.prepare(
-        'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key FROM accounts WHERE credential_lookup_key = ?1'
+        'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key FROM accounts WHERE credential_lookup_key = ?1'
       ).bind(credential_lookup_key).first();
       if (raced &&
           raced.public_key === public_key &&
           raced.wrapped_data_key === wrapped_data_key &&
           raced.app === app &&
           (raced.recovery_lookup_key ?? null) === (recovery_lookup_key ?? null) &&
-          (raced.recovery_public_key ?? null) === (recovery_public_key ?? null)) {
+          (raced.recovery_public_key ?? null) === (recovery_public_key ?? null) &&
+          (raced.share_pub ?? null) === (share_pub ?? null) &&
+          (raced.share_discoverable ?? null) === (shareDiscoverableInt ?? null) &&
+          (raced.share_lookup_key ?? null) === (share_lookup_key ?? null)) {
         return jsonResponse({ data_lookup_key: raced.data_lookup_key }, 201, cors);
       }
-      // Distinguish the two unique-constraint paths so the client gets a
-      // useful error message.
+      // Distinguish the unique-constraint paths so the client gets a useful
+      // error message.
       if (recovery_lookup_key) {
         const recoveryRow = await env.DB.prepare(
           'SELECT 1 FROM accounts WHERE recovery_lookup_key = ?1'
@@ -245,13 +315,26 @@ export async function handleRegister(request, env, ctx, cors) {
           return errorResponse('recovery_lookup_key already in use', 409, cors);
         }
       }
+      if (share_lookup_key) {
+        const shareRow = await env.DB.prepare(
+          'SELECT 1 FROM accounts WHERE share_lookup_key = ?1'
+        ).bind(share_lookup_key).first();
+        if (shareRow) {
+          return errorResponse('share_lookup_key already in use', 409, cors);
+        }
+      }
       return errorResponse('credential_lookup_key already in use with different credentials', 409, cors);
     }
     throw err;
   }
 
   // Persist credential mapping to Arweave (non-blocking)
-  persistCredentialBlob(ctx, env, credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app, recovery_lookup_key, recovery_public_key);
+  persistCredentialBlob(
+    ctx, env,
+    credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app,
+    recovery_lookup_key, recovery_public_key,
+    share_pub ?? null, shareDiscoverableInt === 0 ? false : true, share_lookup_key ?? null,
+  );
 
   return jsonResponse({ data_lookup_key }, 201, cors);
 }
@@ -435,6 +518,9 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     new_wrapped_data_key,
     new_recovery_lookup_key,
     new_recovery_public_key,
+    new_share_pub,
+    new_share_discoverable,
+    new_share_lookup_key,
   } = body;
 
   // Validate new credential_lookup_key
@@ -474,6 +560,31 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     }
   }
 
+  // Optional new sharing fields (issue #13). share_pub + share_lookup_key
+  // travel together; share_discoverable is independent (can flip without
+  // republishing the keypair). Email change rotates share_lookup_key (it's
+  // email-derived); password change rotates share_pub (it's master_key-
+  // derived). The client typically supplies all three on every credential
+  // change, but the API treats omission as "preserve existing" so a future
+  // discoverability-only update can hit the same endpoint with just the flag.
+  const newShareFieldsCount =
+    (new_share_pub != null ? 1 : 0) +
+    (new_share_lookup_key != null ? 1 : 0);
+  if (newShareFieldsCount === 1) {
+    return errorResponse('new_share_pub and new_share_lookup_key must be provided together', 400, cors);
+  }
+  if (new_share_pub != null) {
+    if (typeof new_share_pub !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(new_share_pub)) {
+      return errorResponse('Invalid new_share_pub: must be 43-char base64url (32 raw bytes)', 400, cors);
+    }
+    if (!isValidHex64(new_share_lookup_key)) {
+      return errorResponse('Invalid new_share_lookup_key: must be 64-char lowercase hex', 400, cors);
+    }
+  }
+  if (new_share_discoverable != null && typeof new_share_discoverable !== 'boolean') {
+    return errorResponse('new_share_discoverable must be a boolean', 400, cors);
+  }
+
   // Check new_credential_lookup_key not already in use
   const conflict = await env.DB.prepare(
     'SELECT 1 FROM accounts WHERE credential_lookup_key = ?1'
@@ -482,10 +593,10 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('new_credential_lookup_key already in use', 409, cors);
   }
 
-  // Read current account (need rules_json, app, and existing recovery fields
-  // to preserve them when the caller doesn't supply replacements).
+  // Read current account (need rules_json, app, and existing recovery + share
+  // fields to preserve them when the caller doesn't supply replacements).
   const current = await env.DB.prepare(
-    'SELECT credential_lookup_key, rules_json, app, recovery_lookup_key, recovery_public_key FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT credential_lookup_key, rules_json, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key FROM accounts WHERE data_lookup_key = ?1'
   ).bind(auth.data_lookup_key).first();
   if (!current) {
     return errorResponse('Account not found', 404, cors);
@@ -494,6 +605,16 @@ export async function handleCredentialChange(request, env, ctx, cors) {
   // Recovery factor: caller-supplied values win; otherwise preserve existing.
   const finalRecoveryLookupKey = new_recovery_lookup_key ?? current.recovery_lookup_key ?? null;
   const finalRecoveryPublicKey = new_recovery_public_key ?? current.recovery_public_key ?? null;
+
+  // Sharing fields: same preserve-on-omit semantics. share_discoverable is the
+  // only one that can be flipped independently (UX-side toggle without rotating
+  // the keypair).
+  const finalSharePub = new_share_pub ?? current.share_pub ?? null;
+  const finalShareLookupKey = new_share_lookup_key ?? current.share_lookup_key ?? null;
+  const finalShareDiscoverable =
+    new_share_discoverable != null
+      ? (new_share_discoverable ? 1 : 0)
+      : (current.share_discoverable ?? 1);
 
   // If the caller supplied a new recovery_lookup_key that differs from the
   // existing one, check uniqueness.
@@ -509,6 +630,19 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     }
   }
 
+  // Same uniqueness check for share_lookup_key on email change.
+  if (
+    new_share_lookup_key != null &&
+    new_share_lookup_key !== current.share_lookup_key
+  ) {
+    const shareConflict = await env.DB.prepare(
+      'SELECT 1 FROM accounts WHERE share_lookup_key = ?1'
+    ).bind(new_share_lookup_key).first();
+    if (shareConflict) {
+      return errorResponse('new_share_lookup_key already in use', 409, cors);
+    }
+  }
+
   // PK change: delete old row + insert new (SQLite doesn't support UPDATE of PK).
   // NOTE: There is a small race window here. A concurrent handleChallenge using the old
   // credential_lookup_key could receive a nonce, but by the time handleVerify runs, the
@@ -518,7 +652,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM accounts WHERE credential_lookup_key = ?1').bind(current.credential_lookup_key),
     env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)'
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)'
     ).bind(
       new_credential_lookup_key,
       new_public_key,
@@ -529,6 +663,9 @@ export async function handleCredentialChange(request, env, ctx, cors) {
       Date.now(),
       finalRecoveryLookupKey,
       finalRecoveryPublicKey,
+      finalSharePub,
+      finalShareDiscoverable,
+      finalShareLookupKey,
     ),
   ]);
 
@@ -537,6 +674,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     ctx, env,
     new_credential_lookup_key, auth.data_lookup_key, new_wrapped_data_key, new_public_key, current.app,
     finalRecoveryLookupKey, finalRecoveryPublicKey,
+    finalSharePub, finalShareDiscoverable === 1, finalShareLookupKey,
   );
 
   return jsonResponse({ ok: true }, 200, cors);

@@ -9,6 +9,7 @@
     "./recovery": "./src/recovery.js"
   },
   "dependencies": {
+    "@noble/curves": "^1.9.7",
     "@scure/bip39": "^2.0.1",
     "hash-wasm": "^4.12.0"
   }
