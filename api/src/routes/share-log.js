@@ -42,7 +42,7 @@ const VALID_BLOB_TYPES = new Set(['share-log-v1']);
 // ============ POST /api/v1/share/log/publish ============
 
 export async function handleShareLogPublish(request, env, ctx, cors) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') {
     return errorResponse('Only user accounts can publish to a share log', 403, cors);

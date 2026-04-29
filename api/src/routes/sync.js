@@ -55,8 +55,8 @@ export async function handleSyncStatus(url, env, cors, request) {
 }
 
 // POST /api/v1/sync/ack — requires auth
-export async function handleSyncAck(request, env, cors) {
-  const auth = await requireAuth(request, env);
+export async function handleSyncAck(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   let body;

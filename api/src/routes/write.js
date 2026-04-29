@@ -93,7 +93,7 @@ async function signAndUpload(body, tags, env, ctx, auth) {
 
 export async function handleCreateEntry(request, env, ctx, cors) {
   // Auth
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit
@@ -182,7 +182,7 @@ const MAX_BATCH_SIZE = 25; // Conservative headroom for auth, D1, rate limits, e
 
 export async function handleBatchCreate(request, env, ctx, cors) {
   // Auth
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit (batch counts as 1 rate-limit hit)
@@ -341,7 +341,7 @@ export async function handleBatchCreate(request, env, ctx, cors) {
 
 export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
   // Auth
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit
@@ -429,7 +429,7 @@ export async function handleEditEntry(priorTxid, request, env, ctx, cors) {
 
 export async function handleDeleteEntry(targetTxid, request, env, ctx, cors) {
   // Auth
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Rate limit

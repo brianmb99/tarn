@@ -62,7 +62,7 @@ const VALID_BLOB_TYPES = new Set(['connection-request-v1', 'connection-accept-v1
 // ============ POST /api/v1/share/inbox/publish ============
 
 export async function handleShareInboxPublish(request, env, ctx, cors) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') {
     return errorResponse('Only user accounts can publish to connection inboxes', 403, cors);

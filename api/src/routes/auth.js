@@ -8,6 +8,12 @@ import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
 import { checkAndIncrementRateLimit } from '../rate-limit.js';
+import {
+  validateDeviceLabel,
+  pruneStaleSessions,
+  createOrReuseSession,
+  deleteAllSessionsForAccount,
+} from '../sessions.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
 
@@ -415,10 +421,16 @@ export async function handleVerify(request, env, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, recovery_lookup_key, nonce, signature } = body;
+  const { credential_lookup_key, recovery_lookup_key, nonce, signature, previous_sid, device_label } = body;
   const lookupKey = credential_lookup_key || recovery_lookup_key;
   if (!lookupKey || !nonce || !signature) {
     return errorResponse('lookup_key, nonce, and signature are required', 400, cors);
+  }
+
+  // Section 7.5: device_label is optional but bounded if present.
+  const labelErr = validateDeviceLabel(device_label);
+  if (labelErr) {
+    return errorResponse(labelErr, 400, cors);
   }
 
   // Consume nonce (single-use)
@@ -489,6 +501,24 @@ export async function handleVerify(request, env, cors) {
     return errorResponse('Invalid signature', 401, cors);
   }
 
+  // Section 7.5: user-role JWTs carry a sid claim backed by a sessions row.
+  // App-role JWTs stay stateless. Run prune + createOrReuse only after the
+  // signature check has succeeded so an unauthenticated caller can't grow the
+  // sessions table.
+  if (jwtPayload.role === 'user') {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    await pruneStaleSessions(env, jwtPayload.sub, nowSeconds);
+    const sid = await createOrReuseSession(env, {
+      dlk: jwtPayload.sub,
+      app: jwtPayload.app,
+      deviceLabel: device_label,
+      viaRecovery: !!jwtPayload.via_recovery,
+      previousSid: previous_sid,
+      nowSeconds,
+    });
+    jwtPayload.sid = sid;
+  }
+
   // Issue JWT
   const jwt = await signJWT(jwtPayload, env.JWT_SECRET);
   return jsonResponse({ jwt, expiresIn: 900 }, 200, cors);
@@ -497,7 +527,7 @@ export async function handleVerify(request, env, cors) {
 // ============ PUT /api/v1/auth — Credential Change ============
 
 export async function handleCredentialChange(request, env, ctx, cors) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') return errorResponse('Only user accounts can change credentials', 403, cors);
 
@@ -673,13 +703,21 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     finalSharePub, finalShareDiscoverable === 1, finalShareLookupKey,
   );
 
+  // Section 7.5: rotating credentials revokes every prior session. Best-effort
+  // — a D1 hiccup here must not fail the credential operation.
+  try {
+    await deleteAllSessionsForAccount(env, auth.data_lookup_key);
+  } catch (err) {
+    console.warn('[tarn-api] handleCredentialChange: deleteAllSessionsForAccount failed:', err.message);
+  }
+
   return jsonResponse({ ok: true }, 200, cors);
 }
 
 // ============ DELETE /api/v1/auth — Account Deletion ============
 
 export async function handleDeleteAccount(request, env, ctx, cors) {
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') return errorResponse('Only user accounts can be deleted', 403, cors);
 
@@ -698,6 +736,13 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
 
   // Delete account from D1
   await env.DB.prepare('DELETE FROM accounts WHERE data_lookup_key = ?1').bind(auth.data_lookup_key).run();
+
+  // Section 7.5: also wipe all sessions. Best-effort.
+  try {
+    await deleteAllSessionsForAccount(env, auth.data_lookup_key);
+  } catch (err) {
+    console.warn('[tarn-api] handleDeleteAccount: deleteAllSessionsForAccount failed:', err.message);
+  }
 
   // Write tombstone to Arweave (non-blocking)
   if (credEntry?.txid) {

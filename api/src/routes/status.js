@@ -11,8 +11,8 @@ import { PROTOCOL_VERSION } from '../constants.js';
  * Returns operational status for the authenticated app.
  * Requires app JWT or user JWT (app gets more data).
  */
-export async function handleStatus(request, env, cors) {
-  const auth = await requireAuth(request, env);
+export async function handleStatus(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   const isApp = auth.role === 'app';

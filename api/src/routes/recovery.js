@@ -28,8 +28,8 @@ const MAX_PDF_BYTES = 200 * 1024;
 
 const RESEND_API_URL = 'https://api.resend.com/emails';
 
-export async function handleRecoveryEmail(request, env, cors) {
-  const auth = await requireAuth(request, env);
+export async function handleRecoveryEmail(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') return errorResponse('Only user accounts can send recovery email', 403, cors);
 

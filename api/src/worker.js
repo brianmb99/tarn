@@ -13,6 +13,7 @@ import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntr
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules } from './routes/apps.js';
 import { handleStatus } from './routes/status.js';
+import { handleListSessions, handleRevokeSession, handleRevokeAllSessions } from './routes/sessions.js';
 import { setSkipTurboFromEnv } from './turbo.js';
 
 // ============ CORS ============
@@ -90,7 +91,7 @@ export default {
 
       // Recovery (issue #12) — email forwarder
       if (path === '/api/v1/recovery/email' && method === 'POST') {
-        return await handleRecoveryEmail(request, env, cors);
+        return await handleRecoveryEmail(request, env, ctx, cors);
       }
 
       // Info (public)
@@ -134,7 +135,7 @@ export default {
         return await handleSyncStatus(url, env, cors, request);
       }
       if (path === '/api/v1/sync/ack' && method === 'POST') {
-        return await handleSyncAck(request, env, cors);
+        return await handleSyncAck(request, env, ctx, cors);
       }
 
       // Lookup (credentials, account metadata)
@@ -166,9 +167,24 @@ export default {
         return await handleShareLogFetch(url, request, env, cors);
       }
 
+      // Sessions (Section 7.5, issue #20) — user-role only.
+      // Bare `/api/v1/sessions` MUST be matched before the `/sessions/`
+      // parameterized DELETE so DELETE /api/v1/sessions doesn't get captured
+      // as a sid revoke with empty sid.
+      if (path === '/api/v1/sessions' && method === 'GET') {
+        return await handleListSessions(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/sessions' && method === 'DELETE') {
+        return await handleRevokeAllSessions(request, env, ctx, cors);
+      }
+      if (path.startsWith('/api/v1/sessions/') && method === 'DELETE') {
+        const sid = path.slice('/api/v1/sessions/'.length);
+        return await handleRevokeSession(request, env, ctx, sid, cors);
+      }
+
       // Status (authenticated — app or user)
       if (path === '/api/v1/status' && method === 'GET') {
-        return await handleStatus(request, env, cors);
+        return await handleStatus(request, env, ctx, cors);
       }
 
       // App management — rules (authenticated, app role)

@@ -15,7 +15,7 @@ import { PROTOCOL_VERSION } from '../constants.js';
  */
 export async function handleSetRules(dataLookupKey, request, env, ctx, cors) {
   // Auth
-  const auth = await requireAuth(request, env);
+  const auth = await requireAuth(request, env, ctx);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
 
   // Must be an app identity
