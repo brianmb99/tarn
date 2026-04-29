@@ -206,6 +206,14 @@ export class TarnClient {
   #recoveryFactorMeta = null; // { salt: Uint8Array, kdfParams, wrappingsByGen: Map<gen, base64> } | null
   #recoveryLookupKey = null;  // 64-char hex (server-side) — populated on register/recover; null otherwise
 
+  // Section 7.5 (issue #20) — server-side session id from the JWT's `sid` claim.
+  // Sent back as `previous_sid` on /auth/verify so the server reuses the same
+  // sessions row instead of minting a fresh one. Null until the first verify.
+  #sid = null;
+  // One-shot device label consumed by the next #authenticate call. Set by
+  // register/login/recoverAccount; cleared after the verify body is built.
+  #pendingDeviceLabel = null;
+
   /**
    * @param {string} apiBaseUrl - Tarn API base URL (e.g., 'https://api.tarn.dev')
    * @param {string} appId - Registered app identifier (e.g., 'bookish')
@@ -264,6 +272,9 @@ export class TarnClient {
     // new social-app user can connect by email out of the box. Apps that
     // want a "private by default" stance can pass `shareDiscoverable: false`.
     const shareDiscoverable = opts.shareDiscoverable !== false;
+    // Section 7.5 (issue #20): optional human-readable label for this device,
+    // surfaced via listSessions on every device tied to this account.
+    if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
     const kdfVersion = KDF_DEFAULT; // New accounts always use Argon2id (v2).
 
@@ -474,6 +485,9 @@ export class TarnClient {
     if (!newEmail || !newPassword) {
       throw new Error('recoverAccount(): newEmail and newPassword are required');
     }
+    // Section 7.5 (issue #20): optional deviceLabel applied to the post-recover
+    // re-auth (the second #authenticate below, after credentials rotate).
+    if (opts && opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
     const phraseEntropy = recoveryPhraseToEntropy(validation.normalized);
     const [recoveryLookupKey, recoverySigningKeyPair] = await Promise.all([
@@ -526,6 +540,7 @@ export class TarnClient {
       throw new Error(`recoverAccount(): verify failed: ${verifyRes.json?.error || verifyRes.status}`);
     }
     this.#jwt = verifyRes.json.jwt;
+    this.#sid = this.#extractSidFromJwt(this.#jwt);
     this.#dataLookupKey = data_lookup_key;
     // We do NOT yet have the password-side identity — those are derived next.
 
@@ -696,9 +711,13 @@ export class TarnClient {
    * Log in to an existing account for this app.
    * @param {string} email
    * @param {string} password
+   * @param {{ deviceLabel?: string }} [opts]
    * @returns {Promise<{dataLookupKey: string}>}
    */
-  async login(email, password) {
+  async login(email, password, opts = {}) {
+    // Section 7.5 (issue #20): one-shot device label, consumed by the next
+    // /auth/verify call inside #verifyChallenge below.
+    if (opts && opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
     // KDF dispatch — chicken-and-egg problem: credential_lookup_key depends on
     // master_key, which depends on the KDF, which we don't know until we find
     // the account. Strategy: try the current default KDF (Argon2id v2) first;
@@ -1153,6 +1172,7 @@ export class TarnClient {
     try { await this.clearSession(); } catch {}
 
     this.#jwt = null;
+    this.#sid = null;
     this.#dataLookupKey = null;
     this.#dekByGen = null;
     this.#currentGen = null;
@@ -3550,7 +3570,10 @@ export class TarnClient {
     }
 
     const payload = {
-      v: 1,
+      // Schema v2 (Section 7.5, issue #20) adds the `sid` field. v1 blobs are
+      // still accepted by resumeSession — sid restores as null and the SDK
+      // mints a fresh one on the next /auth/verify call.
+      v: 2,
       createdAt: now,
       expiresAt,
       apiBase: this.#apiBase,
@@ -3568,6 +3591,7 @@ export class TarnClient {
       sharingPublicKey: bytesToBase64(this.#sharingKeyPair.publicKey),
       recoveryFactorMeta,
       jwt: this.#jwt,
+      sid: this.#sid,
     };
 
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
@@ -3620,7 +3644,8 @@ export class TarnClient {
         return null;
       }
       if (!payload || typeof payload !== 'object') return null;
-      if (payload.v !== 1) return null;
+      // v1 (Section 7) and v2 (Section 7.5 — adds optional `sid`) both accepted.
+      if (payload.v !== 1 && payload.v !== 2) return null;
 
       // Origin-binding check: a blob serialized for app A on api B must not
       // resume into app A' or api B'. The wrapping key is already origin-
@@ -3693,6 +3718,9 @@ export class TarnClient {
       // one that just logged in. credentialEncryptionKey is intentionally
       // not persisted (no code path reads it post-login).
       client.#jwt = payload.jwt || null;
+      // v2 carries the sessions sid (Section 7.5). v1 has no field — leave
+      // sid null and the SDK will mint a fresh one on the next verify.
+      client.#sid = (payload.v === 2 && typeof payload.sid === 'string') ? payload.sid : null;
       client.#dataLookupKey = payload.dataLookupKey;
       client.#credentialLookupKey = payload.credentialLookupKey;
       client.#signingKeyPair = { privateKey: signingPrivateKey, publicKey: signingPublicKey };
@@ -3728,6 +3756,107 @@ export class TarnClient {
     await clearWrappingKey();
   }
 
+  // ============ SERVER-SIDE SESSIONS (Section 7.5, issue #20) ============
+
+  /**
+   * List the active server-side sessions for the calling account. Each entry
+   * is one device that has authenticated successfully and not been revoked.
+   *
+   * @returns {Promise<Array<{
+   *   sid: string,
+   *   createdAt: number,
+   *   lastSeenAt: number,
+   *   deviceLabel: string | null,
+   *   viaRecovery: boolean,
+   *   isCurrent: boolean,
+   * }>>}
+   */
+  async listSessions() {
+    await this.#requireAuth();
+    const res = await this.#fetch('/api/v1/sessions', { method: 'GET', auth: true });
+    if (res.status !== 200) {
+      throw new Error(`listSessions failed: ${res.json?.error || res.status}`);
+    }
+    const rows = Array.isArray(res.json?.sessions) ? res.json.sessions : [];
+    return rows.map(r => ({
+      sid: r.sid,
+      createdAt: r.created_at,
+      lastSeenAt: r.last_seen_at,
+      deviceLabel: r.device_label,
+      viaRecovery: !!r.via_recovery,
+      isCurrent: !!r.is_current,
+    }));
+  }
+
+  /**
+   * Revoke a single session by sid. The next authenticated request from the
+   * device that holds that JWT will fail with 401 (immediately on the same
+   * isolate, within the 5s isolate-cache TTL elsewhere).
+   *
+   * @param {string} sid
+   * @returns {Promise<void>}
+   * @throws if the sid does not exist or does not belong to this account.
+   */
+  async revokeSession(sid) {
+    if (!sid || typeof sid !== 'string') {
+      throw new Error('revokeSession(): sid is required');
+    }
+    await this.#requireAuth();
+    const res = await this.#fetchRaw(
+      `/api/v1/sessions/${encodeURIComponent(sid)}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${this.#jwt}` } },
+    );
+    if (res.status === 204) return;
+    let body = null;
+    try { body = await res.json(); } catch {}
+    throw new Error(`revokeSession failed: ${body?.error || res.status}`);
+  }
+
+  /**
+   * Revoke EVERY session for this account, including the calling one. The
+   * caller's JWT becomes useless on the next request — apps should treat this
+   * as a sign-out and prompt re-auth.
+   *
+   * Also wipes the persisted session blob on this origin (clearSession) so a
+   * subsequent resumeSession returns null.
+   *
+   * @returns {Promise<void>}
+   */
+  async revokeAllSessions() {
+    await this.#requireAuth();
+    const res = await this.#fetchRaw('/api/v1/sessions', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${this.#jwt}` },
+    });
+    if (res.status !== 204) {
+      let body = null;
+      try { body = await res.json(); } catch {}
+      throw new Error(`revokeAllSessions failed: ${body?.error || res.status}`);
+    }
+    try { await this.clearSession(); } catch {}
+    this.#jwt = null;
+    this.#sid = null;
+  }
+
+  /**
+   * Revoke every session EXCEPT the calling one. Useful for "sign out all
+   * other devices" UI. The calling device retains its JWT/sid.
+   *
+   * @returns {Promise<void>}
+   */
+  async revokeOtherSessions() {
+    await this.#requireAuth();
+    const res = await this.#fetchRaw('/api/v1/sessions?except=current', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${this.#jwt}` },
+    });
+    if (res.status !== 204) {
+      let body = null;
+      try { body = await res.json(); } catch {}
+      throw new Error(`revokeOtherSessions failed: ${body?.error || res.status}`);
+    }
+  }
+
   // ============ ACCESSORS ============
 
   get dataLookupKey() { return this.#dataLookupKey; }
@@ -3748,6 +3877,17 @@ export class TarnClient {
    * the rehydrated keypair can drive a fresh challenge-response.
    */
   _testInvalidateJwt() { this.#jwt = null; }
+
+  /**
+   * Test-only: force a fresh challenge-response cycle from the cached signing
+   * keys. Used by Section 7.5 tests to re-authenticate after revokeAllSessions
+   * cleared the in-memory JWT/sid (the public path would normally require the
+   * caller to login() again).
+   */
+  async _testForceReauth() {
+    this.#jwt = null;
+    await this.#authenticate();
+  }
 
   /**
    * Test-only: lower the per-connection share-log snapshot compaction interval
@@ -3888,20 +4028,48 @@ export class TarnClient {
   async #verifyChallenge(nonce) {
     const signature = await signChallenge(this.#signingKeyPair.privateKey, nonce);
 
+    // Section 7.5: send the previous sid (if any) so the server reuses the
+    // same sessions row across re-verify, plus an optional device label that
+    // landed on listSessions output.
+    const body = {
+      credential_lookup_key: this.#credentialLookupKey,
+      nonce,
+      signature,
+    };
+    if (this.#sid) body.previous_sid = this.#sid;
+    if (this.#pendingDeviceLabel != null) body.device_label = this.#pendingDeviceLabel;
+
     const verifyRes = await this.#fetch('/api/v1/auth/verify', {
       method: 'POST',
-      body: {
-        credential_lookup_key: this.#credentialLookupKey,
-        nonce,
-        signature,
-      },
+      body,
     });
+
+    // The label is one-shot — even on failure we shouldn't reuse it on the
+    // next call (the caller would supply it again).
+    this.#pendingDeviceLabel = null;
 
     if (verifyRes.status !== 200) {
       throw new Error(`Verify failed: ${verifyRes.json?.error}`);
     }
 
     this.#jwt = verifyRes.json.jwt;
+    this.#sid = this.#extractSidFromJwt(this.#jwt);
+  }
+
+  /**
+   * Decode the `sid` claim out of a HS256 JWT. Returns null if the token is
+   * malformed or has no sid claim (pre-7.5 grandfather path).
+   */
+  #extractSidFromJwt(jwt) {
+    if (!jwt) return null;
+    try {
+      const parts = jwt.split('.');
+      if (parts.length !== 3) return null;
+      const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+      return payload.sid || null;
+    } catch {
+      return null;
+    }
   }
 
   async #fetchBlob(txid) {
