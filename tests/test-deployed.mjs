@@ -449,6 +449,75 @@ await test('Per-tag uniqueness against deployed API: re-publish at same tag → 
   assert(j2.existing_txid === j1.txid, '409 must echo the original txid');
 });
 
+// ============ 9b. SHARE LOG READ FLOW + RETRY (issue #16, Section 5c) ============
+
+console.log('\n=== 9b. Share log read flow + multi-device retry (Section 5c) ===');
+
+await test('readShareLog: Bob bootstraps Alice\'s log, sees content shared by Alice', async () => {
+  // Re-resolve friend records (handshakeAlice/Bob persist from §8/§9).
+  const aliceFriends = await handshakeAlice.listFriends();
+  const bobFriends = await handshakeBob.listFriends();
+  const bobFriendOfAlice = aliceFriends.find(f => f.email === handshakeBobEmail);
+  const aliceFriendOfBob = bobFriends.find(f => f.email === handshakeAliceEmail);
+  assert(bobFriendOfAlice && aliceFriendOfBob, 'friend records missing');
+
+  const cek1 = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const cek2 = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  await handshakeAlice.shareContent(bobFriendOfAlice, 'deploy-5c-A', 'tx-5c-A', cek1);
+  await handshakeAlice.shareContent(bobFriendOfAlice, 'deploy-5c-B', 'tx-5c-B', cek2);
+
+  await sleep(800);
+  const bobState = await handshakeBob.readShareLog(aliceFriendOfBob, { refresh: true });
+  assert(bobState['deploy-5c-A']?.tx_id === 'tx-5c-A', 'deploy-5c-A missing or wrong tx_id');
+  assert(bobState['deploy-5c-B']?.tx_id === 'tx-5c-B', 'deploy-5c-B missing or wrong tx_id');
+});
+
+await test('syncShareLog: incremental update + remove flows through to Bob', async () => {
+  const aliceFriends = await handshakeAlice.listFriends();
+  const bobFriends = await handshakeBob.listFriends();
+  const bobFriendOfAlice = aliceFriends.find(f => f.email === handshakeBobEmail);
+  const aliceFriendOfBob = bobFriends.find(f => f.email === handshakeAliceEmail);
+
+  await handshakeAlice.updateShareContent(bobFriendOfAlice, 'deploy-5c-A', 'tx-5c-A-v2');
+  await handshakeAlice.unshareContent(bobFriendOfAlice, 'deploy-5c-B');
+
+  await sleep(800);
+  const updated = await handshakeBob.syncShareLog(aliceFriendOfBob);
+  assert(updated['deploy-5c-A']?.tx_id === 'tx-5c-A-v2', 'update did not propagate');
+  assert(updated['deploy-5c-B'] === undefined, 'remove did not propagate');
+});
+
+await test('Concurrent publish race against deployed API: exactly one 409, NOT 500', async () => {
+  // Drives the live API's INSERT-vs-UNIQUE catch path for the 409-vs-500
+  // contract that 5c's retry depends on. Two parallel POSTs at the same
+  // synthetic tag from the same JWT.
+  const jwt = handshakeAlice._testJwt();
+  const tagSeed = crypto.getRandomValues(new Uint8Array(32));
+  const { deriveLogTag } = await import('../client/src/share-log.js');
+  const tag = await deriveLogTag(tagSeed, 555000 + Date.now() % 1000);
+  const post = (cipher) => fetch(`${API_BASE}/api/v1/share/log/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+    body: JSON.stringify({ tag, type: 'share-log-v1', ciphertext_base64: cipher }),
+  });
+  const dummyA = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(64))));
+  const dummyB = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(64))));
+  const [rA, rB] = await Promise.all([post(dummyA), post(dummyB)]);
+  const statuses = [rA.status, rB.status].sort((a, b) => a - b);
+  assert(statuses[0] === 200 && statuses[1] === 409,
+    `expected [200, 409] from concurrent publishes; got [${statuses.join(', ')}]`);
+  const winner = rA.status === 200 ? rA : rB;
+  const loser = rA.status === 409 ? rA : rB;
+  const wj = await winner.json();
+  const lj = await loser.json();
+  assert(wj.txid, 'winner missing txid');
+  assert(lj.existing_txid === wj.txid,
+    `loser.existing_txid (${lj.existing_txid}) !== winner.txid (${wj.txid})`);
+});
+
 await test('Delete handshake test accounts', async () => {
   if (handshakeAlice) await handshakeAlice.deleteAccount();
   if (handshakeBob) await handshakeBob.deleteAccount();

@@ -16,16 +16,17 @@
 //   §9.1      per-tag uniqueness on publish
 //
 // 5b stops short of:
-//   - highest-seq discovery (§9.2 — 5c)
-//   - state reconstruction / replay-from-snapshot (§8.5 — 5c)
-//   - multi-device collision retry (§13.1 — 5c)
 //   - revocation flow (§10 — 5d)
 //   - rotate_identity *emission/processing* (§13.5 — 5d). The type itself ships
 //     here so 5d can layer on the emit path without a parser change.
 //
-// The bar for 5b: Alice publishes a sequence of operations; Bob fetches a
-// single specific entry by tag and decrypts + verifies the sender signature.
-// Full state-machine reads land in 5c.
+// 5c (this file's later additions) layers on top of 5b:
+//   - discoverHighestSeq (§9.2): exponential probe + bisect over a caller-
+//     supplied probe(seq)->bool. The seed never leaves the device — Tarn sees
+//     individual pseudorandom tag fetches only.
+//   - applyOperationToState (§8.4 idempotency rules) and replayOperations as
+//     pure helpers. The TarnClient layer composes these with the §8.1 fetch
+//     primitives to do bootstrap + incremental sync (§8.5).
 
 import { x25519 } from '@noble/curves/ed25519';
 import {
@@ -741,4 +742,223 @@ export function shouldEmitSnapshot(state) {
     throw new Error('compactionInterval must be a positive integer');
   }
   return (state.nonSnapshotsSinceLastSnapshot ?? 0) >= interval;
+}
+
+// ============ HIGHEST-SEQ DISCOVERY (sharing §9.2) ============
+
+// Cap on the exponential phase. With doubling, 64 hits cover seq up to 2^63 —
+// far beyond any realistic share-log size. The cap mostly defends against a
+// runaway probe loop if `probe` lies (always returns true), and gives tests a
+// way to assert logarithmic probe count.
+const DEFAULT_MAX_EXPONENTIAL_PROBES = 64;
+
+/**
+ * Walk a per-pair share log forward to find the highest existing seq, using
+ * O(log N) tag probes. The caller supplies a `probe(seq) -> Promise<boolean>`
+ * function — typically a thin wrapper over `GET /share/log/fetch` for the
+ * specific tag derived from a (T_AB_seed, seq) pair. The tag seed itself
+ * never crosses this boundary, matching the design's "no per-pair prefix
+ * sent to Tarn" property.
+ *
+ * Algorithm (sharing §9.2):
+ *   1. Exponential probe starting at `anchor`, with stride 1 doubling each
+ *      hit: probe(anchor), probe(anchor+1), probe(anchor+3), probe(anchor+7),
+ *      ... until first miss.
+ *   2. Bisect the interval [lastHit + 1, firstMiss - 1] — the highest seq
+ *      that exists is the largest seq in that range that probes true.
+ *
+ * Returns `{ highestSeq, probeCount }`:
+ *   - `highestSeq` is `anchor - 1` if no seq >= anchor exists (i.e. the very
+ *     first probe missed).
+ *   - `highestSeq` is the largest seq that probes true otherwise.
+ *   - `probeCount` is the total number of probe(seq) calls made — useful for
+ *     tests that assert logarithmic behavior.
+ *
+ * For the typical bootstrap call (anchor=1) on a log of size N, total probes
+ * are ~ 2*log2(N). For an incremental-sync call (anchor=lastSeqSeen+1) over
+ * a gap of G new entries, total probes are ~ 2*log2(G).
+ *
+ * @param {{
+ *   probe: (seq: number) => Promise<boolean>,
+ *   anchor?: number,                    // lowest seq to consider (default 1)
+ *   maxExponentialProbes?: number,      // safety cap on phase 1
+ * }} opts
+ * @returns {Promise<{ highestSeq: number, probeCount: number }>}
+ */
+export async function discoverHighestSeq({
+  probe,
+  anchor = 1,
+  maxExponentialProbes = DEFAULT_MAX_EXPONENTIAL_PROBES,
+} = {}) {
+  if (typeof probe !== 'function') {
+    throw new Error('discoverHighestSeq: probe must be a function');
+  }
+  if (!Number.isInteger(anchor) || anchor < 0) {
+    throw new Error('discoverHighestSeq: anchor must be a non-negative integer');
+  }
+  if (!Number.isInteger(maxExponentialProbes) || maxExponentialProbes < 1) {
+    throw new Error('discoverHighestSeq: maxExponentialProbes must be a positive integer');
+  }
+
+  let lastHit = anchor - 1;
+  let firstMiss = -1;
+  let probeCount = 0;
+  let candidate = anchor;
+  let stride = 1;
+
+  for (let i = 0; i < maxExponentialProbes; i++) {
+    probeCount++;
+    if (await probe(candidate)) {
+      lastHit = candidate;
+      candidate += stride;
+      stride *= 2;
+    } else {
+      firstMiss = candidate;
+      break;
+    }
+  }
+
+  // Empty case: anchor itself missed → no seq >= anchor exists.
+  if (lastHit < anchor) {
+    return { highestSeq: anchor - 1, probeCount };
+  }
+
+  // Saturation case: hit the cap with no miss. Treat lastHit as best-effort
+  // floor; readers will at least see up to that seq. Practically this only
+  // happens when probe is mocked or the log is impossibly large.
+  if (firstMiss < 0) {
+    return { highestSeq: lastHit, probeCount, truncated: true };
+  }
+
+  // Bisect [lastHit + 1, firstMiss - 1]. Loop invariant:
+  //   probe(lo) is known true, probe(hi) is known false, and we want the
+  //   greatest seq < hi that probes true.
+  let lo = lastHit;
+  let hi = firstMiss;
+  while (hi - lo > 1) {
+    const mid = lo + Math.floor((hi - lo) / 2);
+    probeCount++;
+    if (await probe(mid)) lo = mid;
+    else hi = mid;
+  }
+  return { highestSeq: lo, probeCount };
+}
+
+// ============ STATE MACHINE (sharing §8.4) ============
+
+/**
+ * Apply a single (parsed) operation to a state map in place, per the
+ * idempotency rules of §8.4. State is `{ content_id: { tx_id, cek } }`. The
+ * caller is responsible for verifying the sender signature first
+ * ({@link verifyOperationSignature}); operations that fail verification or
+ * decryption MUST be skipped at the call site, not passed to this function.
+ *
+ * Idempotency rules (§8.4):
+ *   - `add` for a known content_id → treat as `update` with the supplied
+ *     tx_id; if the cek differs, log an error and adopt the new cek
+ *     (defensive — should not occur in normal flow).
+ *   - `update` for an unknown content_id → log warning, no-op.
+ *   - `rotate` for an unknown content_id → log warning, no-op.
+ *   - `remove` for an unknown content_id → silent no-op.
+ *   - `snapshot` → replace state wholesale.
+ *   - `rotate_identity` → recognized but no-op for now (5d will add the
+ *     actual processing). Treat as a state-preserving operation.
+ *   - Unknown types → log warning, no-op.
+ *
+ * Replay safety: repeated application of the same operation produces the
+ * same final state. Reordering can produce a defensible result
+ * (`update`-before-`add` warns and is dropped; `remove`-then-`add` returns
+ * to "added" state).
+ *
+ * @param {Object} state - mutated in place
+ * @param {Object} operation - parsed operation_signed (or operation_unsigned)
+ * @param {{
+ *   onWarn?: (msg: string) => void,
+ *   onError?: (msg: string) => void,
+ * }} [hooks]
+ */
+export function applyOperationToState(state, operation, hooks = {}) {
+  const warn = hooks.onWarn ?? defaultWarn;
+  const error = hooks.onError ?? defaultError;
+
+  if (!state || typeof state !== 'object') {
+    throw new Error('applyOperationToState: state must be an object');
+  }
+  if (!operation || typeof operation !== 'object') {
+    throw new Error('applyOperationToState: operation must be an object');
+  }
+
+  switch (operation.type) {
+    case OP_ADD: {
+      const cid = operation.content_id;
+      if (state[cid]) {
+        // §8.4: treat as update with supplied tx_id; if cek differs, log
+        // error and adopt new cek defensively.
+        if (state[cid].cek !== operation.cek) {
+          error(`share-log: add for known content_id ${cid} with different CEK; adopting new CEK`);
+        }
+        state[cid] = { tx_id: operation.tx_id, cek: operation.cek };
+      } else {
+        state[cid] = { tx_id: operation.tx_id, cek: operation.cek };
+      }
+      return;
+    }
+    case OP_UPDATE: {
+      const cid = operation.content_id;
+      if (!state[cid]) {
+        warn(`share-log: update for unknown content_id ${cid}; ignoring`);
+        return;
+      }
+      state[cid] = { tx_id: operation.tx_id, cek: state[cid].cek };
+      return;
+    }
+    case OP_ROTATE: {
+      const cid = operation.content_id;
+      if (!state[cid]) {
+        warn(`share-log: rotate for unknown content_id ${cid}; ignoring`);
+        return;
+      }
+      state[cid] = { tx_id: state[cid].tx_id, cek: operation.cek };
+      return;
+    }
+    case OP_REMOVE: {
+      delete state[operation.content_id];
+      return;
+    }
+    case OP_SNAPSHOT: {
+      for (const k of Object.keys(state)) delete state[k];
+      const snap = operation.state || {};
+      for (const [cid, entry] of Object.entries(snap)) {
+        state[cid] = { tx_id: entry.tx_id, cek: entry.cek };
+      }
+      return;
+    }
+    case OP_ROTATE_IDENTITY: {
+      // §13.5 / 5d: parsing-only no-op for now. Recognized so the read flow
+      // doesn't warn on encountering one in a long log.
+      return;
+    }
+    default:
+      warn(`share-log: unknown operation type ${operation.type}; ignoring`);
+  }
+}
+
+function defaultWarn(msg) { console.warn(`[share-log] ${msg}`); }
+function defaultError(msg) { console.error(`[share-log] ${msg}`); }
+
+/**
+ * Apply a sequence of operations in order, returning a fresh state map.
+ * Convenience wrapper around {@link applyOperationToState}.
+ *
+ * @param {Array<Object>} operations
+ * @param {Object} [initialState] - default {}
+ * @param {{ onWarn?: Function, onError?: Function }} [hooks]
+ * @returns {Object}
+ */
+export function replayOperations(operations, initialState = {}, hooks = {}) {
+  const state = { ...initialState };
+  for (const op of operations) {
+    applyOperationToState(state, op, hooks);
+  }
+  return state;
 }

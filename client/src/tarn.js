@@ -83,8 +83,13 @@ import {
   encryptShareLogEntry,
   decryptShareLogEntry,
   shouldEmitSnapshot,
+  discoverHighestSeq,
+  applyOperationToState,
   DEFAULT_COMPACTION_INTERVAL,
   SHARE_LOG_TYPE,
+  OP_ADD,
+  OP_UPDATE,
+  OP_REMOVE,
   OP_SNAPSHOT,
 } from './share-log.js';
 
@@ -135,6 +140,36 @@ export class TarnClient {
   // for the lifetime of the session.
   #pairKeyCache = new Map();         // sharePubBase64Url -> { sharedSecret, outboundKey, inboundKey, outboundTagSeed, inboundTagSeed }
   #shareLogCounters = new Map();     // sharePubBase64Url -> { nextOutboundSeq, nonSnapshotsSinceLastSnapshot, compactionInterval }
+
+  // Per-friend reconstructed inbound state (issue #16, Section 5c). Keyed on
+  // the friend's `share_pub`, holds the application's view of what the friend
+  // has shared with us — the result of replaying their outbound log per §8.5.
+  // `lastSeqSeen` is the highest seq we've applied (or -1 if no entries yet).
+  // In-memory only; on session restart `readShareLog` re-bootstraps from
+  // Arweave. Wholly invalidated on credential change / recovery / delete.
+  #readStateCache = new Map();       // sharePubBase64Url -> { state: {[content_id]: {tx_id, cek}}, lastSeqSeen: number }
+
+  // Per-friend reconstructed OUTBOUND state (issue #16, Section 5c). Tracks
+  // what we've shared with each friend so the writer can emit meaningful
+  // snapshots during auto-compaction (§8.6). An empty snapshot is NOT a
+  // no-op per §8.3.5 — it tells the recipient "I'm sharing nothing with you
+  // anymore", which would erase their entire view.
+  //
+  // Hydration: lazily reconstructed on the first high-level publish call
+  // per session by replaying our own outbound log. Updated incrementally
+  // by shareContent / updateShareContent / unshareContent / explicit
+  // snapshotShareLog. Wholly invalidated on credential change / recovery /
+  // delete (the per-pair keys rotate, so the cache is stale anyway).
+  #outboundStateCache = new Map();   // sharePubBase64Url -> { state: {[content_id]: {tx_id, cek}}, hydrated: boolean }
+
+  // Per-friend set of outbound txids we've successfully published in this
+  // session (issue #16, Section 5c). Used by the multi-device retry path
+  // (§13.1) to detect "this 409 is reporting back my own previous publish"
+  // (e.g., the SDK retried after a transient response loss). When the 409's
+  // `existing_txid` is in this set, we treat the publish as already-done
+  // rather than republishing at the next seq. Cleared with the rest of the
+  // share-log caches on credential change / recovery / delete.
+  #publishedTxidsByFriend = new Map(); // sharePubBase64Url -> Set<string>
 
   // v4 recovery-factor state (issue #12). Holds enough information to preserve
   // existing recovery wrappings across a credential change without requiring
@@ -531,6 +566,9 @@ export class TarnClient {
     // Pair-key cache is derived from share_priv; recovery rotates it.
     this.#pairKeyCache.clear();
     this.#shareLogCounters.clear();
+    this.#readStateCache.clear();
+    this.#outboundStateCache.clear();
+    this.#publishedTxidsByFriend.clear();
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
@@ -829,6 +867,9 @@ export class TarnClient {
     // silently signing with the new key under the old K_AB.
     this.#pairKeyCache.clear();
     this.#shareLogCounters.clear();
+    this.#readStateCache.clear();
+    this.#outboundStateCache.clear();
+    this.#publishedTxidsByFriend.clear();
 
     await this.#authenticate();
   }
@@ -881,6 +922,9 @@ export class TarnClient {
     this.#replayNonceCache = makeReplayNonceCache();
     this.#pairKeyCache.clear();
     this.#shareLogCounters.clear();
+    this.#readStateCache.clear();
+    this.#outboundStateCache.clear();
+    this.#publishedTxidsByFriend.clear();
   }
 
   // ============ DATA CRUD ============
@@ -1660,13 +1704,31 @@ export class TarnClient {
    * Returns the final seq + tag + Arweave txid so callers (and tests) can
    * round-trip via `_fetchShareLogEntry`.
    *
+   * 5c retry semantics (§13.1, multi-device): when `opts.retryOn409` is
+   * `true`, a 409 from a sibling-device concurrent publish triggers up to
+   * `opts.maxRetries` (default 5) re-attempts. Each retry re-runs outbound
+   * highest-seq discovery (§9.2), advances the counter past the winner's
+   * seq, **re-signs** the operation under the new seq (since `seq` is in
+   * `sig_input` per §8.1), and re-encrypts under a fresh IV before
+   * republishing. If the 409's `existing_txid` is one this session has
+   * already published, the publish is treated as already-done — defends
+   * against the network-hiccup-then-retry case where we won the race but
+   * never observed the response.
+   *
    * @param {Object} friend - friends-record entry (has share_pub, signing_pub)
    * @param {{type: string, [key: string]: any}} operationFields - omit `seq`
-   * @param {{ skipCompaction?: boolean, snapshotState?: Object }} [opts]
+   * @param {{
+   *   skipCompaction?: boolean,
+   *   snapshotState?: Object,
+   *   retryOn409?: boolean,
+   *   maxRetries?: number,
+   * }} [opts]
    * @returns {Promise<{
    *   seq: number,
    *   tag: string,
    *   txid: string,
+   *   retried?: number,                            // count of 409 retries (0 if first try succeeded)
+   *   alreadyPublished?: boolean,                  // true if 409 was our own previous publish
    *   compactionSnapshot?: { seq: number, tag: string, txid: string },
    * }>}
    */
@@ -1681,26 +1743,89 @@ export class TarnClient {
 
     const pair = await this.#getPairKeysFor(friend.share_pub);
     const counters = this.#getOrInitCounters(friend.share_pub);
+    const retryOn409 = opts.retryOn409 === true;
+    const maxRetries = Number.isInteger(opts.maxRetries) && opts.maxRetries > 0
+      ? opts.maxRetries
+      : 5;
 
-    const seq = counters.nextOutboundSeq;
-    const operation = buildOperationUnsigned({ ...operationFields, seq });
-    const signed = await signOperation(operation, this.#signingKeyPair.privateKey);
-    const blob = await encryptShareLogEntry(signed, pair.outboundKey);
-    const tag = await deriveLogTag(pair.outboundTagSeed, seq);
+    let attempts = 0;
+    let alreadyPublished = false;
+    let seq;
+    let tag;
+    let txid;
 
-    const txid = await this.#postShareLogPublish(tag, blob);
+    while (true) {
+      seq = counters.nextOutboundSeq;
+      const operation = buildOperationUnsigned({ ...operationFields, seq });
+      const signed = await signOperation(operation, this.#signingKeyPair.privateKey);
+      const blob = await encryptShareLogEntry(signed, pair.outboundKey);
+      tag = await deriveLogTag(pair.outboundTagSeed, seq);
 
-    counters.nextOutboundSeq = seq + 1;
-    if (operation.type === OP_SNAPSHOT) {
-      counters.nonSnapshotsSinceLastSnapshot = 0;
-    } else {
-      counters.nonSnapshotsSinceLastSnapshot += 1;
+      try {
+        txid = await this.#postShareLogPublish(tag, blob);
+        break;
+      } catch (err) {
+        if (err.code !== 'SHARE_LOG_TAG_CONFLICT' || !retryOn409) {
+          throw err;
+        }
+
+        // Network-hiccup-retry detection: if the winner txid is one this
+        // session published, we *are* the winner — succeed with the known
+        // txid rather than republishing the same op at the next seq.
+        const ourTxids = this.#publishedTxidsByFriend.get(friend.share_pub);
+        if (err.existingTxid && ourTxids?.has(err.existingTxid)) {
+          // Advance the counter past the conflicting seq so subsequent
+          // publishes don't re-collide with the same already-won slot.
+          counters.nextOutboundSeq = seq + 1;
+          if (operation.type === OP_SNAPSHOT) {
+            counters.nonSnapshotsSinceLastSnapshot = 0;
+          } else {
+            counters.nonSnapshotsSinceLastSnapshot += 1;
+          }
+          txid = err.existingTxid;
+          alreadyPublished = true;
+          break;
+        }
+
+        attempts += 1;
+        if (attempts > maxRetries) {
+          throw new Error(
+            `_publishShareLogEntry: exceeded ${maxRetries} retries for ${operation.type} ` +
+            `to ${friend.share_pub.slice(0, 8)}... — last conflict at seq=${seq} ` +
+            `(winner txid=${err.existingTxid ?? 'unknown'})`,
+          );
+        }
+
+        // §13.1: another writer won this seq slot. Re-discover the current
+        // highest outbound seq, bump our counter past it, re-sign at the new
+        // seq, and republish. Re-signing is mandatory because `seq` is part
+        // of the signature input (§8.1) — reusing the old signature would
+        // make the entry fail recipient verification.
+        const probedHighest = await this.#discoverOutboundHighestSeq(pair, {
+          anchor: seq + 1,
+        });
+        const newNext = Math.max(seq + 1, probedHighest + 1);
+        counters.nextOutboundSeq = newNext;
+        // Loop continues — top of loop will pick up the new seq.
+      }
     }
+
+    if (!alreadyPublished) {
+      counters.nextOutboundSeq = seq + 1;
+      if (operationFields.type === OP_SNAPSHOT) {
+        counters.nonSnapshotsSinceLastSnapshot = 0;
+      } else {
+        counters.nonSnapshotsSinceLastSnapshot += 1;
+      }
+    }
+
+    // Track the txid for own-publish detection on subsequent retries.
+    this.#recordPublishedTxid(friend.share_pub, txid);
 
     let compactionSnapshot;
     if (
       !opts.skipCompaction
-      && operation.type !== OP_SNAPSHOT
+      && operationFields.type !== OP_SNAPSHOT
       && shouldEmitSnapshot(counters)
     ) {
       // Caller may pre-supply the snapshot state (e.g., the app's full
@@ -1715,12 +1840,55 @@ export class TarnClient {
         prior_seq: seq,
       };
       const snap = await this._publishShareLogEntry(
-        friend, snapshotFields, { skipCompaction: true },
+        friend, snapshotFields,
+        { skipCompaction: true, retryOn409, maxRetries },
       );
       compactionSnapshot = { seq: snap.seq, tag: snap.tag, txid: snap.txid };
     }
 
-    return { seq, tag, txid, ...(compactionSnapshot ? { compactionSnapshot } : {}) };
+    const out = { seq, tag, txid };
+    if (attempts > 0) out.retried = attempts;
+    if (alreadyPublished) out.alreadyPublished = true;
+    if (compactionSnapshot) out.compactionSnapshot = compactionSnapshot;
+    return out;
+  }
+
+  #recordPublishedTxid(sharePub, txid) {
+    if (!txid) return;
+    let set = this.#publishedTxidsByFriend.get(sharePub);
+    if (!set) {
+      set = new Set();
+      this.#publishedTxidsByFriend.set(sharePub, set);
+    }
+    set.add(txid);
+  }
+
+  /**
+   * Probe an OUTBOUND tag for existence (no decryption). Used by the
+   * multi-device retry path to find the winner's seq without trying to
+   * decrypt their entry under our outbound key (which would fail anyway,
+   * since outbound is the writer's encryption direction, not the reader's).
+   */
+  async #probeOutboundTagExists(pair, seq) {
+    const tag = await deriveLogTag(pair.outboundTagSeed, seq);
+    const blob = await this.#getShareLogBlobByTag(tag);
+    return blob !== null;
+  }
+
+  /**
+   * Discover the current highest outbound seq (the seq slot of the most
+   * recent entry on our outbound-to-friend log). Used during multi-device
+   * 409 retry (§13.1) to find where the winner landed without per-pair
+   * prefix queries (§9.2).
+   *
+   * Returns -1 if no entry at or above `anchor` exists.
+   */
+  async #discoverOutboundHighestSeq(pair, opts = {}) {
+    const result = await discoverHighestSeq({
+      probe: (s) => this.#probeOutboundTagExists(pair, s),
+      anchor: opts.anchor ?? 0,
+    });
+    return result.highestSeq;
   }
 
   /**
@@ -1787,12 +1955,464 @@ export class TarnClient {
    * @param {{ state?: Object }} [opts]
    */
   async _publishInitialSnapshot(friend, opts = {}) {
-    return await this._publishShareLogEntry(friend, {
+    const state = opts.state ?? {};
+    const result = await this._publishShareLogEntry(friend, {
       type: OP_SNAPSHOT,
-      state: opts.state ?? {},
+      state,
       snapshot_at: Math.floor(Date.now() / 1000),
       prior_seq: null,
     });
+    // Seed the outbound state cache so subsequent shareContent / etc. emit
+    // meaningful auto-snapshots without re-reading the log.
+    this.#outboundStateCache.set(friend.share_pub, {
+      state: { ...state },
+      hydrated: true,
+    });
+    return result;
+  }
+
+  // ============ SHARE LOG — READ FLOW (issue #16, Section 5c) ============
+
+  /**
+   * Read a friend's outbound share log and reconstruct the full state
+   * (sharing §8.5 bootstrap). Walks back from the highest seq to the most
+   * recent `snapshot` (or seq=0 if none), then walks forward applying each
+   * subsequent operation per the §8.4 idempotency rules.
+   *
+   * Returns the resulting `{ content_id: { tx_id, cek } }` map. The map is
+   * also cached per-friend per-device so {@link syncShareLog} can apply
+   * incremental updates without re-walking history.
+   *
+   * Highest-seq discovery is logarithmic (§9.2): O(log N) tag fetches for a
+   * log of length N. The seed never crosses to Tarn — only individual
+   * pseudorandom tag values.
+   *
+   * Entries that fail decryption or signature verification are logged as
+   * warnings and skipped; the state machine continues with the next entry
+   * (sharing §13.3).
+   *
+   * @param {{ share_pub: string, signing_pub: string }} friend - friends-record entry
+   * @param {{
+   *   refresh?: boolean,                       // ignore cache (default: false)
+   * }} [opts]
+   * @returns {Promise<Object>} state map: `{ [content_id]: { tx_id, cek } }`
+   */
+  async readShareLog(friend, opts = {}) {
+    await this.#requireAuth();
+    if (!friend || typeof friend.share_pub !== 'string') {
+      throw new Error('readShareLog(): friend.share_pub is required');
+    }
+    if (typeof friend.signing_pub !== 'string') {
+      throw new Error('readShareLog(): friend.signing_pub is required');
+    }
+    if (!opts.refresh) {
+      const cached = this.#readStateCache.get(friend.share_pub);
+      if (cached) return { ...cached.state };
+    }
+
+    const pair = await this.#getPairKeysFor(friend.share_pub);
+
+    // §9.2 highest-seq discovery, anchored at seq=0 so the result is
+    // unambiguous: -1 means truly empty (no entries at all), 0 means only
+    // the handshake snapshot, N means N+1 entries. Probes 0, 1, 3, 7, 15,
+    // ... — the doubling starts after the first hit.
+    const { highestSeq } = await discoverHighestSeq({
+      probe: (seq) => this.#probeInboundTagExists(pair, seq),
+      anchor: 0,
+    });
+
+    if (highestSeq < 0) {
+      // Truly empty log — no entries at all. Cache the empty state so
+      // syncShareLog can incrementally pick up future entries.
+      this.#readStateCache.set(friend.share_pub, {
+        state: {},
+        lastSeqSeen: -1,
+      });
+      return {};
+    }
+
+    // Walk back to the most recent snapshot (or seq=0 if none found before
+    // we get there). Bootstrap cost is bounded by §8.6 compaction policy:
+    // typical walks land at seq=0 (handshake snapshot) or within
+    // `compactionInterval` entries.
+    let snapshotSeq = -1;
+    let snapshotPayload = null;
+    for (let seq = highestSeq; seq >= 0; seq--) {
+      const entry = await this._fetchShareLogEntry(friend, seq);
+      if (!entry) {
+        // Gap in the dense log — should not occur in normal flow. Continue
+        // walking back; the §8.4 rules will keep state consistent if some
+        // entries are missing.
+        continue;
+      }
+      if (!entry.verified) {
+        console.warn(
+          `[TarnClient] readShareLog: skipping unverifiable entry from ${friend.share_pub.slice(0, 8)}... at seq=${seq}`,
+        );
+        continue;
+      }
+      if (entry.operation.type === OP_SNAPSHOT) {
+        snapshotSeq = seq;
+        snapshotPayload = entry.operation;
+        break;
+      }
+    }
+
+    // Apply snapshot (if any) then walk forward. If no snapshot was found
+    // — unusual but possible if the handshake snapshot's signature failed
+    // verification — start from empty state and apply every entry from
+    // seq=0 forward, letting §8.4 idempotency rules resolve missing-prior
+    // operations as warnings.
+    const state = {};
+    let cursorSeq;
+    if (snapshotSeq >= 0) {
+      applyOperationToState(state, snapshotPayload);
+      cursorSeq = snapshotSeq + 1;
+    } else {
+      cursorSeq = 0;
+    }
+
+    let lastApplied = snapshotSeq;
+    for (let seq = cursorSeq; seq <= highestSeq; seq++) {
+      const entry = await this._fetchShareLogEntry(friend, seq);
+      if (!entry) continue;
+      if (!entry.verified) {
+        console.warn(
+          `[TarnClient] readShareLog: skipping unverifiable entry from ${friend.share_pub.slice(0, 8)}... at seq=${seq}`,
+        );
+        continue;
+      }
+      applyOperationToState(state, entry.operation);
+      lastApplied = seq;
+    }
+
+    this.#readStateCache.set(friend.share_pub, {
+      state: { ...state },
+      lastSeqSeen: Math.max(highestSeq, lastApplied, -1),
+    });
+    return { ...state };
+  }
+
+  /**
+   * Incrementally sync a friend's outbound log: apply any new entries past
+   * the cached `lastSeqSeen` (sharing §8.5 incremental sync). If no cache
+   * exists yet (cold start), this performs a full {@link readShareLog}
+   * bootstrap.
+   *
+   * @param {{ share_pub: string, signing_pub: string }} friend
+   * @returns {Promise<Object>} updated state map
+   */
+  async syncShareLog(friend) {
+    await this.#requireAuth();
+    if (!friend || typeof friend.share_pub !== 'string') {
+      throw new Error('syncShareLog(): friend.share_pub is required');
+    }
+    if (typeof friend.signing_pub !== 'string') {
+      throw new Error('syncShareLog(): friend.signing_pub is required');
+    }
+    const cached = this.#readStateCache.get(friend.share_pub);
+    if (!cached) {
+      return await this.readShareLog(friend);
+    }
+
+    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const { highestSeq } = await discoverHighestSeq({
+      probe: (seq) => this.#probeInboundTagExists(pair, seq),
+      anchor: cached.lastSeqSeen + 1,
+    });
+
+    if (highestSeq <= cached.lastSeqSeen) {
+      return { ...cached.state };
+    }
+
+    const state = { ...cached.state };
+    let lastApplied = cached.lastSeqSeen;
+    for (let seq = cached.lastSeqSeen + 1; seq <= highestSeq; seq++) {
+      const entry = await this._fetchShareLogEntry(friend, seq);
+      if (!entry) continue;
+      if (!entry.verified) {
+        console.warn(
+          `[TarnClient] syncShareLog: skipping unverifiable entry from ${friend.share_pub.slice(0, 8)}... at seq=${seq}`,
+        );
+        lastApplied = seq;
+        continue;
+      }
+      applyOperationToState(state, entry.operation);
+      lastApplied = seq;
+    }
+
+    this.#readStateCache.set(friend.share_pub, {
+      state: { ...state },
+      lastSeqSeen: Math.max(highestSeq, lastApplied),
+    });
+    return { ...state };
+  }
+
+  /**
+   * Probe an INBOUND tag for existence (no decryption). Used by the
+   * read-flow highest-seq discovery to avoid spending an AES-GCM decrypt
+   * per probe.
+   */
+  async #probeInboundTagExists(pair, seq) {
+    const tag = await deriveLogTag(pair.inboundTagSeed, seq);
+    const blob = await this.#getShareLogBlobByTag(tag);
+    return blob !== null;
+  }
+
+  /**
+   * Test-only: peek at the read-state cache for a friend. Returns null if
+   * no entry. Production code should not depend on this — it exists for
+   * tests asserting cache-hit semantics.
+   */
+  _peekReadStateCache(friendSharePubBase64Url) {
+    const e = this.#readStateCache.get(friendSharePubBase64Url);
+    if (!e) return null;
+    return { state: { ...e.state }, lastSeqSeen: e.lastSeqSeen };
+  }
+
+  // ============ SHARE LOG — HIGH-LEVEL WRITE METHODS (Section 5c) ============
+
+  /**
+   * High-level: share a content item with a friend (sharing §8.3.1). Composes
+   * 5b's `_publishShareLogEntry` primitive with 5c's multi-device retry
+   * (§13.1). On a 409 from a sibling-device concurrent publish, the retry
+   * loop re-runs highest-seq discovery, advances the counter, re-signs the
+   * operation under the new seq (mandatory — `seq` is in the signature
+   * input per §8.1), and republishes. Up to 5 retries before surfacing the
+   * failure.
+   *
+   * Tracks the outbound state per friend so any auto-compaction snapshot
+   * (§8.6) emits a meaningful state map rather than the empty-state default
+   * — an empty snapshot is NOT a no-op (§8.3.5) and would wipe the
+   * recipient's view of what we've shared.
+   *
+   * @param {{ share_pub: string, signing_pub: string }} friend
+   * @param {string} contentId - app-stable content id (e.g., book id)
+   * @param {string} txId - Arweave transaction id of the latest content blob
+   * @param {string} cekBase64Url - 32-byte content encryption key, base64url
+   * @returns {Promise<{ seq: number, tag: string, txid: string, retried?: number }>}
+   */
+  async shareContent(friend, contentId, txId, cekBase64Url) {
+    await this.#hydrateOutboundState(friend);
+    const tentative = this.#tentativeOutboundState(friend);
+    tentative[contentId] = { tx_id: txId, cek: cekBase64Url };
+    const result = await this._publishShareLogEntry(friend, {
+      type: OP_ADD,
+      content_id: contentId,
+      tx_id: txId,
+      cek: cekBase64Url,
+      shared_at: Math.floor(Date.now() / 1000),
+    }, { retryOn409: true, snapshotState: tentative });
+    this.#commitOutboundState(friend, tentative);
+    return result;
+  }
+
+  /**
+   * High-level: notify a friend that a shared content item has a new
+   * Arweave version (sharing §8.3.2). CEK is unchanged. Uses the same 409
+   * retry semantics as {@link shareContent}.
+   */
+  async updateShareContent(friend, contentId, newTxId) {
+    await this.#hydrateOutboundState(friend);
+    const tentative = this.#tentativeOutboundState(friend);
+    if (tentative[contentId]) {
+      tentative[contentId] = { tx_id: newTxId, cek: tentative[contentId].cek };
+    }
+    const result = await this._publishShareLogEntry(friend, {
+      type: OP_UPDATE,
+      content_id: contentId,
+      tx_id: newTxId,
+      updated_at: Math.floor(Date.now() / 1000),
+    }, { retryOn409: true, snapshotState: tentative });
+    this.#commitOutboundState(friend, tentative);
+    return result;
+  }
+
+  /**
+   * High-level: revoke a content item from a friend's view (sharing §8.3.4
+   * `remove`). Note this is a UI hint per the design — the recipient may
+   * have cached prior versions locally, and `remove` does not retract those.
+   * For cryptographic revocation, use a `rotate` (5d) instead.
+   */
+  async unshareContent(friend, contentId) {
+    await this.#hydrateOutboundState(friend);
+    const tentative = this.#tentativeOutboundState(friend);
+    delete tentative[contentId];
+    const result = await this._publishShareLogEntry(friend, {
+      type: OP_REMOVE,
+      content_id: contentId,
+      removed_at: Math.floor(Date.now() / 1000),
+    }, { retryOn409: true, snapshotState: tentative });
+    this.#commitOutboundState(friend, tentative);
+    return result;
+  }
+
+  /**
+   * High-level: explicitly publish a snapshot capturing the current outbound
+   * state to a friend (sharing §8.3.5 / §8.6). Apps can call this to bound
+   * the bootstrap cost for new readers, or after a batch of mutations to
+   * checkpoint.
+   *
+   * If `state` is omitted, the current tracked outbound state is used (i.e.,
+   * lazy hydration + accumulated shareContent / updateShareContent /
+   * unshareContent updates from this session).
+   *
+   * @param {{ share_pub: string, signing_pub: string }} friend
+   * @param {Object | undefined} [state] - optional explicit override
+   * @returns {Promise<{ seq: number, tag: string, txid: string }>}
+   */
+  async snapshotShareLog(friend, state) {
+    if (state === undefined) {
+      await this.#hydrateOutboundState(friend);
+      state = this.#tentativeOutboundState(friend);
+    } else if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      throw new Error('snapshotShareLog(): state must be an object');
+    }
+    const counters = this.#getOrInitCounters(friend.share_pub);
+    const result = await this._publishShareLogEntry(friend, {
+      type: OP_SNAPSHOT,
+      state,
+      snapshot_at: Math.floor(Date.now() / 1000),
+      prior_seq: counters.nextOutboundSeq > 0 ? counters.nextOutboundSeq - 1 : null,
+    }, { retryOn409: true });
+    this.#commitOutboundState(friend, state);
+    return result;
+  }
+
+  // ---- Outbound state tracking (Section 5c) ----
+
+  /**
+   * Lazily reconstruct outbound state for a friend by replaying our own
+   * outbound log. No-op if already hydrated this session. Invoked by the
+   * high-level write methods on first use per friend.
+   *
+   * Same algorithm as {@link readShareLog} but with the OUTBOUND tag seed +
+   * outbound key (we encrypted these entries; we can decrypt them with the
+   * symmetric AES-GCM key) and our OWN signing pub for verification.
+   */
+  async #hydrateOutboundState(friend) {
+    const existing = this.#outboundStateCache.get(friend.share_pub);
+    if (existing?.hydrated) return;
+
+    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const ownSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+
+    const { highestSeq } = await discoverHighestSeq({
+      probe: (seq) => this.#probeOutboundTagExists(pair, seq),
+      anchor: 0,
+    });
+
+    if (highestSeq < 0) {
+      this.#outboundStateCache.set(friend.share_pub, { state: {}, hydrated: true });
+      return;
+    }
+
+    // Pre-fetch all entries seq=0..highestSeq into an array. Avoids the
+    // double-walk shape from a naive walk-back-then-forward implementation.
+    // The per-friend cap of MAX_LOG_BLOB_PLAINTEXT_BYTES on the writer side
+    // bounds memory; for typical Bookish-class users (~100s of entries)
+    // this is well under 1 MB total.
+    const entries = new Array(highestSeq + 1);
+    for (let seq = 0; seq <= highestSeq; seq++) {
+      entries[seq] = await this.#fetchOwnOutboundEntry(pair, seq, ownSigningPubBase64);
+    }
+
+    // Walk back to the latest snapshot (or seq=0 if none).
+    let snapshotSeq = -1;
+    for (let seq = highestSeq; seq >= 0; seq--) {
+      const e = entries[seq];
+      if (e?.verified && e.operation.type === OP_SNAPSHOT) {
+        snapshotSeq = seq;
+        break;
+      }
+    }
+
+    // Apply snapshot then walk forward.
+    const state = {};
+    let cursorSeq;
+    if (snapshotSeq >= 0) {
+      applyOperationToState(state, entries[snapshotSeq].operation);
+      cursorSeq = snapshotSeq + 1;
+    } else {
+      cursorSeq = 0;
+    }
+    for (let seq = cursorSeq; seq <= highestSeq; seq++) {
+      const e = entries[seq];
+      if (!e || !e.verified) continue;
+      applyOperationToState(state, e.operation);
+    }
+
+    this.#outboundStateCache.set(friend.share_pub, { state, hydrated: true });
+
+    // Seed the per-friend known-txids set with our own outbound entries so
+    // the multi-device retry path can detect "this 409 reports our own
+    // previous publish" across cold-session boundaries.
+    let txids = this.#publishedTxidsByFriend.get(friend.share_pub);
+    if (!txids) {
+      txids = new Set();
+      this.#publishedTxidsByFriend.set(friend.share_pub, txids);
+    }
+    for (const e of entries) {
+      if (e?.txid) txids.add(e.txid);
+    }
+
+    // Seed the writer's nextOutboundSeq + nonSnapshotsSinceLastSnapshot from
+    // the actual log tip — defends against fresh-session publishes at a
+    // stale seq=0 (which would 409 immediately and trigger the retry path).
+    const counters = this.#getOrInitCounters(friend.share_pub);
+    counters.nextOutboundSeq = highestSeq + 1;
+    if (snapshotSeq >= 0) {
+      counters.nonSnapshotsSinceLastSnapshot = highestSeq - snapshotSeq;
+    } else {
+      counters.nonSnapshotsSinceLastSnapshot = highestSeq + 1;
+    }
+  }
+
+  /**
+   * Fetch our OWN outbound entry at seq. Decrypts with the outbound key
+   * (same as encryption — AES-GCM is symmetric) and verifies against our
+   * own signing pub.
+   */
+  async #fetchOwnOutboundEntry(pair, seq, ownSigningPubBase64) {
+    const tag = await deriveLogTag(pair.outboundTagSeed, seq);
+    const fetched = await this.#getShareLogBlobByTag(tag);
+    if (!fetched) return null;
+    let operation;
+    try {
+      operation = await decryptShareLogEntry(fetched.ciphertext, pair.outboundKey);
+    } catch {
+      return { txid: fetched.txid, tag, operation: null, verified: false };
+    }
+    const verified = await verifyOperationSignature(operation, ownSigningPubBase64);
+    return { txid: fetched.txid, tag, operation, verified };
+  }
+
+  /**
+   * Return a SHALLOW COPY of the current outbound state for a friend, used
+   * as the working set for in-flight write methods. The returned object is
+   * mutated by the caller, then committed via {@link #commitOutboundState}
+   * on successful publish.
+   */
+  #tentativeOutboundState(friend) {
+    const cached = this.#outboundStateCache.get(friend.share_pub);
+    return cached ? { ...cached.state } : {};
+  }
+
+  #commitOutboundState(friend, newState) {
+    this.#outboundStateCache.set(friend.share_pub, {
+      state: { ...newState },
+      hydrated: true,
+    });
+  }
+
+  /**
+   * Test-only: peek at the outbound state cache for a friend. Returns null
+   * if not hydrated. Used by tests asserting outbound-snapshot semantics.
+   */
+  _peekOutboundStateCache(friendSharePubBase64Url) {
+    const e = this.#outboundStateCache.get(friendSharePubBase64Url);
+    if (!e) return null;
+    return { state: { ...e.state }, hydrated: !!e.hydrated };
   }
 
   // ---- Private share-log helpers ----
