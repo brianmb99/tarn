@@ -3,6 +3,7 @@
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { getEntryByLookupKey, refreshLookupCache } from '../cache.js';
+import { checkAndIncrementRateLimit } from '../rate-limit.js';
 
 const MAX_LOOKUPS_PER_HOUR = 30;
 
@@ -17,12 +18,8 @@ async function checkRateLimit(env, request) {
   const ipHash = await hashIP(ip);
   const hour = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
   const key = `lookup:${ipHash}:${hour}`;
-  const count = parseInt(await env.RATE_KV.get(key) || '0');
-  if (count >= MAX_LOOKUPS_PER_HOUR) {
-    return { allowed: false, remaining: 0 };
-  }
-  await env.RATE_KV.put(key, String(count + 1), { expirationTtl: 3600 });
-  return { allowed: true, remaining: MAX_LOOKUPS_PER_HOUR - count - 1 };
+  const { allowed, count } = await checkAndIncrementRateLimit(env.RATE_KV, key, MAX_LOOKUPS_PER_HOUR);
+  return { allowed, remaining: Math.max(0, MAX_LOOKUPS_PER_HOUR - count) };
 }
 
 export async function handleLookup(url, request, env, ctx, cors) {

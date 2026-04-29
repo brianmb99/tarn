@@ -21,38 +21,45 @@ export function generateChallenge() {
 }
 
 /**
- * Store a nonce in AUTH_KV, scoped to a credential_lookup_key.
+ * Store a nonce in D1 (auth_nonces table), scoped to a credential_lookup_key.
  * Nonces are single-use and expire after NONCE_TTL_SECONDS.
- * @param {Object} env - Worker environment (needs AUTH_KV binding)
+ *
+ * Migrated from AUTH_KV in migration 0012 — KV hit the free-tier daily put
+ * limit during testing-heavy days, taking down the entire auth flow. D1 has
+ * no equivalent cap for a workload of this size.
+ *
+ * @param {Object} env - Worker environment (needs DB binding)
  * @param {string} nonce - The nonce to store
  * @param {string} credentialLookupKey - The credential_lookup_key this nonce is for
  */
 export async function storeNonce(env, nonce, credentialLookupKey) {
-  await env.AUTH_KV.put(
-    `nonce:${nonce}`,
-    JSON.stringify({ credentialLookupKey, createdAt: Date.now() }),
-    { expirationTtl: NONCE_TTL_SECONDS }
-  );
+  const now = Date.now();
+  const expiresAt = now + NONCE_TTL_SECONDS * 1000;
+  await env.DB.prepare(
+    'INSERT INTO auth_nonces (nonce, credential_lookup_key, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)'
+  ).bind(nonce, credentialLookupKey, now, expiresAt).run();
 }
 
 /**
  * Consume a nonce (single-use). Returns stored data or null.
- * Deletes the nonce from KV immediately to prevent replay.
+ *
+ * Atomic-ish via D1's DELETE...RETURNING: the nonce row is removed on first
+ * read, so a concurrent second read can't replay it. Expired rows return
+ * null (lazy pruning — the SELECT side filters by expires_at, and the
+ * deleted row goes away in the same statement).
+ *
  * @param {Object} env - Worker environment
  * @param {string} nonce - The nonce to consume
  * @returns {Promise<{credentialLookupKey: string, createdAt: number}|null>}
  */
 export async function consumeNonce(env, nonce) {
-  const key = `nonce:${nonce}`;
-  const raw = await env.AUTH_KV.get(key);
-  if (!raw) return null;
-  // Single-use: delete immediately
-  await env.AUTH_KV.delete(key);
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    'DELETE FROM auth_nonces WHERE nonce = ?1 RETURNING credential_lookup_key, created_at, expires_at'
+  ).bind(nonce).first();
+  if (!row) return null;
+  if (row.expires_at < now) return null;
+  return { credentialLookupKey: row.credential_lookup_key, createdAt: row.created_at };
 }
 
 // ============ JWT (WebCrypto HMAC-SHA256) ============

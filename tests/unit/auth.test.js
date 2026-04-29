@@ -13,28 +13,48 @@ import {
   JWT_TTL_SECONDS,
 } from '../../api/src/auth.js';
 
-// ============ Mock KV Store ============
+// ============ Mock D1 Store (auth_nonces) ============
+//
+// Migration 0012 moved auth nonces from AUTH_KV to D1. This mock supports
+// just the two SQL statements storeNonce / consumeNonce emit:
+//   INSERT INTO auth_nonces (nonce, credential_lookup_key, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)
+//   DELETE FROM auth_nonces WHERE nonce = ?1 RETURNING credential_lookup_key, created_at, expires_at
 
-function createMockKV() {
-  const store = new Map();
+function createMockD1() {
+  const rows = new Map(); // nonce -> { credential_lookup_key, created_at, expires_at }
   return {
-    async get(key) {
-      const entry = store.get(key);
-      if (!entry) return null;
-      if (entry.expireAt && Date.now() > entry.expireAt) {
-        store.delete(key);
-        return null;
-      }
-      return entry.value;
+    prepare(sql) {
+      const params = [];
+      return {
+        bind(...args) {
+          params.push(...args);
+          return this;
+        },
+        async run() {
+          if (sql.startsWith('INSERT INTO auth_nonces')) {
+            const [nonce, clk, createdAt, expiresAt] = params;
+            rows.set(nonce, {
+              credential_lookup_key: clk,
+              created_at: createdAt,
+              expires_at: expiresAt,
+            });
+            return { success: true };
+          }
+          throw new Error(`mock D1: unsupported SQL for run(): ${sql}`);
+        },
+        async first() {
+          if (sql.startsWith('DELETE FROM auth_nonces')) {
+            const [nonce] = params;
+            const row = rows.get(nonce);
+            if (!row) return null;
+            rows.delete(nonce);
+            return row;
+          }
+          throw new Error(`mock D1: unsupported SQL for first(): ${sql}`);
+        },
+      };
     },
-    async put(key, value, opts = {}) {
-      const expireAt = opts.expirationTtl ? Date.now() + opts.expirationTtl * 1000 : null;
-      store.set(key, { value, expireAt });
-    },
-    async delete(key) {
-      store.delete(key);
-    },
-    _store: store,
+    _rows: rows,
   };
 }
 
@@ -66,7 +86,7 @@ describe('nonce lifecycle', () => {
   let env;
 
   beforeEach(() => {
-    env = { AUTH_KV: createMockKV() };
+    env = { DB: createMockD1() };
   });
 
   it('should store and consume a nonce', async () => {

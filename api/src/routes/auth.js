@@ -7,6 +7,7 @@ import { importPublicKey, verifySignature, isValidHex64 } from '../crypto.js';
 import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
+import { checkAndIncrementRateLimit } from '../rate-limit.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
 
@@ -100,12 +101,7 @@ async function checkRegistrationRateLimit(env, request) {
   const ipHash = Array.from(new Uint8Array(hash)).slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
   const hour = new Date().toISOString().slice(0, 13);
   const key = `register:${ipHash}:${hour}`;
-  const count = parseInt(await env.RATE_KV.get(key) || '0');
-  if (count >= MAX_REGISTRATIONS_PER_HOUR) {
-    return { allowed: false };
-  }
-  await env.RATE_KV.put(key, String(count + 1), { expirationTtl: 3600 });
-  return { allowed: true };
+  return await checkAndIncrementRateLimit(env.RATE_KV, key, MAX_REGISTRATIONS_PER_HOUR);
 }
 
 export async function handleRegister(request, env, ctx, cors) {
