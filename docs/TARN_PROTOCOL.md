@@ -1,7 +1,7 @@
 # Tarn Protocol — Working Draft
 
 **Status:** Active design discussion (Issue #69)
-**Last updated:** 2026-04-10
+**Last updated:** 2026-04-29
 
 Tarn is an app-agnostic platform for storing encrypted, user-owned data permanently on Arweave. This document defines the complete protocol: identity, authentication, encryption, and data operations.
 
@@ -781,6 +781,123 @@ DEK-encrypted via the per-content CEK pattern (same as the connections + pending
 - **App-driven filtering.** `readShareLog` and `syncShareLog` do NOT short-circuit on muted connections. Apps still need programmatic access to muted-connection state (e.g., to render a "Muted" tab). The SDK exposes `isMuted(connection)` and `listMutedConnections()` so apps can filter at the call sites that should be filtered (the main feed) without losing access at the call sites that shouldn't (the muted tab).
 
 SDK surface: `tarn.muteConnection(c)` / `tarn.unmuteConnection(c)` / `tarn.listMutedConnections()` / `tarn.isMuted(c)`.
+
+---
+
+## Session persistence (Section 7, issue #19)
+
+A logged-in `TarnClient` holds a bag of derived secrets in memory: the password-derived signing keypair, the unwrapped DEK chain, the X25519 sharing keypair, and the JWT. When the page closes, this state is lost — the user must re-enter their password (paying the full Argon2id cost) on every tab open and every browser restart.
+
+For consumer apps this is a UX floor that's hard to ship below. Section 7 adds an explicit, opt-in session-persistence primitive that lets apps trade a bounded increase in attack surface for the ability to restore the in-memory state without re-deriving from password.
+
+### Why it must be opt-in
+
+Persisting derived keys to client-side storage is a meaningful change to Tarn's threat surface. Today, a same-origin XSS on a Tarn app can act as the user **for as long as the page is open** — once the tab closes, the keys are gone. With persistence enabled, the same XSS gains the ability to either decrypt the persisted blob in-page (calling the SDK on the live origin) or, if combined with a localStorage/IndexedDB exfil to a remote server, replay the session **only while the wrapping key remains valid** (see at-rest encryption below).
+
+This is a real escalation, even with a non-extractable wrapping key. Apps with stricter postures should not opt in. The default (`new TarnClient(api, appId)` followed by `login()`) does not persist anything; apps must explicitly call `serializeSession()` to enable persistence.
+
+### Threat model
+
+What persistence costs:
+
+1. **Same-origin XSS becomes pseudo-persistent.** An attacker who lands code execution on the origin can call `resumeSession()` on the persisted blob and act as the user up to the blob's `expiresAt`. This is bounded by the 7-day max age and by the absence of refresh-on-use (see lifecycle).
+2. **No server-side revocation in v1.** A user who suspects their device is compromised cannot tell the API "log out all sessions." The mitigation is `changeCredentials()` — which rotates the signing key and the DEK chain, and the SDK clears the IndexedDB wrapping key as a side effect, rendering all previously-emitted blobs on this origin unreadable. v2 will add per-session identifiers and an explicit revoke endpoint so a user can invalidate sessions without changing credentials.
+3. **Cross-tab attack visibility.** All same-origin tabs can read each other's IndexedDB and localStorage. An attacker on one tab can resume the session on another. This is identical to the existing same-origin XSS surface and is not new.
+
+What persistence does NOT cost:
+
+1. **Cross-origin attackers** see no change. The wrapping key is bound to origin via IndexedDB scoping; the persisted blob is unreadable off-origin.
+2. **Network attackers** see no change. The persisted blob never leaves the device.
+3. **Tarn API operators** see no change. The persisted blob is never sent to the API.
+
+### Wire format (pre-encryption JSON)
+
+The plaintext payload below is what gets encrypted under the at-rest wrapping key. Apps MUST treat the resulting ciphertext as opaque — schema fields are subject to change in future versions and are documented here only so the threat model can be reasoned about.
+
+```json
+{
+  "v": 1,
+  "createdAt": <unix-seconds>,
+  "expiresAt": <unix-seconds>,
+  "apiBase": "https://api.tarn.dev",
+  "appId": "bookish",
+  "email": "user@example.com",
+  "dataLookupKey": "<64-char hex>",
+  "credentialLookupKey": "<64-char hex>",
+  "kdfVersion": 2,
+  "envelopeVersion": 4,
+  "currentGen": 2,
+  "dekByGen": [
+    { "gen": 1, "rawBytes": "<base64 32 bytes>" },
+    { "gen": 2, "rawBytes": "<base64 32 bytes>" }
+  ],
+  "signingPrivateKey": "<base64 PKCS#8 DER>",
+  "signingPublicKey": "<base64 SPKI>",
+  "sharingPrivateKey": "<base64 32 bytes>",
+  "sharingPublicKey": "<base64 32 bytes>",
+  "recoveryFactorMeta": null | {
+    "salt": "<base64 16 bytes>",
+    "kdfParams": { "m_kib": ..., "t": ..., "p": ... },
+    "wrappingsByGen": [{ "gen": 1, "wrapped": "<base64>" }, ...]
+  },
+  "jwt": "<jwt or null>"
+}
+```
+
+The `credential_encryption_key` is intentionally NOT persisted — once the DEK chain is unwrapped at login, the KEK becomes dead state on the client (no code path reads it post-login). Re-deriving it would require the password, which we do not have. Persistence carries the unwrapped DEKs directly, sidestepping the KEK entirely. The recovery factor's `wrappingsByGen` is preserved verbatim (per-gen AES-KW ciphertext bytes) so a subsequent `changeCredentials()` can re-emit the recovery wrappings without requiring the user to re-enter the phrase, matching the in-memory `#recoveryFactorMeta` semantics.
+
+### At-rest encryption
+
+The plaintext schema above is encrypted under an AES-256-GCM wrapping key managed by the SDK and stored in IndexedDB (database `tarn-session`, object store `keys`, record id `wrapping-key-v1`). The wrapping key is created with `extractable: false` so its raw bytes never enter JS userland — even if XSS reads the IndexedDB store, it can only invoke the key for decrypt (which still grants in-page session takeover) but cannot exfiltrate it for offline replay on another device or origin.
+
+```
+on-disk blob (returned from serializeSession, base64url-encoded):
+  IV (12 bytes) || AES-256-GCM ciphertext+tag
+
+wrapping key (in IndexedDB, non-extractable):
+  AES-256-GCM, generated on first persist, scoped to origin
+```
+
+The SDK creates the wrapping key on first call to `serializeSession()`. Subsequent calls reuse it. `clearSession()` deletes the IndexedDB record, which renders all previously-emitted blobs on this origin unreadable.
+
+### Lifecycle
+
+1. **Creation.** App authenticates via `login()`, `register()`, or `recoverAccount()`. App calls `await client.serializeSession()` and stores the returned blob (typically in `localStorage`).
+2. **Resume.** On a subsequent page load, app calls `await TarnClient.resumeSession(apiBase, appId, blob)`. If the blob is well-formed, decryptable on this origin, schema-version `1`, and not past `expiresAt`, returns a logged-in `TarnClient`. Otherwise returns `null` — caller falls back to the login UI.
+3. **Expiry.** Hard 7-day max age, baked into the blob's `expiresAt` field at creation. The SDK does NOT auto-refresh expiry on use — a "fresh" blob is only emitted by an explicit `serializeSession()` call. This bounds the worst-case window of a quiet exfil-and-replay attack.
+4. **Invalidation events.** `changeCredentials()`, `recoverAccount()`, and `deleteAccount()` all rotate the signing key and the DEK chain. The SDK clears the IndexedDB wrapping key on each, rendering all previously-emitted blobs on this origin unreadable. Apps that want continued persistence must re-call `serializeSession()` after these events.
+5. **Explicit logout.** `await client.clearSession()` deletes the IndexedDB wrapping key. Subsequent `resumeSession()` calls return `null` for any pre-existing blob.
+
+The `expiresAt` field is enforced client-side. A motivated attacker with code execution on the origin could in principle tamper with the field before it's encrypted (the SDK is in their JS context; they can call any of its functions). v1 accepts this — the threat is upper-bounded by the existing in-page-XSS exposure, which is itself the dominant risk this section is documenting.
+
+### SDK API surface
+
+```
+client.serializeSession(): Promise<string>
+  Requires: client is authenticated.
+  Returns:  opaque base64url ciphertext.
+  Side effects: creates the IndexedDB wrapping key if absent; idempotent.
+  Throws:   if the client is not authenticated.
+
+TarnClient.resumeSession(apiBase, appId, blob): Promise<TarnClient | null>
+  Returns:  a logged-in TarnClient, or null if the blob is expired,
+            tampered, schema-mismatched, or unreadable on this origin.
+  Never throws on bad blobs — null is the recoverable signal so apps can
+  uniformly fall back to the login UI without distinguishing failure modes.
+
+client.clearSession(): Promise<void>
+  Deletes the IndexedDB wrapping key. Renders all previously-emitted
+  blobs unreadable on this origin. Does not affect the in-memory
+  client state — the caller can keep using the live client until it's
+  garbage-collected.
+```
+
+### Known v1 gaps
+
+- **No server-side revocation.** "Log out all devices" requires `changeCredentials()`. An explicit `DELETE /api/v1/sessions` endpoint plus per-session identifiers is deferred to v2.
+- **No idle expiry.** Blobs expire only at the hard 7-day mark; an actively-used session has no separate idle timeout. Apps that want shorter idle windows can implement them by calling `clearSession()` from their own activity tracker.
+- **Browser-only.** The IndexedDB + non-extractable WebCrypto storage strategy is browser-specific. Tarn-on-Node and Tarn-on-React-Native session persistence are deferred — the API surface (`serializeSession` / `resumeSession`) is intentionally storage-agnostic in shape so a future implementation can swap backends without changing the surface.
+- **No share-log cache participation.** Persisted sessions hydrate share-log state on first read/sync from Arweave, just like fresh logins. Pure perf optimization, not a correctness gap.
 
 ---
 
