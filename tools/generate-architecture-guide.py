@@ -541,8 +541,109 @@ CONTENT = [
      "credentials. Future hardening (a separate rotation key derived from "
      "the recovery phrase) is on the roadmap."),
 
+    # ============ SESSION PERSISTENCE ============
+    ('h1', '9. Session persistence'),
+    ('p',
+     "By default a logged-in Tarn client holds its derived keys — signing "
+     "keypair, unwrapped DEK chain, sharing keypair, JWT — in memory only. "
+     "When the page closes, the keys are gone, and the next session requires "
+     "re-deriving from email + password (paying the full Argon2id cost). For "
+     "consumer apps this is a UX floor that's hard to ship below."),
+    ('p',
+     "Tarn provides an <i>opt-in</i> session-persistence primitive: apps that "
+     "want it can serialize a logged-in client to an opaque blob, store the "
+     "blob in <code>localStorage</code>, and resume from it on a later page "
+     "load without prompting the user for their password. The default "
+     "behaviour (no persistence) is unchanged; apps with stricter postures "
+     "stay opted out."),
+    ('h2', 'At-rest encryption'),
+    ('p',
+     "The serialized session is encrypted under an AES-256-GCM wrapping key "
+     "stored in IndexedDB with <code>extractable: false</code>. The "
+     "non-extractable flag is the load-bearing piece of the threat model: "
+     "even an attacker with code execution on the origin (XSS) cannot "
+     "exfiltrate the raw key bytes for offline replay on another device — "
+     "they can only invoke the key in-page, and only while they hold "
+     "execution. The persisted blob is unreadable off-origin."),
+    ('h2', 'Threat model and trade-offs'),
+    ('p',
+     "Persisting derived keys to client-side storage is a meaningful change "
+     "to Tarn's threat surface, and Tarn is honest about it. Without "
+     "persistence, a same-origin XSS can act as the user only while the page "
+     "is open. With persistence, the same XSS gains pseudo-persistent access: "
+     "it can decrypt the persisted blob in-page and act as the user up to "
+     "the blob's expiry."),
+    ('p',
+     "Three constraints bound this risk:"),
+    ('b',
+     "<b>Hard 7-day max age</b>, baked into the blob at creation. The SDK "
+     "does not refresh expiry on use; a quiet exfil-and-replay attack is "
+     "bounded to one week regardless of activity."),
+    ('b',
+     "<b>Origin binding via the non-extractable wrapping key.</b> Stealing "
+     "the persisted blob is useless without simultaneous code execution on "
+     "the origin."),
+    ('b',
+     "<b>Automatic invalidation on key rotation.</b> Credential change, "
+     "account recovery, and account deletion each rotate the wrapping key "
+     "as a side effect, rendering all previously-emitted blobs on the origin "
+     "unreadable."),
+    ('p',
+     "Apps with stricter threat models (financial, medical, etc.) should "
+     "simply not opt in. The default constructor + <code>login()</code> "
+     "path persists nothing."),
+    ('h2', 'What gets persisted'),
+    ('p',
+     "Just enough to reconstitute the in-memory client without re-deriving "
+     "from password: the signing keypair (PKCS#8 + SPKI), the unwrapped DEK "
+     "chain (raw bytes per generation), the sharing keypair, the data and "
+     "credential lookup keys, the recovery-factor metadata used by "
+     "<code>changeCredentials</code>, and the current JWT. The "
+     "credential_encryption_key is intentionally omitted — once the DEK "
+     "chain is unwrapped at login, the KEK is dead state. Share-log caches "
+     "are not persisted; they re-hydrate from Arweave on first use."),
+    ('h2', 'Server-side session management'),
+    ('p',
+     "Section 7 (above) covers persistence — keeping a logged-in client "
+     "alive across page reloads on a single device. A complementary "
+     "capability, sequenced as the immediate follow-up, covers "
+     "<i>multi-device session management</i>: letting a user list active "
+     "sessions across devices and revoke any of them individually without "
+     "performing a full credential change."),
+    ('p',
+     "Shape of the change:"),
+    ('b',
+     "<b>Per-session identifier.</b> Every successful "
+     "<code>/auth/verify</code> issues a JWT carrying a <code>sid</code> "
+     "claim — a fresh UUID. The server records the session in a new D1 "
+     "<code>sessions</code> table with <code>created_at</code>, "
+     "<code>last_seen_at</code>, and an optional device label."),
+    ('b',
+     "<b>Revocation endpoints.</b> <code>DELETE /api/v1/sessions/:sid</code> "
+     "kills one session; <code>DELETE /api/v1/sessions</code> kills all "
+     "active sessions for the user. Both require a valid JWT from any "
+     "session belonging to the same account."),
+    ('b',
+     "<b>Listing endpoint.</b> <code>GET /api/v1/sessions</code> returns "
+     "the user's active sessions so an app can render a "
+     "<i>Manage devices</i> page."),
+    ('b',
+     "<b>Stateful auth middleware.</b> Authenticated request handling "
+     "consults the <code>sessions</code> table to confirm the JWT's "
+     "<code>sid</code> is still active. The added D1 lookup is mitigated "
+     "by a short in-Worker cache to avoid hot-pathing the database."),
+    ('p',
+     "Together, persistence (this section) and session management "
+     "(Section 7.5) close the consumer-app session story: users stay "
+     "logged in across reloads on the devices they trust, and can kill "
+     "individual sessions cleanly when they don't. Until 7.5 ships, the "
+     "available revocation path is <code>changeCredentials</code>, which "
+     "rotates the signing key and locks out every other device — a "
+     "heavy hammer that works but isn't the right tool for routine "
+     "device management."),
+
     # ============ DEFERRED ============
-    ('h1', '9. Deferred features'),
+    ('h1', '10. Deferred features'),
     ('p',
      "Several capabilities are intentionally deferred from the v1 platform. "
      "They are documented here so that future evolution paths are visible."),
@@ -572,7 +673,7 @@ CONTENT = [
      "improvement; deferred."),
 
     # ============ GLOSSARY ============
-    ('h1', '10. Glossary'),
+    ('h1', '11. Glossary'),
     ('table',
      ['Term', 'Meaning'],
      [
@@ -590,7 +691,7 @@ CONTENT = [
      ]),
 
     # ============ POINTERS ============
-    ('h1', '11. Where to learn more'),
+    ('h1', '12. Where to learn more'),
     ('p',
      "<b>Protocol specification.</b> The canonical reference is "
      "<code>docs/TARN_PROTOCOL.md</code> in the Tarn repository — full "
@@ -609,7 +710,7 @@ CONTENT = [
      "<i>why</i> certain decisions were made — particularly the trade-offs "
      "around revocation, metadata privacy, and recovery."),
     ('p',
-     "<b>Implementation history.</b> Issues 9–18 on the Tarn repository, "
+     "<b>Implementation history.</b> Issues 9–19 on the Tarn repository, "
      "filed and closed during the platform build, document the unit of work "
      "for each protocol section. Each closing comment serves as a self-"
      "contained record of what shipped under that section."),
