@@ -294,9 +294,98 @@ await test('share_lookup_key is per-app isolated (cross-app probe misses)', asyn
   assert(discoverable === false, 'cross-app lookup should be opaque');
 });
 
-// ============ 8. CLEANUP ============
+// ============ 8. FRIEND HANDSHAKE (issue #14, Section 5a) ============
 
-console.log('\n=== 8. Cleanup ===');
+console.log('\n=== 8. Friend handshake (HPKE inbox) ===');
+
+let handshakeAlice;
+let handshakeBob;
+let handshakeAliceEmail;
+let handshakeAliceDlk;
+let handshakeBobEmail;
+let handshakeBobDlk;
+let handshakeRequestNonce;
+
+await test('Two test users register + complete a mutual handshake against the deployed API', async () => {
+  // Note: we don't need to set rules for the friends + pending records
+  // because Bookish's standard rules (max_entries with no entry_type filter,
+  // max_bytes) apply per-app. The test creates only a few share-state
+  // entries — well under the limit. If max_entries were lower than ~5 the
+  // test would fail; the smoke-test rule set is `max_entries: 5, app:
+  // bookish` and we use 2 entries per user (friends + pending), so we have
+  // headroom.
+  handshakeAliceEmail = `deploy-handshake-a-${Date.now()}@test.com`;
+  handshakeBobEmail = `deploy-handshake-b-${Date.now()}@test.com`;
+  const password = 'handshake-test-' + Date.now();
+
+  handshakeAlice = new TarnClient(API_BASE, APP_ID);
+  handshakeBob = new TarnClient(API_BASE, APP_ID);
+  const a = await handshakeAlice.register(handshakeAliceEmail, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const b = await handshakeBob.register(handshakeBobEmail, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  handshakeAliceDlk = a.dataLookupKey;
+  handshakeBobDlk = b.dataLookupKey;
+
+  // Set permissive rules on each user via the bookish app JWT (the
+  // existing test scaffolding sets rules for testDlk only; we replicate
+  // the auth+PUT for our two new users).
+  const pkcs8 = new Uint8Array(APP_KEY.length / 2);
+  for (let i = 0; i < APP_KEY.length; i += 2) pkcs8[i / 2] = parseInt(APP_KEY.substr(i, 2), 16);
+  const privateKey = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const cRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: APP_ID }),
+  });
+  const { nonce } = await cRes.json();
+  const nonceBytes = new Uint8Array(nonce.length / 2);
+  for (let i = 0; i < nonce.length; i += 2) nonceBytes[i / 2] = parseInt(nonce.substr(i, 2), 16);
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, nonceBytes);
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  const vRes = await fetch(`${API_BASE}/api/v1/auth/verify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: APP_ID, nonce, signature: sigB64 }),
+  });
+  const { jwt } = await vRes.json();
+
+  for (const dlk of [handshakeAliceDlk, handshakeBobDlk]) {
+    const r = await fetch(`${API_BASE}/api/v1/accounts/${dlk}/rules`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 20, app: APP_ID }, { type: 'max_bytes', limit: 102400 }] }),
+    });
+    assert(r.status === 200, `Set rules failed for ${dlk}: ${r.status}`);
+  }
+
+  // Alice → Bob friend request.
+  const send = await handshakeAlice.sendFriendRequest(handshakeBobEmail, { message: 'hi from deployed test' });
+  assert(send.requestNonce, 'no requestNonce');
+  handshakeRequestNonce = send.requestNonce;
+
+  // Bob picks it up.
+  await sleep(500);
+  const inbox = await handshakeBob.listIncomingRequests();
+  assert(inbox.length >= 1, `Bob expected ≥1 incoming, got ${inbox.length}`);
+  assert(inbox.some(r => r.requestNonce === handshakeRequestNonce), 'request nonce not in inbox');
+
+  // Bob accepts.
+  await handshakeBob.acceptFriendRequest(handshakeRequestNonce);
+  const bobFriends = await handshakeBob.listFriends();
+  assert(bobFriends.some(f => f.email === handshakeAliceEmail), 'Alice not in Bob\'s friends');
+
+  // Alice processes the accept.
+  await sleep(500);
+  await handshakeAlice.listIncomingRequests();
+  const aliceFriends = await handshakeAlice.listFriends();
+  assert(aliceFriends.some(f => f.email === handshakeBobEmail), 'Bob not in Alice\'s friends');
+});
+
+await test('Delete handshake test accounts', async () => {
+  if (handshakeAlice) await handshakeAlice.deleteAccount();
+  if (handshakeBob) await handshakeBob.deleteAccount();
+});
+
+// ============ 9. CLEANUP ============
+
+console.log('\n=== 9. Cleanup ===');
 
 await test('Delete test account', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
