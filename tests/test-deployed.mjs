@@ -263,6 +263,33 @@ await test('resumeSession returns null on tampered blob', async () => {
   assert(result === null, 'tampered blob must resume to null');
 });
 
+// ============ 5c. SESSION MANAGEMENT (Section 7.5, issue #20) ============
+
+console.log('\n=== 5c. Session Management ===');
+
+await test('listSessions returns at least one session, marked isCurrent', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testEmail, testPassword);
+  const sessions = await tarn.listSessions();
+  assert(Array.isArray(sessions), 'listSessions returns an array');
+  assert(sessions.length >= 1, `expected ≥1 session, got ${sessions.length}`);
+  assert(sessions.some(s => s.isCurrent === true), 'one session should be isCurrent');
+});
+
+await test('revokeOtherSessions preserves the calling session', async () => {
+  // Login as a "second device" so we have something to revoke.
+  const peer = new TarnClient(API_BASE, APP_ID);
+  await peer.login(testEmail, testPassword);
+
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testEmail, testPassword);
+
+  await tarn.revokeOtherSessions();
+  const after = await tarn.listSessions();
+  assert(after.length === 1, `expected 1 session after revokeOtherSessions, got ${after.length}`);
+  assert(after[0].isCurrent === true, 'remaining session should be the calling one');
+});
+
 // ============ 6. STATUS ============
 
 console.log('\n=== 6. Status ===');

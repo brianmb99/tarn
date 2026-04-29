@@ -292,23 +292,25 @@ await test('resumeSession: malformed (non-base64url) blob returns null', async (
   await c.deleteAccount();
 });
 
-await test('resumeSession: schema-mismatch (v != 1) returns null', async () => {
+await test('resumeSession: schema-mismatch (unknown v) returns null', async () => {
   await clearWrappingKey();
   const email = randomEmail();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
 
-  // Hand-build a blob with v: 2 by encrypting under the same wrapping key.
+  // Hand-build a blob with an unknown schema version (v: 99) by encrypting
+  // under the same wrapping key. v1 (Section 7) and v2 (Section 7.5) are
+  // both valid; anything else must reject.
   const { encryptSessionBlob, getOrCreateWrappingKey } = await import('../client/src/session-persistence.js');
   const { bytesToBase64Url } = await import('../client/src/crypto.js');
-  const fake = { v: 2, expiresAt: Math.floor(Date.now() / 1000) + 1000 };
+  const fake = { v: 99, expiresAt: Math.floor(Date.now() / 1000) + 1000 };
   const pt = new TextEncoder().encode(JSON.stringify(fake));
   const key = await getOrCreateWrappingKey();
   const ct = await encryptSessionBlob(pt, key);
   const blob = bytesToBase64Url(ct);
 
   const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob);
-  assert(result === null, 'v != 1 must resume to null');
+  assert(result === null, 'unknown schema v must resume to null');
 
   await client.deleteAccount();
 });
