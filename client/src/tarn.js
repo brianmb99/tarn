@@ -75,6 +75,11 @@ import {
   INFO_CONNECTION_REQUEST,
   INFO_CONNECTION_ACCEPT,
   DEFAULT_POLL_WINDOWS,
+  MUTED_CONNECTIONS_CONTENT_ID,
+  emptyMutedConnectionsRecord,
+  addMutedConnection,
+  removeMutedConnection,
+  isMutedInRecord,
 } from './sharing.js';
 import {
   deriveSharedSecret,
@@ -650,6 +655,7 @@ export class TarnClient {
     this.#readStateCache.clear();
     this.#outboundStateCache.clear();
     this.#publishedTxidsByConnection.clear();
+    this.#mutedConnectionsState = null;
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
@@ -1065,6 +1071,7 @@ export class TarnClient {
     this.#readStateCache.clear();
     this.#outboundStateCache.clear();
     this.#publishedTxidsByConnection.clear();
+    this.#mutedConnectionsState = null;
 
     await this.#authenticate();
 
@@ -1140,6 +1147,7 @@ export class TarnClient {
     this.#readStateCache.clear();
     this.#outboundStateCache.clear();
     this.#publishedTxidsByConnection.clear();
+    this.#mutedConnectionsState = null;
   }
 
   // ============ DATA CRUD ============
@@ -1835,6 +1843,99 @@ export class TarnClient {
       outbound: state.record.outbound.slice(),
       inbound: state.record.inbound.slice(),
     };
+  }
+
+  // ============ MUTED CONNECTIONS (issue #18, Section 6) ============
+
+  /**
+   * Mute a connection. Adds the connection's `share_pub` to the persisted
+   * muted-connections record so subsequent sessions and other devices can
+   * see the muted state. Idempotent — re-muting a muted connection is a
+   * no-op (the original `muted_at` is preserved).
+   *
+   * Mute is purely a per-side visibility filter. It does NOT:
+   *   - stop the muted party from publishing share-log entries to us
+   *   - alter what they can see on their side (we don't notify them)
+   *   - cause `readShareLog` / `syncShareLog` to short-circuit on their
+   *     log — apps may want to display muted-connection content in a
+   *     "Muted" tab even while excluding them from the main feed
+   *
+   * Apps decide when to filter; the SDK only stores the toggle.
+   *
+   * @param {{ share_pub: string }} connection
+   * @returns {Promise<{ muted: boolean }>} `muted: true` on add, `muted: false`
+   *   if the connection was already muted (no record write).
+   */
+  async muteConnection(connection) {
+    await this.#requireAuth();
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('muteConnection(): connection.share_pub is required');
+    }
+    const state = await this.#loadMutedConnectionsRecord();
+    if (isMutedInRecord(state.record, connection.share_pub)) {
+      return { muted: false };
+    }
+    const updated = addMutedConnection(
+      state.record, connection.share_pub, Math.floor(Date.now() / 1000),
+    );
+    const written = await this.#saveMutedConnectionsRecord(state, updated);
+    this.#mutedConnectionsState = { record: written.record, txid: written.txid };
+    return { muted: true };
+  }
+
+  /**
+   * Unmute a connection. Removes the connection's `share_pub` from the
+   * persisted muted-connections record. Idempotent — unmuting a non-muted
+   * connection is a no-op.
+   *
+   * @param {{ share_pub: string }} connection
+   * @returns {Promise<{ unmuted: boolean }>} `unmuted: true` on remove,
+   *   `unmuted: false` if the connection wasn't muted (no record write).
+   */
+  async unmuteConnection(connection) {
+    await this.#requireAuth();
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('unmuteConnection(): connection.share_pub is required');
+    }
+    const state = await this.#loadMutedConnectionsRecord();
+    if (!isMutedInRecord(state.record, connection.share_pub)) {
+      return { unmuted: false };
+    }
+    const updated = removeMutedConnection(state.record, connection.share_pub);
+    const written = await this.#saveMutedConnectionsRecord(state, updated);
+    this.#mutedConnectionsState = { record: written.record, txid: written.txid };
+    return { unmuted: true };
+  }
+
+  /**
+   * List currently-muted connections. Returns a shallow copy of the persisted
+   * muted entries: `[{ share_pub, muted_at }, ...]`.
+   *
+   * On the first call per session this hydrates the record from Arweave; on
+   * subsequent calls the in-memory copy is returned directly (kept current
+   * by `muteConnection` / `unmuteConnection`).
+   */
+  async listMutedConnections() {
+    await this.#requireAuth();
+    const state = await this.#loadMutedConnectionsRecord();
+    return state.record.muted.slice();
+  }
+
+  /**
+   * True if `connection` is currently in the muted list.
+   *
+   * Like `listMutedConnections`, hydrates on first call per session.
+   *
+   * @param {{ share_pub: string }} connection
+   * @returns {Promise<boolean>}
+   */
+  async isMuted(connection) {
+    await this.#requireAuth();
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('isMuted(): connection.share_pub is required');
+    }
+    const state = await this.#loadMutedConnectionsRecord();
+    return isMutedInRecord(state.record, connection.share_pub);
   }
 
   // ============ SHARE LOG (issue #15, Section 5b) ============
@@ -3273,6 +3374,30 @@ export class TarnClient {
 
   async #savePendingRequestsRecord(state, newRecord) {
     return await this.#writeShareStateEntry(PENDING_REQUESTS_CONTENT_ID, state, newRecord);
+  }
+
+  /**
+   * Load (or hydrate the cached) muted-connections record for the current
+   * app (issue #18, Section 6). On the first call per session this issues a
+   * fetch against Arweave (via the standard `tarn-share-state` lookup); on
+   * subsequent calls the in-memory copy is returned. Mute / unmute keep the
+   * cache in sync so reads after a write are immediate.
+   *
+   * Wholly invalidated on credential change / recovery / delete (the DEK
+   * chain rotates; we re-hydrate on next mute-related call).
+   */
+  async #loadMutedConnectionsRecord() {
+    if (this.#mutedConnectionsState) return this.#mutedConnectionsState;
+    const entry = await this.#findShareStateEntry(MUTED_CONNECTIONS_CONTENT_ID);
+    const state = entry
+      ? { record: entry.data, txid: entry.txid }
+      : { record: emptyMutedConnectionsRecord(this.#appId), txid: null };
+    this.#mutedConnectionsState = state;
+    return state;
+  }
+
+  async #saveMutedConnectionsRecord(state, newRecord) {
+    return await this.#writeShareStateEntry(MUTED_CONNECTIONS_CONTENT_ID, state, newRecord);
   }
 
   /**

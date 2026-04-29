@@ -753,6 +753,81 @@ function ensurePendingShape(record) {
   }
 }
 
+// ============ MUTED-CONNECTIONS RECORD (Section 6, issue #18) ============
+
+// Per-side, per-user visibility filter on top of the mutual-connection
+// primitive. Muted state has no protocol-level effect — it does NOT stop the
+// muted party from publishing share-log entries to us, and it does NOT alter
+// what they can read on their side. It is purely a local "should this
+// connection's content show up in the default feed" toggle, persisted as a
+// DEK-encrypted Tarn data blob so it syncs across the user's own devices.
+//
+// Apps decide when to filter. The SDK exposes `isMuted(connection)` and
+// `listMutedConnections()` so an app can render a muted connection in a
+// "Muted" tab even while excluding them from the main feed.
+
+export const MUTED_CONNECTIONS_CONTENT_ID = 'tarn-muted-connections-v1';
+
+/**
+ * Shape: an empty muted-connections record for a fresh account.
+ * @param {string} appId
+ */
+export function emptyMutedConnectionsRecord(appId) {
+  return { app_id: appId, version: 1, muted: [] };
+}
+
+/**
+ * Add a muted entry (idempotent on `share_pub`). Existing entries' `muted_at`
+ * are preserved — re-muting an already-muted connection is a no-op.
+ *
+ * @param {Object} record
+ * @param {string} connectionSharePubBase64Url
+ * @param {number} mutedAt - unix seconds
+ */
+export function addMutedConnection(record, connectionSharePubBase64Url, mutedAt) {
+  if (!record || !Array.isArray(record.muted)) {
+    throw new Error('record must be a muted-connections record');
+  }
+  if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
+    throw new Error('connectionSharePubBase64Url is required');
+  }
+  if (!Number.isInteger(mutedAt)) {
+    throw new Error('mutedAt must be an integer (unix seconds)');
+  }
+  if (record.muted.some(m => m.share_pub === connectionSharePubBase64Url)) {
+    return record;
+  }
+  return {
+    ...record,
+    muted: [...record.muted, { share_pub: connectionSharePubBase64Url, muted_at: mutedAt }],
+  };
+}
+
+/**
+ * Remove a muted entry (idempotent on `share_pub`). Returns the record
+ * unchanged if the connection wasn't muted.
+ */
+export function removeMutedConnection(record, connectionSharePubBase64Url) {
+  if (!record || !Array.isArray(record.muted)) {
+    throw new Error('record must be a muted-connections record');
+  }
+  if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
+    throw new Error('connectionSharePubBase64Url is required');
+  }
+  return {
+    ...record,
+    muted: record.muted.filter(m => m.share_pub !== connectionSharePubBase64Url),
+  };
+}
+
+/** True if `connectionSharePubBase64Url` appears in the muted record. */
+export function isMutedInRecord(record, connectionSharePubBase64Url) {
+  if (!record || !Array.isArray(record.muted)) {
+    throw new Error('record must be a muted-connections record');
+  }
+  return record.muted.some(m => m.share_pub === connectionSharePubBase64Url);
+}
+
 function requireString(v, name) {
   if (typeof v !== 'string' || v.length === 0) throw new Error(`${name} must be a non-empty string`);
   return v;

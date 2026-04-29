@@ -877,9 +877,98 @@ await test('Re-reading rotate_identity is idempotent (replay produces same final
   assert(refreshed['post-rotate-target'], 'post-rotate-target should still be present');
 });
 
-// ============ 10. Cleanup ============
+// ============ 10. Mute lifecycle (issue #18, Section 6) ============
 
-console.log('\n=== 10. Cleanup ===');
+console.log('\n=== 10. Mute lifecycle: per-side filter, syncs across devices ===');
+
+const karlEmail = randomEmail();
+const karlPassword = 'pw-karl-' + Date.now();
+const lilyEmail = randomEmail();
+const lilyPassword = 'pw-lily-' + Date.now();
+const karl = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+const lily = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+let lilyConnectionOfKarl;
+
+await test('Karl + Lily register and connection each other', async () => {
+  await registerWithRules(karl, karlEmail, karlPassword);
+  await registerWithRules(lily, lilyEmail, lilyPassword);
+  const send = await karl.sendConnectionRequest(lilyEmail);
+  await sleep(200);
+  await lily.listIncomingRequests();
+  await lily.acceptConnectionRequest(send.requestNonce);
+  await sleep(200);
+  await karl.listIncomingRequests();
+  lilyConnectionOfKarl = (await karl.listConnections()).find(c => c.email === lilyEmail);
+  assert(lilyConnectionOfKarl, 'Karl missing Lily');
+});
+
+await test('isMuted is false on a fresh connection', async () => {
+  assert(!(await karl.isMuted(lilyConnectionOfKarl)), 'fresh connection should not be muted');
+  const muted0 = await karl.listMutedConnections();
+  assert(muted0.length === 0, `expected empty muted list, got ${muted0.length}`);
+});
+
+await test('muteConnection persists and isMuted returns true', async () => {
+  const result = await karl.muteConnection(lilyConnectionOfKarl);
+  assert(result.muted === true, 'first mute should report muted: true');
+  assert(await karl.isMuted(lilyConnectionOfKarl), 'isMuted should be true after mute');
+  const muted = await karl.listMutedConnections();
+  assert(muted.length === 1, `expected 1 muted entry, got ${muted.length}`);
+  assert(muted[0].share_pub === lilyConnectionOfKarl.share_pub, 'muted entry share_pub mismatch');
+  assert(typeof muted[0].muted_at === 'number', 'muted_at should be a number');
+});
+
+await test('muteConnection is idempotent', async () => {
+  const result = await karl.muteConnection(lilyConnectionOfKarl);
+  assert(result.muted === false, 'second mute should be a no-op');
+  const muted = await karl.listMutedConnections();
+  assert(muted.length === 1, 'list should remain at 1 entry');
+});
+
+await test('muting does NOT block readShareLog from surfacing the connection', async () => {
+  // Lily shares something so Karl has content to read.
+  await lily.shareContent(
+    (await lily.listConnections()).find(c => c.email === karlEmail),
+    'mute-visibility-test',
+    'arweave-mute-test',
+    bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+  );
+  await sleep(200);
+  const state = await karl.readShareLog(lilyConnectionOfKarl, { refresh: true });
+  assert(state['mute-visibility-test'],
+    'readShareLog must NOT short-circuit on muted connections — apps decide when to filter');
+});
+
+await test('mute state syncs across devices: device B sees the mute after a fresh login', async () => {
+  const karl2 = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+  await karl2.login(karlEmail, karlPassword);
+  const muted = await karl2.listMutedConnections();
+  assert(muted.length === 1, `device B should see 1 muted entry, got ${muted.length}`);
+  assert(muted[0].share_pub === lilyConnectionOfKarl.share_pub, 'device B share_pub mismatch');
+  assert(await karl2.isMuted(lilyConnectionOfKarl), 'device B isMuted should be true');
+});
+
+await test('unmuteConnection removes the mute and persists across devices', async () => {
+  const result = await karl.unmuteConnection(lilyConnectionOfKarl);
+  assert(result.unmuted === true, 'first unmute should report unmuted: true');
+  assert(!(await karl.isMuted(lilyConnectionOfKarl)), 'isMuted should be false after unmute');
+  const muted = await karl.listMutedConnections();
+  assert(muted.length === 0, `muted list should be empty, got ${muted.length}`);
+
+  const karl3 = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+  await karl3.login(karlEmail, karlPassword);
+  assert(!(await karl3.isMuted(lilyConnectionOfKarl)),
+    'device C (fresh login) should see the unmute');
+});
+
+await test('unmuteConnection is idempotent', async () => {
+  const result = await karl.unmuteConnection(lilyConnectionOfKarl);
+  assert(result.unmuted === false, 'second unmute should be a no-op');
+});
+
+// ============ 11. Cleanup ============
+
+console.log('\n=== 11. Cleanup ===');
 
 await test('Delete test accounts', async () => {
   await alice.deleteAccount();
@@ -891,6 +980,8 @@ await test('Delete test accounts', async () => {
   await gary.deleteAccount();
   await helen.deleteAccount();
   await ivan.deleteAccount();
+  await karl.deleteAccount();
+  await lily.deleteAccount();
 });
 
 // ============ Summary ============
