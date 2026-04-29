@@ -784,6 +784,51 @@ SDK surface: `tarn.muteConnection(c)` / `tarn.unmuteConnection(c)` / `tarn.listM
 
 ---
 
+## Publicly observable metadata
+
+Tarn protects content (and the keys protecting content) end-to-end, but a number of metadata properties are observable to anyone who knows enough to ask. Apps building on Tarn should be aware of what's visible vs. what's protected, and surface this honestly to users where relevant.
+
+**What's protected (encrypted; not observable to anyone without keys):**
+
+- All content blobs (book entries, etc.) — encrypted under per-content CEKs, only owner + explicitly-shared recipients can decrypt.
+- All share-log entries (per-pair shared content) — encrypted under per-pair `K_AB`.
+- All connection-handshake payloads (request + accept) — HPKE-sealed to recipient's `share_pub`.
+- All friend-graph relationships — neither Tarn nor an Arweave observer can extract who is connected to whom from the protocol alone.
+- All recovery phrases — generated client-side, never persisted by Tarn.
+
+**What's publicly observable (no keys needed):**
+
+- **Connection-request inbox metadata.** `GET /api/v1/share/inbox/fetch` is **unauthenticated by design** — a recipient who lost their JWT (e.g., still booting on a fresh device) needs to be able to poll their inbox. Anyone who knows a user's `share_pub` can:
+  - Compute their inbox tag for any time window (the tag is `HMAC(H(share_pub), "tarn-connection-inbox-v1-" || app_id || "-" || window)` — derivable from public info)
+  - Fetch the sealed-but-non-decryptable HPKE blobs at that tag
+  - Observe the **volume + timing** of incoming connection requests for that user
+
+  The contents stay encrypted; only HPKE recipient (the user) can open them. But "user X received N connection requests on day D" is publicly extractable.
+
+- **Account existence via discoverability.** If a user has `share_discoverable=true`, anyone who knows their email can look up their `share_pub` via `GET /api/v1/share/lookup`. This confirms the email is a registered Tarn user. If `share_discoverable=false`, the lookup returns `share_pub: null` — but existing connections already cached `share_pub` from the original handshake.
+
+- **Per-recipient activity from share-log writes.** Tarn's per-tag uniqueness check at `POST /api/v1/share/log/publish` means an observer querying tag-existence can confirm specific tags are taken. Tags are pseudorandom (HMAC under per-pair secret), so this doesn't reveal relationships, but bulk-enumeration of common patterns isn't ruled out at scale.
+
+- **Aggregate volume + timing on Arweave.** All Tarn-bundled writes are signed by the Tarn-bundler wallet on Arweave. An Arweave observer can see "Tarn bundler activity per hour" but cannot link writes to individual users without protocol-level knowledge.
+
+**Acceptable residual leaks documented for v1** (per sharing design §11.5):
+
+1. **Email-based discoverability lookup leaks "user A is interested in user B"** at handshake time. Once connected, all subsequent traffic is unlinkable — the per-pair tags are stealth-addressed.
+2. **Tarn-side correlation** of write/read timing per session may allow Tarn (the operator) to infer some relationships statistically. Mitigation deferred (would require dummy traffic, mixing networks, etc.).
+3. **Per-recipient inbox metadata** (the bullet above) — accepted because the unauthenticated fetch is a hard requirement for fresh-device recovery flows.
+
+**App-side guidance:**
+
+Apps building on Tarn should communicate in user-facing privacy docs that:
+
+- Connection-request **timing and volume** can be observed by anyone who has seen the user's `share_pub` (typically: their email contacts + accepted connections).
+- Setting `share_discoverable=false` prevents new strangers from discovering the user's `share_pub` via email lookup, but does not retroactively hide it from anyone who already cached it.
+- **Content** is protected by end-to-end encryption; only the people the user explicitly shares with can read what they share.
+
+For most use cases (private reading lists, friend-circle apps), these properties are appropriate trade-offs. For higher-stakes sensitive data, additional mitigations (decoy traffic, alternative discovery flows) would be needed; sharing roadmap §14.2 + §14.7 covers that direction.
+
+---
+
 ## Cryptographic References
 
 - **HKDF:** RFC 5869 — HMAC-based Extract-and-Expand Key Derivation Function

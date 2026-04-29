@@ -89,13 +89,15 @@ await test('Register new user', async () => {
   console.log(`    DLK: ${testDlk.slice(0, 16)}...`);
 });
 
-await test('Re-register with same credentials is idempotent (issue #6)', async () => {
-  // Simulates the 503-after-commit case: client retries with an identical
-  // payload. Server should return 201 with the same DLK, not 409.
-  const tarn = new TarnClient(API_BASE, APP_ID);
-  const { dataLookupKey } = await tarn.register(testEmail, testPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
-  assert(dataLookupKey === testDlk, `DLK changed on retry: ${dataLookupKey} vs ${testDlk}`);
-});
+// NOTE: the previous "Re-register with same credentials is idempotent
+// (issue #6)" test was removed. It asserted cross-call byte-identical output
+// from `register()`, but post-#11 (random DEK at registration) and post-#12
+// (random recovery salt + phrase), `register()` is non-deterministic by
+// design — every call produces fresh randomness, so byte-identical retries
+// across separate TarnClient instances are impossible. The genuine #6
+// case (in-flight retry of an interrupted register) still works because
+// `register()` builds the body once before the retry loop; that case is
+// covered by unit tests in `tests/unit/client-retry.test.js`.
 
 // ============ 3. APP AUTH + SET RULES ============
 

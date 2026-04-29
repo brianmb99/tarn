@@ -9,14 +9,56 @@ import { createSignedDataItem, computeDataItemId } from './ans104.js';
 const TURBO_UPLOAD_URL = 'https://upload.ardrive.io/v1/tx/ethereum';
 export const TURBO_GATEWAY = 'https://turbo-gateway.com';
 
+// Production hostnames where TARN_SKIP_TURBO must NEVER be honored, even if
+// accidentally set as a Worker secret. Defense-in-depth on the local-dev
+// escape hatch — if `wrangler secret put TARN_SKIP_TURBO` is ever run against
+// production, we refuse the flag and log loudly so ops monitoring catches it.
+const TARN_SKIP_TURBO_PRODUCTION_HOSTS = new Set([
+  'api.tarn.dev',
+  'api.getbookish.app',
+]);
+
 /**
  * Wire the `TARN_SKIP_TURBO` Worker env var into a process-global flag so
  * `uploadSignedDataItem` (called from many call sites) can consult it
  * without each site having to thread `env` through its signature. Called
  * once per request from `worker.js`.
+ *
+ * Defense-in-depth: if `TARN_SKIP_TURBO` is truthy AND the request hostname
+ * is a known production host, we refuse to honor the flag and log a critical
+ * error. This prevents a misconfigured production deploy from silently
+ * skipping Arweave uploads.
  */
-export function setSkipTurboFromEnv(env) {
-  globalThis.__TARN_SKIP_TURBO__ = !!(env && env.TARN_SKIP_TURBO);
+export function setSkipTurboFromEnv(env, request) {
+  const skipRequested = !!(env && env.TARN_SKIP_TURBO);
+  if (!skipRequested) {
+    globalThis.__TARN_SKIP_TURBO__ = false;
+    return;
+  }
+
+  if (request) {
+    let hostname;
+    try {
+      hostname = new URL(request.url).hostname;
+    } catch {
+      hostname = null;
+    }
+    if (hostname && TARN_SKIP_TURBO_PRODUCTION_HOSTS.has(hostname)) {
+      console.error(
+        `[TARN CRITICAL] TARN_SKIP_TURBO=true detected on production host ${hostname}. ` +
+        `REFUSING to skip Turbo uploads. Remove this Worker secret immediately ` +
+        `(\`npx wrangler secret delete TARN_SKIP_TURBO --name tarn-api\`). ` +
+        `If you see this in logs, writes have been bypassing Arweave on this host.`
+      );
+      globalThis.__TARN_SKIP_TURBO__ = false;
+      return;
+    }
+  }
+
+  // Local-dev path. Log noisily so any unexpected appearance in logs gets
+  // noticed — this flag should ONLY be set in api/.dev.vars.
+  console.warn('[TARN] TARN_SKIP_TURBO=true is active. Turbo uploads will be skipped (local-dev only).');
+  globalThis.__TARN_SKIP_TURBO__ = true;
 }
 
 /**

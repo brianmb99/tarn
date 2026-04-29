@@ -194,6 +194,16 @@ await tarn.sendRecoveryKitEmail({
 - **Multi-factor DEK chain (v4 envelope).** Each chain entry is wrapped twice: once under a password-derived KEK, once under a phrase-derived KEK (Argon2id over the BIP39 recovery phrase). Either factor independently unwraps the DEK — recovery via phrase works without the password.
 - **Arweave permanence.** Data stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.
 
+### Publicly observable metadata
+
+Tarn protects content end-to-end, but a few metadata properties are visible to anyone who can derive them from public info. Apps building on Tarn should be honest with users about these:
+
+- **Connection-request inbox volume + timing** is publicly observable to anyone who knows a user's `share_pub`. The `GET /api/v1/share/inbox/fetch` endpoint is unauthenticated by design (recipients on a fresh device need to poll without a JWT yet). The blobs at the inbox tag stay HPKE-encrypted, but their existence + timing is extractable. Bookish-class use is fine; sensitive contexts should consider `share_discoverable: false`.
+- **Account existence via discoverability lookup** — a `share_discoverable: true` account leaks "this email is a Tarn user" to anyone who runs the email→share_pub lookup.
+- **Once connected, all subsequent share-log traffic is unlinkable** — the per-pair tags are stealth-addressed; an Arweave observer cannot extract the connection graph from the protocol alone.
+
+See [TARN_PROTOCOL.md § Publicly observable metadata](../docs/TARN_PROTOCOL.md#publicly-observable-metadata) for the full breakdown.
+
 See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specification.
 
 ## API
@@ -286,6 +296,107 @@ for (const c of await tarn.listConnections()) {
   if (!(await tarn.isMuted(c))) visible.push(c);
 }
 ```
+
+## Integration patterns
+
+This section captures patterns that come up when building real apps on Tarn — particularly useful for agentic dev tools that need a clear contract for each operation.
+
+### Full lifecycle example
+
+```javascript
+import { TarnClient } from 'tarn-client';
+
+const tarn = new TarnClient('https://api.tarn.dev', 'your-app-id');
+
+// 1. New user signs up. The SDK generates a 24-word phrase + PDF and (by
+//    default) emails the PDF. Caller gets the phrase + PDF in-memory too —
+//    DO NOT persist either; hand off to the user and drop.
+const reg = await tarn.register('sara@example.com', 'p@ssw0rd', {
+  recoveryAcknowledged: true,  // REQUIRED — UI must surface the phrase
+  emailRecoveryKit: true,
+  appName: 'Bookish',
+});
+// reg.recoveryPhrase is a 24-word string; reg.pdfBytes is a Uint8Array.
+
+// 2. User creates content.
+const { txid } = await tarn.createEntry('book', { title: 'Mountains', read_at: Date.now() });
+
+// 3. Later: user adds a connection.
+await tarn.sendConnectionRequest('alice@example.com');
+// Alice accepts on her end → tarn.acceptConnectionRequest(...)
+
+// 4. Sara shares the book with Alice. CEK is in Sara's outbound state cache
+//    after the createEntry call; the SDK pulls it automatically.
+const alice = (await tarn.listConnections()).find(c => c.email === 'alice@example.com');
+await tarn.shareContent(alice, 'book-mountains', txid, /*cek*/ undefined);
+
+// 5. Alice, on her own client, reads what Sara has shared.
+const aliceTarn = new TarnClient('https://api.tarn.dev', 'your-app-id');
+await aliceTarn.login('alice@example.com', 'alice-password');
+const sara = (await aliceTarn.listConnections()).find(c => c.email === 'sara@example.com');
+const state = await aliceTarn.readShareLog(sara);
+// state is { 'book-mountains': { tx_id, cek }, ... }
+
+// 6. Sara loses her password. She enters her phrase to recover.
+const recovery = new TarnClient('https://api.tarn.dev', 'your-app-id');
+await recovery.recoverAccount({
+  phrase: reg.recoveryPhrase,
+  newEmail: 'sara@example.com',  // can be the same or different
+  newPassword: 'new-password',
+});
+// All her data + connections are still there. Alice's client picks up the
+// rotation announcement on next syncShareLog and updates Sara's keys
+// transparently.
+```
+
+### Error handling
+
+Tarn methods throw on failure. Common error categories:
+
+- **Validation errors** (synchronous, no network): `register` throws if `recoveryAcknowledged !== true`; `acceptConnectionRequest` throws if the nonce doesn't match a pending request. These indicate a programming error in the calling code; do not retry.
+- **Auth errors** (HTTP 401): the JWT expired or the user isn't authenticated. Call `tarn.login` (or `tarn.recoverAccount`) and retry the operation.
+- **Conflict errors** (HTTP 409): a write collided with a concurrent write at the same tag. The SDK's `shareContent` / `updateShareContent` / `unshareContent` retry automatically with a higher seq. For lower-level `_publishShareLogEntry`, pass `{ retryOn409: true }` or handle the 409 in caller code.
+- **Rate-limit errors** (HTTP 429): the per-session or per-IP rate limit was exceeded. Surface to the user; do not auto-retry tightly.
+- **Server errors** (HTTP 5xx, network errors): generally retriable. The SDK has built-in retry with exponential backoff for idempotent operations; non-idempotent operations (e.g., raw register without an idempotency key) should be retried by the caller with care.
+
+### Idempotency
+
+Which operations are safe to retry blindly:
+
+| Operation | Idempotent? | Notes |
+|---|---|---|
+| `login` | Yes | Same credentials → same DLK. |
+| `register` (in-flight) | Yes (within one `register` call) | The SDK builds the body once before the retry loop. Cross-call retries are NOT idempotent — every fresh call mints a new random DEK + recovery phrase. |
+| `recoverAccount` | Yes | Same phrase + new credentials → same final state. |
+| `createEntry` | No (without an external idempotency key) | Each call mints a fresh CEK and creates a new Arweave tx. Caller-side dedup if needed. |
+| `updateEntry` | Yes | The supplied prior tx_id pins the operation to a known state. |
+| `deleteEntry` | Yes | Tombstone is content-addressed by ref. |
+| `sendConnectionRequest` | Yes (modulo nonce uniqueness) | Each call generates a fresh nonce; calling twice creates two distinct pending requests. Caller-side dedup recommended. |
+| `acceptConnectionRequest` | Yes | Re-accepting an already-accepted request is a no-op. |
+| `shareContent` / `updateShareContent` / `unshareContent` | Yes | Built-in 409 retry; caller can replay safely. |
+| `revokeContentFromConnections` | Yes | Repeated rotation produces successive CEKs; each is a no-op for connections that already received the previous rotate. |
+| `muteConnection` / `unmuteConnection` | Yes | Set semantics — repeated calls converge. |
+
+### Multi-device considerations
+
+Tarn supports multi-device usage natively, but apps need to be aware of a few things:
+
+- **State that's per-device:** the in-memory replay-nonce cache (rebuilt on each session) and any local UI state.
+- **State that's per-user, multi-device synced:** the connections record, the pending-requests record, the muted-connections record, the share-log content blobs themselves. All persisted as encrypted Tarn data blobs, picked up on next login.
+- **Concurrent writes:** if two devices write to the same share-log seq simultaneously, one wins, the other gets a 409 and the SDK retries at the next seq. Total ordering is preserved.
+- **Cache invalidation:** the SDK clears all per-friend caches (pair-keys, share-log counters, read-state, outbound-state, published-txids, muted-connections) on `changeCredentials`, `recoverAccount`, and `deleteAccount`. Apps don't need to manage this manually.
+
+### For agentic dev tools
+
+If you're an AI agent integrating Tarn:
+
+- **The `recoveryAcknowledged: true` flag is mandatory at register.** This is a deliberate choice to force apps to surface the recovery phrase to the user. Bypassing this with a hardcoded `true` is a bug if the user hasn't actually seen the phrase.
+- **Treat the recovery phrase + PDF bytes as ephemeral.** The SDK does not cache them; apps must NOT persist them. The user is the only durable store.
+- **`shareContent` with `cek: undefined`** is the common case — the SDK automatically pulls the CEK from its outbound state cache (which it hydrates on first share-log call per session). Only pass an explicit CEK when you have a specific reason.
+- **`readShareLog` returns the full state map.** For incremental sync after the first read, use `syncShareLog` to avoid replaying history.
+- **Connections are the primitive; "follow" / "friend" / etc. are app-level UX.** The SDK is intentionally neutral. Apps should pick terminology and stick to it consistently in their own user-facing copy.
+
+See [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the full protocol specification, and [docs/tarn-architecture-guide.pdf](../docs/tarn-architecture-guide.pdf) for the human-facing architecture overview.
 
 ### `tarn.dataLookupKey` — the user's data lookup key (available after register/login)
 

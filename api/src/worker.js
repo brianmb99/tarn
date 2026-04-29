@@ -56,7 +56,9 @@ export default {
 
     // Wire the local-dev TARN_SKIP_TURBO flag (see turbo.js) into the
     // Worker-scoped global. Cheap idempotent assignment per request.
-    setSkipTurboFromEnv(env);
+    // Pass `request` so the function can refuse the flag on production hosts
+    // (defense-in-depth against accidental `wrangler secret put` in prod).
+    setSkipTurboFromEnv(env, request);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: cors });

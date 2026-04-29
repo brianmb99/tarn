@@ -1621,6 +1621,17 @@ export class TarnClient {
     let pendingRecord = pendingState.record;
     let pendingDirty = false;
 
+    // Existing connections — used to silently drop replayed requests from
+    // already-connected senders. Without this guard, a fresh-device session
+    // (with an empty replay-nonce cache + cleared inbound-pending after
+    // accept) would surface a re-fetched request blob as if it were a new
+    // request from someone the user has already accepted. UX polish, not
+    // a security check — `upsertConnection` is idempotent on share_pub.
+    const connectionsState = await this.#loadConnectionsRecord();
+    const existingConnectionPubs = new Set(
+      (connectionsState.record.connections || []).map(c => c.share_pub)
+    );
+
     for (const blobs of fetched) {
       for (const blob of blobs) {
         let payload;
@@ -1637,6 +1648,14 @@ export class TarnClient {
         }
         const validation = validateConnectionRequestPayload(payload, this.#appId);
         if (!validation.valid) continue;
+
+        // Skip requests from senders we've already connected to. This handles
+        // the "request blob replayed on a fresh device" case cleanly — the
+        // user isn't prompted to re-accept someone they're already connected
+        // to.
+        if (existingConnectionPubs.has(validation.normalized.senderSharePubBase64Url)) {
+          continue;
+        }
 
         // Replay defense (§13.8): in-memory recent-nonce cache.
         const replayCheck = checkAndRecordNonce(this.#replayNonceCache, validation.normalized.nonceBase64Url);
