@@ -634,6 +634,76 @@ export function upsertFriend(record, friend) {
   return out;
 }
 
+/**
+ * Remove a friend (idempotent on `share_pub`) from the friends record. Used
+ * by the §10.1 unfriend flow. Returns the record unchanged if no entry
+ * matched. Direction-aware: this is one-side; the unfriended party retains
+ * their own friends record entry until they independently unfriend back.
+ */
+export function removeFriend(record, friendSharePubBase64Url) {
+  if (!record || !Array.isArray(record.friends)) {
+    throw new Error('record must be a friends record');
+  }
+  if (typeof friendSharePubBase64Url !== 'string' || friendSharePubBase64Url.length === 0) {
+    throw new Error('friendSharePubBase64Url is required');
+  }
+  return {
+    ...record,
+    friends: record.friends.filter(f => f.share_pub !== friendSharePubBase64Url),
+  };
+}
+
+/**
+ * Apply a `rotate_identity` announcement (sharing §13.5) to a friend's entry
+ * in the friends record. The caller is responsible for verifying the
+ * announcement's ECDSA signature against the friend's currently-cached
+ * `signing_pub` BEFORE calling this — the helper itself does no crypto.
+ *
+ * Replaces share_pub, signing_pub, and credential_lookup_key with the values
+ * carried in the announcement. Records the rotation timestamp and the
+ * pre-rotation share_pub for audit. Returns the record unchanged if the
+ * friend isn't found (defensive — should not happen in normal flow).
+ *
+ * @param {Object} record - friends record
+ * @param {string} friendSharePubBase64Url - the friend's CURRENT share_pub
+ * @param {{
+ *   newSharePubBase64Url: string,
+ *   newSigningPubBase64: string,
+ *   newCredentialLookupKey: string,
+ *   rotatedAt: number,
+ * }} update
+ */
+export function rotateFriendIdentity(record, friendSharePubBase64Url, update) {
+  if (!record || !Array.isArray(record.friends)) {
+    throw new Error('record must be a friends record');
+  }
+  if (typeof friendSharePubBase64Url !== 'string' || friendSharePubBase64Url.length === 0) {
+    throw new Error('friendSharePubBase64Url is required');
+  }
+  if (!update
+    || typeof update.newSharePubBase64Url !== 'string'
+    || typeof update.newSigningPubBase64 !== 'string'
+    || typeof update.newCredentialLookupKey !== 'string'
+    || !Number.isInteger(update.rotatedAt)
+  ) {
+    throw new Error('rotateFriendIdentity: update must have newSharePubBase64Url, newSigningPubBase64, newCredentialLookupKey, rotatedAt');
+  }
+  const idx = record.friends.findIndex(f => f.share_pub === friendSharePubBase64Url);
+  if (idx < 0) return record;
+  const prior = record.friends[idx];
+  const rotated = {
+    ...prior,
+    share_pub: update.newSharePubBase64Url,
+    signing_pub: update.newSigningPubBase64,
+    credential_lookup_key: update.newCredentialLookupKey,
+    rotated_at: update.rotatedAt,
+    prior_share_pub: friendSharePubBase64Url,
+  };
+  const friends = record.friends.slice();
+  friends[idx] = rotated;
+  return { ...record, friends };
+}
+
 /** Add an outbound pending request (idempotent on request_nonce). */
 export function addOutboundPending(record, entry) {
   ensurePendingShape(record);

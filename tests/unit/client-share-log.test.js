@@ -471,15 +471,17 @@ describe('buildOperationUnsigned: all five normal types + rotate_identity', () =
     assert.equal(op.prior_seq, null);
   });
 
-  it('rotate_identity is recognized (parses without error) — emit lives in 5d', () => {
+  it('rotate_identity is recognized (parses without error) — emitted by 5d', () => {
     assert.ok(KNOWN_OP_TYPES.has(OP_ROTATE_IDENTITY));
     const op = buildOperationUnsigned({
       type: OP_ROTATE_IDENTITY, seq: baseSeq,
       new_share_pub: bytesToBase64Url(new Uint8Array(32).fill(0xab)),
       new_signing_pub: 'MFkw...somefakeSPKI...==',
+      new_credential_lookup_key: 'a'.repeat(64),
       rotated_at: 1714000005,
     });
     assert.equal(op.type, 'rotate_identity');
+    assert.equal(op.new_credential_lookup_key, 'a'.repeat(64));
   });
 
   it('rejects unknown operation types', () => {

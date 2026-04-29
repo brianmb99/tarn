@@ -172,10 +172,11 @@ await test('Change credentials: new login works, old fails', async () => {
 
   // Register + login
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey, recoveryPhrase } = await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
-  // Change credentials
-  await client.changeCredentials(newEmail, newPassword);
+  // Change credentials. v4 accounts require the phrase (issue #17 follow-up:
+  // close the recovery-wrapping gap by default).
+  await client.changeCredentials(newEmail, newPassword, { phrase: recoveryPhrase });
   assert(client.isAuthenticated, 'Should be re-authenticated after credential change');
 
   // New credentials should work

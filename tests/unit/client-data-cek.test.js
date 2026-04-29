@@ -129,7 +129,7 @@ describe('TarnClient.createEntry — new blob format (issue #11)', () => {
 
     const client = new TarnClient('https://api.tarn.dev', APP);
     await client.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
-    await client.changeCredentials('rotated@example.com', 'new-password');
+    await client.changeCredentials('rotated@example.com', 'new-password', { acceptRecoveryGap: true, skipRotationAnnounce: true });
     await client.createEntry('entry', { title: 'After rotation' });
 
     const writeCall = fetchCalls.find(c =>
@@ -278,7 +278,7 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
       { status: 200, body: JSON.stringify({ nonce: 'b'.repeat(64) }) },
       { status: 200, body: JSON.stringify({ jwt: fakeJwt('change') }) },
     ]);
-    await client.changeCredentials('rotated@example.com', 'new-pass');
+    await client.changeCredentials('rotated@example.com', 'new-pass', { acceptRecoveryGap: true, skipRotationAnnounce: true });
 
     // Write a gen-2 blob
     mockFetch([{ status: 200, body: JSON.stringify({ id: 'tx-2' }) }]);

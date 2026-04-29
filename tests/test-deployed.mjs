@@ -523,6 +523,139 @@ await test('Delete handshake test accounts', async () => {
   if (handshakeBob) await handshakeBob.deleteAccount();
 });
 
+// ============ 9c. SECTION 5d — REVOCATION + IDENTITY ROTATION ============
+
+console.log('\n=== 9c. Revocation + identity rotation (Section 5d) ===');
+
+// Build two fresh accounts (Pat + Quinn) for the rotation E2E. The §9c flow
+// proves the §13.5 protocol works against the deployed API:
+//   1. Both accounts register + handshake.
+//   2. Pat shares a content item with Quinn.
+//   3. Pat changes credentials (issue #17 §13.5 sender flow).
+//   4. Quinn syncs and picks up the rotation: friend record updated to
+//      Pat's NEW share_pub + signing_pub; subsequent shares from Pat under
+//      the NEW pair keys reach Quinn.
+
+const patEmail = `tarn-pat-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
+const patPassword = 'pat-pw-' + Date.now();
+const quinnEmail = `tarn-quinn-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
+const quinnPassword = 'quinn-pw-' + Date.now();
+
+let pat, quinn;
+let quinnFriendOfPat, patFriendOfQuinn;
+let patPhrase;
+let patSharePubBeforeRotate;
+
+await test('Pat + Quinn register + handshake against deployed API', async () => {
+  pat = new TarnClient(API_BASE, APP_ID);
+  quinn = new TarnClient(API_BASE, APP_ID);
+  const patReg = await pat.register(patEmail, patPassword, {
+    recoveryAcknowledged: true,
+    emailRecoveryKit: false,
+  });
+  patPhrase = patReg.recoveryPhrase;
+  const quinnReg = await quinn.register(quinnEmail, quinnPassword, {
+    recoveryAcknowledged: true,
+    emailRecoveryKit: false,
+  });
+
+  // Set permissive rules on each user via the bookish app JWT (same pattern
+  // as §8). Friends + pending records + share-log entries + tarn-share-state
+  // writes need rules — the credential-change flow also writes share-state
+  // entries to publish snapshots to friends' new logs after rotation.
+  const pkcs8 = new Uint8Array(APP_KEY.length / 2);
+  for (let i = 0; i < APP_KEY.length; i += 2) pkcs8[i / 2] = parseInt(APP_KEY.substr(i, 2), 16);
+  const privateKey = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const cRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: APP_ID }),
+  });
+  const { nonce } = await cRes.json();
+  const nonceBytes = new Uint8Array(nonce.length / 2);
+  for (let i = 0; i < nonce.length; i += 2) nonceBytes[i / 2] = parseInt(nonce.substr(i, 2), 16);
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, nonceBytes);
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  const vRes = await fetch(`${API_BASE}/api/v1/auth/verify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: APP_ID, nonce, signature: sigB64 }),
+  });
+  const { jwt } = await vRes.json();
+
+  for (const dlk of [pat.dataLookupKey, quinn.dataLookupKey]) {
+    const r = await fetch(`${API_BASE}/api/v1/accounts/${dlk}/rules`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+      body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 50, app: APP_ID }, { type: 'max_bytes', limit: 204800 }] }),
+    });
+    assert(r.status === 200, `Set rules failed for ${dlk}: ${r.status}`);
+  }
+
+  const send = await pat.sendFriendRequest(quinnEmail);
+  await sleep(500);
+  await quinn.listIncomingRequests();
+  await quinn.acceptFriendRequest(send.requestNonce);
+  await sleep(500);
+  await pat.listIncomingRequests();
+  quinnFriendOfPat = (await pat.listFriends()).find(f => f.email === quinnEmail);
+  patFriendOfQuinn = (await quinn.listFriends()).find(f => f.email === patEmail);
+  assert(quinnFriendOfPat, 'Pat missing Quinn after handshake');
+  assert(patFriendOfQuinn, 'Quinn missing Pat after handshake');
+  patSharePubBeforeRotate = patFriendOfQuinn.share_pub;
+});
+
+await test('Pat shares a content item with Quinn', async () => {
+  const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  await pat.shareContent(quinnFriendOfPat, 'rot-target-1', 'arweave-rot-pre', cek);
+  await sleep(500);
+  const state = await quinn.readShareLog(patFriendOfQuinn, { refresh: true });
+  assert(state['rot-target-1'], 'Quinn should see rot-target-1 before rotation');
+});
+
+await test('Pat changes credentials → publishes rotate_identity to Quinn (deployed API)', async () => {
+  const newEmail = `tarn-pat-rotated-${Date.now()}@test.com`;
+  const result = await pat.changeCredentials(newEmail, 'new-pw-' + Date.now(), {
+    phrase: patPhrase,
+  });
+  assert(Array.isArray(result.rotationAnnouncements), 'expected rotationAnnouncements');
+  assert(result.rotationAnnouncements.length === 1, 'expected exactly one rotation announcement');
+  const ann = result.rotationAnnouncements[0];
+  assert(ann.friendSharePub === quinnFriendOfPat.share_pub, 'rotation targets the right friend');
+  assert(typeof ann.txid === 'string', 'rotation announcement should have a txid');
+});
+
+await test('Quinn syncs against deployed API: rotate_identity processed, friend record updated', async () => {
+  await sleep(800);
+  const stateAfter = await quinn.syncShareLog(patFriendOfQuinn);
+  assert(stateAfter['rot-target-1'], 'Quinn still sees rot-target-1 after rotation (NEW-log seq=0 snapshot)');
+
+  const updatedFriend = (await quinn.listFriends())[0];
+  assert(updatedFriend.share_pub !== patSharePubBeforeRotate,
+    'Quinn\'s friend record holds Pat\'s NEW share_pub');
+  assert(updatedFriend.prior_share_pub === patSharePubBeforeRotate,
+    'Quinn records the pre-rotation share_pub');
+});
+
+await test('Pat publishes a post-rotation share; Quinn picks it up via NEW-log keys', async () => {
+  // Refresh references — Pat's friend record was updated by the rotation
+  // (no, actually Pat's view of Quinn is unchanged; only Quinn's view of
+  // Pat rotated). But re-fetch defensively.
+  quinnFriendOfPat = (await pat.listFriends()).find(f => f.email === quinnEmail);
+  const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  await pat.shareContent(quinnFriendOfPat, 'rot-target-2-postrotate', 'arweave-rot-post', cek);
+  await sleep(500);
+  const updatedQuinnFriend = (await quinn.listFriends())[0];
+  const stateAfter = await quinn.syncShareLog(updatedQuinnFriend);
+  assert(stateAfter['rot-target-2-postrotate'],
+    'Quinn should see post-rotation content via NEW-log keys');
+});
+
+await test('Cleanup §9c accounts (Pat + Quinn)', async () => {
+  await pat.deleteAccount();
+  await quinn.deleteAccount();
+});
+
 // ============ 10. CLEANUP ============
 
 console.log('\n=== 10. Cleanup ===');

@@ -177,13 +177,13 @@ await test('changeCredentials() rotates share_pub (master_key change)', async ()
   const dEmail = randomEmail();
   const dPassword = 'pw-d-' + Date.now();
   const d = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  await d.register(dEmail, dPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const dReg = await d.register(dEmail, dPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   const before = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(dEmail);
   assert(before.sharePubBase64Url, 'no initial share_pub');
 
   const newPassword = dPassword + '-rotated';
-  await d.changeCredentials(dEmail, newPassword);
+  await d.changeCredentials(dEmail, newPassword, { phrase: dReg.recoveryPhrase });
 
   // Same email => same share_lookup_key, so the lookup still finds the
   // account, but with a fresh share_pub (because master_key changed).
@@ -203,7 +203,7 @@ await test('changeCredentials() rotates share_lookup_key on email change', async
   const eEmail = randomEmail();
   const ePassword = 'pw-e-' + Date.now();
   const e = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  await e.register(eEmail, ePassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const eReg = await e.register(eEmail, ePassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
   // Lookup at the OLD email should work.
   const before = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(eEmail);
@@ -211,7 +211,7 @@ await test('changeCredentials() rotates share_lookup_key on email change', async
 
   // Change email.
   const newEmail = randomEmail();
-  await e.changeCredentials(newEmail, ePassword);
+  await e.changeCredentials(newEmail, ePassword, { phrase: eReg.recoveryPhrase });
 
   // Lookup at the NEW email should now resolve.
   const newRes = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(newEmail);

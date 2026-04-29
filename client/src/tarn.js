@@ -35,6 +35,7 @@ import {
   parseWrappedDataKey,
   base64ToBytes,
   bytesToBase64,
+  bytesToBase64Url,
   KDF_V1_PBKDF2,
   KDF_V2_ARGON2ID,
   KDF_DEFAULT,
@@ -63,6 +64,8 @@ import {
   emptyFriendsRecord,
   emptyPendingRequestsRecord,
   upsertFriend,
+  removeFriend,
+  rotateFriendIdentity,
   addOutboundPending,
   addInboundPending,
   removeOutboundPending,
@@ -89,8 +92,10 @@ import {
   SHARE_LOG_TYPE,
   OP_ADD,
   OP_UPDATE,
+  OP_ROTATE,
   OP_REMOVE,
   OP_SNAPSHOT,
+  OP_ROTATE_IDENTITY,
 } from './share-log.js';
 
 // Re-export the recovery-side surface so consumers can import them directly
@@ -440,7 +445,7 @@ export class TarnClient {
    * @param {{ phrase: string, newEmail: string, newPassword: string }} opts
    * @returns {Promise<{dataLookupKey: string}>}
    */
-  async recoverAccount({ phrase, newEmail, newPassword }) {
+  async recoverAccount({ phrase, newEmail, newPassword, ...opts } = {}) {
     const validation = validateRecoveryPhrase(phrase);
     if (!validation.valid) {
       throw new Error(`recoverAccount(): ${validation.reason}`);
@@ -536,6 +541,54 @@ export class TarnClient {
     // so a corrupted server-side row gets healed on the next credential
     // change. This is also what register sends.
     const recoveryPublicKey = await exportPublicKey(recoverySigningKeyPair.publicKey);
+
+    // Snapshot OLD key material + outbound state per friend before swapping.
+    // Recovery rotates share_priv + signing_priv just like changeCredentials,
+    // so the §13.5 rotation announcement applies identically. Note: in the
+    // recovery code path the user has rotated credentials AS A RESULT of
+    // suspected compromise OR routine — the §13.5 known limitation about
+    // rotation under compromised OLD keys is documented and accepted.
+    //
+    // Two recovery scenarios:
+    //   - Fresh-client recovery (most common): a new TarnClient is calling
+    //     recoverAccount with no prior login. #sharingKeyPair and
+    //     #signingKeyPair are null → no OLD keys to sign rotation
+    //     announcements with. Skip the announce loop; friends will need to
+    //     reconcile via out-of-band channel (the §13.5 known limitation).
+    //   - Logged-in recovery (rare): the user is already authenticated under
+    //     the OLD identity and is recovering for routine reasons. OLD keys
+    //     and DEK chain are in memory → we can announce.
+    const oldSharingKeyPair = this.#sharingKeyPair;
+    const oldSigningKeyPair = this.#signingKeyPair;
+    const skipRotationAnnounce = opts?.skipRotationAnnounce === true;
+    const canAnnounce = !skipRotationAnnounce
+      && !!oldSharingKeyPair?.privateKey
+      && !!oldSigningKeyPair?.privateKey
+      && this.#dekByGen != null;
+
+    let oldFriendsState = { record: { friends: [] }, txid: null };
+    const outboundStateByFriend = new Map();
+    if (canAnnounce) {
+      try {
+        oldFriendsState = await this.#loadFriendsRecord();
+      } catch (err) {
+        console.warn(
+          `[TarnClient] recoverAccount: friends record load failed (no rotation announce): ${err.message}`,
+        );
+      }
+      for (const friend of oldFriendsState.record.friends) {
+        try {
+          await this.#hydrateOutboundState(friend);
+          outboundStateByFriend.set(friend.share_pub, this.#tentativeOutboundState(friend));
+        } catch (err) {
+          console.warn(
+            `[TarnClient] recoverAccount: outbound state hydration failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+          );
+          outboundStateByFriend.set(friend.share_pub, {});
+        }
+      }
+    }
+
     const putRes = await this.#fetch('/api/v1/auth', {
       method: 'PUT',
       auth: true,
@@ -551,6 +604,25 @@ export class TarnClient {
     });
     if (putRes.status !== 200) {
       throw new Error(`recoverAccount(): credential change failed: ${putRes.json?.error || putRes.status}`);
+    }
+
+    // Announce the rotation to friends BEFORE swapping local key state, so
+    // we can sign with the OLD signing_priv and encrypt under OLD K_AB.
+    let rotationAnnouncements = [];
+    if (canAnnounce && oldFriendsState.record.friends.length > 0) {
+      try {
+        rotationAnnouncements = await this.#announceIdentityRotationToFriends({
+          oldSharingKeyPair,
+          oldSigningKeyPair,
+          oldFriendsRecord: oldFriendsState.record,
+          newSharingPublicKey: newKeys.sharingKeyPair.publicKey,
+          newSigningPublicKey: newKeys.signingKeyPair.publicKey,
+          newCredentialLookupKey: newKeys.credentialLookupKey,
+          rotatedAt: Math.floor(Date.now() / 1000),
+        });
+      } catch (err) {
+        console.warn(`[TarnClient] recoverAccount: rotation announce failed: ${err.message}`);
+      }
     }
 
     // Update local state to the new identity.
@@ -572,7 +644,24 @@ export class TarnClient {
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
-    return { dataLookupKey: this.#dataLookupKey };
+    // §13.5 step 8: publish a fresh seq=0 snapshot to every friend's NEW
+    // outbound log under the new pair keys. Only meaningful if we ran
+    // rotation announce (we need to have known the OLD log existed +
+    // captured outbound state).
+    if (canAnnounce) {
+      for (const friend of oldFriendsState.record.friends) {
+        const state = outboundStateByFriend.get(friend.share_pub) ?? {};
+        try {
+          await this._publishInitialSnapshot(friend, { state });
+        } catch (err) {
+          console.warn(
+            `[TarnClient] recoverAccount: NEW-log seq=0 snapshot publish failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+          );
+        }
+      }
+    }
+
+    return { dataLookupKey: this.#dataLookupKey, rotationAnnouncements };
   }
 
   /**
@@ -680,22 +769,59 @@ export class TarnClient {
    *   can't re-wrap. AES-KW is deterministic anyway: re-wrapping the same DEK
    *   under the same recovery KEK would produce identical bytes, so preserving
    *   is byte-equivalent.
-   * - The NEW gen (N+1) only gets a recovery wrapping if the caller passes
-   *   `phrase`. Without it, the new gen has only a password wrapping, and
-   *   recovery for that gen is not possible until the user runs
-   *   `regenerateRecoveryKit` or `recoverAccount` to repair the gap.
+   * - The NEW gen (N+1) gets a recovery wrapping when the caller passes
+   *   `phrase`. **Required by default for v4 accounts** (issue #17 follow-up):
+   *   without it, the new gen has only a password wrapping, and recovery for
+   *   data written under that gen is not possible until the user runs
+   *   `regenerateRecoveryKit` or `recoverAccount` to repair the gap. Apps that
+   *   need to skip the prompt may pass `acceptRecoveryGap: true` to opt out;
+   *   this is intended only for non-interactive flows where the gap is
+   *   knowingly accepted.
    *
    * For PBKDF2 (KDF v1) accounts the rotation upgrade is intentionally not
    * applied — they stay on the legacy single-key envelope (issue #11 is
    * scoped to Argon2id accounts; legacy KDF migration is a separate concern).
    *
+   * Friend-side identity rotation (issue #17, sharing §13.5): after the
+   * credential blob is published, this method announces the new sharing +
+   * signing pubkeys to every friend by publishing a `rotate_identity` entry
+   * to each friend's OLD outbound log under OLD per-pair keys. Friends'
+   * clients pick up the rotation on their next read/sync, update the friend
+   * record, and switch to the new keys without user intervention. The known
+   * limitation about rotation under compromised OLD keys (sharing §13.5) is
+   * accepted for v1; out-of-band recovery is the documented response.
+   *
    * @param {string} newEmail
    * @param {string} newPassword
-   * @param {{ phrase?: string }} [opts] - optional phrase to extend the
-   *   recovery wrapping to gen N+1 (v4 accounts only)
+   * @param {{
+   *   phrase?: string,
+   *   acceptRecoveryGap?: boolean,
+   *   skipRotationAnnounce?: boolean,
+   * }} [opts]
+   *   - `phrase`: BIP39 recovery phrase. Required for v4 accounts unless
+   *     `acceptRecoveryGap: true` is set. Extends the recovery wrapping to
+   *     gen N+1.
+   *   - `acceptRecoveryGap`: opt out of the v4 phrase requirement. The new
+   *     gen ships without a recovery wrapping.
+   *   - `skipRotationAnnounce`: skip the §13.5 rotation announcement to
+   *     friends. Used by tests + low-level flows that intentionally manage
+   *     identity rotation themselves; production callers should leave it
+   *     unset (default false).
    */
   async changeCredentials(newEmail, newPassword, opts = {}) {
     await this.#requireAuth();
+
+    // §17 follow-up: phrase is required by default for v4 accounts. Skipping
+    // it leaves the new gen without a recovery wrapping; if the user later
+    // forgets the password, data written under the new gen is lost. Apps
+    // that have a knowing reason to skip can pass `acceptRecoveryGap: true`.
+    if (this.#envelopeVersion === 4 && !opts.phrase && opts.acceptRecoveryGap !== true) {
+      throw new Error(
+        'changeCredentials(): v4 accounts must supply `phrase` (the recovery phrase) ' +
+        'so the new generation gets a recovery wrapping. Pass `acceptRecoveryGap: true` ' +
+        'to override (the new gen will be unrecoverable via phrase until repaired).',
+      );
+    }
 
     // Preserve the original KDF — silent upgrade from PBKDF2 to Argon2id is
     // out of scope for this issue (would be a separate migration concern).
@@ -832,6 +958,46 @@ export class TarnClient {
       newEnvelopeVersion = 3;
     }
 
+    // Capture OLD key material BEFORE the PUT swaps things over. The
+    // rotation-announce flow (§13.5) needs OLD share_priv + OLD signing_priv
+    // to derive the OLD per-pair keys and sign the announcement under the
+    // key Bob has cached. Pause non-rotation share-log writes during the
+    // rotation window per §13.5; we accomplish this implicitly because the
+    // rotation announce + new-log snapshots run inline before the method
+    // returns control to the caller.
+    const oldSharingKeyPair = this.#sharingKeyPair;
+    const oldSigningKeyPair = this.#signingKeyPair;
+    const skipRotationAnnounce = opts.skipRotationAnnounce === true;
+
+    // Hydrate outbound state per friend BEFORE the swap so we can publish
+    // meaningful seq=0 snapshots to the NEW logs after rotation. Hydration
+    // runs against the OLD per-pair keys (still cached) and reads our own
+    // outbound entries from the OLD logs. Only loads the friends record
+    // when we're going to announce (skipRotationAnnounce keeps test surfaces
+    // clean for unit tests that mock fetch without a friends record).
+    let oldFriendsState = { record: { friends: [] }, txid: null };
+    const outboundStateByFriend = new Map();
+    if (!skipRotationAnnounce) {
+      try {
+        oldFriendsState = await this.#loadFriendsRecord();
+      } catch (err) {
+        console.warn(
+          `[TarnClient] changeCredentials: friends record load failed (no rotation announce): ${err.message}`,
+        );
+      }
+      for (const friend of oldFriendsState.record.friends) {
+        try {
+          await this.#hydrateOutboundState(friend);
+          outboundStateByFriend.set(friend.share_pub, this.#tentativeOutboundState(friend));
+        } catch (err) {
+          console.warn(
+            `[TarnClient] changeCredentials: outbound state hydration failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+          );
+          outboundStateByFriend.set(friend.share_pub, {});
+        }
+      }
+    }
+
     const res = await this.#fetch('/api/v1/auth', {
       method: 'PUT',
       auth: true,
@@ -851,6 +1017,28 @@ export class TarnClient {
       throw new Error(`Credential change failed: ${res.json?.error || res.status}`);
     }
 
+    // §13.5 step 4: with the new credential blob published (durable
+    // indicator of rotation in flight), publish a `rotate_identity`
+    // announcement to every friend's OLD outbound log under OLD pair keys.
+    // The OLD signing_priv proves authenticity to the friend (their cached
+    // signing_pub still matches OLD).
+    let rotationAnnouncements = [];
+    if (!skipRotationAnnounce && oldFriendsState.record.friends.length > 0) {
+      try {
+        rotationAnnouncements = await this.#announceIdentityRotationToFriends({
+          oldSharingKeyPair,
+          oldSigningKeyPair,
+          oldFriendsRecord: oldFriendsState.record,
+          newSharingPublicKey: newKeys.sharingKeyPair.publicKey,
+          newSigningPublicKey: newKeys.signingKeyPair.publicKey,
+          newCredentialLookupKey: newKeys.credentialLookupKey,
+          rotatedAt: Math.floor(Date.now() / 1000),
+        });
+      } catch (err) {
+        console.warn(`[TarnClient] changeCredentials: rotation announce failed: ${err.message}`);
+      }
+    }
+
     this.#credentialLookupKey = newKeys.credentialLookupKey;
     this.#credentialEncryptionKey = newKeys.credentialEncryptionKey;
     this.#signingKeyPair = newKeys.signingKeyPair;
@@ -861,10 +1049,8 @@ export class TarnClient {
     this.#email = newEmail;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
     // Per-pair S_AB is derived from share_priv, which just rotated — every
-    // cached friend's pair keys are stale. The 5d rotate_identity flow is
-    // what re-establishes per-friend keys end-to-end; for 5b we just drop
-    // the cache so the next per-friend operation throws cleanly rather than
-    // silently signing with the new key under the old K_AB.
+    // cached entry is stale. The NEW pair keys are derived lazily on first
+    // use via #getPairKeysFor (post-rotation).
     this.#pairKeyCache.clear();
     this.#shareLogCounters.clear();
     this.#readStateCache.clear();
@@ -872,6 +1058,26 @@ export class TarnClient {
     this.#publishedTxidsByFriend.clear();
 
     await this.#authenticate();
+
+    // §13.5 step 8: publish a fresh seq=0 snapshot to every friend's NEW
+    // outbound log so the recipient bootstraps the new log with the
+    // expected state. Best-effort: a per-friend failure is logged and the
+    // method still returns success — the friend can re-bootstrap once we
+    // publish later operations.
+    if (!skipRotationAnnounce) {
+      for (const friend of oldFriendsState.record.friends) {
+        const state = outboundStateByFriend.get(friend.share_pub) ?? {};
+        try {
+          await this._publishInitialSnapshot(friend, { state });
+        } catch (err) {
+          console.warn(
+            `[TarnClient] changeCredentials: NEW-log seq=0 snapshot publish failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+          );
+        }
+      }
+    }
+
+    return { rotationAnnouncements };
   }
 
   /**
@@ -1828,22 +2034,39 @@ export class TarnClient {
       && operationFields.type !== OP_SNAPSHOT
       && shouldEmitSnapshot(counters)
     ) {
-      // Caller may pre-supply the snapshot state (e.g., the app's full
-      // current shared library). Without it we emit an empty snapshot — a
-      // no-op state-checkpoint that still satisfies §8.6's "bound bootstrap
-      // cost" intent. Apps that want richer compaction should call
-      // _publishShareLogEntry directly with a snapshot operation.
+      // §8.3.5: a snapshot REPLACES state wholesale on the recipient. An
+      // empty snapshot would erase the recipient's view of everything we've
+      // shared — that's a destructive bug, not a no-op compaction. Two paths:
+      //   1. Caller supplied `opts.snapshotState` — high-level methods like
+      //      shareContent/updateShareContent/unshareContent build the tentative
+      //      post-op state explicitly and pass it through.
+      //   2. Caller omitted `opts.snapshotState` — auto-hydrate the outbound
+      //      state from our own log and apply the just-published op to it
+      //      so the snapshot reflects the correct post-op state.
+      // The previous "fallback to {}" was a destructive default; #17 removes
+      // it so callers can't accidentally publish an empty snapshot.
+      let snapshotState;
+      if (opts.snapshotState !== undefined) {
+        snapshotState = opts.snapshotState;
+      } else {
+        await this.#hydrateOutboundState(friend);
+        snapshotState = this.#tentativeOutboundState(friend);
+        applyOperationToState(snapshotState, { ...operationFields, seq });
+      }
       const snapshotFields = {
         type: OP_SNAPSHOT,
-        state: opts.snapshotState ?? {},
+        state: snapshotState,
         snapshot_at: Math.floor(Date.now() / 1000),
         prior_seq: seq,
       };
       const snap = await this._publishShareLogEntry(
         friend, snapshotFields,
-        { skipCompaction: true, retryOn409, maxRetries },
+        { skipCompaction: true, retryOn409, maxRetries, snapshotState },
       );
       compactionSnapshot = { seq: snap.seq, tag: snap.tag, txid: snap.txid };
+      // Commit the snapshot state into the outbound cache so subsequent
+      // operations don't re-hydrate redundantly.
+      this.#commitOutboundState(friend, snapshotState);
     }
 
     const out = { seq, tag, txid };
@@ -2082,6 +2305,19 @@ export class TarnClient {
         );
         continue;
       }
+      // §13.5: rotate_identity is a TERMINAL entry on the OLD log. Once we
+      // see it (with a valid signature under the friend's currently-cached
+      // signing_pub, i.e., the OLD signing_pub from the rotating party's
+      // perspective), update the friend record and re-bootstrap on the
+      // NEW log. Any further entries on the OLD log past this point are
+      // forgeries or stale duplicates and must be ignored.
+      if (entry.operation.type === OP_ROTATE_IDENTITY) {
+        const updatedFriend = await this.#processRotateIdentityEntry(friend, entry.operation);
+        // Re-bootstrap on the NEW log. The NEW log starts at seq=0 with a
+        // fresh snapshot from the rotating party (sharing §13.5 step 8),
+        // so a `refresh: true` read produces a defensible final state.
+        return await this.readShareLog(updatedFriend, { refresh: true });
+      }
       applyOperationToState(state, entry.operation);
       lastApplied = seq;
     }
@@ -2136,6 +2372,12 @@ export class TarnClient {
         );
         lastApplied = seq;
         continue;
+      }
+      if (entry.operation.type === OP_ROTATE_IDENTITY) {
+        // §13.5: terminal entry on OLD log → process rotation, switch to
+        // NEW log. Any further entries on the OLD log are ignored.
+        const updatedFriend = await this.#processRotateIdentityEntry(friend, entry.operation);
+        return await this.readShareLog(updatedFriend, { refresh: true });
       }
       applyOperationToState(state, entry.operation);
       lastApplied = seq;
@@ -2274,9 +2516,436 @@ export class TarnClient {
       state,
       snapshot_at: Math.floor(Date.now() / 1000),
       prior_seq: counters.nextOutboundSeq > 0 ? counters.nextOutboundSeq - 1 : null,
-    }, { retryOn409: true });
+    }, { retryOn409: true, snapshotState: state });
     this.#commitOutboundState(friend, state);
     return result;
+  }
+
+  // ============ REVOCATION (issue #17, Section 5d, sharing §10) ============
+
+  /**
+   * Unfriend (sharing §10.1). Removes the friend from the persisted friends
+   * record; subsequent share-log writes to that friend stop, and the read
+   * flow stops surfacing their outbound updates. Per-friend caches are
+   * cleared so a subsequent re-friend (§13.7) starts clean.
+   *
+   * **Direction-aware**: this is one-side. The unfriended party receives no
+   * cryptographic signal — they may infer from sustained inactivity, or via
+   * an app-level UX cue ("no recent activity from this friend"). Mutual
+   * unfriending requires both sides to call `unfriend` independently.
+   *
+   * **Optional courtesy** (`{ notify: true }`): before stopping further
+   * publication, publishes a final `remove` operation to the friend's
+   * outbound log for every content_id we were currently sharing with them.
+   * This is a UI signal to the recipient, NOT a cryptographic enforcement.
+   * The recipient may have cached prior versions locally; `remove` does not
+   * retract those. Use {@link revokeContentForFriends} for cryptographic
+   * revocation (CEK rotation) of remaining friends' access.
+   *
+   * @param {{ share_pub: string }} friend
+   * @param {{ notify?: boolean }} [opts]
+   * @returns {Promise<{
+   *   removed: boolean,
+   *   notifications?: Array<{ content_id: string, seq: number, txid: string }>,
+   * }>}
+   */
+  async unfriend(friend, opts = {}) {
+    await this.#requireAuth();
+    if (!friend || typeof friend.share_pub !== 'string') {
+      throw new Error('unfriend(): friend.share_pub is required');
+    }
+
+    const friendsState = await this.#loadFriendsRecord();
+    const present = friendsState.record.friends.some(f => f.share_pub === friend.share_pub);
+    if (!present) {
+      this.#clearFriendCaches(friend.share_pub);
+      return { removed: false };
+    }
+
+    let notifications;
+    if (opts.notify === true) {
+      // Courtesy: publish a final `remove` per content_id we're currently
+      // sharing with this friend. We need the outbound state to enumerate
+      // the content_ids — hydrate from the existing log if not cached.
+      const fullFriend = friendsState.record.friends.find(f => f.share_pub === friend.share_pub) || friend;
+      try {
+        await this.#hydrateOutboundState(fullFriend);
+      } catch (err) {
+        // If hydration fails (e.g., transient API error), still proceed with
+        // the unfriend — the friend record removal is the durable signal.
+        console.warn(`[TarnClient] unfriend(notify): hydrate outbound state failed: ${err.message}`);
+      }
+      const tentative = this.#tentativeOutboundState(fullFriend);
+      const contentIds = Object.keys(tentative);
+      notifications = [];
+      for (const contentId of contentIds) {
+        try {
+          const res = await this._publishShareLogEntry(fullFriend, {
+            type: OP_REMOVE,
+            content_id: contentId,
+            removed_at: Math.floor(Date.now() / 1000),
+          }, {
+            retryOn409: true,
+            // After this loop we drop all outbound state for this friend; the
+            // tentative snapshotState reflects the running removal so any
+            // mid-loop auto-compaction snapshot doesn't re-include items
+            // we've already removed.
+            snapshotState: { ...tentative },
+          });
+          delete tentative[contentId];
+          notifications.push({ content_id: contentId, seq: res.seq, txid: res.txid });
+        } catch (err) {
+          // Best-effort: log + continue. The friend record removal still
+          // happens below.
+          console.warn(`[TarnClient] unfriend(notify): remove ${contentId} failed: ${err.message}`);
+        }
+      }
+    }
+
+    const updated = removeFriend(friendsState.record, friend.share_pub);
+    await this.#saveFriendsRecord(friendsState, updated);
+    this.#clearFriendCaches(friend.share_pub);
+
+    return notifications ? { removed: true, notifications } : { removed: true };
+  }
+
+  /**
+   * Rotate the CEK for a content_id and announce it to all remaining friends
+   * with access (sharing §10.3). Going-forward only: old versions of the
+   * content (encrypted under the OLD CEK) remain decryptable to anyone who
+   * already has them; the new CEK is required for future versions.
+   *
+   * Apps drive this when a content item should become inaccessible to a
+   * just-unfriended party (or to bound side-channel risk per §10.2). The
+   * SDK fans out a signed `rotate` operation to every friend currently
+   * sharing this content_id; the next published version of the content
+   * blob (per the per-content CEK pattern from #11) wraps the new CEK
+   * under the user's DEK. Apps are responsible for re-encrypting and
+   * publishing the next content version under the new CEK — Tarn's SDK
+   * is app-agnostic, so it returns the new CEK for the caller to use.
+   *
+   * Cost: O(remaining_friends_with_access) signed log entries per content
+   * item rotated. Practical for typical Bookish-class friend counts.
+   *
+   * @param {string} contentId - app-stable content id (e.g., book id)
+   * @param {{ friends?: Array<{share_pub: string}> }} [opts] - explicit
+   *   friend list override; defaults to the current friends record. Apps
+   *   that just unfriended Bob should call `unfriend(bob)` first, then
+   *   `revokeContentForFriends(bookId)` — the friends record already excludes
+   *   Bob by then.
+   * @returns {Promise<{
+   *   newCekBase64Url: string,
+   *   announcements: Array<{ friendSharePub: string, seq: number, txid: string }>,
+   *   skipped: Array<{ friendSharePub: string, reason: string }>,
+   * }>}
+   */
+  async revokeContentForFriends(contentId, opts = {}) {
+    await this.#requireAuth();
+    if (typeof contentId !== 'string' || contentId.length === 0) {
+      throw new Error('revokeContentForFriends(): contentId is required');
+    }
+
+    let friends;
+    if (Array.isArray(opts.friends)) {
+      friends = opts.friends;
+    } else {
+      const friendsState = await this.#loadFriendsRecord();
+      friends = friendsState.record.friends;
+    }
+
+    // Generate a fresh 32-byte CEK. AES-KW unwrapped form lives client-side;
+    // apps wrap it under their DEK on the next content publish.
+    const newCekBytes = crypto.getRandomValues(new Uint8Array(32));
+    const newCekBase64Url = bytesToBase64Url(newCekBytes);
+    const rotatedAt = Math.floor(Date.now() / 1000);
+
+    const announcements = [];
+    const skipped = [];
+    for (const friend of friends) {
+      // Hydrate so we know whether this friend currently has access. A friend
+      // not currently sharing this content_id gets skipped — emitting a rotate
+      // for them is wasted log space (and per §8.4 idempotency, recipients
+      // would log a warning and ignore it anyway).
+      try {
+        await this.#hydrateOutboundState(friend);
+      } catch (err) {
+        skipped.push({ friendSharePub: friend.share_pub, reason: `hydrate failed: ${err.message}` });
+        continue;
+      }
+      const tentative = this.#tentativeOutboundState(friend);
+      if (!tentative[contentId]) {
+        skipped.push({ friendSharePub: friend.share_pub, reason: 'not currently sharing' });
+        continue;
+      }
+      tentative[contentId] = { tx_id: tentative[contentId].tx_id, cek: newCekBase64Url };
+      try {
+        const res = await this._publishShareLogEntry(friend, {
+          type: OP_ROTATE,
+          content_id: contentId,
+          cek: newCekBase64Url,
+          rotated_at: rotatedAt,
+        }, { retryOn409: true, snapshotState: tentative });
+        this.#commitOutboundState(friend, tentative);
+        announcements.push({ friendSharePub: friend.share_pub, seq: res.seq, txid: res.txid });
+      } catch (err) {
+        skipped.push({ friendSharePub: friend.share_pub, reason: err.message });
+      }
+    }
+
+    return { newCekBase64Url, announcements, skipped };
+  }
+
+  // ============ IDENTITY ROTATION (issue #17, Section 5d, sharing §13.5) ============
+
+  /**
+   * Publish a `rotate_identity` announcement to every friend's OLD outbound
+   * log (sharing §13.5). Called by `changeCredentials` and `recoverAccount`
+   * AFTER the new credential blob is published but BEFORE the local key
+   * material is swapped to the new identity.
+   *
+   * Invariants the caller must uphold:
+   *   - `oldSharingKeyPair`, `oldSigningKeyPair`, `oldFriendsRecord` reflect
+   *     the pre-rotation state.
+   *   - `this.#sharingKeyPair`, `this.#signingKeyPair`, `this.#pairKeyCache`
+   *     all still hold OLD values (we read them via the pair-key cache to
+   *     produce OLD K_AB_to_B + OLD T_AB_seed_to_B).
+   *   - The new credential blob has already been written so a recipient who
+   *     re-fetches Alice's blob mid-rotation sees the NEW pubkeys
+   *     (the durable indicator of in-flight rotation per §13.5).
+   *
+   * Race handling: each per-friend publish uses 5c's `retryOn409` retry. If a
+   * stale-device concurrent publish lands at `seq_max_old + 1` first, the
+   * retry path advances past it and lands the rotation at `seq_max_old + 2`.
+   * Recipients walking forward see the rotation in order; any further
+   * entries on the OLD log after rotation are ignored per §13.5.
+   *
+   * Best-effort across friends: a per-friend failure is logged and the
+   * announcement loop continues. The next session retries (the new credential
+   * blob is already published, so the next session can detect "some friends
+   * still have OLD pubkeys cached" via the rotation-in-flight signal).
+   *
+   * @returns {Promise<Array<{ friendSharePub: string, seq?: number, txid?: string, error?: string }>>}
+   */
+  async #announceIdentityRotationToFriends({
+    oldSharingKeyPair,
+    oldSigningKeyPair,
+    oldFriendsRecord,
+    newSharingPublicKey,
+    newSigningPublicKey,
+    newCredentialLookupKey,
+    rotatedAt,
+  }) {
+    if (!oldSharingKeyPair?.privateKey) {
+      throw new Error('#announceIdentityRotationToFriends: oldSharingKeyPair.privateKey is required');
+    }
+    if (!oldSigningKeyPair?.privateKey) {
+      throw new Error('#announceIdentityRotationToFriends: oldSigningKeyPair.privateKey is required');
+    }
+    if (!oldFriendsRecord || !Array.isArray(oldFriendsRecord.friends)) {
+      throw new Error('#announceIdentityRotationToFriends: oldFriendsRecord is required');
+    }
+
+    const newSharePubBase64Url = encodeSharePub(newSharingPublicKey);
+    const newSigningPubBase64 = await exportPublicKey(newSigningPublicKey);
+
+    const results = [];
+    for (const friend of oldFriendsRecord.friends) {
+      try {
+        // Derive OLD per-pair keys directly (NOT via the cache; the cache
+        // entry would be re-derived on the fly from the OLD share_priv but
+        // we want explicit control here to keep the logic auditable).
+        let peerSharePub;
+        try {
+          peerSharePub = decodeSharePub(friend.share_pub);
+        } catch (err) {
+          results.push({ friendSharePub: friend.share_pub, error: `decode share_pub: ${err.message}` });
+          continue;
+        }
+        const oldSharedSecret = deriveSharedSecret(oldSharingKeyPair.privateKey, peerSharePub);
+        const oldPair = await derivePairKeys({
+          sharedSecret: oldSharedSecret,
+          appId: this.#appId,
+          selfSharePub: oldSharingKeyPair.publicKey,
+          peerSharePub,
+        });
+
+        // Discover the OLD highest seq so the rotation lands at seq_max + 1.
+        const oldHighestSeq = await this.#discoverHighestSeqViaTagSeed(oldPair.outboundTagSeed, 0);
+        const targetSeq = oldHighestSeq + 1;
+
+        const txidOrError = await this.#publishRotateIdentityAtSeq({
+          friend,
+          oldPair,
+          oldSigningPrivateKey: oldSigningKeyPair.privateKey,
+          startSeq: targetSeq,
+          payload: {
+            new_share_pub: newSharePubBase64Url,
+            new_signing_pub: newSigningPubBase64,
+            new_credential_lookup_key: newCredentialLookupKey,
+            rotated_at: rotatedAt,
+          },
+        });
+
+        if (txidOrError.error) {
+          results.push({ friendSharePub: friend.share_pub, error: txidOrError.error });
+        } else {
+          results.push({
+            friendSharePub: friend.share_pub,
+            seq: txidOrError.seq,
+            txid: txidOrError.txid,
+          });
+        }
+      } catch (err) {
+        results.push({ friendSharePub: friend.share_pub, error: err.message });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Discover the highest existing seq on a log identified by a tag seed, by
+   * probing OUTBOUND tags. Used by the rotation-announce path (which works
+   * with explicitly-derived pair keys, not the cached pair-key entry).
+   */
+  async #discoverHighestSeqViaTagSeed(tagSeed, anchor = 0) {
+    const result = await discoverHighestSeq({
+      probe: async (seq) => {
+        const tag = await deriveLogTag(tagSeed, seq);
+        const blob = await this.#getShareLogBlobByTag(tag);
+        return blob !== null;
+      },
+      anchor,
+    });
+    return result.highestSeq;
+  }
+
+  /**
+   * Publish a rotate_identity entry under the OLD pair keys, with built-in
+   * retry on 409 for the rotation window race (§13.5). Returns either
+   * `{ seq, txid }` on success or `{ error }` on terminal failure.
+   *
+   * Each retry re-derives the next free seq, re-builds the operation with
+   * that seq baked in, re-signs (mandatory — `seq` is in the signature input
+   * per §8.1), re-encrypts under a fresh IV, and republishes. Bounded to 5
+   * retries so a perpetually-busy log doesn't loop forever.
+   */
+  async #publishRotateIdentityAtSeq({
+    friend, oldPair, oldSigningPrivateKey, startSeq, payload,
+  }) {
+    const MAX_RETRIES = 5;
+    let seq = startSeq;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const operation = buildOperationUnsigned({ type: OP_ROTATE_IDENTITY, seq, ...payload });
+      const signed = await signOperation(operation, oldSigningPrivateKey);
+      const blob = await encryptShareLogEntry(signed, oldPair.outboundKey);
+      const tag = await deriveLogTag(oldPair.outboundTagSeed, seq);
+      try {
+        const txid = await this.#postShareLogPublish(tag, blob);
+        return { seq, txid };
+      } catch (err) {
+        if (err.code !== 'SHARE_LOG_TAG_CONFLICT') {
+          return { error: err.message };
+        }
+        if (attempt === MAX_RETRIES) {
+          return { error: `rotate_identity exceeded ${MAX_RETRIES} retries (last conflict at seq=${seq})` };
+        }
+        // Re-discover anchored at seq+1 so we skip past whatever raced us.
+        const probedHighest = await this.#discoverHighestSeqViaTagSeed(oldPair.outboundTagSeed, seq + 1);
+        seq = Math.max(seq + 1, probedHighest + 1);
+      }
+    }
+    return { error: 'rotate_identity: unreachable retry loop exit' };
+  }
+
+  /**
+   * Recipient-side processing of a `rotate_identity` entry surfaced during
+   * read/sync (sharing §13.5).
+   *
+   * Pre-condition: the caller has already verified the operation's signature
+   * against the friend's CURRENT signing_pub (which is the OLD signing_pub
+   * from the rotating party's perspective — that's what makes the
+   * announcement trustworthy).
+   *
+   * Steps (§13.5 step 4-7):
+   *   1. Update Alice's friend record entry: replace share_pub, signing_pub,
+   *      credential_lookup_key. Persist.
+   *   2. Clear all per-friend caches keyed on the OLD share_pub. The NEW
+   *      share_pub becomes the cache key going forward.
+   *   3. Return the updated friend object so the caller can re-bootstrap the
+   *      read flow on the NEW log under the new keys.
+   *
+   * Idempotent: replaying the same announcement on a fresh device produces
+   * the same final state (the friend record's signing_pub now matches the
+   * announcement's `new_signing_pub` so a subsequent verify still succeeds
+   * because the announcement has already been accepted; if the announcement
+   * is replayed, the friend record's `share_pub` no longer matches the
+   * incoming `friend.share_pub` so the caller's lookup short-circuits).
+   *
+   * @param {Object} friend - friends-record entry (has OLD share_pub +
+   *   OLD signing_pub at call time)
+   * @param {Object} operation - the parsed, signature-verified
+   *   rotate_identity operation
+   * @returns {Promise<Object>} updated friend entry
+   */
+  async #processRotateIdentityEntry(friend, operation) {
+    const newSharePubBase64Url = operation.new_share_pub;
+    const newSigningPubBase64 = operation.new_signing_pub;
+    const newCredentialLookupKey = operation.new_credential_lookup_key;
+    const rotatedAt = operation.rotated_at;
+
+    if (typeof newSharePubBase64Url !== 'string'
+      || typeof newSigningPubBase64 !== 'string'
+      || typeof newCredentialLookupKey !== 'string'
+      || !Number.isInteger(rotatedAt)
+    ) {
+      throw new Error(
+        '#processRotateIdentityEntry: malformed rotate_identity payload — caller should have validated',
+      );
+    }
+
+    // Defensive: validate the new share_pub decodes cleanly. A malformed
+    // value here would explode the next pair-key derivation; better to bail
+    // now than half-update the friend record.
+    decodeSharePub(newSharePubBase64Url);
+
+    const oldSharePub = friend.share_pub;
+    const friendsState = await this.#loadFriendsRecord();
+    const updatedRecord = rotateFriendIdentity(friendsState.record, oldSharePub, {
+      newSharePubBase64Url,
+      newSigningPubBase64,
+      newCredentialLookupKey,
+      rotatedAt,
+    });
+
+    if (updatedRecord !== friendsState.record) {
+      await this.#saveFriendsRecord(friendsState, updatedRecord);
+    }
+
+    // Clear OLD caches — the NEW share_pub is a different cache key, so
+    // explicit invalidation is mostly defensive (no entry should exist under
+    // the NEW key yet). The OLD-keyed entries are now stale and must not be
+    // accidentally used.
+    this.#clearFriendCaches(oldSharePub);
+
+    return (
+      updatedRecord.friends.find(f => f.share_pub === newSharePubBase64Url)
+      || { ...friend, share_pub: newSharePubBase64Url, signing_pub: newSigningPubBase64 }
+    );
+  }
+
+  /**
+   * Drop all per-friend share-log caches for a given share_pub. Used by
+   * unfriend (§10.1) and identity rotation (§13.5) — both invalidate the
+   * cached pair keys + state since the pair-keys derivation is now stale
+   * (the friend's share_pub no longer maps to a current relationship, or
+   * has rotated to a new value).
+   */
+  #clearFriendCaches(friendSharePubBase64Url) {
+    this.#pairKeyCache.delete(friendSharePubBase64Url);
+    this.#shareLogCounters.delete(friendSharePubBase64Url);
+    this.#readStateCache.delete(friendSharePubBase64Url);
+    this.#outboundStateCache.delete(friendSharePubBase64Url);
+    this.#publishedTxidsByFriend.delete(friendSharePubBase64Url);
   }
 
   // ---- Outbound state tracking (Section 5c) ----

@@ -93,7 +93,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     const gen1RecoveryWrapAtRegister =
       registeredEnvelope.dek_chain[0].wrappings.find(w => w.factor === 'recovery_phrase').wrapped;
 
-    await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD);
+    await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD, { acceptRecoveryGap: true, skipRotationAnnounce: true });
 
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');
     assert.ok(putCall, 'changeCredentials should send PUT /api/v1/auth');
@@ -177,7 +177,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     );
 
     // Run credential change.
-    await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD);
+    await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD, { acceptRecoveryGap: true, skipRotationAnnounce: true });
 
     // Now grab the new envelope, unwrap with NEW credentials, recover gen 1.
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');
@@ -209,9 +209,9 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     const client = new TarnClient('https://api.tarn.dev', APP);
     await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
 
-    await client.changeCredentials('e1@x.com', 'p1');
-    await client.changeCredentials('e2@x.com', 'p2');
-    await client.changeCredentials('e3@x.com', 'p3');
+    await client.changeCredentials('e1@x.com', 'p1', { acceptRecoveryGap: true, skipRotationAnnounce: true });
+    await client.changeCredentials('e2@x.com', 'p2', { acceptRecoveryGap: true, skipRotationAnnounce: true });
+    await client.changeCredentials('e3@x.com', 'p3', { acceptRecoveryGap: true, skipRotationAnnounce: true });
 
     const putCalls = fetchCalls.filter(c => c.url.endsWith('/auth') && c.method === 'PUT');
     assert.equal(putCalls.length, 3);
@@ -243,7 +243,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
 
     const client = new TarnClient('https://api.tarn.dev', APP);
     await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
-    await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD);
+    await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD, { acceptRecoveryGap: true, skipRotationAnnounce: true });
 
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');
     const newWdk = JSON.parse(putCall.body).new_wrapped_data_key;

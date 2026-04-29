@@ -433,11 +433,13 @@ export function buildOperationUnsigned(fields) {
       requirePriorSeq(fields.prior_seq);
       break;
     case OP_ROTATE_IDENTITY:
-      // 5b recognizes the type for forward-compat parsing only — we don't emit
-      // it here. Validation is "permissive but typed" so a 5d-emitted entry
-      // round-trips through buildOperationUnsigned cleanly.
+      // §13.5 — emitted by the sender (5d) when the master_key changes (email
+      // or password change, account recovery). Recipients verify the signature
+      // with the OLD signing_pub cached in their friend record before adopting
+      // the new pubkeys.
       requireBase64UrlBytes(fields.new_share_pub, 'new_share_pub', 32);
       requireString(fields.new_signing_pub, 'new_signing_pub');
+      requireString(fields.new_credential_lookup_key, 'new_credential_lookup_key');
       requireUnixSeconds(fields.rotated_at, 'rotated_at');
       break;
     default:
@@ -482,6 +484,7 @@ function copyKnownFieldsByType(out, src, type) {
     case OP_ROTATE_IDENTITY:
       out.new_share_pub = src.new_share_pub;
       out.new_signing_pub = src.new_signing_pub;
+      out.new_credential_lookup_key = src.new_credential_lookup_key;
       out.rotated_at = src.rotated_at;
       break;
   }

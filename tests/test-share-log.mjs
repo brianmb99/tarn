@@ -586,13 +586,311 @@ await test('Concurrent publish race: two parallel writers at the same tag → ex
   }
 });
 
-// ============ 9. Cleanup ============
+// ============ 9. Section 5d — Revocation + identity rotation (issue #17) ============
 
-console.log('\n=== 9. Cleanup ===');
+console.log('\n=== 9. Revocation: unfriend (silent + notify modes) ===');
+
+// Use a fresh pair so the prior tests' state doesn't pollute revocation tests.
+const charlieEmail = randomEmail();
+const charliePassword = 'pw-charlie-' + Date.now();
+const dianaEmail = randomEmail();
+const dianaPassword = 'pw-diana-' + Date.now();
+const charlie = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+const diana = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+
+let dianaFriendOfCharlie;
+let charlieFriendOfDiana;
+
+await test('Charlie + Diana register and friend each other', async () => {
+  await registerWithRules(charlie, charlieEmail, charliePassword);
+  await registerWithRules(diana, dianaEmail, dianaPassword);
+  const send = await charlie.sendFriendRequest(dianaEmail);
+  await sleep(200);
+  await diana.listIncomingRequests();
+  await diana.acceptFriendRequest(send.requestNonce);
+  await sleep(200);
+  await charlie.listIncomingRequests();
+  charlieFriendOfDiana = (await charlie.listFriends()).find(f => f.email === dianaEmail);
+  dianaFriendOfCharlie = (await diana.listFriends()).find(f => f.email === charlieEmail);
+  assert(charlieFriendOfDiana, 'Charlie missing Diana');
+  assert(dianaFriendOfCharlie, 'Diana missing Charlie');
+});
+
+await test('unfriend (silent): friend dropped from listFriends, per-friend caches cleared', async () => {
+  await charlie.shareContent(
+    charlieFriendOfDiana,
+    'tobe-revoked-1',
+    'arweave-rev-1',
+    bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+  );
+  const before = await charlie.listFriends();
+  assert(before.some(f => f.email === dianaEmail), 'Diana should still be a friend');
+  const r = await charlie.unfriend(charlieFriendOfDiana);
+  assert(r.removed === true, 'unfriend should report removal');
+  assert(!r.notifications, 'silent unfriend should not produce notifications');
+  const after = await charlie.listFriends();
+  assert(!after.some(f => f.email === dianaEmail), 'Diana should be gone after unfriend');
+});
+
+await test('unfriend (idempotent): re-unfriending a non-friend returns removed:false', async () => {
+  const r = await charlie.unfriend(charlieFriendOfDiana);
+  assert(r.removed === false, 'second unfriend should be a no-op');
+});
+
+// Re-friend Charlie + Diana to test the notify-mode unfriend.
+await test('Re-establish Charlie+Diana for notify-mode test', async () => {
+  const send2 = await diana.sendFriendRequest(charlieEmail);
+  await sleep(200);
+  await charlie.listIncomingRequests();
+  await charlie.acceptFriendRequest(send2.requestNonce);
+  await sleep(200);
+  await diana.listIncomingRequests();
+  charlieFriendOfDiana = (await charlie.listFriends()).find(f => f.email === dianaEmail);
+  dianaFriendOfCharlie = (await diana.listFriends()).find(f => f.email === charlieEmail);
+  assert(charlieFriendOfDiana, 'Re-friend failed for Charlie');
+  assert(dianaFriendOfCharlie, 'Re-friend failed for Diana');
+  // Charlie publishes 2 add ops to have something to revoke.
+  await charlie.shareContent(
+    charlieFriendOfDiana,
+    'notify-target-A',
+    'arweave-notify-A',
+    bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+  );
+  await charlie.shareContent(
+    charlieFriendOfDiana,
+    'notify-target-B',
+    'arweave-notify-B',
+    bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+  );
+});
+
+await test('unfriend ({notify: true}): publishes a final remove for every shared content_id', async () => {
+  // Diana reads Charlie's log and confirms the items are present BEFORE notify-unfriend.
+  const beforeState = await diana.readShareLog(dianaFriendOfCharlie, { refresh: true });
+  assert(beforeState['notify-target-A'], 'Diana should see notify-target-A');
+  assert(beforeState['notify-target-B'], 'Diana should see notify-target-B');
+
+  const r = await charlie.unfriend(charlieFriendOfDiana, { notify: true });
+  assert(r.removed === true);
+  assert(Array.isArray(r.notifications), 'notify mode returns notifications array');
+  // Notify mode emits one `remove` per content_id in the hydrated outbound
+  // state. The hydrate reads from the OLD log (sharing §13.7 "continue old
+  // log" semantics — re-friending reuses the same per-pair tag stream), so
+  // a tobe-revoked-1 from the FIRST friendship may still be in the state at
+  // re-friend time. We assert >= 2 (the two notify-target items) rather than
+  // pinning the exact count.
+  assert(r.notifications.length >= 2, `expected at least 2 notifications, got ${r.notifications.length}`);
+  const removedIds = new Set(r.notifications.map(n => n.content_id));
+  assert(removedIds.has('notify-target-A'), 'notify-target-A must be removed');
+  assert(removedIds.has('notify-target-B'), 'notify-target-B must be removed');
+  for (const n of r.notifications) {
+    assert(typeof n.seq === 'number');
+    assert(typeof n.txid === 'string');
+  }
+
+  // Diana syncs and sees the targeted items removed.
+  const afterState = await diana.syncShareLog(dianaFriendOfCharlie);
+  assert(!afterState['notify-target-A'], 'Diana should no longer see notify-target-A');
+  assert(!afterState['notify-target-B'], 'Diana should no longer see notify-target-B');
+});
+
+console.log('\n=== 9b. Revocation: revokeContentForFriends (CEK rotation) ===');
+
+const eveEmail = randomEmail();
+const evePassword = 'pw-eve-' + Date.now();
+const frankEmail = randomEmail();
+const frankPassword = 'pw-frank-' + Date.now();
+const garyEmail = randomEmail();
+const garyPassword = 'pw-gary-' + Date.now();
+const eve = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+const frank = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+const gary = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+
+let frankFriendOfEve, garyFriendOfEve;
+let eveFriendOfFrank, eveFriendOfGary;
+const sharedContentId = 'book-' + Date.now();
+const originalCek = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+
+await test('Eve registers, friends Frank and Gary, shares same content with both', async () => {
+  await registerWithRules(eve, eveEmail, evePassword);
+  await registerWithRules(frank, frankEmail, frankPassword);
+  await registerWithRules(gary, garyEmail, garyPassword);
+
+  const r1 = await eve.sendFriendRequest(frankEmail);
+  await sleep(200);
+  await frank.listIncomingRequests();
+  await frank.acceptFriendRequest(r1.requestNonce);
+  await sleep(200);
+  await eve.listIncomingRequests();
+
+  const r2 = await eve.sendFriendRequest(garyEmail);
+  await sleep(200);
+  await gary.listIncomingRequests();
+  await gary.acceptFriendRequest(r2.requestNonce);
+  await sleep(200);
+  await eve.listIncomingRequests();
+
+  const eveFriends = await eve.listFriends();
+  frankFriendOfEve = eveFriends.find(f => f.email === frankEmail);
+  garyFriendOfEve = eveFriends.find(f => f.email === garyEmail);
+  eveFriendOfFrank = (await frank.listFriends()).find(f => f.email === eveEmail);
+  eveFriendOfGary = (await gary.listFriends()).find(f => f.email === eveEmail);
+  assert(frankFriendOfEve && garyFriendOfEve, 'Eve\'s friend list incomplete');
+  assert(eveFriendOfFrank && eveFriendOfGary, 'Frank/Gary missing Eve');
+
+  await eve.shareContent(frankFriendOfEve, sharedContentId, 'arweave-orig', originalCek);
+  await eve.shareContent(garyFriendOfEve, sharedContentId, 'arweave-orig', originalCek);
+});
+
+await test('revokeContentForFriends: produces a new CEK, fans out rotate to all remaining friends', async () => {
+  // Eve unfriends Frank first, then revokes content from remaining friends
+  // (Gary). This is the recommended §10.3 flow: drop Bob, then rotate.
+  await eve.unfriend(frankFriendOfEve);
+
+  const result = await eve.revokeContentForFriends(sharedContentId);
+  assert(typeof result.newCekBase64Url === 'string', 'new CEK should be returned');
+  assert(result.newCekBase64Url.length === 43, 'CEK should be 32-byte base64url');
+  assert(result.newCekBase64Url !== originalCek, 'new CEK must differ from old');
+  assert(Array.isArray(result.announcements), 'announcements array required');
+  assert(result.announcements.length === 1, `expected 1 announcement (Gary only), got ${result.announcements.length}`);
+  assert(result.announcements[0].friendSharePub === garyFriendOfEve.share_pub);
+});
+
+await test('Gary syncs and sees the new CEK; Frank still has old CEK in his last-known state', async () => {
+  const garyState = await gary.syncShareLog(eveFriendOfGary);
+  assert(garyState[sharedContentId], `Gary should still have ${sharedContentId} after rotation`);
+  assert(garyState[sharedContentId].cek !== originalCek, `Gary's CEK should have rotated`);
+
+  // Frank's last sync (pre-revocation) still has the original CEK. Frank
+  // would not see further updates because Eve unfriended him.
+  const frankState = await frank.readShareLog(eveFriendOfFrank, { refresh: true });
+  if (frankState[sharedContentId]) {
+    assert(frankState[sharedContentId].cek === originalCek,
+      'Frank\'s view of the content (if any) should still hold the old CEK');
+  }
+});
+
+console.log('\n=== 9c. Identity rotation: changeCredentials → friend picks up new keys ===');
+
+const helenEmail = randomEmail();
+const helenPassword = 'pw-helen-' + Date.now();
+const ivanEmail = randomEmail();
+const ivanPassword = 'pw-ivan-' + Date.now();
+const helen = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+const ivan = new TarnClient(BASE_URL, DEFAULT_APP_ID);
+let ivanFriendOfHelen, helenFriendOfIvan;
+let helenPhrase;
+let helenSharePubBeforeRotate;
+
+await test('Helen + Ivan register + handshake; Helen shares a content item', async () => {
+  const reg = await helen.register(helenEmail, helenPassword, {
+    recoveryAcknowledged: true,
+    emailRecoveryKit: false,
+  });
+  helenPhrase = reg.recoveryPhrase;
+  await forceAllowRulesForAccount(reg.dataLookupKey);
+  await registerWithRules(ivan, ivanEmail, ivanPassword);
+
+  const send = await helen.sendFriendRequest(ivanEmail);
+  await sleep(200);
+  await ivan.listIncomingRequests();
+  await ivan.acceptFriendRequest(send.requestNonce);
+  await sleep(200);
+  await helen.listIncomingRequests();
+
+  ivanFriendOfHelen = (await helen.listFriends()).find(f => f.email === ivanEmail);
+  helenFriendOfIvan = (await ivan.listFriends()).find(f => f.email === helenEmail);
+  assert(ivanFriendOfHelen, 'Helen missing Ivan');
+  assert(helenFriendOfIvan, 'Ivan missing Helen');
+  helenSharePubBeforeRotate = helenFriendOfIvan.share_pub;
+
+  await helen.shareContent(
+    ivanFriendOfHelen,
+    'rotate-target-1',
+    'arweave-pre-rotate',
+    bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+  );
+});
+
+await test('Ivan reads pre-rotation state', async () => {
+  const state = await ivan.readShareLog(helenFriendOfIvan, { refresh: true });
+  assert(state['rotate-target-1'], 'Ivan should see rotate-target-1 before rotation');
+});
+
+await test('Helen rotates credentials (email + password change)', async () => {
+  const newEmail = `rotated-${Date.now()}@test.com`;
+  const result = await helen.changeCredentials(newEmail, 'new-pw-' + Date.now(), {
+    phrase: helenPhrase,
+  });
+  assert(Array.isArray(result.rotationAnnouncements), 'should return rotationAnnouncements');
+  assert(result.rotationAnnouncements.length === 1, 'expected 1 friend rotated');
+  const ann = result.rotationAnnouncements[0];
+  assert(ann.friendSharePub === ivanFriendOfHelen.share_pub);
+  assert(typeof ann.txid === 'string', 'rotation announcement should have a txid');
+  assert(typeof ann.seq === 'number', 'rotation announcement should have a seq');
+});
+
+await test('Ivan syncs: detects rotate_identity, updates friend record, switches to new keys', async () => {
+  await sleep(300);
+  const stateAfter = await ivan.syncShareLog(helenFriendOfIvan);
+  // After rotation, the friend record now holds Helen's NEW share_pub. The
+  // returned state should reflect the seq=0 NEW-log snapshot Helen published
+  // with her pre-rotation outbound state.
+  assert(stateAfter['rotate-target-1'], 'Ivan should still see rotate-target-1 after rotation');
+
+  const ivanFriends = await ivan.listFriends();
+  const updatedFriend = ivanFriends[0];
+  assert(updatedFriend.share_pub !== helenSharePubBeforeRotate,
+    'Ivan\'s friend record should hold the NEW share_pub');
+  assert(typeof updatedFriend.rotated_at === 'number', 'Ivan should record rotated_at');
+  assert(updatedFriend.prior_share_pub === helenSharePubBeforeRotate,
+    'Ivan should record the pre-rotation share_pub for audit');
+});
+
+await test('Helen publishes a new share post-rotation; Ivan picks it up via sync', async () => {
+  // Helen's friends record was updated by changeCredentials: but the
+  // ivanFriendOfHelen reference is stale post-rotation. Refresh it.
+  ivanFriendOfHelen = (await helen.listFriends()).find(f => f.email === ivanEmail);
+  await helen.shareContent(
+    ivanFriendOfHelen,
+    'post-rotate-target',
+    'arweave-post-rotate',
+    bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+  );
+  await sleep(300);
+  // Refresh Ivan's friend pointer too.
+  const ivanFriends = await ivan.listFriends();
+  const helenFromIvan = ivanFriends.find(f => f.email !== helenEmail || f.share_pub) || ivanFriends[0];
+  const stateAfter = await ivan.syncShareLog(helenFromIvan);
+  assert(stateAfter['post-rotate-target'], 'Ivan should pick up post-rotation share via NEW-log keys');
+});
+
+await test('Re-reading rotate_identity is idempotent (replay produces same final state)', async () => {
+  // Trigger a fresh refresh — readShareLog with refresh:true re-bootstraps
+  // and re-encounters the rotation announcement. The friend record is
+  // already at NEW keys, so the recursive read flow goes straight into the
+  // NEW log without re-mutating the friend record.
+  const ivanFriends = await ivan.listFriends();
+  const helenFromIvan = ivanFriends[0];
+  const refreshed = await ivan.readShareLog(helenFromIvan, { refresh: true });
+  assert(refreshed['rotate-target-1'], 'rotate-target-1 should still be present');
+  assert(refreshed['post-rotate-target'], 'post-rotate-target should still be present');
+});
+
+// ============ 10. Cleanup ============
+
+console.log('\n=== 10. Cleanup ===');
 
 await test('Delete test accounts', async () => {
   await alice.deleteAccount();
   await bob.deleteAccount();
+  await charlie.deleteAccount();
+  await diana.deleteAccount();
+  await eve.deleteAccount();
+  await frank.deleteAccount();
+  await gary.deleteAccount();
+  await helen.deleteAccount();
+  await ivan.deleteAccount();
 });
 
 // ============ Summary ============
