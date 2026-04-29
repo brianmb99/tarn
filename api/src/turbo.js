@@ -10,6 +10,16 @@ const TURBO_UPLOAD_URL = 'https://upload.ardrive.io/v1/tx/ethereum';
 export const TURBO_GATEWAY = 'https://turbo-gateway.com';
 
 /**
+ * Wire the `TARN_SKIP_TURBO` Worker env var into a process-global flag so
+ * `uploadSignedDataItem` (called from many call sites) can consult it
+ * without each site having to thread `env` through its signature. Called
+ * once per request from `worker.js`.
+ */
+export function setSkipTurboFromEnv(env) {
+  globalThis.__TARN_SKIP_TURBO__ = !!(env && env.TARN_SKIP_TURBO);
+}
+
+/**
  * Build and sign a DataItem, compute its ID locally, and return it.
  * Does NOT upload to Turbo — caller decides whether to upload synchronously
  * or in background.
@@ -36,10 +46,22 @@ export async function buildSignedDataItem(payload, tags, signingKey) {
 
 /**
  * Upload a pre-built signed DataItem to Turbo.
+ *
+ * Local-dev escape hatch: if `env.TARN_SKIP_TURBO` is truthy (set in
+ * `api/.dev.vars`), the upload is short-circuited to `{ ok: true }`. This
+ * lets integration tests run when the dev wallet has no Turbo balance
+ * (Turbo returns 403, breaking every write path). The flag is read from a
+ * Worker-scoped global because this function is called from many sites
+ * without `env` in scope; the worker's startup wires it up via
+ * `setSkipTurboFromEnv(env)`.
+ *
  * @param {Uint8Array} signedDataItem
  * @returns {Promise<{ok: boolean, turboTxid?: string, status?: number, body?: string}>}
  */
 export async function uploadSignedDataItem(signedDataItem) {
+  if (globalThis.__TARN_SKIP_TURBO__) {
+    return { ok: true, turboTxid: 'skipped-local-dev' };
+  }
   try {
     // 20s ceiling (not 30s): Cloudflare Workers have a 30s wall-time limit on
     // the initial response. A 30s Turbo timeout would consume the entire budget

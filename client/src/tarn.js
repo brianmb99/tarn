@@ -47,6 +47,32 @@ import {
   recoveryPhraseToEntropy,
   renderRecoveryPDF,
 } from './recovery.js';
+import {
+  deriveInboxTag,
+  recentInboxWindows,
+  currentInboxWindow,
+  hpkeSeal,
+  hpkeOpen,
+  buildFriendRequestPayload,
+  validateFriendRequestPayload,
+  buildFriendAcceptPayload,
+  validateFriendAcceptPayload,
+  makeReplayNonceCache,
+  checkAndRecordNonce,
+  findOutboundForAccept,
+  emptyFriendsRecord,
+  emptyPendingRequestsRecord,
+  upsertFriend,
+  addOutboundPending,
+  addInboundPending,
+  removeOutboundPending,
+  removeInboundPending,
+  FRIENDS_CONTENT_ID,
+  PENDING_REQUESTS_CONTENT_ID,
+  INFO_FRIEND_REQUEST,
+  INFO_FRIEND_ACCEPT,
+  DEFAULT_POLL_WINDOWS,
+} from './sharing.js';
 
 // Re-export the recovery-side surface so consumers can import them directly
 // from the package root without reaching into ./recovery (private path).
@@ -74,6 +100,14 @@ export class TarnClient {
   #dekByGen = null;          // Map<gen:number, {gcmKey, kwKey}>
   #currentGen = null;        // number — gen used for new writes
   #envelopeVersion = null;   // 1 (bare base64), 2 (single), 3 (chain), 4 (multi-factor chain)
+
+  // Sharing handshake state (issue #14, Section 5a). Populated on every
+  // register/login/changeCredentials/recoverAccount path so the friend
+  // handshake methods can HPKE-Open inbox blobs without re-deriving from
+  // master_key on every call. share_priv NEVER leaves the device.
+  #email = null;                     // string — caller-supplied normalized email
+  #sharingKeyPair = null;            // {privateKey: Uint8Array, publicKey: Uint8Array}
+  #replayNonceCache = makeReplayNonceCache(); // §13.8 in-memory recent-nonce cache
 
   // v4 recovery-factor state (issue #12). Holds enough information to preserve
   // existing recovery wrappings across a credential change without requiring
@@ -206,6 +240,8 @@ export class TarnClient {
     this.#currentGen = 1;
     this.#envelopeVersion = 4;
     this.#kdfVersion = kdfVersion;
+    this.#email = email;
+    this.#sharingKeyPair = keys.sharingKeyPair;
     // Snapshot the recovery wrapping bytes for the freshly-registered chain
     // so a subsequent changeCredentials() can preserve them without needing
     // the phrase. Re-parse the envelope (cheap — local JSON) to capture the
@@ -463,6 +499,8 @@ export class TarnClient {
     this.#currentGen = unwrapped.currentGen;
     this.#envelopeVersion = 4;
     this.#kdfVersion = kdfVersion;
+    this.#email = newEmail;
+    this.#sharingKeyPair = newKeys.sharingKeyPair;
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
@@ -529,6 +567,8 @@ export class TarnClient {
     this.#currentGen = unwrapped.currentGen;
     this.#envelopeVersion = unwrapped.envelopeVersion;
     this.#kdfVersion = keys.kdfVersion;
+    this.#email = email;
+    this.#sharingKeyPair = keys.sharingKeyPair;
     // Capture the recovery-factor metadata (v4 only) so a subsequent
     // changeCredentials() can preserve existing recovery wrappings without
     // requiring the user to re-enter the phrase. Login does NOT reveal the
@@ -750,6 +790,8 @@ export class TarnClient {
     this.#currentGen = newCurrentGen;
     this.#envelopeVersion = newEnvelopeVersion;
     this.#recoveryFactorMeta = newRecoveryFactorMeta;
+    this.#email = newEmail;
+    this.#sharingKeyPair = newKeys.sharingKeyPair;
 
     await this.#authenticate();
   }
@@ -797,6 +839,9 @@ export class TarnClient {
     this.#kdfVersion = null;
     this.#recoveryFactorMeta = null;
     this.#recoveryLookupKey = null;
+    this.#email = null;
+    this.#sharingKeyPair = null;
+    this.#replayNonceCache = makeReplayNonceCache();
   }
 
   // ============ DATA CRUD ============
@@ -1112,6 +1157,538 @@ export class TarnClient {
     };
   }
 
+  // ============ FRIEND HANDSHAKE (issue #14, Section 5a) ============
+
+  /**
+   * Send an HPKE-sealed friend request to the named recipient (sharing §6.2).
+   *
+   * Flow:
+   *   1. Look up recipient's `share_pub` via `getRecipientShareKey`. If absent
+   *      (pre-#13 account, or non-discoverable), fail with a recognizable
+   *      error so the caller can surface "this person isn't friendable" UX.
+   *   2. Build the request payload (sender_email, sender_share_pub,
+   *      sender_signing_pub, sender_app_id, nonce, timestamp, optional message).
+   *   3. HPKE_Seal to the recipient under info "tarn-friend-request-v1".
+   *   4. Compute the recipient's current-window inbox tag.
+   *   5. Publish the sealed blob to the inbox via the rate-limited endpoint.
+   *   6. Append to our outbound pending list (encrypted Tarn data blob,
+   *      content_id "tarn-pending-requests-v1") so we can later cross-reference
+   *      incoming accepts (§13.9 forged-accept defense).
+   *
+   * Idempotency: the nonce is fresh per call. A retry by the user is a fresh
+   * request from the recipient's standpoint; the protocol does not collapse
+   * duplicates.
+   *
+   * @param {string} recipientEmail
+   * @param {{ message?: string }} [opts]
+   * @returns {Promise<{
+   *   txid: string,                    // Arweave tx_id of the published request
+   *   requestNonce: string,            // base64url 16 bytes
+   *   recipientSharePubBase64Url: string,
+   * }>}
+   */
+  async sendFriendRequest(recipientEmail, opts = {}) {
+    await this.#requireAuth();
+    if (!this.#sharingKeyPair) {
+      throw new Error('sendFriendRequest(): no sharing keypair — login as a v4 account first');
+    }
+    if (!this.#email) {
+      throw new Error('sendFriendRequest(): client missing sender email — re-login');
+    }
+
+    const { sharePub, sharePubBase64Url } = await this.getRecipientShareKey(recipientEmail);
+    if (!sharePub) {
+      // Three causes are indistinguishable to the caller (sharing §11.5): the
+      // recipient doesn't exist, the recipient's account predates #13, or the
+      // recipient has set discoverable=false. Surface a single-shape error
+      // that callers can match on without knowing which one.
+      const err = new Error('sendFriendRequest(): recipient is not friendable (no share_pub published, or discoverable=false)');
+      err.code = 'RECIPIENT_NOT_FRIENDABLE';
+      throw err;
+    }
+
+    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const payload = buildFriendRequestPayload({
+      senderEmail: this.#email,
+      senderSharePub: this.#sharingKeyPair.publicKey,
+      senderSigningPubBase64,
+      senderAppId: this.#appId,
+      message: opts.message,
+    });
+
+    const blob = await hpkeSeal({
+      recipientSharePub: sharePub,
+      info: INFO_FRIEND_REQUEST,
+      plaintext: new TextEncoder().encode(JSON.stringify(payload)),
+    });
+
+    const tag = await deriveInboxTag(sharePub, this.#appId, currentInboxWindow());
+
+    // Publish to the rate-limited inbox endpoint (sharing §9.5).
+    const publishRes = await this.#fetch('/api/v1/share/inbox/publish', {
+      method: 'POST',
+      auth: true,
+      // Not retry-safe: fresh nonce per call means a network-level retry
+      // would silently send a *new* request to the same recipient. The
+      // server-side rate limit is the protection if a caller does retry
+      // explicitly; here we leave retry off so transient 5xx surfaces.
+      body: {
+        tag,
+        type: 'friend-request-v1',
+        ciphertext_base64: bytesToBase64(blob),
+      },
+    });
+    if (publishRes.status !== 200) {
+      throw new Error(`sendFriendRequest(): publish failed: ${publishRes.json?.error || publishRes.status}`);
+    }
+
+    // Update outbound pending list. Persist before returning success so a
+    // subsequent listIncomingRequests() that races with an accept can find
+    // the matching outbound entry. (Without this, the incoming accept would
+    // hit the forged-accept defense and be dropped.)
+    const pending = await this.#loadPendingRequestsRecord();
+    const outbound = {
+      recipient_email: recipientEmail,
+      recipient_share_pub: sharePubBase64Url,
+      request_nonce: payload.nonce,
+      sent_at: payload.timestamp,
+    };
+    const updated = addOutboundPending(pending.record, outbound);
+    await this.#savePendingRequestsRecord(pending, updated);
+
+    return {
+      txid: publishRes.json.txid,
+      requestNonce: payload.nonce,
+      recipientSharePubBase64Url: sharePubBase64Url,
+    };
+  }
+
+  /**
+   * Poll the inbox for incoming friend requests (sharing §6.3 + §13.8).
+   *
+   * Walks the recent N day-windows (default 30, per design), fetches all
+   * blobs at each (recipient_inbox_tag, friend-request-v1) tuple, attempts
+   * HPKE_Open, validates the resulting payload, and deduplicates against
+   * the recipient's recent-nonce cache. Surfaces validated requests; updates
+   * the inbound pending record so subsequent calls (and accept) can see them.
+   *
+   * Failures (HPKE_Open returns nothing, validation fails, replay) are
+   * silently dropped — never surfaced to the caller. This is the
+   * spam-resilience property of §6.8.
+   *
+   * @param {{ windows?: number }} [opts]
+   * @returns {Promise<Array<{
+   *   senderEmail: string,
+   *   senderSharePubBase64Url: string,
+   *   senderSigningPubBase64: string,
+   *   senderAppId: string,
+   *   requestNonce: string,
+   *   timestamp: number,
+   *   message: string | null,
+   *   txid: string,
+   * }>>}
+   */
+  async listIncomingRequests(opts = {}) {
+    await this.#requireAuth();
+    if (!this.#sharingKeyPair) {
+      throw new Error('listIncomingRequests(): no sharing keypair — login as a v4 account first');
+    }
+    const windows = Number.isInteger(opts.windows) && opts.windows > 0
+      ? opts.windows
+      : DEFAULT_POLL_WINDOWS;
+
+    const myPub = this.#sharingKeyPair.publicKey;
+    const myPriv = this.#sharingKeyPair.privateKey;
+
+    // Fetch every window in parallel — typical case is no requests, so we
+    // want to short-circuit fast. The fetch endpoint is IP rate-limited on
+    // the API side; 30 fetches per login is well under the per-hour budget.
+    const tags = await Promise.all(
+      recentInboxWindows(windows).map(w => deriveInboxTag(myPub, this.#appId, w)),
+    );
+    const fetched = await Promise.all(
+      tags.map(tag => this.#fetchInboxBlobs(tag, 'friend-request-v1')),
+    );
+
+    const surfaced = [];
+    const pendingState = await this.#loadPendingRequestsRecord();
+    let pendingRecord = pendingState.record;
+    let pendingDirty = false;
+
+    for (const blobs of fetched) {
+      for (const blob of blobs) {
+        let payload;
+        try {
+          const pt = await hpkeOpen({
+            sharePriv: myPriv,
+            info: INFO_FRIEND_REQUEST,
+            blob: blob.ciphertext,
+          });
+          payload = JSON.parse(new TextDecoder().decode(pt));
+        } catch {
+          // Not for us, or tampered, or wrong info — silently skip (§6.3).
+          continue;
+        }
+        const validation = validateFriendRequestPayload(payload, this.#appId);
+        if (!validation.valid) continue;
+
+        // Replay defense (§13.8): in-memory recent-nonce cache.
+        const replayCheck = checkAndRecordNonce(this.#replayNonceCache, validation.normalized.nonceBase64Url);
+        if (replayCheck.replay) continue;
+
+        // De-dup against existing inbound pending — the same nonce might
+        // already be in the persisted record from a prior session.
+        if (pendingRecord.inbound.some(i => i.request_nonce === validation.normalized.nonceBase64Url)) {
+          // Surface from existing record (so the caller sees a stable view)
+          // but don't duplicate-write.
+          surfaced.push({
+            senderEmail: validation.normalized.senderEmail,
+            senderSharePubBase64Url: validation.normalized.senderSharePubBase64Url,
+            senderSigningPubBase64: validation.normalized.senderSigningPubBase64,
+            senderAppId: validation.normalized.senderAppId,
+            requestNonce: validation.normalized.nonceBase64Url,
+            timestamp: validation.normalized.timestamp,
+            message: validation.normalized.message,
+            txid: blob.txid,
+          });
+          continue;
+        }
+
+        // Persist into inbound pending so the user can act on it later
+        // (acceptFriendRequest uses this list to find the matching request).
+        pendingRecord = addInboundPending(pendingRecord, {
+          sender_email: validation.normalized.senderEmail,
+          sender_share_pub: validation.normalized.senderSharePubBase64Url,
+          sender_signing_pub: validation.normalized.senderSigningPubBase64,
+          sender_app_id: validation.normalized.senderAppId,
+          request_nonce: validation.normalized.nonceBase64Url,
+          message: validation.normalized.message,
+          received_at: Math.floor(Date.now() / 1000),
+        });
+        pendingDirty = true;
+
+        surfaced.push({
+          senderEmail: validation.normalized.senderEmail,
+          senderSharePubBase64Url: validation.normalized.senderSharePubBase64Url,
+          senderSigningPubBase64: validation.normalized.senderSigningPubBase64,
+          senderAppId: validation.normalized.senderAppId,
+          requestNonce: validation.normalized.nonceBase64Url,
+          timestamp: validation.normalized.timestamp,
+          message: validation.normalized.message,
+          txid: blob.txid,
+        });
+      }
+    }
+
+    if (pendingDirty) {
+      await this.#savePendingRequestsRecord(pendingState, pendingRecord);
+    }
+
+    // Also poll for incoming ACCEPTS while we're at it — Bob's accept lands
+    // in Alice's inbox, so Alice's listIncomingRequests is also Alice's
+    // accept-poll. This keeps the SDK surface narrow (one polling primitive
+    // per direction was overkill for v1). Returns surfaced friend-requests
+    // only; processed accepts mutate the friends record + pending record
+    // silently.
+    await this.#pollAndProcessIncomingAccepts(myPriv, myPub);
+
+    return surfaced;
+  }
+
+  /**
+   * Accept a previously-received friend request (sharing §6.4).
+   *
+   * Looks up the inbound pending entry by `requestNonce`, builds an HPKE-
+   * sealed accept blob targeted at the original sender's share_pub, and
+   * publishes to the sender's inbox tag. On success, the sender is added to
+   * our friends record and the inbound pending entry is removed. The sender
+   * sees the accept on their next `listIncomingRequests` poll, which moves
+   * the matching outbound pending into their friends record.
+   *
+   * @param {string} requestNonce - base64url nonce from the original request
+   * @returns {Promise<{ txid: string }>}
+   */
+  async acceptFriendRequest(requestNonce) {
+    await this.#requireAuth();
+    if (!this.#sharingKeyPair) {
+      throw new Error('acceptFriendRequest(): no sharing keypair — login as a v4 account first');
+    }
+    if (typeof requestNonce !== 'string' || requestNonce.length === 0) {
+      throw new Error('requestNonce is required');
+    }
+
+    const pendingState = await this.#loadPendingRequestsRecord();
+    const inbound = pendingState.record.inbound.find(i => i.request_nonce === requestNonce);
+    if (!inbound) {
+      throw new Error(`acceptFriendRequest(): no inbound pending request with nonce ${requestNonce}`);
+    }
+
+    let senderSharePub;
+    try {
+      senderSharePub = decodeSharePub(inbound.sender_share_pub);
+    } catch (err) {
+      throw new Error(`acceptFriendRequest(): inbound sender_share_pub is invalid: ${err.message}`);
+    }
+
+    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const payload = buildFriendAcceptPayload({
+      senderEmail: this.#email,
+      senderSharePub: this.#sharingKeyPair.publicKey,
+      senderSigningPubBase64,
+      senderAppId: this.#appId,
+      inReplyToNonceBase64Url: requestNonce,
+    });
+
+    const blob = await hpkeSeal({
+      recipientSharePub: senderSharePub,
+      info: INFO_FRIEND_ACCEPT,
+      plaintext: new TextEncoder().encode(JSON.stringify(payload)),
+    });
+
+    const tag = await deriveInboxTag(senderSharePub, this.#appId, currentInboxWindow());
+    const publishRes = await this.#fetch('/api/v1/share/inbox/publish', {
+      method: 'POST',
+      auth: true,
+      body: {
+        tag,
+        type: 'friend-accept-v1',
+        ciphertext_base64: bytesToBase64(blob),
+      },
+    });
+    if (publishRes.status !== 200) {
+      throw new Error(`acceptFriendRequest(): publish failed: ${publishRes.json?.error || publishRes.status}`);
+    }
+
+    // Move inbound → friends. Persist both updates as a (small) sequence:
+    // friends record first (the durable record), then pending second. If the
+    // pending update fails, the user has a duplicate inbound entry but the
+    // friend was added — re-running accept idempotently fixes it (the
+    // friends-record upsertFriend is keyed on share_pub).
+    const friendsState = await this.#loadFriendsRecord();
+    const friendsUpdated = upsertFriend(friendsState.record, {
+      email: inbound.sender_email,
+      share_pub: inbound.sender_share_pub,
+      signing_pub: inbound.sender_signing_pub,
+      established_at: payload.timestamp,
+      initial_request_nonce: requestNonce,
+    });
+    await this.#saveFriendsRecord(friendsState, friendsUpdated);
+
+    const pendingUpdated = removeInboundPending(pendingState.record, requestNonce);
+    await this.#savePendingRequestsRecord(pendingState, pendingUpdated);
+
+    return { txid: publishRes.json.txid };
+  }
+
+  /**
+   * Read the friends record (sharing §7.1). Returns an empty list for users
+   * who have not completed any handshakes yet.
+   *
+   * @returns {Promise<Array<{
+   *   email: string,
+   *   share_pub: string,
+   *   signing_pub: string,
+   *   established_at: number,
+   *   initial_request_nonce: string,
+   *   label?: string,
+   * }>>}
+   */
+  async listFriends() {
+    await this.#requireAuth();
+    const state = await this.#loadFriendsRecord();
+    return state.record.friends.slice();
+  }
+
+  /**
+   * Read the pending-requests record (sharing §7.2). Returns the union of
+   * outbound (requests we've sent, awaiting accept) and inbound (requests
+   * we've received, awaiting our action).
+   */
+  async getPendingRequests() {
+    await this.#requireAuth();
+    const state = await this.#loadPendingRequestsRecord();
+    return {
+      outbound: state.record.outbound.slice(),
+      inbound: state.record.inbound.slice(),
+    };
+  }
+
+  // ---- Private handshake helpers ----
+
+  async #fetchInboxBlobs(tag, type) {
+    // Public endpoint — no auth needed. The recipient (us) is the only party
+    // that can decrypt anyway; the API just acts as a tag-keyed cache.
+    const url = `/api/v1/share/inbox/fetch?app=${encodeURIComponent(this.#appId)}&tag=${tag}&type=${encodeURIComponent(type)}`;
+    const res = await this.#fetch(url);
+    if (res.status !== 200) {
+      console.warn(`[TarnClient] inbox fetch ${tag.slice(0, 8)}.../${type} failed: ${res.json?.error || res.status}`);
+      return [];
+    }
+    const blobs = res.json?.blobs ?? [];
+    return blobs.map(b => ({
+      txid: b.txid,
+      ciphertext: base64ToBytes(b.ciphertext_base64),
+      published_at: b.published_at,
+    }));
+  }
+
+  async #pollAndProcessIncomingAccepts(myPriv, myPub) {
+    const windows = DEFAULT_POLL_WINDOWS;
+    const tags = await Promise.all(
+      recentInboxWindows(windows).map(w => deriveInboxTag(myPub, this.#appId, w)),
+    );
+    const fetched = await Promise.all(
+      tags.map(tag => this.#fetchInboxBlobs(tag, 'friend-accept-v1')),
+    );
+
+    let pendingState = await this.#loadPendingRequestsRecord();
+    let friendsState = await this.#loadFriendsRecord();
+    let pendingDirty = false;
+    let friendsDirty = false;
+
+    for (const blobs of fetched) {
+      for (const blob of blobs) {
+        let payload;
+        try {
+          const pt = await hpkeOpen({
+            sharePriv: myPriv,
+            info: INFO_FRIEND_ACCEPT,
+            blob: blob.ciphertext,
+          });
+          payload = JSON.parse(new TextDecoder().decode(pt));
+        } catch {
+          continue;
+        }
+        const v = validateFriendAcceptPayload(payload, this.#appId);
+        if (!v.valid) continue;
+
+        // Forged-accept defense (§13.9): cross-reference against outbound
+        // pending. Unmatched accepts are silently dropped — no friend record
+        // entry created, no UI prompt. The user is not informed.
+        const outbound = findOutboundForAccept(v.normalized.inReplyToNonceBase64Url, pendingState.record.outbound);
+        if (!outbound) continue;
+
+        // Replay protection on accepts: if we've already processed this
+        // accept (it appears in friends already), skip without re-writing.
+        const existingFriend = friendsState.record.friends.find(f => f.share_pub === v.normalized.senderSharePubBase64Url);
+        if (existingFriend) {
+          // Still clear the matched outbound — sender side already moved on.
+          if (pendingState.record.outbound.some(o => o.request_nonce === outbound.request_nonce)) {
+            pendingState = { ...pendingState, record: removeOutboundPending(pendingState.record, outbound.request_nonce) };
+            pendingDirty = true;
+          }
+          continue;
+        }
+
+        friendsState = {
+          ...friendsState,
+          record: upsertFriend(friendsState.record, {
+            email: v.normalized.senderEmail,
+            share_pub: v.normalized.senderSharePubBase64Url,
+            signing_pub: v.normalized.senderSigningPubBase64,
+            established_at: v.normalized.timestamp,
+            initial_request_nonce: outbound.request_nonce,
+          }),
+        };
+        friendsDirty = true;
+
+        pendingState = {
+          ...pendingState,
+          record: removeOutboundPending(pendingState.record, outbound.request_nonce),
+        };
+        pendingDirty = true;
+      }
+    }
+
+    if (friendsDirty) await this.#saveFriendsRecord(friendsState, friendsState.record);
+    if (pendingDirty) await this.#savePendingRequestsRecord(pendingState, pendingState.record);
+  }
+
+  /**
+   * Load (or initialize) the friends record for the current app.
+   * Returns `{ record, txid }` — `txid` is null if we're creating it for
+   * the first time, or the prior version's txid if updating.
+   */
+  async #loadFriendsRecord() {
+    const entry = await this.#findShareStateEntry(FRIENDS_CONTENT_ID);
+    if (!entry) {
+      return { record: emptyFriendsRecord(this.#appId), txid: null };
+    }
+    return { record: entry.data, txid: entry.txid };
+  }
+
+  async #saveFriendsRecord(state, newRecord) {
+    return await this.#writeShareStateEntry(FRIENDS_CONTENT_ID, state, newRecord);
+  }
+
+  async #loadPendingRequestsRecord() {
+    const entry = await this.#findShareStateEntry(PENDING_REQUESTS_CONTENT_ID);
+    if (!entry) {
+      return { record: emptyPendingRequestsRecord(this.#appId), txid: null };
+    }
+    return { record: entry.data, txid: entry.txid };
+  }
+
+  async #savePendingRequestsRecord(state, newRecord) {
+    return await this.#writeShareStateEntry(PENDING_REQUESTS_CONTENT_ID, state, newRecord);
+  }
+
+  /**
+   * Find the latest (resolved) `tarn-share-state` entry for a given
+   * content_id. Returns `{ txid, data }` or null if no entry exists yet.
+   *
+   * The friends + pending records use type='tarn-share-state' with
+   * Eid=<content_id>. Resolution dedupes by Eid + Prev chain so we get the
+   * single live version.
+   */
+  async #findShareStateEntry(contentId) {
+    const entries = await this.getEntries('tarn-share-state');
+    for (const e of entries) {
+      const eid = e.tags?.find(t => t.name === 'Eid')?.value;
+      if (eid === contentId) return e;
+    }
+    return null;
+  }
+
+  async #writeShareStateEntry(contentId, state, newRecord) {
+    // Build tags manually so we can include both Prev (continuity across
+    // updates) and Eid (resolution-layer safety net for eid-dedup). The
+    // public createEntry/updateEntry helpers don't expose Eid in their tag
+    // construction, so we inline the request here.
+    const extraTags = [{ name: 'Eid', value: contentId }];
+    const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(newRecord);
+    const tags = [
+      { name: 'App', value: this.#appId },
+      { name: 'Type', value: 'tarn-share-state' },
+      { name: 'Lk', value: this.#dataLookupKey },
+      ...(state.txid ? [{ name: 'Prev', value: state.txid }] : []),
+      ...cryptoTags,
+      { name: 'V', value: '0.4.0' },
+      ...extraTags,
+    ];
+    const path = state.txid
+      ? `/api/v1/entries/${state.txid}`
+      : '/api/v1/entries';
+    const method = state.txid ? 'PUT' : 'POST';
+
+    const res = await this.#fetchRaw(path, {
+      method,
+      headers: {
+        'Authorization': `Bearer ${this.#jwt}`,
+        'X-Arweave-Tags': JSON.stringify(tags),
+        'X-Idempotency-Key': generateIdempotencyKey(),
+        'Content-Type': 'application/octet-stream',
+      },
+      body: encrypted,
+    }, { retry: true });
+
+    const json = await res.json().catch(() => null);
+    if (res.status !== 200) {
+      throw new Error(`#writeShareStateEntry(${contentId}): ${json?.error || res.status}`);
+    }
+    return { record: newRecord, txid: json.id };
+  }
+
   // ============ ACCESSORS ============
 
   get dataLookupKey() { return this.#dataLookupKey; }
@@ -1335,6 +1912,15 @@ export class TarnClient {
         try { await res.body?.cancel(); } catch {}
 
         const retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
+        // Don't honor Retry-After values longer than 60 seconds — the server
+        // is telling us to back off for a budget window we can't realistically
+        // wait for (recovery email rate limit, share-inbox fetch limit, etc.
+        // all return Retry-After: 3600). Surface the 429 to the caller instead
+        // so they can decide what to do, rather than blocking the test or
+        // the UX for an hour.
+        if (retryAfterSec != null && retryAfterSec > 60) {
+          return res;
+        }
         const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : backoffMs(attempt);
         console.warn(`[TarnClient] ${res.status} on ${url} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
         await sleep(waitMs);

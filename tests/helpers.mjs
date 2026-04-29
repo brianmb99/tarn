@@ -37,3 +37,21 @@ export function randomEmail() {
 export async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
+
+/**
+ * Force `rules_json='[]'` (== ALLOW) on a freshly-registered account in the
+ * local D1 so the test can exercise data writes without involving an app
+ * JWT. The production path is `app sets rules via PUT /accounts/:dlk/rules`,
+ * but seeding rules directly is the standard pattern in test-e2e and avoids
+ * teaching the test about app authentication.
+ *
+ * @param {string} dataLookupKey - 64-char hex from register's response
+ */
+export async function forceAllowRulesForAccount(dataLookupKey) {
+  const { execSync } = await import('child_process');
+  const sql = `UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dataLookupKey}'`;
+  execSync(
+    `npx wrangler d1 execute tarn-api --local --command "${sql}"`,
+    { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 15000 },
+  );
+}

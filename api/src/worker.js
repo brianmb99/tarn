@@ -5,12 +5,14 @@ import { handleHealth } from './routes/info.js';
 import { handleEntries, handleEntryById } from './routes/entries.js';
 import { handleLookup } from './routes/lookup.js';
 import { handleShareLookup } from './routes/share.js';
+import { handleShareInboxPublish, handleShareInboxFetch } from './routes/share-inbox.js';
 import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
 import { handleRecoveryEmail } from './routes/recovery.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules } from './routes/apps.js';
 import { handleStatus } from './routes/status.js';
+import { setSkipTurboFromEnv } from './turbo.js';
 
 // ============ CORS ============
 
@@ -50,6 +52,10 @@ export function errorResponse(message, status, cors = {}) {
 export default {
   async fetch(request, env, ctx) {
     const cors = getCorsHeaders(request);
+
+    // Wire the local-dev TARN_SKIP_TURBO flag (see turbo.js) into the
+    // Worker-scoped global. Cheap idempotent assignment per request.
+    setSkipTurboFromEnv(env);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: cors });
@@ -136,6 +142,15 @@ export default {
       // Share keypair lookup (issue #13) — returns share_pub by email-only key
       if (path === '/api/v1/share/lookup' && method === 'GET') {
         return await handleShareLookup(url, request, env, cors);
+      }
+
+      // Friend-handshake inbox (issue #14, Section 5a) — HPKE-sealed
+      // friend_request + friend_accept blobs, addressed by inbox tag.
+      if (path === '/api/v1/share/inbox/publish' && method === 'POST') {
+        return await handleShareInboxPublish(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/share/inbox/fetch' && method === 'GET') {
+        return await handleShareInboxFetch(url, request, env, cors);
       }
 
       // Status (authenticated — app or user)
