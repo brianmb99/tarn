@@ -302,6 +302,7 @@ let handshakeAlice;
 let handshakeBob;
 let handshakeAliceEmail;
 let handshakeAliceDlk;
+let handshakeAlicePassword;
 let handshakeBobEmail;
 let handshakeBobDlk;
 let handshakeRequestNonce;
@@ -317,6 +318,7 @@ await test('Two test users register + complete a mutual handshake against the de
   handshakeAliceEmail = `deploy-handshake-a-${Date.now()}@test.com`;
   handshakeBobEmail = `deploy-handshake-b-${Date.now()}@test.com`;
   const password = 'handshake-test-' + Date.now();
+  handshakeAlicePassword = password;
 
   handshakeAlice = new TarnClient(API_BASE, APP_ID);
   handshakeBob = new TarnClient(API_BASE, APP_ID);
@@ -518,10 +520,8 @@ await test('Concurrent publish race against deployed API: exactly one 409, NOT 5
     `loser.existing_txid (${lj.existing_txid}) !== winner.txid (${wj.txid})`);
 });
 
-await test('Delete handshake test accounts', async () => {
-  if (handshakeAlice) await handshakeAlice.deleteAccount();
-  if (handshakeBob) await handshakeBob.deleteAccount();
-});
+// (Alice + Bob cleanup moved to after §9d so the mute lifecycle test
+// can reuse the established mutual-connection pair without re-registering.)
 
 // ============ 9c. SECTION 5d — REVOCATION + IDENTITY ROTATION ============
 
@@ -654,6 +654,71 @@ await test('Pat publishes a post-rotation share; Quinn picks it up via NEW-log k
 await test('Cleanup §9c accounts (Pat + Quinn)', async () => {
   await pat.deleteAccount();
   await quinn.deleteAccount();
+});
+
+// ============ 9d. MUTE LIFECYCLE (issue #18, Section 6) ============
+
+console.log('\n=== 9d. Mute lifecycle (per-side filter, syncs across devices) ===');
+
+await test('muteConnection persists; isMuted reflects state; unmute reverses; multi-device sync', async () => {
+  // Reuse handshake Alice + Bob from §8 — they're still mutual connections.
+  const aliceConnections = await handshakeAlice.listConnections();
+  const bobOfAlice = aliceConnections.find(c => c.email === handshakeBobEmail);
+  assert(bobOfAlice, 'Alice missing Bob (handshake §8 setup gone?)');
+
+  // Baseline.
+  assert((await handshakeAlice.isMuted(bobOfAlice)) === false, 'baseline isMuted should be false');
+  assert((await handshakeAlice.listMutedConnections()).length === 0, 'baseline list should be empty');
+
+  // Mute.
+  const muteRes = await handshakeAlice.muteConnection(bobOfAlice);
+  assert(muteRes.muted === true, 'first mute should report muted: true');
+  assert(await handshakeAlice.isMuted(bobOfAlice), 'isMuted should be true after mute');
+  const muted = await handshakeAlice.listMutedConnections();
+  assert(muted.length === 1 && muted[0].share_pub === bobOfAlice.share_pub,
+    'list should contain Bob\'s share_pub');
+  assert(typeof muted[0].muted_at === 'number', 'muted_at should be a number');
+
+  // Idempotency.
+  const muteAgain = await handshakeAlice.muteConnection(bobOfAlice);
+  assert(muteAgain.muted === false, 'second mute should be a no-op');
+
+  // Read flow not short-circuited: Alice can still read Bob's outbound log.
+  // (The setup published a seq=0 snapshot from Bob during §8 acceptance.)
+  const bobAlice = await handshakeBob.listConnections();
+  const aliceOfBob = bobAlice.find(c => c.email === handshakeAliceEmail);
+  const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  await handshakeBob.shareContent(aliceOfBob, 'mute-visibility-deployed', 'arweave-mute-deploy', cek);
+  await sleep(500);
+  const aliceState = await handshakeAlice.readShareLog(bobOfAlice, { refresh: true });
+  assert(aliceState['mute-visibility-deployed'],
+    'readShareLog must NOT short-circuit on muted connections');
+
+  // Multi-device sync: a fresh Alice client (different "device") sees the mute.
+  const alice2 = new TarnClient(API_BASE, APP_ID);
+  await alice2.login(handshakeAliceEmail, handshakeAlicePassword);
+  const muted2 = await alice2.listMutedConnections();
+  assert(muted2.length === 1 && muted2[0].share_pub === bobOfAlice.share_pub,
+    'device B should see the mute set on device A');
+  assert(await alice2.isMuted(bobOfAlice), 'device B isMuted should be true');
+
+  // Unmute on device A; verify device C sees the unmute.
+  const unmuteRes = await handshakeAlice.unmuteConnection(bobOfAlice);
+  assert(unmuteRes.unmuted === true, 'first unmute should report unmuted: true');
+  assert((await handshakeAlice.isMuted(bobOfAlice)) === false, 'isMuted false after unmute');
+  const alice3 = new TarnClient(API_BASE, APP_ID);
+  await alice3.login(handshakeAliceEmail, handshakeAlicePassword);
+  assert((await alice3.isMuted(bobOfAlice)) === false, 'device C should see the unmute');
+
+  // Idempotent unmute.
+  const unmuteAgain = await handshakeAlice.unmuteConnection(bobOfAlice);
+  assert(unmuteAgain.unmuted === false, 'second unmute should be a no-op');
+});
+
+await test('Cleanup §8/§9/§9d accounts (Alice + Bob)', async () => {
+  await handshakeAlice.deleteAccount();
+  await handshakeBob.deleteAccount();
 });
 
 // ============ 10. CLEANUP ============

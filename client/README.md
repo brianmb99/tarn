@@ -239,6 +239,54 @@ const results = await tarn.batchCreate('entry', [
 
 ### `tarn.deleteAccount()`
 
+## Sharing — Connections + mute filter
+
+Tarn ships a mutual-connection sharing primitive: two users mutually agree (HPKE handshake, then a per-pair stealth-addressed encrypted log), after which either side can share content with the other. The full protocol is in [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) and [the sharing design doc](../notes/2026-04-28-tarn-sharing-design.md).
+
+The connection surface:
+
+```javascript
+const { txid, requestNonce } = await tarn.sendConnectionRequest('bob@example.com');
+// Bob, on his own client:
+const incoming = await tarn.listIncomingRequests();
+await tarn.acceptConnectionRequest(incoming[0].requestNonce);
+// Both sides:
+const connections = await tarn.listConnections();
+const bob = connections.find(c => c.email === 'bob@example.com');
+
+await tarn.shareContent(bob, contentId, txId, cekBase64Url);
+await tarn.updateShareContent(bob, contentId, newTxId);
+await tarn.unshareContent(bob, contentId);
+
+const state = await tarn.readShareLog(bob);          // bootstrap
+await tarn.syncShareLog(bob);                        // incremental
+
+await tarn.removeConnection(bob);                    // §10.1 unfollow
+await tarn.revokeContentFromConnections(contentId);  // §10.3 CEK rotation
+```
+
+### Mute / visibility
+
+The connection primitive is symmetric. Apps that want a Strava-style "I follow you, you don't follow me" feel build it on top of the mutual primitive plus a per-side mute filter:
+
+```javascript
+await tarn.muteConnection(bob);          // hide Bob's content from my feed
+await tarn.unmuteConnection(bob);
+await tarn.listMutedConnections();       // [{ share_pub, muted_at }, ...]
+const muted = await tarn.isMuted(bob);
+```
+
+Mute is **per-side, per-user** — set by the muting party, invisible to the muted party, no protocol-level effect. Persisted as an encrypted Tarn blob (`tarn-muted-connections-v1`) so the state syncs across the user's own devices.
+
+`readShareLog` / `syncShareLog` do **not** short-circuit on muted connections. Apps still need access to muted-connection state programmatically (e.g., to render a "Muted" tab), so the SDK exposes the toggle via `isMuted` and lets apps decide when to filter at the call sites that should filter — typically the main feed:
+
+```javascript
+const visible = [];
+for (const c of await tarn.listConnections()) {
+  if (!(await tarn.isMuted(c))) visible.push(c);
+}
+```
+
 ### `tarn.dataLookupKey` — the user's data lookup key (available after register/login)
 
 ### `tarn.appId` — the app this client is scoped to

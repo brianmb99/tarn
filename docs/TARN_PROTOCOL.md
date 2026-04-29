@@ -744,6 +744,46 @@ Section 5 (sharing protocol) requires that a recipient holding only a CEK can de
 
 ---
 
+## Sharing primitives — terminology
+
+The full sharing protocol (HPKE handshake, per-pair stealth-addressed share log, identity rotation, revocation) is specified in [`notes/2026-04-28-tarn-sharing-design.md`](../notes/2026-04-28-tarn-sharing-design.md). Section 6 of the implementation plan (issue #18) renamed the public surface from "friend" to "connection" so the SDK is product-neutral. The on-the-wire protocol identifiers are now:
+
+| Layer | Identifier |
+|---|---|
+| HPKE info (request) | `tarn-connection-request-v1` |
+| HPKE info (accept) | `tarn-connection-accept-v1` |
+| Inbox tag prefix | `tarn-connection-inbox-v1-` |
+| Connections record content_id | `tarn-connections-v1` |
+| Pending requests record content_id | `tarn-pending-requests-v1` |
+| Server-recognized inbox blob types | `connection-request-v1`, `connection-accept-v1` |
+
+The persisted connections record's inner array field is `connections: [...]` (was `friends: [...]` in the design doc).
+
+## Muted-connections record (issue #18)
+
+The mutual-connection primitive is symmetric — both sides see each other's share-log entries by default. Apps that want a Strava-style asymmetric "follow" feel build it on top of the mutual primitive plus a per-side mute filter. The SDK persists the filter as an encrypted Tarn data blob:
+
+```
+content_id = "tarn-muted-connections-v1"
+plaintext  = JSON({
+  app_id:  <string>,
+  version: 1,
+  muted:   [{ share_pub: B(32 bytes), muted_at: <unix_seconds> }, ...]
+})
+```
+
+DEK-encrypted via the per-content CEK pattern (same as the connections + pending-requests records). Stored on Arweave as a normal `tarn-share-state` entry with `Eid=tarn-muted-connections-v1`, so it syncs across the user's own devices via the existing data-blob storage path. No new D1 schema, no API change.
+
+**Semantics — explicitly local:**
+
+- **Per-side, per-user.** Mute is set by the muting party only. The muted party receives no signal and continues publishing share-log entries to the muting party's outbound log as normal. Only the muting party's *view* changes.
+- **No protocol-level effect.** Mute does NOT alter what the muted party can see, what they can publish, or what tags either side polls. It is purely a UI hint.
+- **App-driven filtering.** `readShareLog` and `syncShareLog` do NOT short-circuit on muted connections. Apps still need programmatic access to muted-connection state (e.g., to render a "Muted" tab). The SDK exposes `isMuted(connection)` and `listMutedConnections()` so apps can filter at the call sites that should be filtered (the main feed) without losing access at the call sites that shouldn't (the muted tab).
+
+SDK surface: `tarn.muteConnection(c)` / `tarn.unmuteConnection(c)` / `tarn.listMutedConnections()` / `tarn.isMuted(c)`.
+
+---
+
 ## Cryptographic References
 
 - **HKDF:** RFC 5869 — HMAC-based Extract-and-Expand Key Derivation Function
