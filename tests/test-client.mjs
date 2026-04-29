@@ -2,56 +2,7 @@
 // Run: node tests/test-client.mjs [apiBaseUrl]
 // Requires: wrangler dev running (cd api && npx wrangler dev --port 8787)
 
-// Minimal in-memory IndexedDB shim for the Section 7 session-persistence path.
-// Node has no IndexedDB; the production runtime is the browser. We polyfill
-// just the surface session-persistence.js touches: open + objectStore +
-// readonly/readwrite get/put/delete on a single store named "keys". This is
-// a test-time shim, not a runtime dep — the production code path is browser.
-if (typeof globalThis.indexedDB === 'undefined') {
-  const stores = new Map(); // dbName -> Map<storeName, Map<id, value>>
-  function makeReq(resultFn) {
-    const req = { onsuccess: null, onerror: null, result: undefined, error: null };
-    queueMicrotask(() => {
-      try { req.result = resultFn(); req.onsuccess?.({ target: req }); }
-      catch (err) { req.error = err; req.onerror?.({ target: req }); }
-    });
-    return req;
-  }
-  globalThis.indexedDB = {
-    open(dbName /*, version*/) {
-      const req = { onupgradeneeded: null, onsuccess: null, onerror: null, result: null };
-      const isFirst = !stores.has(dbName);
-      queueMicrotask(() => {
-        if (!stores.has(dbName)) stores.set(dbName, new Map());
-        const dbStores = stores.get(dbName);
-        const db = {
-          objectStoreNames: { contains: (name) => dbStores.has(name) },
-          createObjectStore(name) { if (!dbStores.has(name)) dbStores.set(name, new Map()); return {}; },
-          transaction(name /*, mode*/) {
-            return {
-              objectStore: () => {
-                const store = dbStores.get(name);
-                return {
-                  get: (id) => makeReq(() => store.get(id)),
-                  put: (value, id) => makeReq(() => { store.set(id, value); return undefined; }),
-                  delete: (id) => makeReq(() => { store.delete(id); return undefined; }),
-                };
-              },
-            };
-          },
-          close() {},
-        };
-        req.result = db;
-        // Fire onupgradeneeded only on first open of this dbName, mirroring
-        // real IndexedDB which fires it only on version bumps.
-        if (isFirst && req.onupgradeneeded) req.onupgradeneeded({ target: req });
-        req.onsuccess?.({ target: req });
-      });
-      return req;
-    },
-  };
-}
-
+import './indexeddb-shim.mjs';
 import { TarnClient } from '../client/src/tarn.js';
 import { deriveAllKeys, exportPublicKey, wrapDataKey } from '../client/src/crypto.js';
 import { clearWrappingKey } from '../client/src/session-persistence.js';

@@ -16,6 +16,7 @@
  *   - WARP VPN disabled (blocks Turbo uploads)
  */
 
+import './indexeddb-shim.mjs';
 import { TarnClient } from '../client/src/tarn.js';
 import {
   deriveAllKeys, exportPublicKey, wrapDataKey, signChallenge,
@@ -234,13 +235,6 @@ await test('Entry available on Turbo gateway', async () => {
 console.log('\n=== 5b. Session Persistence ===');
 
 await test('serializeSession + resumeSession round-trips against deployed API', async () => {
-  // Browser-only path: serializeSession touches IndexedDB. Skipping when
-  // no `indexedDB` global is present (e.g., raw Node without a shim).
-  if (typeof globalThis.indexedDB === 'undefined') {
-    console.log('    skip: no IndexedDB in this runtime');
-    return;
-  }
-
   const tarn = new TarnClient(API_BASE, APP_ID);
   await tarn.login(testEmail, testPassword);
 
@@ -259,10 +253,6 @@ await test('serializeSession + resumeSession round-trips against deployed API', 
 });
 
 await test('resumeSession returns null on tampered blob', async () => {
-  if (typeof globalThis.indexedDB === 'undefined') {
-    console.log('    skip: no IndexedDB in this runtime');
-    return;
-  }
   const tarn = new TarnClient(API_BASE, APP_ID);
   await tarn.login(testEmail, testPassword);
   const blob = await tarn.serializeSession();
