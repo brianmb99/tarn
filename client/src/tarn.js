@@ -34,6 +34,7 @@ import {
   generateRecoverySalt,
   parseWrappedDataKey,
   base64ToBytes,
+  base64UrlToBytes,
   bytesToBase64,
   bytesToBase64Url,
   KDF_V1_PBKDF2,
@@ -48,6 +49,12 @@ import {
   recoveryPhraseToEntropy,
   renderRecoveryPDF,
 } from './recovery.js';
+import {
+  encryptSessionBlob,
+  decryptSessionBlob,
+  getOrCreateWrappingKey,
+  clearWrappingKey,
+} from './session-persistence.js';
 import {
   deriveInboxTag,
   recentInboxWindows,
@@ -620,6 +627,12 @@ export class TarnClient {
       throw new Error(`recoverAccount(): credential change failed: ${putRes.json?.error || putRes.status}`);
     }
 
+    // §7 invalidation: signing/DEK rotation makes any prior session blob
+    // un-resumable. Wipe the IndexedDB wrapping key so prior blobs become
+    // unreadable on this origin. Best-effort — IndexedDB failure must not
+    // fail the credential operation.
+    try { await this.clearSession(); } catch {}
+
     // Announce the rotation to connections BEFORE swapping local key state, so
     // we can sign with the OLD signing_priv and encrypt under OLD K_AB.
     let rotationAnnouncements = [];
@@ -1032,6 +1045,12 @@ export class TarnClient {
       throw new Error(`Credential change failed: ${res.json?.error || res.status}`);
     }
 
+    // §7 invalidation: signing/DEK rotation makes any prior session blob
+    // un-resumable. Wipe the IndexedDB wrapping key so prior blobs become
+    // unreadable on this origin. Best-effort — IndexedDB failure must not
+    // fail the credential operation.
+    try { await this.clearSession(); } catch {}
+
     // §13.5 step 4: with the new credential blob published (durable
     // indicator of rotation in flight), publish a `rotate_identity`
     // announcement to every connection's OLD outbound log under OLD pair keys.
@@ -1127,6 +1146,11 @@ export class TarnClient {
     if (res.status !== 200) {
       throw new Error(`Account deletion failed: ${res.json?.error || res.status}`);
     }
+
+    // §7 invalidation: rotate the IndexedDB wrapping key so any persisted
+    // session blob on this origin becomes unreadable. Best-effort — IndexedDB
+    // failure must not fail the credential operation.
+    try { await this.clearSession(); } catch {}
 
     this.#jwt = null;
     this.#dataLookupKey = null;
@@ -3475,6 +3499,235 @@ export class TarnClient {
     return { record: newRecord, txid: json.id };
   }
 
+  // ============ SESSION PERSISTENCE (Section 7, issue #19) ============
+
+  /**
+   * Serialize the in-memory session into an opaque base64url blob suitable for
+   * `localStorage`. The blob is encrypted under an AES-256-GCM wrapping key
+   * stored in IndexedDB (`tarn-session.keys["wrapping-key-v1"]`,
+   * `extractable: false`). The blob hard-expires 7 days after creation; the
+   * SDK does not auto-refresh on use.
+   *
+   * Apps MUST treat the result as opaque. The plaintext schema is documented
+   * in the protocol doc only so the threat model can be reasoned about.
+   *
+   * @returns {Promise<string>} base64url ciphertext
+   * @throws if the client is not authenticated
+   */
+  async serializeSession() {
+    if (!this.#signingKeyPair || !this.#credentialLookupKey || !this.#dekByGen) {
+      throw new Error('serializeSession(): client is not authenticated');
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + 7 * 24 * 60 * 60; // 7-day hard cap, no refresh-on-use
+
+    const [pkcs8, spki] = await Promise.all([
+      crypto.subtle.exportKey('pkcs8', this.#signingKeyPair.privateKey),
+      crypto.subtle.exportKey('spki', this.#signingKeyPair.publicKey),
+    ]);
+
+    const dekByGen = [];
+    for (const [gen, pair] of this.#dekByGen) {
+      const raw = await crypto.subtle.exportKey('raw', pair.gcmKey);
+      dekByGen.push({ gen, rawBytes: bytesToBase64(new Uint8Array(raw)) });
+    }
+    dekByGen.sort((a, b) => a.gen - b.gen);
+
+    let recoveryFactorMeta = null;
+    if (this.#recoveryFactorMeta) {
+      const m = this.#recoveryFactorMeta;
+      const wrappingsByGen = [];
+      for (const [gen, wrapped] of m.wrappingsByGen) {
+        wrappingsByGen.push({ gen, wrapped });
+      }
+      wrappingsByGen.sort((a, b) => a.gen - b.gen);
+      recoveryFactorMeta = {
+        salt: bytesToBase64(m.salt),
+        kdfParams: m.kdfParams,
+        wrappingsByGen,
+      };
+    }
+
+    const payload = {
+      v: 1,
+      createdAt: now,
+      expiresAt,
+      apiBase: this.#apiBase,
+      appId: this.#appId,
+      email: this.#email,
+      dataLookupKey: this.#dataLookupKey,
+      credentialLookupKey: this.#credentialLookupKey,
+      kdfVersion: this.#kdfVersion,
+      envelopeVersion: this.#envelopeVersion,
+      currentGen: this.#currentGen,
+      dekByGen,
+      signingPrivateKey: bytesToBase64(new Uint8Array(pkcs8)),
+      signingPublicKey: bytesToBase64(new Uint8Array(spki)),
+      sharingPrivateKey: bytesToBase64(this.#sharingKeyPair.privateKey),
+      sharingPublicKey: bytesToBase64(this.#sharingKeyPair.publicKey),
+      recoveryFactorMeta,
+      jwt: this.#jwt,
+    };
+
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+    const wrappingKey = await getOrCreateWrappingKey();
+    const blob = await encryptSessionBlob(plaintext, wrappingKey);
+    return bytesToBase64Url(blob);
+  }
+
+  /**
+   * Resume a previously-serialized session. Returns a logged-in `TarnClient`
+   * if the blob is well-formed, decryptable on this origin, schema v1, and
+   * not past `expiresAt`. Returns `null` for any recoverable failure
+   * (expired, tampered, schema-mismatched, wrong origin, missing fields,
+   * malformed JSON, IndexedDB error). Apps fall back to the login UI on null.
+   *
+   * Never throws on bad blob data — only on programmer errors (missing args).
+   *
+   * @param {string} apiBase
+   * @param {string} appId
+   * @param {string} blob — base64url ciphertext from serializeSession()
+   * @param {{ _nowSeconds?: number }} [opts] — test hook for the expiry path
+   * @returns {Promise<TarnClient | null>}
+   */
+  static async resumeSession(apiBase, appId, blob, opts = {}) {
+    if (!apiBase) throw new Error('resumeSession(): apiBase is required');
+    if (!appId) throw new Error('resumeSession(): appId is required');
+    if (typeof blob !== 'string' || blob.length === 0) {
+      throw new Error('resumeSession(): blob is required');
+    }
+
+    try {
+      let blobBytes;
+      try {
+        blobBytes = base64UrlToBytes(blob);
+      } catch {
+        return null;
+      }
+      const wrappingKey = await getOrCreateWrappingKey();
+      let plaintext;
+      try {
+        plaintext = await decryptSessionBlob(blobBytes, wrappingKey);
+      } catch {
+        return null;
+      }
+
+      let payload;
+      try {
+        payload = JSON.parse(new TextDecoder().decode(plaintext));
+      } catch {
+        return null;
+      }
+      if (!payload || typeof payload !== 'object') return null;
+      if (payload.v !== 1) return null;
+
+      // Origin-binding check: a blob serialized for app A on api B must not
+      // resume into app A' or api B'. The wrapping key is already origin-
+      // scoped via IndexedDB, but a same-origin app that switches appId
+      // (or apiBase) shouldn't accidentally rehydrate state from the other.
+      if (payload.apiBase !== apiBase.replace(/\/$/, '')) return null;
+      if (payload.appId !== appId) return null;
+
+      const required = [
+        'createdAt', 'expiresAt', 'email', 'dataLookupKey', 'credentialLookupKey',
+        'kdfVersion', 'envelopeVersion', 'currentGen', 'dekByGen',
+        'signingPrivateKey', 'signingPublicKey', 'sharingPrivateKey', 'sharingPublicKey',
+      ];
+      for (const k of required) {
+        if (payload[k] === undefined || payload[k] === null) return null;
+      }
+      if (!Array.isArray(payload.dekByGen) || payload.dekByGen.length === 0) return null;
+
+      const nowSeconds = opts._nowSeconds != null ? opts._nowSeconds : Math.floor(Date.now() / 1000);
+      if (typeof payload.expiresAt !== 'number' || nowSeconds >= payload.expiresAt) return null;
+
+      // Rehydrate keys.
+      const signingPrivateKey = await crypto.subtle.importKey(
+        'pkcs8',
+        base64ToBytes(payload.signingPrivateKey),
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign'],
+      );
+      const signingPublicKey = await crypto.subtle.importKey(
+        'spki',
+        base64ToBytes(payload.signingPublicKey),
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['verify'],
+      );
+      const dekByGen = new Map();
+      for (const { gen, rawBytes } of payload.dekByGen) {
+        if (typeof gen !== 'number' || typeof rawBytes !== 'string') return null;
+        const raw = base64ToBytes(rawBytes);
+        const [gcmKey, kwKey] = await Promise.all([
+          crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+          crypto.subtle.importKey('raw', raw, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+        ]);
+        dekByGen.set(gen, { gcmKey, kwKey });
+      }
+      if (!dekByGen.has(payload.currentGen)) return null;
+
+      let recoveryFactorMeta = null;
+      if (payload.recoveryFactorMeta) {
+        const m = payload.recoveryFactorMeta;
+        if (typeof m.salt !== 'string' || !m.kdfParams || !Array.isArray(m.wrappingsByGen)) {
+          return null;
+        }
+        const wrappingsByGen = new Map();
+        for (const { gen, wrapped } of m.wrappingsByGen) {
+          if (typeof gen !== 'number' || typeof wrapped !== 'string') return null;
+          wrappingsByGen.set(gen, wrapped);
+        }
+        recoveryFactorMeta = {
+          salt: base64ToBytes(m.salt),
+          kdfParams: m.kdfParams,
+          wrappingsByGen,
+        };
+      }
+
+      const client = new TarnClient(apiBase, appId);
+      // Mirror the field-set pattern at the end of login() — populate the
+      // private slots directly so the resumed client behaves identically to
+      // one that just logged in. credentialEncryptionKey is intentionally
+      // not persisted (no code path reads it post-login).
+      client.#jwt = payload.jwt || null;
+      client.#dataLookupKey = payload.dataLookupKey;
+      client.#credentialLookupKey = payload.credentialLookupKey;
+      client.#signingKeyPair = { privateKey: signingPrivateKey, publicKey: signingPublicKey };
+      client.#dekByGen = dekByGen;
+      client.#currentGen = payload.currentGen;
+      client.#envelopeVersion = payload.envelopeVersion;
+      client.#kdfVersion = payload.kdfVersion;
+      client.#email = payload.email;
+      client.#sharingKeyPair = {
+        privateKey: base64ToBytes(payload.sharingPrivateKey),
+        publicKey: base64ToBytes(payload.sharingPublicKey),
+      };
+      client.#recoveryFactorMeta = recoveryFactorMeta;
+
+      return client;
+    } catch {
+      // Catch-all for any unexpected failure (IndexedDB error, etc.) — null
+      // is the recoverable signal so apps can uniformly fall back to login UI.
+      return null;
+    }
+  }
+
+  /**
+   * Delete the IndexedDB wrapping key. Renders all previously-emitted session
+   * blobs unreadable on this origin. Does not affect the in-memory client
+   * state — the caller can keep using the live client until it's
+   * garbage-collected. Side-effected from changeCredentials / recoverAccount /
+   * deleteAccount so persisted blobs invalidate on key rotation.
+   *
+   * @returns {Promise<void>}
+   */
+  async clearSession() {
+    await clearWrappingKey();
+  }
+
   // ============ ACCESSORS ============
 
   get dataLookupKey() { return this.#dataLookupKey; }
@@ -3488,6 +3741,13 @@ export class TarnClient {
    * production code; call the public methods instead.
    */
   _testJwt() { return this.#jwt; }
+
+  /**
+   * Test-only: drop the in-memory JWT so the next API call must re-authenticate
+   * via the signing keypair. Used by Section 7 resume-session tests to verify
+   * the rehydrated keypair can drive a fresh challenge-response.
+   */
+  _testInvalidateJwt() { this.#jwt = null; }
 
   /**
    * Test-only: lower the per-connection share-log snapshot compaction interval
