@@ -1,7 +1,7 @@
 # Tarn Protocol — Working Draft
 
 **Status:** Active design discussion (Issue #69)
-**Last updated:** 2026-04-29
+**Last updated:** 2026-04-29 (Section 7.5 spec added)
 
 Tarn is an app-agnostic platform for storing encrypted, user-owned data permanently on Arweave. This document defines the complete protocol: identity, authentication, encryption, and data operations.
 
@@ -894,10 +894,217 @@ client.clearSession(): Promise<void>
 
 ### Known v1 gaps
 
-- **No server-side revocation.** "Log out all devices" requires `changeCredentials()`. An explicit `DELETE /api/v1/sessions` endpoint plus per-session identifiers is deferred to v2.
+- **No server-side revocation.** Addressed in [Section 7.5](#server-side-session-management-section-75-issue-20) below — per-session identifiers + revoke endpoints. Until 7.5 ships, "log out all devices" requires `changeCredentials()`.
 - **No idle expiry.** Blobs expire only at the hard 7-day mark; an actively-used session has no separate idle timeout. Apps that want shorter idle windows can implement them by calling `clearSession()` from their own activity tracker.
 - **Browser-only.** The IndexedDB + non-extractable WebCrypto storage strategy is browser-specific. Tarn-on-Node and Tarn-on-React-Native session persistence are deferred — the API surface (`serializeSession` / `resumeSession`) is intentionally storage-agnostic in shape so a future implementation can swap backends without changing the surface.
 - **No share-log cache participation.** Persisted sessions hydrate share-log state on first read/sync from Arweave, just like fresh logins. Pure perf optimization, not a correctness gap.
+
+---
+
+## Server-side session management (Section 7.5, issue #20)
+
+Section 7 covers persistence on a single device — keeping a logged-in client alive across page reloads. Section 7.5 covers the complementary capability across devices: letting users see active sessions and revoke individual ones without performing a full credential change.
+
+The combination closes the consumer-app session story. Apps render a "Manage devices" page; users kill an unwanted session with a click; the API enforces the revocation immediately.
+
+### Why server-side state at all
+
+Today, JWTs are stateless: signed at `/auth/verify`, verified by signature + expiry on every authenticated request, with no D1 round-trip. This is the right default for performance and operational simplicity. The cost: there is no way to invalidate a JWT before its 15-minute TTL elapses.
+
+Section 7.5 makes user-role JWTs stateful by attaching a per-session identifier (`sid`) and a corresponding row in a new D1 `sessions` table. Revoking a session = deleting the row. Subsequent authenticated requests carrying that JWT fail at the middleware layer.
+
+App-role JWTs (`role: 'app'`) stay stateless. Apps are not session-tracked in v1 — per-app revocation is a separate concern handled at the app-registry level.
+
+### D1 schema
+
+New migration `0013_sessions.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+  sid TEXT PRIMARY KEY,
+  data_lookup_key TEXT NOT NULL,
+  app TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  device_label TEXT,
+  via_recovery INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_dlk ON sessions(data_lookup_key);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen_at);
+```
+
+`sid` is a UUID (v4). `device_label` is nullable and app-supplied at `/auth/verify` time (see below). `via_recovery` mirrors the JWT's `via_recovery` claim so the user can see in their session list whether a session was created via the recovery flow.
+
+### JWT changes
+
+User-role JWTs gain a `sid` claim:
+
+```json
+{ "sub": "<data_lookup_key>", "role": "user", "app": "<app_id>", "sid": "<uuid>", "iat": ..., "exp": ... }
+```
+
+App-role JWTs unchanged. `via_recovery: true` JWTs (issue #12) also carry `sid`.
+
+### `/auth/verify` body changes
+
+```
+POST /api/v1/auth/verify
+Body: {
+  credential_lookup_key | recovery_lookup_key,
+  nonce,
+  signature,
+  previous_sid?: string,        // optional — see "session continuity" below
+  device_label?: string,        // optional — max 64 chars; stored on new sessions only
+}
+```
+
+#### Session continuity across JWT refreshes
+
+The SDK's `#requireAuth` silently re-authenticates when the JWT expires. Without continuity, every refresh would create a new session row — ~96 rows/day per active device under typical use.
+
+To prevent that, `/auth/verify` accepts an optional `previous_sid`:
+
+- **Present and active for the same `data_lookup_key`:** server reuses the sid, updates `last_seen_at`, returns a fresh JWT with the same `sid`. No new row.
+- **Absent, expired, or revoked:** server mints a new sid, inserts a new row. Returns the new sid in the JWT.
+
+The SDK extracts `sid` from its current JWT (decoding the payload, no signature check needed since the SDK trusts its own state) and passes it as `previous_sid` on every re-verify. Result: one row per device-installation per app, persisting until either the user revokes it or the lazy-prune step (next paragraph) removes it as stale.
+
+#### Lazy pruning
+
+At the start of `/auth/verify`, before minting a new sid, the server runs:
+
+```sql
+DELETE FROM sessions
+WHERE data_lookup_key = ?1 AND last_seen_at < ?2
+```
+
+with `?2 = now - 24h`. This bounds the table to "sessions used in the last 24h" per account. A user who hasn't logged in for a day gets a clean slate; an active user keeps their existing rows.
+
+### New endpoints
+
+```
+GET /api/v1/sessions
+  Auth: JWT (user role)
+  Returns: [
+    {
+      sid: <uuid>,
+      created_at: <unix_seconds>,
+      last_seen_at: <unix_seconds>,
+      device_label: <string | null>,
+      via_recovery: <boolean>,
+      is_current: <boolean>,
+    },
+    ...
+  ]
+  Sorted by last_seen_at descending. is_current is true for the row matching
+  the calling JWT's sid. Empty array is a valid response (e.g., session
+  pruned between calls).
+```
+
+```
+DELETE /api/v1/sessions/:sid
+  Auth: JWT (user role)
+  Returns: 204 No Content on success.
+  Errors: 401 (no JWT or stale sid), 404 (sid not found OR belongs to a
+          different account — no existence leak across accounts).
+```
+
+```
+DELETE /api/v1/sessions
+  Auth: JWT (user role)
+  Query: ?except=current — optional; preserve the calling sid.
+  Returns: 204 No Content. Without ?except=current, the calling JWT's sid
+           is also deleted; the next request from this client will 401.
+```
+
+All three endpoints scope by `data_lookup_key` extracted from the JWT. A user cannot list, see, or revoke sessions belonging to another account.
+
+### Auth middleware: stateful verification
+
+User-role JWTs with a `sid` claim now require an additional D1 check:
+
+```
+1. Verify JWT signature + exp (existing)
+2. Extract sid from claims; if absent (pre-7.5 JWT), grandfather — see migration
+3. Look up sid in sessions table (with isolate-level cache, see below)
+4. If row absent → 401
+5. Update last_seen_at via ctx.waitUntil() (off the hot path, throttled — skip
+   if existing last_seen_at is < 60s old)
+```
+
+#### Isolate-level cache
+
+The naïve implementation runs a D1 SELECT on every authenticated request. To amortize: each Worker isolate keeps a small `Map<sid, { active: boolean, cachedAt: number }>` with a 5-second TTL.
+
+- **Hit (within TTL):** answer from memory; no D1 read.
+- **Miss or stale:** D1 SELECT, update cache.
+- **Revoke endpoints:** the isolate handling the revoke updates its own cache entry to `active: false` immediately; other isolates serve stale until the 5-second TTL expires.
+
+Net revocation latency: ≤5 seconds globally, immediate on the originating isolate. The 5-second window is acceptable — the threat model already accommodates same-origin-XSS-equivalent risk for the lifetime of the JWT (15 min). A 5-second cross-isolate inconsistency is well within that envelope.
+
+The cache is in-memory only; no KV, no Durable Object. It evaporates on isolate eviction (no persistence concern) and is naturally bounded by the working set of recent sids.
+
+### Pre-7.5 migration
+
+Rolling deploy:
+
+1. Apply the D1 migration creating the `sessions` table.
+2. Deploy the Worker. From this moment, new JWTs from `/auth/verify` carry `sid` and create rows. Existing in-flight JWTs (no `sid` claim) are grandfathered — the auth middleware skips the sessions check when the claim is absent.
+3. After ~15 minutes (the JWT TTL), all live JWTs carry `sid` and the grandfather path is dead code. It is left in place for safety (handles a clock skew or a long-lived test JWT); it's a no-op for production traffic.
+
+No client-side migration is required. SDKs older than 7.5 continue to work — they receive sid-bearing JWTs from the new server but don't pass `previous_sid` on re-verify, so each refresh creates a new row. That's the "table bloat" path; the lazy-prune step keeps it bounded. SDK upgrade brings the client onto the continuity path.
+
+### Interaction with credential rotation
+
+`changeCredentials`, `recoverAccount`, and `deleteAccount` all rotate the signing key. The new public_key invalidates old JWTs at signature-check time, so revoking sessions is technically redundant — but doing it explicitly is the cleaner mental model and removes any timing-window concern.
+
+The API performs:
+
+```sql
+DELETE FROM sessions WHERE data_lookup_key = ?1
+```
+
+as part of each operation, before publishing the new credential blob. The SDK additionally calls `clearSession()` (Section 7) on the local device to wipe the persisted blob.
+
+### SDK API surface
+
+```
+client.listSessions(): Promise<Array<SessionInfo>>
+  SessionInfo = {
+    sid, createdAt, lastSeenAt, deviceLabel, viaRecovery, isCurrent
+  }
+  Auth: requires authenticated client. Returns sessions for the calling user.
+
+client.revokeSession(sid: string): Promise<void>
+  Auth: requires authenticated client. 404 surfaces as null (caller can no-op
+  or refresh listSessions to reflect the now-removed row).
+
+client.revokeAllSessions(): Promise<void>
+  Revokes all sessions including the current. After this resolves, the SDK
+  also calls clearSession() locally; the caller should treat the client as
+  dead and prompt for re-login.
+
+client.revokeOtherSessions(): Promise<void>
+  Revokes all sessions except the current. Implemented by the SDK as a
+  DELETE /api/v1/sessions?except=current. Current session continues working.
+```
+
+Plus optional `deviceLabel` parameters on the existing entry points:
+
+```
+client.register(email, password, { ..., deviceLabel?: string })
+client.login(email, password, { deviceLabel?: string })
+client.recoverAccount({ ..., deviceLabel?: string })
+```
+
+`deviceLabel` flows to `/auth/verify` and is stored on the freshly-created session row. It is not modifiable post-creation in v1; a future endpoint may add `PATCH /api/v1/sessions/:sid` for relabeling.
+
+### Known v1 gaps
+
+- **24h pruning window.** The lazy-prune step deletes sessions older than 24h, so a user who logs in once and never returns has no surfacing in `listSessions` even if their JWT is still valid (it isn't — JWT TTL is 15 min). For long-term audit logging, a separate "session-history Arweave-pinned audit log" would be a different piece of work; not v1.
+- **Revocation latency up to 5 seconds.** Bounded by the isolate cache TTL. Acceptable trade-off for amortized D1 reads. If a use case demands sub-second revocation, the cache TTL can be lowered or disabled per-environment via a config.
+- **No device-grouping heuristics.** The SDK's `previous_sid` continuity keeps it to one row per device-installation, but a single user with two browser profiles on the same physical machine has two rows. Apps that want to group by physical device must rely on app-supplied `device_label` to disambiguate.
+- **App-role JWTs are stateless.** Per-app session tracking would require a separate `app_sessions` table and is out of scope for 7.5.
 
 ---
 
