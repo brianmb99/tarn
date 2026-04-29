@@ -1,13 +1,18 @@
-// Tarn Client — Sharing Section 5a: HPKE friend handshake
+// Tarn Client — Sharing Section 5a: HPKE connection handshake
 //
-// Implements the friend-handshake bootstrap from
-// `2026-04-28-tarn-sharing-design.md` §6 (handshake), §7 (friends + pending
-// records), §13.8 (replay defense), §13.9 (forged-accept defense).
+// Implements the connection-handshake bootstrap from
+// `2026-04-28-tarn-sharing-design.md` §6 (handshake), §7 (connections +
+// pending records), §13.8 (replay defense), §13.9 (forged-accept defense).
 //
 // Stops short of the share log (5b) — this module produces no signed
 // operations, no per-pair shared secret, no stealth-addressed tags, no
 // snapshot. Two users completing the handshake end up in each other's
-// friends record, and that's the entire surface.
+// connections record, and that's the entire surface.
+//
+// Section 6 (issue #18) renamed the public surface from "friend" to
+// "connection" to keep the SDK product-neutral. Apps wanting Strava-style
+// asymmetric follow build it on top of the mutual-connection primitive plus
+// the per-side mute filter (see `mute*` methods on TarnClient).
 //
 // Crypto suite (RFC 9180): DHKEM-X25519 + HKDF-SHA-256 + AES-256-GCM.
 // HPKE library: `@hpke/core` 1.9 — modular core, ~60 KB raw ESM after
@@ -33,8 +38,8 @@ const TEXT_DECODER = new TextDecoder();
 // AEAD-level decryption failure, so a connection-request sealed under one info
 // cannot be replayed as an accept (or any other future role) even if it lands
 // at the same tag.
-export const INFO_FRIEND_REQUEST = 'tarn-connection-request-v1';
-export const INFO_FRIEND_ACCEPT = 'tarn-connection-accept-v1';
+export const INFO_CONNECTION_REQUEST = 'tarn-connection-request-v1';
+export const INFO_CONNECTION_ACCEPT = 'tarn-connection-accept-v1';
 
 // Inbox-tag HMAC info string (sharing design §6.1):
 //   inbox_tag = B(HMAC(H(recipient_share_pub),
@@ -59,14 +64,14 @@ export const REPLAY_NONCE_TTL_SEC = REPLAY_PAST_WINDOW_SEC + SECONDS_PER_DAY;
 // N (default 30) on each login").
 export const DEFAULT_POLL_WINDOWS = 30;
 
-// Friend-request blob size cap. The plaintext is a small JSON object
+// Connection-request blob size cap. The plaintext is a small JSON object
 // (sender_email + 32-byte sender_share_pub + 65-byte sender_signing_pub +
 // nonce + timestamp + optional message). HPKE sealed adds 32 (enc) + 16
 // (AEAD tag). 8 KB is a generous cap that catches nothing legitimate but
 // bounds memory before we touch crypto.
 export const MAX_HANDSHAKE_BLOB_BYTES = 8 * 1024;
 
-// Cap on user-supplied free-text greeting in a friend request. UI surface,
+// Cap on user-supplied free-text greeting in a connection request. UI surface,
 // not a security property — but limits abuse vectors and keeps the JSON small
 // enough to fit comfortably under the blob cap.
 export const MAX_REQUEST_MESSAGE_LEN = 280;
@@ -287,10 +292,10 @@ export async function hpkeOpen({ sharePriv, info, blob }) {
   return new Uint8Array(ptBuf);
 }
 
-// ============ FRIEND REQUEST / ACCEPT PAYLOADS ============
+// ============ CONNECTION REQUEST / ACCEPT PAYLOADS ============
 
 /**
- * Build a friend-request payload (sharing §6.2). Returns the JSON object —
+ * Build a connection-request payload (sharing §6.2). Returns the JSON object —
  * caller will serialize, HPKE-seal, and publish.
  *
  * @param {{
@@ -304,7 +309,7 @@ export async function hpkeOpen({ sharePriv, info, blob }) {
  * }} opts
  * @returns {{ type: 'connection_request', sender_email: string, sender_share_pub: string, sender_signing_pub: string, sender_app_id: string, nonce: string, timestamp: number, message?: string }}
  */
-export function buildFriendRequestPayload(opts) {
+export function buildConnectionRequestPayload(opts) {
   const senderEmail = requireString(opts.senderEmail, 'senderEmail');
   const senderSigningPub = requireString(opts.senderSigningPubBase64, 'senderSigningPubBase64');
   const senderAppId = requireString(opts.senderAppId, 'senderAppId');
@@ -337,7 +342,7 @@ export function buildFriendRequestPayload(opts) {
 }
 
 /**
- * Validate a decoded friend-request payload (sharing §6.3 + §13.8).
+ * Validate a decoded connection-request payload (sharing §6.3 + §13.8).
  *
  * Returns `{ valid: false, reason }` on any structural problem, replay-window
  * violation, or wrong-app mismatch. Returns `{ valid: true, normalized }` on
@@ -352,7 +357,7 @@ export function buildFriendRequestPayload(opts) {
  * @param {string} expectedAppId - app_id of the recipient's TarnClient
  * @param {number} [now=Date.now()/1000] - unix seconds, override for tests
  */
-export function validateFriendRequestPayload(payload, expectedAppId, now = Math.floor(Date.now() / 1000)) {
+export function validateConnectionRequestPayload(payload, expectedAppId, now = Math.floor(Date.now() / 1000)) {
   if (!payload || typeof payload !== 'object') {
     return { valid: false, reason: 'payload must be an object' };
   }
@@ -435,7 +440,7 @@ export function validateFriendRequestPayload(payload, expectedAppId, now = Math.
  *   timestamp?: number,
  * }} opts
  */
-export function buildFriendAcceptPayload(opts) {
+export function buildConnectionAcceptPayload(opts) {
   const senderEmail = requireString(opts.senderEmail, 'senderEmail');
   const senderSigningPub = requireString(opts.senderSigningPubBase64, 'senderSigningPubBase64');
   const senderAppId = requireString(opts.senderAppId, 'senderAppId');
@@ -456,12 +461,12 @@ export function buildFriendAcceptPayload(opts) {
 
 /**
  * Validate a decoded accept payload. Same shape as
- * {@link validateFriendRequestPayload} except for `in_reply_to`. Forged-accept
- * defense (sharing §13.9) is performed by callers cross-referencing the
- * returned `inReplyTo` against their outbound pending list — see
- * {@link findOutboundForAccept}.
+ * {@link validateConnectionRequestPayload} except for `in_reply_to`.
+ * Forged-accept defense (sharing §13.9) is performed by callers
+ * cross-referencing the returned `inReplyTo` against their outbound pending
+ * list — see {@link findOutboundForAccept}.
  */
-export function validateFriendAcceptPayload(payload, expectedAppId, now = Math.floor(Date.now() / 1000)) {
+export function validateConnectionAcceptPayload(payload, expectedAppId, now = Math.floor(Date.now() / 1000)) {
   if (!payload || typeof payload !== 'object') {
     return { valid: false, reason: 'payload must be an object' };
   }
@@ -528,7 +533,7 @@ export function validateFriendAcceptPayload(payload, expectedAppId, now = Math.f
  * same key. We do NOT scope by sender, so an attacker swapping `sender_email`
  * but keeping `nonce` still gets dropped. (Sender swap can't pass HPKE_Open
  * anyway — the recipient's private key is what unwraps, and the inner
- * sender_share_pub is what gets compared during friending — but the cache
+ * sender_share_pub is what gets compared during connection establishment — but the cache
  * dedupe is one extra layer.)
  */
 
@@ -569,7 +574,7 @@ export function checkAndRecordNonce(cache, nonceBase64Url, now = Math.floor(Date
 /**
  * Cross-reference an incoming accept's `in_reply_to` nonce against the local
  * outbound pending list. Unmatched accepts are silently ignored — the user
- * is not prompted, no friend record entry is created.
+ * is not prompted, no connection record entry is created.
  *
  * Accepts entries that expose either `request_nonce` (the on-the-wire record
  * shape per §7.2) or `requestNonce` (the camelCase view typically used in
@@ -590,22 +595,22 @@ export function findOutboundForAccept(inReplyToNonceBase64Url, outboundPending) 
   return null;
 }
 
-// ============ FRIENDS + PENDING-REQUESTS RECORD SHAPES ============
+// ============ CONNECTIONS + PENDING-REQUESTS RECORD SHAPES ============
 
-// Empty initial record bodies (sharing §7.1, §7.2). The friends + pending
+// Empty initial record bodies (sharing §7.1, §7.2). The connections + pending
 // records live as encrypted Tarn data blobs (per-content CEK pattern from
 // issue #11 / Section 2). Operational state like `last_seq_seen` is per-
 // device, NOT in the durable record (Section 3 review).
 
-export const FRIENDS_CONTENT_ID = 'tarn-connections-v1';
+export const CONNECTIONS_CONTENT_ID = 'tarn-connections-v1';
 export const PENDING_REQUESTS_CONTENT_ID = 'tarn-pending-requests-v1';
 
 /**
- * Shape: an empty friends record for a fresh account.
+ * Shape: an empty connections record for a fresh account.
  * @param {string} appId
  */
-export function emptyFriendsRecord(appId) {
-  return { app_id: appId, version: 1, friends: [] };
+export function emptyConnectionsRecord(appId) {
+  return { app_id: appId, version: 1, connections: [] };
 }
 
 /** Shape: an empty pending-requests record. */
@@ -614,58 +619,60 @@ export function emptyPendingRequestsRecord(appId) {
 }
 
 /**
- * Append a friend (idempotent on `share_pub`) to the friends record.
+ * Append a connection (idempotent on `share_pub`) to the connections record.
  * Replaces an existing entry with the same share_pub if present.
  *
  * Inputs are de-typed (base64url strings + JSON numbers) so the record can
  * be JSON-serialized verbatim.
  */
-export function upsertFriend(record, friend) {
-  if (!record || !Array.isArray(record.friends)) {
-    throw new Error('record must be a friends record');
+export function upsertConnection(record, connection) {
+  if (!record || !Array.isArray(record.connections)) {
+    throw new Error('record must be a connections record');
   }
-  if (!friend || typeof friend.share_pub !== 'string') {
-    throw new Error('friend.share_pub is required');
+  if (!connection || typeof connection.share_pub !== 'string') {
+    throw new Error('connection.share_pub is required');
   }
-  const idx = record.friends.findIndex(f => f.share_pub === friend.share_pub);
-  const out = { ...record, friends: record.friends.slice() };
-  if (idx >= 0) out.friends[idx] = friend;
-  else out.friends.push(friend);
+  const idx = record.connections.findIndex(c => c.share_pub === connection.share_pub);
+  const out = { ...record, connections: record.connections.slice() };
+  if (idx >= 0) out.connections[idx] = connection;
+  else out.connections.push(connection);
   return out;
 }
 
 /**
- * Remove a friend (idempotent on `share_pub`) from the friends record. Used
- * by the §10.1 unfriend flow. Returns the record unchanged if no entry
- * matched. Direction-aware: this is one-side; the unfriended party retains
- * their own friends record entry until they independently unfriend back.
+ * Remove a connection (idempotent on `share_pub`) from the connections
+ * record. Used by the §10.1 removeConnection flow. Returns the record
+ * unchanged if no entry matched. Direction-aware: this is one-side; the
+ * removed party retains their own connections record entry until they
+ * independently remove back.
  */
-export function removeFriend(record, friendSharePubBase64Url) {
-  if (!record || !Array.isArray(record.friends)) {
-    throw new Error('record must be a friends record');
+export function removeConnection(record, connectionSharePubBase64Url) {
+  if (!record || !Array.isArray(record.connections)) {
+    throw new Error('record must be a connections record');
   }
-  if (typeof friendSharePubBase64Url !== 'string' || friendSharePubBase64Url.length === 0) {
-    throw new Error('friendSharePubBase64Url is required');
+  if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
+    throw new Error('connectionSharePubBase64Url is required');
   }
   return {
     ...record,
-    friends: record.friends.filter(f => f.share_pub !== friendSharePubBase64Url),
+    connections: record.connections.filter(c => c.share_pub !== connectionSharePubBase64Url),
   };
 }
 
 /**
- * Apply a `rotate_identity` announcement (sharing §13.5) to a friend's entry
- * in the friends record. The caller is responsible for verifying the
- * announcement's ECDSA signature against the friend's currently-cached
- * `signing_pub` BEFORE calling this — the helper itself does no crypto.
+ * Apply a `rotate_identity` announcement (sharing §13.5) to a connection's
+ * entry in the connections record. The caller is responsible for verifying
+ * the announcement's ECDSA signature against the connection's
+ * currently-cached `signing_pub` BEFORE calling this — the helper itself
+ * does no crypto.
  *
  * Replaces share_pub, signing_pub, and credential_lookup_key with the values
  * carried in the announcement. Records the rotation timestamp and the
  * pre-rotation share_pub for audit. Returns the record unchanged if the
- * friend isn't found (defensive — should not happen in normal flow).
+ * connection isn't found (defensive — should not happen in normal flow).
  *
- * @param {Object} record - friends record
- * @param {string} friendSharePubBase64Url - the friend's CURRENT share_pub
+ * @param {Object} record - connections record
+ * @param {string} connectionSharePubBase64Url - the connection's CURRENT share_pub
  * @param {{
  *   newSharePubBase64Url: string,
  *   newSigningPubBase64: string,
@@ -673,12 +680,12 @@ export function removeFriend(record, friendSharePubBase64Url) {
  *   rotatedAt: number,
  * }} update
  */
-export function rotateFriendIdentity(record, friendSharePubBase64Url, update) {
-  if (!record || !Array.isArray(record.friends)) {
-    throw new Error('record must be a friends record');
+export function rotateConnectionIdentity(record, connectionSharePubBase64Url, update) {
+  if (!record || !Array.isArray(record.connections)) {
+    throw new Error('record must be a connections record');
   }
-  if (typeof friendSharePubBase64Url !== 'string' || friendSharePubBase64Url.length === 0) {
-    throw new Error('friendSharePubBase64Url is required');
+  if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
+    throw new Error('connectionSharePubBase64Url is required');
   }
   if (!update
     || typeof update.newSharePubBase64Url !== 'string'
@@ -686,22 +693,22 @@ export function rotateFriendIdentity(record, friendSharePubBase64Url, update) {
     || typeof update.newCredentialLookupKey !== 'string'
     || !Number.isInteger(update.rotatedAt)
   ) {
-    throw new Error('rotateFriendIdentity: update must have newSharePubBase64Url, newSigningPubBase64, newCredentialLookupKey, rotatedAt');
+    throw new Error('rotateConnectionIdentity: update must have newSharePubBase64Url, newSigningPubBase64, newCredentialLookupKey, rotatedAt');
   }
-  const idx = record.friends.findIndex(f => f.share_pub === friendSharePubBase64Url);
+  const idx = record.connections.findIndex(c => c.share_pub === connectionSharePubBase64Url);
   if (idx < 0) return record;
-  const prior = record.friends[idx];
+  const prior = record.connections[idx];
   const rotated = {
     ...prior,
     share_pub: update.newSharePubBase64Url,
     signing_pub: update.newSigningPubBase64,
     credential_lookup_key: update.newCredentialLookupKey,
     rotated_at: update.rotatedAt,
-    prior_share_pub: friendSharePubBase64Url,
+    prior_share_pub: connectionSharePubBase64Url,
   };
-  const friends = record.friends.slice();
-  friends[idx] = rotated;
-  return { ...record, friends };
+  const connections = record.connections.slice();
+  connections[idx] = rotated;
+  return { ...record, connections };
 }
 
 /** Add an outbound pending request (idempotent on request_nonce). */

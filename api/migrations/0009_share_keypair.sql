@@ -2,14 +2,14 @@
 --
 -- New accounts (and any account that runs credential change after this rolls
 -- out) publish a per-app X25519 share_pub in the credential mapping blob so
--- that other users can bootstrap a friend handshake (sharing design §4 + §9.6).
+-- that other users can bootstrap a connection handshake (sharing design §4 + §9.6).
 -- share_discoverable controls whether the public lookup endpoint returns
--- share_pub to non-friends — defaults to TRUE for new accounts; existing
--- friends already have share_pub cached locally and aren't affected by the
+-- share_pub to non-connections — defaults to TRUE for new accounts; existing
+-- connections already have share_pub cached locally and aren't affected by the
 -- gate (Section 5 work).
 --
 -- share_lookup_key is a per-app HKDF derived from the (normalized) email
--- alone. It lets a friend look up share_pub knowing only the recipient's
+-- alone. It lets a connection look up share_pub knowing only the recipient's
 -- email + app_id (no password). Lookup-by-email leaks "Alice is interested in
 -- Bob" at handshake time — accepted residual leak per sharing §11.5.
 --

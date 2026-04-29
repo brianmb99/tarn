@@ -68,7 +68,7 @@ const RECOVERY_SALT_LEN = 16;
 
 // Sharing keypair (issue #13). X25519 keys are 32 bytes for both private and
 // public — public key is base64url-encoded into the credential blob's
-// `share_pub` field for friend handshake bootstrap (Section 5 work).
+// `share_pub` field for connection handshake bootstrap (Section 5 work).
 const X25519_KEY_LEN = 32;
 
 // Per-content CEK pattern (issue #11):
@@ -400,7 +400,7 @@ export async function exportPublicKey(publicKey) {
 // ============ SHARING KEYPAIR (issue #13) ============
 
 /**
- * Derive an email-only `share_lookup_key` for the friend-handshake bootstrap
+ * Derive an email-only `share_lookup_key` for the connection-handshake bootstrap
  * (issue #13). This is the index Tarn uses to find a recipient's `share_pub`
  * when the requester knows only the recipient's email + app — i.e., before any
  * handshake has happened, when no shared secret exists yet.

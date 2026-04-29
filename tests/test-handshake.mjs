@@ -1,15 +1,15 @@
-// Integration tests for the friend handshake (issue #14, Section 5a).
+// Integration tests for the connection handshake (issue #14, Section 5a).
 //
 // Exercises the full handshake against a running wrangler dev:
 //   - Alice registers, Bob registers — both publish share_pub
-//   - Alice sendFriendRequest(bob) → blob lands at Bob's inbox tag
+//   - Alice sendConnectionRequest(bob) → blob lands at Bob's inbox tag
 //   - Bob listIncomingRequests() → decrypts + surfaces the request
-//   - Bob acceptFriendRequest(nonce) → publishes accept, adds Alice to friends
-//   - Alice listIncomingRequests() (also processes accepts) → adds Bob to friends
+//   - Bob acceptConnectionRequest(nonce) → publishes accept, adds Alice to connections
+//   - Alice listIncomingRequests() (also processes accepts) → adds Bob to connections
 //   - Replay attack: re-publishing Alice's blob is silently dropped
 //   - Forged accept: an accept with no matching outbound is silently dropped
-//   - Spam mitigation: 11th friend request in an hour gets 429
-//   - Pre-#13 accounts can't be friended — sendFriendRequest fails cleanly
+//   - Spam mitigation: 11th connection request in an hour gets 429
+//   - Pre-#13 accounts aren't connectable — sendConnectionRequest fails cleanly
 //   - Per-app isolation: a Bookish handshake doesn't bootstrap a Cellar one
 //
 // Run: cd api && npx wrangler dev --port 8787 (in another terminal)
@@ -24,10 +24,10 @@ import {
   hpkeSeal,
   deriveInboxTag,
   currentInboxWindow,
-  buildFriendRequestPayload,
-  buildFriendAcceptPayload,
-  INFO_FRIEND_REQUEST,
-  INFO_FRIEND_ACCEPT,
+  buildConnectionRequestPayload,
+  buildConnectionAcceptPayload,
+  INFO_CONNECTION_REQUEST,
+  INFO_CONNECTION_ACCEPT,
 } from '../client/src/sharing.js';
 import {
   seedTestApp, DEFAULT_APP_ID, randomEmail, forceAllowRulesForAccount, sleep,
@@ -94,8 +94,8 @@ await test('Alice + Bob register with discoverable share keys', async () => {
   assert(aliceDlk && bobDlk, 'both should have DLKs');
 });
 
-await test('Alice sendFriendRequest(bob) succeeds and tracks outbound pending', async () => {
-  const res = await alice.sendFriendRequest(bobEmail, { message: 'hi from alice' });
+await test('Alice sendConnectionRequest(bob) succeeds and tracks outbound pending', async () => {
+  const res = await alice.sendConnectionRequest(bobEmail, { message: 'hi from alice' });
   assert(res.txid, 'no txid returned');
   assert(res.requestNonce, 'no requestNonce returned');
   requestNonce = res.requestNonce;
@@ -121,28 +121,28 @@ await test('Bob listIncomingRequests() returns Alice\'s request', async () => {
   assert(pending.inbound.length === 1, 'inbound pending should have 1 entry');
 });
 
-await test('Bob acceptFriendRequest() adds Alice to Bob\'s friends', async () => {
-  const res = await bob.acceptFriendRequest(requestNonce);
+await test('Bob acceptConnectionRequest() adds Alice to Bob\'s connections', async () => {
+  const res = await bob.acceptConnectionRequest(requestNonce);
   assert(res.txid, 'no txid for accept');
 
-  const friends = await bob.listFriends();
-  assert(friends.length === 1, `Bob should have 1 friend, got ${friends.length}`);
-  assert(friends[0].email === aliceEmail, `wrong friend email: ${friends[0].email}`);
+  const connections = await bob.listConnections();
+  assert(connections.length === 1, `Bob should have 1 connection, got ${connections.length}`);
+  assert(connections[0].email === aliceEmail, `wrong connection email: ${connections[0].email}`);
 
   const pending = await bob.getPendingRequests();
   assert(pending.inbound.length === 0, 'Bob inbound should be empty after accept');
 });
 
-await test('Alice listIncomingRequests() processes accept, adds Bob to her friends', async () => {
+await test('Alice listIncomingRequests() processes accept, adds Bob to her connections', async () => {
   // The same poll that surfaces incoming requests also processes incoming
-  // accepts. After this call Alice's friends list should contain Bob and
+  // accepts. After this call Alice's connections list should contain Bob and
   // her outbound pending should be empty.
   await sleep(150);
   await alice.listIncomingRequests();
 
-  const friends = await alice.listFriends();
-  assert(friends.length === 1, `Alice should have 1 friend, got ${friends.length}`);
-  assert(friends[0].email === bobEmail, `wrong friend email: ${friends[0].email}`);
+  const connections = await alice.listConnections();
+  assert(connections.length === 1, `Alice should have 1 connection, got ${connections.length}`);
+  assert(connections[0].email === bobEmail, `wrong connection email: ${connections[0].email}`);
 
   const pending = await alice.getPendingRequests();
   assert(pending.outbound.length === 0, 'Alice outbound should be empty after accept-process');
@@ -160,7 +160,7 @@ await test('Re-publishing Alice\'s already-seen request blob is silently ignored
   const carol = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   await registerWithRules(carol, carolEmail, 'pw-carol-' + Date.now());
 
-  const sendRes = await carol.sendFriendRequest(bobEmail);
+  const sendRes = await carol.sendConnectionRequest(bobEmail);
   await sleep(150);
 
   const first = await bob.listIncomingRequests();
@@ -184,12 +184,12 @@ await test('Accept blob with no matching outbound is silently ignored', async ()
   // Eve sends a fake "accept" to Alice's inbox without Alice having sent a
   // request. Alice's pending outbound list contains nothing matching this
   // accept's `in_reply_to`, so processing should drop it silently and
-  // produce no friends-record change.
+  // produce no connections-record change.
   const eveEmail = randomEmail();
   const eve = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   await registerWithRules(eve, eveEmail, 'pw-eve-' + Date.now());
 
-  const beforeFriends = (await alice.listFriends()).length;
+  const beforeConnections = (await alice.listConnections()).length;
 
   // Build a forged accept directly. We need Alice's share_pub for the inbox
   // tag + HPKE seal target. Get it via the public lookup.
@@ -202,9 +202,9 @@ await test('Accept blob with no matching outbound is silently ignored', async ()
   const eveSharePub = (await deriveAllKeys(eveEmail, 'pw-eve-' + Date.now() /*ignored*/, DEFAULT_APP_ID)).sharingKeyPair.publicKey;
 
   // Use a random nonce that's NOT in Alice's outbound pending — by
-  // construction (Alice never asked Eve to be friends).
+  // construction (Alice never asked Eve to be connections).
   const fakeReplyTo = bytesToBase64(crypto.getRandomValues(new Uint8Array(16))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  const acceptPayload = buildFriendAcceptPayload({
+  const acceptPayload = buildConnectionAcceptPayload({
     senderEmail: eveEmail,
     senderSharePub: eveSharePub,
     senderSigningPubBase64: eveSigningPub,
@@ -213,14 +213,14 @@ await test('Accept blob with no matching outbound is silently ignored', async ()
   });
   const sealed = await hpkeSeal({
     recipientSharePub: aliceShare.sharePub,
-    info: INFO_FRIEND_ACCEPT,
+    info: INFO_CONNECTION_ACCEPT,
     plaintext: new TextEncoder().encode(JSON.stringify(acceptPayload)),
   });
   const tag = await deriveInboxTag(aliceShare.sharePub, DEFAULT_APP_ID, currentInboxWindow());
 
   // Eve has a session, so she can publish via the rate-limited endpoint.
   // (In a real attack she'd post via a different account; the API enforces
-  // JWT presence but doesn't require sender to be the recipient's friend.)
+  // JWT presence but doesn't require sender to be the recipient's connection.)
   const eveJwt = eve._testJwt();
   const publishRes = await fetch(`${BASE_URL}/api/v1/share/inbox/publish`, {
     method: 'POST',
@@ -235,18 +235,18 @@ await test('Accept blob with no matching outbound is silently ignored', async ()
 
   // Alice polls — the forged accept should be silently dropped.
   await alice.listIncomingRequests();
-  const afterFriends = await alice.listFriends();
-  assert(afterFriends.length === beforeFriends,
-    `forged accept should not add a friend (was ${beforeFriends}, now ${afterFriends.length})`);
+  const afterConnections = await alice.listConnections();
+  assert(afterConnections.length === beforeConnections,
+    `forged accept should not add a connection (was ${beforeConnections}, now ${afterConnections.length})`);
 });
 
 // ============ 4. Spam mitigation (rate limit) ============
 
 console.log('\n=== 4. Spam mitigation ===');
 
-await test('11th friend request in an hour returns 429', async () => {
+await test('11th connection request in an hour returns 429', async () => {
   // Use a fresh account to avoid colliding with limits already consumed
-  // by earlier tests (sharing §9.5: 10 friend-request publishes/hour per
+  // by earlier tests (sharing §9.5: 10 connection-request publishes/hour per
   // session).
   const spammerEmail = randomEmail();
   const spammer = new TarnClient(BASE_URL, DEFAULT_APP_ID);
@@ -262,13 +262,13 @@ await test('11th friend request in an hour returns 429', async () => {
 
   // First 10 should succeed.
   for (let i = 0; i < 10; i++) {
-    await spammer.sendFriendRequest(targets[i]);
+    await spammer.sendConnectionRequest(targets[i]);
   }
 
   // 11th should fail with the 429 surfaced as an error.
   let threw = false;
   try {
-    await spammer.sendFriendRequest(targets[10]);
+    await spammer.sendConnectionRequest(targets[10]);
   } catch (err) {
     threw = true;
     assert(/rate limit/i.test(err.message) || /429/.test(err.message),
@@ -279,9 +279,9 @@ await test('11th friend request in an hour returns 429', async () => {
 
 // ============ 5. Pre-#13 / non-discoverable account ============
 
-console.log('\n=== 5. Pre-#13 account is not friendable ===');
+console.log('\n=== 5. Pre-#13 account is not connectable ===');
 
-await test('sendFriendRequest to non-discoverable account fails cleanly', async () => {
+await test('sendConnectionRequest to non-discoverable account fails cleanly', async () => {
   const hiddenEmail = randomEmail();
   const hidden = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   await registerWithRules(hidden, hiddenEmail, 'pw-hidden-' + Date.now(), {
@@ -294,29 +294,29 @@ await test('sendFriendRequest to non-discoverable account fails cleanly', async 
 
   let caught;
   try {
-    await seeker.sendFriendRequest(hiddenEmail);
+    await seeker.sendConnectionRequest(hiddenEmail);
   } catch (err) {
     caught = err;
   }
-  assert(caught, 'sendFriendRequest should throw for non-discoverable target');
-  assert(caught.code === 'RECIPIENT_NOT_FRIENDABLE',
-    `expected code RECIPIENT_NOT_FRIENDABLE, got ${caught.code}`);
+  assert(caught, 'sendConnectionRequest should throw for non-discoverable target');
+  assert(caught.code === 'RECIPIENT_NOT_CONNECTABLE',
+    `expected code RECIPIENT_NOT_CONNECTABLE, got ${caught.code}`);
 });
 
-await test('sendFriendRequest to unknown email fails cleanly', async () => {
+await test('sendConnectionRequest to unknown email fails cleanly', async () => {
   const seeker = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   // Use the alice account from earlier — already authenticated via login on
   // a fresh client. Cheaper than registering yet another user.
   await seeker.login(aliceEmail, alicePassword);
   let caught;
   try {
-    await seeker.sendFriendRequest(`nobody-${Date.now()}@nowhere.test`);
+    await seeker.sendConnectionRequest(`nobody-${Date.now()}@nowhere.test`);
   } catch (err) {
     caught = err;
   }
   assert(caught, 'should throw for unknown email');
-  assert(caught.code === 'RECIPIENT_NOT_FRIENDABLE',
-    `expected RECIPIENT_NOT_FRIENDABLE, got ${caught.code}`);
+  assert(caught.code === 'RECIPIENT_NOT_CONNECTABLE',
+    `expected RECIPIENT_NOT_CONNECTABLE, got ${caught.code}`);
 });
 
 // ============ 6. Per-app isolation ============
@@ -326,7 +326,7 @@ console.log('\n=== 6. Per-app isolation ===');
 await test('A Bookish-side request to Bob\'s email does NOT land in Bob\'s Cellar inbox', async () => {
   // Same email, two apps. Bob's Cellar account has its own share_pub
   // (different keypair) and its own inbox tag (different app_id in HMAC).
-  // A Bookish friend request to bobEmail must not appear when Bob polls
+  // A Bookish connection request to bobEmail must not appear when Bob polls
   // his Cellar inbox.
   const bobOnCellarEmail = randomEmail();
   const bobOnCellar = new TarnClient(BASE_URL, SECONDARY_APP_ID);
@@ -339,11 +339,11 @@ await test('A Bookish-side request to Bob\'s email does NOT land in Bob\'s Cella
   await bookishSender.login(aliceEmail, alicePassword);
   let caught;
   try {
-    await bookishSender.sendFriendRequest(bobOnCellarEmail);
+    await bookishSender.sendConnectionRequest(bobOnCellarEmail);
   } catch (err) {
     caught = err;
   }
-  assert(caught && caught.code === 'RECIPIENT_NOT_FRIENDABLE',
+  assert(caught && caught.code === 'RECIPIENT_NOT_CONNECTABLE',
     'bookish→cellar lookup should miss (per-app isolation)');
 
   // Sanity: Bob in cellar polling his own inbox should see no requests.

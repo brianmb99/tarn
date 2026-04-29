@@ -1,16 +1,16 @@
 // Sharing keypair lookup endpoint (issue #13).
 //
-// Returns a recipient's published `share_pub` for friend-handshake bootstrap
-// (sharing design §4 + §9.6). The query is keyed by `share_lookup_key` —
-// derivable from email + app_id alone (no password) so a friend who only
-// knows the recipient's email can fetch the keypair without an authenticated
-// session against the recipient's account.
+// Returns a recipient's published `share_pub` for connection-handshake
+// bootstrap (sharing design §4 + §9.6). The query is keyed by
+// `share_lookup_key` — derivable from email + app_id alone (no password) so a
+// connection-to-be who only knows the recipient's email can fetch the keypair
+// without an authenticated session against the recipient's account.
 //
 // Discoverability gate: when the account has `share_discoverable=false`,
 // `share_pub` is returned as null even if the row exists. This matches the
-// design's "strangers cannot bootstrap a request" semantics. Existing friends
-// already cache `share_pub` from the original handshake (Section 5 work) and
-// don't depend on this endpoint, so the gate is a no-op for them.
+// design's "strangers cannot bootstrap a request" semantics. Existing
+// connections already cache `share_pub` from the original handshake (Section
+// 5 work) and don't depend on this endpoint, so the gate is a no-op for them.
 //
 // Privacy: lookup-by-email leaks "user A is interested in user B" at handshake
 // time — accepted residual leak per sharing §11.5. We rate-limit by IP to make

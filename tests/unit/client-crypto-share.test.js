@@ -163,7 +163,7 @@ describe('deriveShareLookupKey', () => {
   });
 
   it('does NOT depend on password — derivable from email alone', async () => {
-    // The whole point of share_lookup_key is the friend handshake bootstrap:
+    // The whole point of share_lookup_key is the connection handshake bootstrap:
     // Alice can find Bob's row knowing only Bob's email. There is no password
     // input to the function — verify by inspecting the signature behavior:
     // calling without a password works.

@@ -54,26 +54,26 @@ import {
   currentInboxWindow,
   hpkeSeal,
   hpkeOpen,
-  buildFriendRequestPayload,
-  validateFriendRequestPayload,
-  buildFriendAcceptPayload,
-  validateFriendAcceptPayload,
+  buildConnectionRequestPayload,
+  validateConnectionRequestPayload,
+  buildConnectionAcceptPayload,
+  validateConnectionAcceptPayload,
   makeReplayNonceCache,
   checkAndRecordNonce,
   findOutboundForAccept,
-  emptyFriendsRecord,
+  emptyConnectionsRecord,
   emptyPendingRequestsRecord,
-  upsertFriend,
-  removeFriend,
-  rotateFriendIdentity,
+  upsertConnection,
+  removeConnection,
+  rotateConnectionIdentity,
   addOutboundPending,
   addInboundPending,
   removeOutboundPending,
   removeInboundPending,
-  FRIENDS_CONTENT_ID,
+  CONNECTIONS_CONTENT_ID,
   PENDING_REQUESTS_CONTENT_ID,
-  INFO_FRIEND_REQUEST,
-  INFO_FRIEND_ACCEPT,
+  INFO_CONNECTION_REQUEST,
+  INFO_CONNECTION_ACCEPT,
   DEFAULT_POLL_WINDOWS,
 } from './sharing.js';
 import {
@@ -126,18 +126,18 @@ export class TarnClient {
   #envelopeVersion = null;   // 1 (bare base64), 2 (single), 3 (chain), 4 (multi-factor chain)
 
   // Sharing handshake state (issue #14, Section 5a). Populated on every
-  // register/login/changeCredentials/recoverAccount path so the friend
+  // register/login/changeCredentials/recoverAccount path so the connection
   // handshake methods can HPKE-Open inbox blobs without re-deriving from
   // master_key on every call. share_priv NEVER leaves the device.
   #email = null;                     // string — caller-supplied normalized email
   #sharingKeyPair = null;            // {privateKey: Uint8Array, publicKey: Uint8Array}
   #replayNonceCache = makeReplayNonceCache(); // §13.8 in-memory recent-nonce cache
 
-  // Per-friend share-log state (issue #15, Section 5b). Map keyed on the
-  // friend's `share_pub` (base64url string) — small, fast lookups by stable
-  // identifier. Each entry holds:
+  // Per-connection share-log state (issue #15, Section 5b). Map keyed on the
+  // connection's `share_pub` (base64url string) — small, fast lookups by
+  // stable identifier. Each entry holds:
   //   - keys: derived once per session via derivePairKeys()
-  //   - nextOutboundSeq: writer-side counter for our outbound-to-friend log
+  //   - nextOutboundSeq: writer-side counter for our outbound-to-connection log
   //   - nonSnapshotsSinceLastSnapshot: snapshot-compaction trigger (§8.6)
   // Cache is in-memory only; on session restart the writer must rediscover
   // the highest existing seq before publishing (5c work). For 5b, the
@@ -146,19 +146,20 @@ export class TarnClient {
   #pairKeyCache = new Map();         // sharePubBase64Url -> { sharedSecret, outboundKey, inboundKey, outboundTagSeed, inboundTagSeed }
   #shareLogCounters = new Map();     // sharePubBase64Url -> { nextOutboundSeq, nonSnapshotsSinceLastSnapshot, compactionInterval }
 
-  // Per-friend reconstructed inbound state (issue #16, Section 5c). Keyed on
-  // the friend's `share_pub`, holds the application's view of what the friend
-  // has shared with us — the result of replaying their outbound log per §8.5.
-  // `lastSeqSeen` is the highest seq we've applied (or -1 if no entries yet).
-  // In-memory only; on session restart `readShareLog` re-bootstraps from
-  // Arweave. Wholly invalidated on credential change / recovery / delete.
+  // Per-connection reconstructed inbound state (issue #16, Section 5c).
+  // Keyed on the connection's `share_pub`, holds the application's view of
+  // what the connection has shared with us — the result of replaying their
+  // outbound log per §8.5. `lastSeqSeen` is the highest seq we've applied
+  // (or -1 if no entries yet). In-memory only; on session restart
+  // `readShareLog` re-bootstraps from Arweave. Wholly invalidated on
+  // credential change / recovery / delete.
   #readStateCache = new Map();       // sharePubBase64Url -> { state: {[content_id]: {tx_id, cek}}, lastSeqSeen: number }
 
-  // Per-friend reconstructed OUTBOUND state (issue #16, Section 5c). Tracks
-  // what we've shared with each friend so the writer can emit meaningful
-  // snapshots during auto-compaction (§8.6). An empty snapshot is NOT a
-  // no-op per §8.3.5 — it tells the recipient "I'm sharing nothing with you
-  // anymore", which would erase their entire view.
+  // Per-connection reconstructed OUTBOUND state (issue #16, Section 5c).
+  // Tracks what we've shared with each connection so the writer can emit
+  // meaningful snapshots during auto-compaction (§8.6). An empty snapshot
+  // is NOT a no-op per §8.3.5 — it tells the recipient "I'm sharing nothing
+  // with you anymore", which would erase their entire view.
   //
   // Hydration: lazily reconstructed on the first high-level publish call
   // per session by replaying our own outbound log. Updated incrementally
@@ -167,14 +168,22 @@ export class TarnClient {
   // delete (the per-pair keys rotate, so the cache is stale anyway).
   #outboundStateCache = new Map();   // sharePubBase64Url -> { state: {[content_id]: {tx_id, cek}}, hydrated: boolean }
 
-  // Per-friend set of outbound txids we've successfully published in this
-  // session (issue #16, Section 5c). Used by the multi-device retry path
-  // (§13.1) to detect "this 409 is reporting back my own previous publish"
-  // (e.g., the SDK retried after a transient response loss). When the 409's
-  // `existing_txid` is in this set, we treat the publish as already-done
-  // rather than republishing at the next seq. Cleared with the rest of the
-  // share-log caches on credential change / recovery / delete.
-  #publishedTxidsByFriend = new Map(); // sharePubBase64Url -> Set<string>
+  // Per-connection set of outbound txids we've successfully published in
+  // this session (issue #16, Section 5c). Used by the multi-device retry
+  // path (§13.1) to detect "this 409 is reporting back my own previous
+  // publish" (e.g., the SDK retried after a transient response loss). When
+  // the 409's `existing_txid` is in this set, we treat the publish as
+  // already-done rather than republishing at the next seq. Cleared with the
+  // rest of the share-log caches on credential change / recovery / delete.
+  #publishedTxidsByConnection = new Map(); // sharePubBase64Url -> Set<string>
+
+  // Muted-connections record (issue #18, Section 6). Loaded on demand on
+  // the first mute-related call per session and kept in sync with the
+  // persisted `tarn-muted-connections-v1` blob across calls. The record
+  // syncs across devices via the encrypted Tarn data blob; subsequent
+  // sessions hydrate from Arweave. Wholly invalidated on credential change
+  // / recovery / delete (re-hydrate on next mute-related call).
+  #mutedConnectionsState = null;     // null | { record, txid }
 
   // v4 recovery-factor state (issue #12). Holds enough information to preserve
   // existing recovery wrappings across a credential change without requiring
@@ -240,7 +249,7 @@ export class TarnClient {
     const recipientEmail = opts.recipientEmail || email;
     const appName = opts.appName;
     // Sharing keypair publication (issue #13). Defaults to discoverable so a
-    // new social-app user can be friended by email out of the box. Apps that
+    // new social-app user can connect by email out of the box. Apps that
     // want a "private by default" stance can pass `shareDiscoverable: false`.
     const shareDiscoverable = opts.shareDiscoverable !== false;
 
@@ -542,7 +551,7 @@ export class TarnClient {
     // change. This is also what register sends.
     const recoveryPublicKey = await exportPublicKey(recoverySigningKeyPair.publicKey);
 
-    // Snapshot OLD key material + outbound state per friend before swapping.
+    // Snapshot OLD key material + outbound state per connection before swapping.
     // Recovery rotates share_priv + signing_priv just like changeCredentials,
     // so the §13.5 rotation announcement applies identically. Note: in the
     // recovery code path the user has rotated credentials AS A RESULT of
@@ -553,7 +562,7 @@ export class TarnClient {
     //   - Fresh-client recovery (most common): a new TarnClient is calling
     //     recoverAccount with no prior login. #sharingKeyPair and
     //     #signingKeyPair are null → no OLD keys to sign rotation
-    //     announcements with. Skip the announce loop; friends will need to
+    //     announcements with. Skip the announce loop; connections will need to
     //     reconcile via out-of-band channel (the §13.5 known limitation).
     //   - Logged-in recovery (rare): the user is already authenticated under
     //     the OLD identity and is recovering for routine reasons. OLD keys
@@ -566,25 +575,25 @@ export class TarnClient {
       && !!oldSigningKeyPair?.privateKey
       && this.#dekByGen != null;
 
-    let oldFriendsState = { record: { friends: [] }, txid: null };
-    const outboundStateByFriend = new Map();
+    let oldConnectionsState = { record: { connections: [] }, txid: null };
+    const outboundStateByConnection = new Map();
     if (canAnnounce) {
       try {
-        oldFriendsState = await this.#loadFriendsRecord();
+        oldConnectionsState = await this.#loadConnectionsRecord();
       } catch (err) {
         console.warn(
-          `[TarnClient] recoverAccount: friends record load failed (no rotation announce): ${err.message}`,
+          `[TarnClient] recoverAccount: connections record load failed (no rotation announce): ${err.message}`,
         );
       }
-      for (const friend of oldFriendsState.record.friends) {
+      for (const connection of oldConnectionsState.record.connections) {
         try {
-          await this.#hydrateOutboundState(friend);
-          outboundStateByFriend.set(friend.share_pub, this.#tentativeOutboundState(friend));
+          await this.#hydrateOutboundState(connection);
+          outboundStateByConnection.set(connection.share_pub, this.#tentativeOutboundState(connection));
         } catch (err) {
           console.warn(
-            `[TarnClient] recoverAccount: outbound state hydration failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+            `[TarnClient] recoverAccount: outbound state hydration failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
-          outboundStateByFriend.set(friend.share_pub, {});
+          outboundStateByConnection.set(connection.share_pub, {});
         }
       }
     }
@@ -606,15 +615,15 @@ export class TarnClient {
       throw new Error(`recoverAccount(): credential change failed: ${putRes.json?.error || putRes.status}`);
     }
 
-    // Announce the rotation to friends BEFORE swapping local key state, so
+    // Announce the rotation to connections BEFORE swapping local key state, so
     // we can sign with the OLD signing_priv and encrypt under OLD K_AB.
     let rotationAnnouncements = [];
-    if (canAnnounce && oldFriendsState.record.friends.length > 0) {
+    if (canAnnounce && oldConnectionsState.record.connections.length > 0) {
       try {
-        rotationAnnouncements = await this.#announceIdentityRotationToFriends({
+        rotationAnnouncements = await this.#announceIdentityRotationToConnections({
           oldSharingKeyPair,
           oldSigningKeyPair,
-          oldFriendsRecord: oldFriendsState.record,
+          oldConnectionsRecord: oldConnectionsState.record,
           newSharingPublicKey: newKeys.sharingKeyPair.publicKey,
           newSigningPublicKey: newKeys.signingKeyPair.publicKey,
           newCredentialLookupKey: newKeys.credentialLookupKey,
@@ -640,22 +649,22 @@ export class TarnClient {
     this.#shareLogCounters.clear();
     this.#readStateCache.clear();
     this.#outboundStateCache.clear();
-    this.#publishedTxidsByFriend.clear();
+    this.#publishedTxidsByConnection.clear();
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
-    // §13.5 step 8: publish a fresh seq=0 snapshot to every friend's NEW
+    // §13.5 step 8: publish a fresh seq=0 snapshot to every connection's NEW
     // outbound log under the new pair keys. Only meaningful if we ran
     // rotation announce (we need to have known the OLD log existed +
     // captured outbound state).
     if (canAnnounce) {
-      for (const friend of oldFriendsState.record.friends) {
-        const state = outboundStateByFriend.get(friend.share_pub) ?? {};
+      for (const connection of oldConnectionsState.record.connections) {
+        const state = outboundStateByConnection.get(connection.share_pub) ?? {};
         try {
-          await this._publishInitialSnapshot(friend, { state });
+          await this._publishInitialSnapshot(connection, { state });
         } catch (err) {
           console.warn(
-            `[TarnClient] recoverAccount: NEW-log seq=0 snapshot publish failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+            `[TarnClient] recoverAccount: NEW-log seq=0 snapshot publish failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
         }
       }
@@ -782,11 +791,11 @@ export class TarnClient {
    * applied — they stay on the legacy single-key envelope (issue #11 is
    * scoped to Argon2id accounts; legacy KDF migration is a separate concern).
    *
-   * Friend-side identity rotation (issue #17, sharing §13.5): after the
+   * Connection-side identity rotation (issue #17, sharing §13.5): after the
    * credential blob is published, this method announces the new sharing +
-   * signing pubkeys to every friend by publishing a `rotate_identity` entry
-   * to each friend's OLD outbound log under OLD per-pair keys. Friends'
-   * clients pick up the rotation on their next read/sync, update the friend
+   * signing pubkeys to every connection by publishing a `rotate_identity` entry
+   * to each connection's OLD outbound log under OLD per-pair keys. Connections'
+   * clients pick up the rotation on their next read/sync, update the connection
    * record, and switch to the new keys without user intervention. The known
    * limitation about rotation under compromised OLD keys (sharing §13.5) is
    * accepted for v1; out-of-band recovery is the documented response.
@@ -804,7 +813,7 @@ export class TarnClient {
    *   - `acceptRecoveryGap`: opt out of the v4 phrase requirement. The new
    *     gen ships without a recovery wrapping.
    *   - `skipRotationAnnounce`: skip the §13.5 rotation announcement to
-   *     friends. Used by tests + low-level flows that intentionally manage
+   *     connections. Used by tests + low-level flows that intentionally manage
    *     identity rotation themselves; production callers should leave it
    *     unset (default false).
    */
@@ -969,31 +978,31 @@ export class TarnClient {
     const oldSigningKeyPair = this.#signingKeyPair;
     const skipRotationAnnounce = opts.skipRotationAnnounce === true;
 
-    // Hydrate outbound state per friend BEFORE the swap so we can publish
+    // Hydrate outbound state per connection BEFORE the swap so we can publish
     // meaningful seq=0 snapshots to the NEW logs after rotation. Hydration
     // runs against the OLD per-pair keys (still cached) and reads our own
-    // outbound entries from the OLD logs. Only loads the friends record
+    // outbound entries from the OLD logs. Only loads the connections record
     // when we're going to announce (skipRotationAnnounce keeps test surfaces
-    // clean for unit tests that mock fetch without a friends record).
-    let oldFriendsState = { record: { friends: [] }, txid: null };
-    const outboundStateByFriend = new Map();
+    // clean for unit tests that mock fetch without a connections record).
+    let oldConnectionsState = { record: { connections: [] }, txid: null };
+    const outboundStateByConnection = new Map();
     if (!skipRotationAnnounce) {
       try {
-        oldFriendsState = await this.#loadFriendsRecord();
+        oldConnectionsState = await this.#loadConnectionsRecord();
       } catch (err) {
         console.warn(
-          `[TarnClient] changeCredentials: friends record load failed (no rotation announce): ${err.message}`,
+          `[TarnClient] changeCredentials: connections record load failed (no rotation announce): ${err.message}`,
         );
       }
-      for (const friend of oldFriendsState.record.friends) {
+      for (const connection of oldConnectionsState.record.connections) {
         try {
-          await this.#hydrateOutboundState(friend);
-          outboundStateByFriend.set(friend.share_pub, this.#tentativeOutboundState(friend));
+          await this.#hydrateOutboundState(connection);
+          outboundStateByConnection.set(connection.share_pub, this.#tentativeOutboundState(connection));
         } catch (err) {
           console.warn(
-            `[TarnClient] changeCredentials: outbound state hydration failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+            `[TarnClient] changeCredentials: outbound state hydration failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
-          outboundStateByFriend.set(friend.share_pub, {});
+          outboundStateByConnection.set(connection.share_pub, {});
         }
       }
     }
@@ -1019,16 +1028,16 @@ export class TarnClient {
 
     // §13.5 step 4: with the new credential blob published (durable
     // indicator of rotation in flight), publish a `rotate_identity`
-    // announcement to every friend's OLD outbound log under OLD pair keys.
-    // The OLD signing_priv proves authenticity to the friend (their cached
+    // announcement to every connection's OLD outbound log under OLD pair keys.
+    // The OLD signing_priv proves authenticity to the connection (their cached
     // signing_pub still matches OLD).
     let rotationAnnouncements = [];
-    if (!skipRotationAnnounce && oldFriendsState.record.friends.length > 0) {
+    if (!skipRotationAnnounce && oldConnectionsState.record.connections.length > 0) {
       try {
-        rotationAnnouncements = await this.#announceIdentityRotationToFriends({
+        rotationAnnouncements = await this.#announceIdentityRotationToConnections({
           oldSharingKeyPair,
           oldSigningKeyPair,
-          oldFriendsRecord: oldFriendsState.record,
+          oldConnectionsRecord: oldConnectionsState.record,
           newSharingPublicKey: newKeys.sharingKeyPair.publicKey,
           newSigningPublicKey: newKeys.signingKeyPair.publicKey,
           newCredentialLookupKey: newKeys.credentialLookupKey,
@@ -1055,23 +1064,23 @@ export class TarnClient {
     this.#shareLogCounters.clear();
     this.#readStateCache.clear();
     this.#outboundStateCache.clear();
-    this.#publishedTxidsByFriend.clear();
+    this.#publishedTxidsByConnection.clear();
 
     await this.#authenticate();
 
-    // §13.5 step 8: publish a fresh seq=0 snapshot to every friend's NEW
+    // §13.5 step 8: publish a fresh seq=0 snapshot to every connection's NEW
     // outbound log so the recipient bootstraps the new log with the
-    // expected state. Best-effort: a per-friend failure is logged and the
-    // method still returns success — the friend can re-bootstrap once we
+    // expected state. Best-effort: a per-connection failure is logged and the
+    // method still returns success — the connection can re-bootstrap once we
     // publish later operations.
     if (!skipRotationAnnounce) {
-      for (const friend of oldFriendsState.record.friends) {
-        const state = outboundStateByFriend.get(friend.share_pub) ?? {};
+      for (const connection of oldConnectionsState.record.connections) {
+        const state = outboundStateByConnection.get(connection.share_pub) ?? {};
         try {
-          await this._publishInitialSnapshot(friend, { state });
+          await this._publishInitialSnapshot(connection, { state });
         } catch (err) {
           console.warn(
-            `[TarnClient] changeCredentials: NEW-log seq=0 snapshot publish failed for ${friend.share_pub.slice(0, 8)}...: ${err.message}`,
+            `[TarnClient] changeCredentials: NEW-log seq=0 snapshot publish failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
         }
       }
@@ -1130,7 +1139,7 @@ export class TarnClient {
     this.#shareLogCounters.clear();
     this.#readStateCache.clear();
     this.#outboundStateCache.clear();
-    this.#publishedTxidsByFriend.clear();
+    this.#publishedTxidsByConnection.clear();
   }
 
   // ============ DATA CRUD ============
@@ -1398,7 +1407,7 @@ export class TarnClient {
 
   /**
    * Look up a recipient's published X25519 sharing public key by email + this
-   * client's app_id. Used by the friend-handshake bootstrap (Section 5 work)
+   * client's app_id. Used by the connection-handshake bootstrap (Section 5 work)
    * to encrypt-to-pubkey before any pairwise shared secret has been
    * established.
    *
@@ -1446,15 +1455,15 @@ export class TarnClient {
     };
   }
 
-  // ============ FRIEND HANDSHAKE (issue #14, Section 5a) ============
+  // ============ CONNECTION HANDSHAKE (issue #14, Section 5a; issue #18) ============
 
   /**
-   * Send an HPKE-sealed friend request to the named recipient (sharing §6.2).
+   * Send an HPKE-sealed connection request to the named recipient (sharing §6.2).
    *
    * Flow:
    *   1. Look up recipient's `share_pub` via `getRecipientShareKey`. If absent
    *      (pre-#13 account, or non-discoverable), fail with a recognizable
-   *      error so the caller can surface "this person isn't friendable" UX.
+   *      error so the caller can surface "this person isn't connectable" UX.
    *   2. Build the request payload (sender_email, sender_share_pub,
    *      sender_signing_pub, sender_app_id, nonce, timestamp, optional message).
    *   3. HPKE_Seal to the recipient under info "tarn-connection-request-v1".
@@ -1476,13 +1485,13 @@ export class TarnClient {
    *   recipientSharePubBase64Url: string,
    * }>}
    */
-  async sendFriendRequest(recipientEmail, opts = {}) {
+  async sendConnectionRequest(recipientEmail, opts = {}) {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('sendFriendRequest(): no sharing keypair — login as a v4 account first');
+      throw new Error('sendConnectionRequest(): no sharing keypair — login as a v4 account first');
     }
     if (!this.#email) {
-      throw new Error('sendFriendRequest(): client missing sender email — re-login');
+      throw new Error('sendConnectionRequest(): client missing sender email — re-login');
     }
 
     const { sharePub, sharePubBase64Url } = await this.getRecipientShareKey(recipientEmail);
@@ -1491,13 +1500,13 @@ export class TarnClient {
       // recipient doesn't exist, the recipient's account predates #13, or the
       // recipient has set discoverable=false. Surface a single-shape error
       // that callers can match on without knowing which one.
-      const err = new Error('sendFriendRequest(): recipient is not friendable (no share_pub published, or discoverable=false)');
-      err.code = 'RECIPIENT_NOT_FRIENDABLE';
+      const err = new Error('sendConnectionRequest(): recipient is not connectable (no share_pub published, or discoverable=false)');
+      err.code = 'RECIPIENT_NOT_CONNECTABLE';
       throw err;
     }
 
     const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
-    const payload = buildFriendRequestPayload({
+    const payload = buildConnectionRequestPayload({
       senderEmail: this.#email,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
@@ -1507,7 +1516,7 @@ export class TarnClient {
 
     const blob = await hpkeSeal({
       recipientSharePub: sharePub,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       plaintext: new TextEncoder().encode(JSON.stringify(payload)),
     });
 
@@ -1528,7 +1537,7 @@ export class TarnClient {
       },
     });
     if (publishRes.status !== 200) {
-      throw new Error(`sendFriendRequest(): publish failed: ${publishRes.json?.error || publishRes.status}`);
+      throw new Error(`sendConnectionRequest(): publish failed: ${publishRes.json?.error || publishRes.status}`);
     }
 
     // Update outbound pending list. Persist before returning success so a
@@ -1553,7 +1562,7 @@ export class TarnClient {
   }
 
   /**
-   * Poll the inbox for incoming friend requests (sharing §6.3 + §13.8).
+   * Poll the inbox for incoming connection requests (sharing §6.3 + §13.8).
    *
    * Walks the recent N day-windows (default 30, per design), fetches all
    * blobs at each (recipient_inbox_tag, connection-request-v1) tuple, attempts
@@ -1610,7 +1619,7 @@ export class TarnClient {
         try {
           const pt = await hpkeOpen({
             sharePriv: myPriv,
-            info: INFO_FRIEND_REQUEST,
+            info: INFO_CONNECTION_REQUEST,
             blob: blob.ciphertext,
           });
           payload = JSON.parse(new TextDecoder().decode(pt));
@@ -1618,7 +1627,7 @@ export class TarnClient {
           // Not for us, or tampered, or wrong info — silently skip (§6.3).
           continue;
         }
-        const validation = validateFriendRequestPayload(payload, this.#appId);
+        const validation = validateConnectionRequestPayload(payload, this.#appId);
         if (!validation.valid) continue;
 
         // Replay defense (§13.8): in-memory recent-nonce cache.
@@ -1644,7 +1653,7 @@ export class TarnClient {
         }
 
         // Persist into inbound pending so the user can act on it later
-        // (acceptFriendRequest uses this list to find the matching request).
+        // (acceptConnectionRequest uses this list to find the matching request).
         pendingRecord = addInboundPending(pendingRecord, {
           sender_email: validation.normalized.senderEmail,
           sender_share_pub: validation.normalized.senderSharePubBase64Url,
@@ -1676,8 +1685,8 @@ export class TarnClient {
     // Also poll for incoming ACCEPTS while we're at it — Bob's accept lands
     // in Alice's inbox, so Alice's listIncomingRequests is also Alice's
     // accept-poll. This keeps the SDK surface narrow (one polling primitive
-    // per direction was overkill for v1). Returns surfaced friend-requests
-    // only; processed accepts mutate the friends record + pending record
+    // per direction was overkill for v1). Returns surfaced connection-requests
+    // only; processed accepts mutate the connections record + pending record
     // silently.
     await this.#pollAndProcessIncomingAccepts(myPriv, myPub);
 
@@ -1685,22 +1694,22 @@ export class TarnClient {
   }
 
   /**
-   * Accept a previously-received friend request (sharing §6.4).
+   * Accept a previously-received connection request (sharing §6.4).
    *
    * Looks up the inbound pending entry by `requestNonce`, builds an HPKE-
    * sealed accept blob targeted at the original sender's share_pub, and
    * publishes to the sender's inbox tag. On success, the sender is added to
-   * our friends record and the inbound pending entry is removed. The sender
+   * our connections record and the inbound pending entry is removed. The sender
    * sees the accept on their next `listIncomingRequests` poll, which moves
-   * the matching outbound pending into their friends record.
+   * the matching outbound pending into their connections record.
    *
    * @param {string} requestNonce - base64url nonce from the original request
    * @returns {Promise<{ txid: string }>}
    */
-  async acceptFriendRequest(requestNonce) {
+  async acceptConnectionRequest(requestNonce) {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('acceptFriendRequest(): no sharing keypair — login as a v4 account first');
+      throw new Error('acceptConnectionRequest(): no sharing keypair — login as a v4 account first');
     }
     if (typeof requestNonce !== 'string' || requestNonce.length === 0) {
       throw new Error('requestNonce is required');
@@ -1709,18 +1718,18 @@ export class TarnClient {
     const pendingState = await this.#loadPendingRequestsRecord();
     const inbound = pendingState.record.inbound.find(i => i.request_nonce === requestNonce);
     if (!inbound) {
-      throw new Error(`acceptFriendRequest(): no inbound pending request with nonce ${requestNonce}`);
+      throw new Error(`acceptConnectionRequest(): no inbound pending request with nonce ${requestNonce}`);
     }
 
     let senderSharePub;
     try {
       senderSharePub = decodeSharePub(inbound.sender_share_pub);
     } catch (err) {
-      throw new Error(`acceptFriendRequest(): inbound sender_share_pub is invalid: ${err.message}`);
+      throw new Error(`acceptConnectionRequest(): inbound sender_share_pub is invalid: ${err.message}`);
     }
 
     const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
-    const payload = buildFriendAcceptPayload({
+    const payload = buildConnectionAcceptPayload({
       senderEmail: this.#email,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
@@ -1730,7 +1739,7 @@ export class TarnClient {
 
     const blob = await hpkeSeal({
       recipientSharePub: senderSharePub,
-      info: INFO_FRIEND_ACCEPT,
+      info: INFO_CONNECTION_ACCEPT,
       plaintext: new TextEncoder().encode(JSON.stringify(payload)),
     });
 
@@ -1745,29 +1754,29 @@ export class TarnClient {
       },
     });
     if (publishRes.status !== 200) {
-      throw new Error(`acceptFriendRequest(): publish failed: ${publishRes.json?.error || publishRes.status}`);
+      throw new Error(`acceptConnectionRequest(): publish failed: ${publishRes.json?.error || publishRes.status}`);
     }
 
-    // Move inbound → friends. Persist both updates as a (small) sequence:
-    // friends record first (the durable record), then pending second. If the
+    // Move inbound → connections. Persist both updates as a (small) sequence:
+    // connections record first (the durable record), then pending second. If the
     // pending update fails, the user has a duplicate inbound entry but the
-    // friend was added — re-running accept idempotently fixes it (the
-    // friends-record upsertFriend is keyed on share_pub).
-    const friendsState = await this.#loadFriendsRecord();
-    const newFriend = {
+    // connection was added — re-running accept idempotently fixes it (the
+    // connections-record upsertConnection is keyed on share_pub).
+    const connectionsState = await this.#loadConnectionsRecord();
+    const newConnection = {
       email: inbound.sender_email,
       share_pub: inbound.sender_share_pub,
       signing_pub: inbound.sender_signing_pub,
       established_at: payload.timestamp,
       initial_request_nonce: requestNonce,
     };
-    const friendsUpdated = upsertFriend(friendsState.record, newFriend);
-    await this.#saveFriendsRecord(friendsState, friendsUpdated);
+    const connectionsUpdated = upsertConnection(connectionsState.record, newConnection);
+    await this.#saveConnectionsRecord(connectionsState, connectionsUpdated);
 
     const pendingUpdated = removeInboundPending(pendingState.record, requestNonce);
     await this.#savePendingRequestsRecord(pendingState, pendingUpdated);
 
-    // Publish the seq=0 snapshot to our outbound-to-friend log (sharing §6.6).
+    // Publish the seq=0 snapshot to our outbound-to-connection log (sharing §6.6).
     // Default state is empty — apps with "share my full library" semantics
     // should call _publishInitialSnapshot directly with their state, but the
     // platform-layer SDK is app-agnostic so we can't enumerate content here.
@@ -1776,16 +1785,16 @@ export class TarnClient {
     // seq=1+.
     let initialSnapshotTxid = null;
     try {
-      const snap = await this._publishInitialSnapshot(newFriend);
+      const snap = await this._publishInitialSnapshot(newConnection);
       initialSnapshotTxid = snap.txid;
     } catch (err) {
-      // Don't roll back the friend addition if the snapshot publish fails —
-      // the friendship is established (durable in the friends record), and
+      // Don't roll back the connection addition if the snapshot publish fails —
+      // the connectionship is established (durable in the connections record), and
       // the writer can publish later operations at seq=0 on retry. Surface
       // a warning so callers can investigate; the handshake is still useful
-      // for direction-aware reads from the friend's outbound log.
+      // for direction-aware reads from the connection's outbound log.
       console.warn(
-        `[TarnClient] acceptFriendRequest: initial snapshot publish failed: ${err.message}`,
+        `[TarnClient] acceptConnectionRequest: initial snapshot publish failed: ${err.message}`,
       );
     }
 
@@ -1796,7 +1805,7 @@ export class TarnClient {
   }
 
   /**
-   * Read the friends record (sharing §7.1). Returns an empty list for users
+   * Read the connections record (sharing §7.1). Returns an empty list for users
    * who have not completed any handshakes yet.
    *
    * @returns {Promise<Array<{
@@ -1808,10 +1817,10 @@ export class TarnClient {
    *   label?: string,
    * }>>}
    */
-  async listFriends() {
+  async listConnections() {
     await this.#requireAuth();
-    const state = await this.#loadFriendsRecord();
-    return state.record.friends.slice();
+    const state = await this.#loadConnectionsRecord();
+    return state.record.connections.slice();
   }
 
   /**
@@ -1832,26 +1841,26 @@ export class TarnClient {
 
   /**
    * Internal: derive (or fetch from cache) the per-pair keys for a given
-   * friend. Friend is identified by `share_pub` base64url string — that's
-   * the stable identifier in the friends record. Throws if the friend isn't
+   * connection. Connection is identified by `share_pub` base64url string — that's
+   * the stable identifier in the connections record. Throws if the connection isn't
    * recognized; the caller is responsible for ensuring the handshake
-   * completed first (acceptFriendRequest, or sendFriendRequest +
+   * completed first (acceptConnectionRequest, or sendConnectionRequest +
    * listIncomingRequests-processed accept).
    *
    * Caches the derived AES-GCM CryptoKey handles + raw HMAC tag seeds keyed
    * by `share_pub`. Every entry depends on the user's current `share_priv`,
    * so the cache is invalidated wholesale on credential change / recovery.
    */
-  async #getPairKeysFor(friendSharePubBase64Url) {
+  async #getPairKeysFor(connectionSharePubBase64Url) {
     if (!this.#sharingKeyPair) {
       throw new Error('share log: no sharing keypair — login as a v4 account first');
     }
-    if (typeof friendSharePubBase64Url !== 'string' || friendSharePubBase64Url.length === 0) {
-      throw new Error('share log: friendSharePubBase64Url must be a non-empty string');
+    if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
+      throw new Error('share log: connectionSharePubBase64Url must be a non-empty string');
     }
-    const cached = this.#pairKeyCache.get(friendSharePubBase64Url);
+    const cached = this.#pairKeyCache.get(connectionSharePubBase64Url);
     if (cached) return cached;
-    const peerSharePub = decodeSharePub(friendSharePubBase64Url);
+    const peerSharePub = decodeSharePub(connectionSharePubBase64Url);
     const sharedSecret = deriveSharedSecret(this.#sharingKeyPair.privateKey, peerSharePub);
     const keys = await derivePairKeys({
       sharedSecret,
@@ -1860,44 +1869,44 @@ export class TarnClient {
       peerSharePub,
     });
     const entry = { sharedSecret, ...keys };
-    this.#pairKeyCache.set(friendSharePubBase64Url, entry);
+    this.#pairKeyCache.set(connectionSharePubBase64Url, entry);
     return entry;
   }
 
-  #getOrInitCounters(friendSharePubBase64Url) {
-    let counters = this.#shareLogCounters.get(friendSharePubBase64Url);
+  #getOrInitCounters(connectionSharePubBase64Url) {
+    let counters = this.#shareLogCounters.get(connectionSharePubBase64Url);
     if (!counters) {
       counters = {
         nextOutboundSeq: 0,
         nonSnapshotsSinceLastSnapshot: 0,
         compactionInterval: DEFAULT_COMPACTION_INTERVAL,
       };
-      this.#shareLogCounters.set(friendSharePubBase64Url, counters);
+      this.#shareLogCounters.set(connectionSharePubBase64Url, counters);
     }
     return counters;
   }
 
   /**
-   * Look up a friend in the persisted friends record by share_pub. Used by
-   * the share-log helpers to check that we're talking to a real friend (and
+   * Look up a connection in the persisted connections record by share_pub. Used by
+   * the share-log helpers to check that we're talking to a real connection (and
    * to grab the cached `signing_pub` for verification).
    *
    * @returns {Promise<Object | null>}
    */
-  async #findFriendBySharePub(friendSharePubBase64Url) {
-    const friendsState = await this.#loadFriendsRecord();
-    return friendsState.record.friends.find(
-      f => f.share_pub === friendSharePubBase64Url,
+  async #findConnectionBySharePub(connectionSharePubBase64Url) {
+    const connectionsState = await this.#loadConnectionsRecord();
+    return connectionsState.record.connections.find(
+      f => f.share_pub === connectionSharePubBase64Url,
     ) || null;
   }
 
   /**
    * Internal: publish a single signed + encrypted share-log entry to a
-   * friend's outbound log at the writer's next seq.
+   * connection's outbound log at the writer's next seq.
    *
    * Steps (sharing §8.1, §9.1):
    *   1. Resolve pair keys (S_AB, outbound K_AB / T_AB_seed).
-   *   2. Allocate the next outbound seq from the per-friend counter.
+   *   2. Allocate the next outbound seq from the per-connection counter.
    *   3. Build the operation with that seq baked in.
    *   4. Sign with the user's existing ECDSA P-256 signing key.
    *   5. AES-GCM encrypt under outbound K_AB (AAD = "tarn-share-log-v1").
@@ -1921,7 +1930,7 @@ export class TarnClient {
    * against the network-hiccup-then-retry case where we won the race but
    * never observed the response.
    *
-   * @param {Object} friend - friends-record entry (has share_pub, signing_pub)
+   * @param {Object} connection - connections-record entry (has share_pub, signing_pub)
    * @param {{type: string, [key: string]: any}} operationFields - omit `seq`
    * @param {{
    *   skipCompaction?: boolean,
@@ -1938,17 +1947,17 @@ export class TarnClient {
    *   compactionSnapshot?: { seq: number, tag: string, txid: string },
    * }>}
    */
-  async _publishShareLogEntry(friend, operationFields, opts = {}) {
+  async _publishShareLogEntry(connection, operationFields, opts = {}) {
     await this.#requireAuth();
-    if (!friend || typeof friend.share_pub !== 'string') {
-      throw new Error('_publishShareLogEntry: friend.share_pub is required');
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('_publishShareLogEntry: connection.share_pub is required');
     }
     if (!operationFields || typeof operationFields !== 'object') {
       throw new Error('_publishShareLogEntry: operationFields is required');
     }
 
-    const pair = await this.#getPairKeysFor(friend.share_pub);
-    const counters = this.#getOrInitCounters(friend.share_pub);
+    const pair = await this.#getPairKeysFor(connection.share_pub);
+    const counters = this.#getOrInitCounters(connection.share_pub);
     const retryOn409 = opts.retryOn409 === true;
     const maxRetries = Number.isInteger(opts.maxRetries) && opts.maxRetries > 0
       ? opts.maxRetries
@@ -1978,7 +1987,7 @@ export class TarnClient {
         // Network-hiccup-retry detection: if the winner txid is one this
         // session published, we *are* the winner — succeed with the known
         // txid rather than republishing the same op at the next seq.
-        const ourTxids = this.#publishedTxidsByFriend.get(friend.share_pub);
+        const ourTxids = this.#publishedTxidsByConnection.get(connection.share_pub);
         if (err.existingTxid && ourTxids?.has(err.existingTxid)) {
           // Advance the counter past the conflicting seq so subsequent
           // publishes don't re-collide with the same already-won slot.
@@ -1997,7 +2006,7 @@ export class TarnClient {
         if (attempts > maxRetries) {
           throw new Error(
             `_publishShareLogEntry: exceeded ${maxRetries} retries for ${operation.type} ` +
-            `to ${friend.share_pub.slice(0, 8)}... — last conflict at seq=${seq} ` +
+            `to ${connection.share_pub.slice(0, 8)}... — last conflict at seq=${seq} ` +
             `(winner txid=${err.existingTxid ?? 'unknown'})`,
           );
         }
@@ -2026,7 +2035,7 @@ export class TarnClient {
     }
 
     // Track the txid for own-publish detection on subsequent retries.
-    this.#recordPublishedTxid(friend.share_pub, txid);
+    this.#recordPublishedTxid(connection.share_pub, txid);
 
     let compactionSnapshot;
     if (
@@ -2049,8 +2058,8 @@ export class TarnClient {
       if (opts.snapshotState !== undefined) {
         snapshotState = opts.snapshotState;
       } else {
-        await this.#hydrateOutboundState(friend);
-        snapshotState = this.#tentativeOutboundState(friend);
+        await this.#hydrateOutboundState(connection);
+        snapshotState = this.#tentativeOutboundState(connection);
         applyOperationToState(snapshotState, { ...operationFields, seq });
       }
       const snapshotFields = {
@@ -2060,13 +2069,13 @@ export class TarnClient {
         prior_seq: seq,
       };
       const snap = await this._publishShareLogEntry(
-        friend, snapshotFields,
+        connection, snapshotFields,
         { skipCompaction: true, retryOn409, maxRetries, snapshotState },
       );
       compactionSnapshot = { seq: snap.seq, tag: snap.tag, txid: snap.txid };
       // Commit the snapshot state into the outbound cache so subsequent
       // operations don't re-hydrate redundantly.
-      this.#commitOutboundState(friend, snapshotState);
+      this.#commitOutboundState(connection, snapshotState);
     }
 
     const out = { seq, tag, txid };
@@ -2078,10 +2087,10 @@ export class TarnClient {
 
   #recordPublishedTxid(sharePub, txid) {
     if (!txid) return;
-    let set = this.#publishedTxidsByFriend.get(sharePub);
+    let set = this.#publishedTxidsByConnection.get(sharePub);
     if (!set) {
       set = new Set();
-      this.#publishedTxidsByFriend.set(sharePub, set);
+      this.#publishedTxidsByConnection.set(sharePub, set);
     }
     set.add(txid);
   }
@@ -2100,7 +2109,7 @@ export class TarnClient {
 
   /**
    * Discover the current highest outbound seq (the seq slot of the most
-   * recent entry on our outbound-to-friend log). Used during multi-device
+   * recent entry on our outbound-to-connection log). Used during multi-device
    * 409 retry (§13.1) to find where the winner landed without per-pair
    * prefix queries (§9.2).
    *
@@ -2115,33 +2124,33 @@ export class TarnClient {
   }
 
   /**
-   * Internal: fetch a single share-log entry by seq from a friend's outbound
+   * Internal: fetch a single share-log entry by seq from a connection's outbound
    * log (the inbound direction from our perspective). Decrypts with the
-   * inbound K_AB, verifies the sender's ECDSA signature against the friend's
+   * inbound K_AB, verifies the sender's ECDSA signature against the connection's
    * cached `signing_pub`, and returns the parsed signed operation.
    *
    * Single-entry fetch only — full state-machine read is 5c.
    *
-   * @param {Object} friend - friends-record entry (has share_pub, signing_pub)
+   * @param {Object} connection - connections-record entry (has share_pub, signing_pub)
    * @param {number} seq
    * @returns {Promise<{
    *   txid: string,
    *   tag: string,
    *   operation: Object,            // operation_signed (with `signature` field)
-   *   verified: boolean,            // ECDSA verify result vs. friend.signing_pub
+   *   verified: boolean,            // ECDSA verify result vs. connection.signing_pub
    *   publishedAt: number | null,
    * } | null>}
    */
-  async _fetchShareLogEntry(friend, seq) {
+  async _fetchShareLogEntry(connection, seq) {
     await this.#requireAuth();
-    if (!friend || typeof friend.share_pub !== 'string') {
-      throw new Error('_fetchShareLogEntry: friend.share_pub is required');
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('_fetchShareLogEntry: connection.share_pub is required');
     }
-    if (typeof friend.signing_pub !== 'string') {
-      throw new Error('_fetchShareLogEntry: friend.signing_pub is required');
+    if (typeof connection.signing_pub !== 'string') {
+      throw new Error('_fetchShareLogEntry: connection.signing_pub is required');
     }
 
-    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const pair = await this.#getPairKeysFor(connection.share_pub);
     const tag = await deriveLogTag(pair.inboundTagSeed, seq);
     const fetched = await this.#getShareLogBlobByTag(tag);
     if (!fetched) return null;
@@ -2152,7 +2161,7 @@ export class TarnClient {
     } catch (err) {
       throw new Error(`_fetchShareLogEntry: decrypt failed at seq ${seq}: ${err.message}`);
     }
-    const verified = await verifyOperationSignature(operation, friend.signing_pub);
+    const verified = await verifyOperationSignature(operation, connection.signing_pub);
 
     return {
       txid: fetched.txid,
@@ -2164,7 +2173,7 @@ export class TarnClient {
   }
 
   /**
-   * Internal: publish a seq=0 snapshot to a freshly-friended outbound log
+   * Internal: publish a seq=0 snapshot to a freshly-connected outbound log
    * (sharing §6.6). Default: empty snapshot (a no-op bootstrap point). Apps
    * that want "Bob sees Alice's current full library" pass `state` explicitly
    * — Tarn's SDK is app-agnostic, so the platform layer doesn't know what
@@ -2174,12 +2183,12 @@ export class TarnClient {
    * surface stays predictable for 5c/5d. Apps will call higher-level
    * methods once those land.
    *
-   * @param {Object} friend
+   * @param {Object} connection
    * @param {{ state?: Object }} [opts]
    */
-  async _publishInitialSnapshot(friend, opts = {}) {
+  async _publishInitialSnapshot(connection, opts = {}) {
     const state = opts.state ?? {};
-    const result = await this._publishShareLogEntry(friend, {
+    const result = await this._publishShareLogEntry(connection, {
       type: OP_SNAPSHOT,
       state,
       snapshot_at: Math.floor(Date.now() / 1000),
@@ -2187,7 +2196,7 @@ export class TarnClient {
     });
     // Seed the outbound state cache so subsequent shareContent / etc. emit
     // meaningful auto-snapshots without re-reading the log.
-    this.#outboundStateCache.set(friend.share_pub, {
+    this.#outboundStateCache.set(connection.share_pub, {
       state: { ...state },
       hydrated: true,
     });
@@ -2197,13 +2206,13 @@ export class TarnClient {
   // ============ SHARE LOG — READ FLOW (issue #16, Section 5c) ============
 
   /**
-   * Read a friend's outbound share log and reconstruct the full state
+   * Read a connection's outbound share log and reconstruct the full state
    * (sharing §8.5 bootstrap). Walks back from the highest seq to the most
    * recent `snapshot` (or seq=0 if none), then walks forward applying each
    * subsequent operation per the §8.4 idempotency rules.
    *
    * Returns the resulting `{ content_id: { tx_id, cek } }` map. The map is
-   * also cached per-friend per-device so {@link syncShareLog} can apply
+   * also cached per-connection per-device so {@link syncShareLog} can apply
    * incremental updates without re-walking history.
    *
    * Highest-seq discovery is logarithmic (§9.2): O(log N) tag fetches for a
@@ -2214,26 +2223,26 @@ export class TarnClient {
    * warnings and skipped; the state machine continues with the next entry
    * (sharing §13.3).
    *
-   * @param {{ share_pub: string, signing_pub: string }} friend - friends-record entry
+   * @param {{ share_pub: string, signing_pub: string }} connection - connections-record entry
    * @param {{
    *   refresh?: boolean,                       // ignore cache (default: false)
    * }} [opts]
    * @returns {Promise<Object>} state map: `{ [content_id]: { tx_id, cek } }`
    */
-  async readShareLog(friend, opts = {}) {
+  async readShareLog(connection, opts = {}) {
     await this.#requireAuth();
-    if (!friend || typeof friend.share_pub !== 'string') {
-      throw new Error('readShareLog(): friend.share_pub is required');
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('readShareLog(): connection.share_pub is required');
     }
-    if (typeof friend.signing_pub !== 'string') {
-      throw new Error('readShareLog(): friend.signing_pub is required');
+    if (typeof connection.signing_pub !== 'string') {
+      throw new Error('readShareLog(): connection.signing_pub is required');
     }
     if (!opts.refresh) {
-      const cached = this.#readStateCache.get(friend.share_pub);
+      const cached = this.#readStateCache.get(connection.share_pub);
       if (cached) return { ...cached.state };
     }
 
-    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const pair = await this.#getPairKeysFor(connection.share_pub);
 
     // §9.2 highest-seq discovery, anchored at seq=0 so the result is
     // unambiguous: -1 means truly empty (no entries at all), 0 means only
@@ -2247,7 +2256,7 @@ export class TarnClient {
     if (highestSeq < 0) {
       // Truly empty log — no entries at all. Cache the empty state so
       // syncShareLog can incrementally pick up future entries.
-      this.#readStateCache.set(friend.share_pub, {
+      this.#readStateCache.set(connection.share_pub, {
         state: {},
         lastSeqSeen: -1,
       });
@@ -2261,7 +2270,7 @@ export class TarnClient {
     let snapshotSeq = -1;
     let snapshotPayload = null;
     for (let seq = highestSeq; seq >= 0; seq--) {
-      const entry = await this._fetchShareLogEntry(friend, seq);
+      const entry = await this._fetchShareLogEntry(connection, seq);
       if (!entry) {
         // Gap in the dense log — should not occur in normal flow. Continue
         // walking back; the §8.4 rules will keep state consistent if some
@@ -2270,7 +2279,7 @@ export class TarnClient {
       }
       if (!entry.verified) {
         console.warn(
-          `[TarnClient] readShareLog: skipping unverifiable entry from ${friend.share_pub.slice(0, 8)}... at seq=${seq}`,
+          `[TarnClient] readShareLog: skipping unverifiable entry from ${connection.share_pub.slice(0, 8)}... at seq=${seq}`,
         );
         continue;
       }
@@ -2297,32 +2306,32 @@ export class TarnClient {
 
     let lastApplied = snapshotSeq;
     for (let seq = cursorSeq; seq <= highestSeq; seq++) {
-      const entry = await this._fetchShareLogEntry(friend, seq);
+      const entry = await this._fetchShareLogEntry(connection, seq);
       if (!entry) continue;
       if (!entry.verified) {
         console.warn(
-          `[TarnClient] readShareLog: skipping unverifiable entry from ${friend.share_pub.slice(0, 8)}... at seq=${seq}`,
+          `[TarnClient] readShareLog: skipping unverifiable entry from ${connection.share_pub.slice(0, 8)}... at seq=${seq}`,
         );
         continue;
       }
       // §13.5: rotate_identity is a TERMINAL entry on the OLD log. Once we
-      // see it (with a valid signature under the friend's currently-cached
+      // see it (with a valid signature under the connection's currently-cached
       // signing_pub, i.e., the OLD signing_pub from the rotating party's
-      // perspective), update the friend record and re-bootstrap on the
+      // perspective), update the connection record and re-bootstrap on the
       // NEW log. Any further entries on the OLD log past this point are
       // forgeries or stale duplicates and must be ignored.
       if (entry.operation.type === OP_ROTATE_IDENTITY) {
-        const updatedFriend = await this.#processRotateIdentityEntry(friend, entry.operation);
+        const updatedConnection = await this.#processRotateIdentityEntry(connection, entry.operation);
         // Re-bootstrap on the NEW log. The NEW log starts at seq=0 with a
         // fresh snapshot from the rotating party (sharing §13.5 step 8),
         // so a `refresh: true` read produces a defensible final state.
-        return await this.readShareLog(updatedFriend, { refresh: true });
+        return await this.readShareLog(updatedConnection, { refresh: true });
       }
       applyOperationToState(state, entry.operation);
       lastApplied = seq;
     }
 
-    this.#readStateCache.set(friend.share_pub, {
+    this.#readStateCache.set(connection.share_pub, {
       state: { ...state },
       lastSeqSeen: Math.max(highestSeq, lastApplied, -1),
     });
@@ -2330,28 +2339,28 @@ export class TarnClient {
   }
 
   /**
-   * Incrementally sync a friend's outbound log: apply any new entries past
+   * Incrementally sync a connection's outbound log: apply any new entries past
    * the cached `lastSeqSeen` (sharing §8.5 incremental sync). If no cache
    * exists yet (cold start), this performs a full {@link readShareLog}
    * bootstrap.
    *
-   * @param {{ share_pub: string, signing_pub: string }} friend
+   * @param {{ share_pub: string, signing_pub: string }} connection
    * @returns {Promise<Object>} updated state map
    */
-  async syncShareLog(friend) {
+  async syncShareLog(connection) {
     await this.#requireAuth();
-    if (!friend || typeof friend.share_pub !== 'string') {
-      throw new Error('syncShareLog(): friend.share_pub is required');
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('syncShareLog(): connection.share_pub is required');
     }
-    if (typeof friend.signing_pub !== 'string') {
-      throw new Error('syncShareLog(): friend.signing_pub is required');
+    if (typeof connection.signing_pub !== 'string') {
+      throw new Error('syncShareLog(): connection.signing_pub is required');
     }
-    const cached = this.#readStateCache.get(friend.share_pub);
+    const cached = this.#readStateCache.get(connection.share_pub);
     if (!cached) {
-      return await this.readShareLog(friend);
+      return await this.readShareLog(connection);
     }
 
-    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const pair = await this.#getPairKeysFor(connection.share_pub);
     const { highestSeq } = await discoverHighestSeq({
       probe: (seq) => this.#probeInboundTagExists(pair, seq),
       anchor: cached.lastSeqSeen + 1,
@@ -2364,11 +2373,11 @@ export class TarnClient {
     const state = { ...cached.state };
     let lastApplied = cached.lastSeqSeen;
     for (let seq = cached.lastSeqSeen + 1; seq <= highestSeq; seq++) {
-      const entry = await this._fetchShareLogEntry(friend, seq);
+      const entry = await this._fetchShareLogEntry(connection, seq);
       if (!entry) continue;
       if (!entry.verified) {
         console.warn(
-          `[TarnClient] syncShareLog: skipping unverifiable entry from ${friend.share_pub.slice(0, 8)}... at seq=${seq}`,
+          `[TarnClient] syncShareLog: skipping unverifiable entry from ${connection.share_pub.slice(0, 8)}... at seq=${seq}`,
         );
         lastApplied = seq;
         continue;
@@ -2376,14 +2385,14 @@ export class TarnClient {
       if (entry.operation.type === OP_ROTATE_IDENTITY) {
         // §13.5: terminal entry on OLD log → process rotation, switch to
         // NEW log. Any further entries on the OLD log are ignored.
-        const updatedFriend = await this.#processRotateIdentityEntry(friend, entry.operation);
-        return await this.readShareLog(updatedFriend, { refresh: true });
+        const updatedConnection = await this.#processRotateIdentityEntry(connection, entry.operation);
+        return await this.readShareLog(updatedConnection, { refresh: true });
       }
       applyOperationToState(state, entry.operation);
       lastApplied = seq;
     }
 
-    this.#readStateCache.set(friend.share_pub, {
+    this.#readStateCache.set(connection.share_pub, {
       state: { ...state },
       lastSeqSeen: Math.max(highestSeq, lastApplied),
     });
@@ -2402,12 +2411,12 @@ export class TarnClient {
   }
 
   /**
-   * Test-only: peek at the read-state cache for a friend. Returns null if
+   * Test-only: peek at the read-state cache for a connection. Returns null if
    * no entry. Production code should not depend on this — it exists for
    * tests asserting cache-hit semantics.
    */
-  _peekReadStateCache(friendSharePubBase64Url) {
-    const e = this.#readStateCache.get(friendSharePubBase64Url);
+  _peekReadStateCache(connectionSharePubBase64Url) {
+    const e = this.#readStateCache.get(connectionSharePubBase64Url);
     if (!e) return null;
     return { state: { ...e.state }, lastSeqSeen: e.lastSeqSeen };
   }
@@ -2415,7 +2424,7 @@ export class TarnClient {
   // ============ SHARE LOG — HIGH-LEVEL WRITE METHODS (Section 5c) ============
 
   /**
-   * High-level: share a content item with a friend (sharing §8.3.1). Composes
+   * High-level: share a content item with a connection (sharing §8.3.1). Composes
    * 5b's `_publishShareLogEntry` primitive with 5c's multi-device retry
    * (§13.1). On a 409 from a sibling-device concurrent publish, the retry
    * loop re-runs highest-seq discovery, advances the counter, re-signs the
@@ -2423,75 +2432,75 @@ export class TarnClient {
    * input per §8.1), and republishes. Up to 5 retries before surfacing the
    * failure.
    *
-   * Tracks the outbound state per friend so any auto-compaction snapshot
+   * Tracks the outbound state per connection so any auto-compaction snapshot
    * (§8.6) emits a meaningful state map rather than the empty-state default
    * — an empty snapshot is NOT a no-op (§8.3.5) and would wipe the
    * recipient's view of what we've shared.
    *
-   * @param {{ share_pub: string, signing_pub: string }} friend
+   * @param {{ share_pub: string, signing_pub: string }} connection
    * @param {string} contentId - app-stable content id (e.g., book id)
    * @param {string} txId - Arweave transaction id of the latest content blob
    * @param {string} cekBase64Url - 32-byte content encryption key, base64url
    * @returns {Promise<{ seq: number, tag: string, txid: string, retried?: number }>}
    */
-  async shareContent(friend, contentId, txId, cekBase64Url) {
-    await this.#hydrateOutboundState(friend);
-    const tentative = this.#tentativeOutboundState(friend);
+  async shareContent(connection, contentId, txId, cekBase64Url) {
+    await this.#hydrateOutboundState(connection);
+    const tentative = this.#tentativeOutboundState(connection);
     tentative[contentId] = { tx_id: txId, cek: cekBase64Url };
-    const result = await this._publishShareLogEntry(friend, {
+    const result = await this._publishShareLogEntry(connection, {
       type: OP_ADD,
       content_id: contentId,
       tx_id: txId,
       cek: cekBase64Url,
       shared_at: Math.floor(Date.now() / 1000),
     }, { retryOn409: true, snapshotState: tentative });
-    this.#commitOutboundState(friend, tentative);
+    this.#commitOutboundState(connection, tentative);
     return result;
   }
 
   /**
-   * High-level: notify a friend that a shared content item has a new
+   * High-level: notify a connection that a shared content item has a new
    * Arweave version (sharing §8.3.2). CEK is unchanged. Uses the same 409
    * retry semantics as {@link shareContent}.
    */
-  async updateShareContent(friend, contentId, newTxId) {
-    await this.#hydrateOutboundState(friend);
-    const tentative = this.#tentativeOutboundState(friend);
+  async updateShareContent(connection, contentId, newTxId) {
+    await this.#hydrateOutboundState(connection);
+    const tentative = this.#tentativeOutboundState(connection);
     if (tentative[contentId]) {
       tentative[contentId] = { tx_id: newTxId, cek: tentative[contentId].cek };
     }
-    const result = await this._publishShareLogEntry(friend, {
+    const result = await this._publishShareLogEntry(connection, {
       type: OP_UPDATE,
       content_id: contentId,
       tx_id: newTxId,
       updated_at: Math.floor(Date.now() / 1000),
     }, { retryOn409: true, snapshotState: tentative });
-    this.#commitOutboundState(friend, tentative);
+    this.#commitOutboundState(connection, tentative);
     return result;
   }
 
   /**
-   * High-level: revoke a content item from a friend's view (sharing §8.3.4
+   * High-level: revoke a content item from a connection's view (sharing §8.3.4
    * `remove`). Note this is a UI hint per the design — the recipient may
    * have cached prior versions locally, and `remove` does not retract those.
    * For cryptographic revocation, use a `rotate` (5d) instead.
    */
-  async unshareContent(friend, contentId) {
-    await this.#hydrateOutboundState(friend);
-    const tentative = this.#tentativeOutboundState(friend);
+  async unshareContent(connection, contentId) {
+    await this.#hydrateOutboundState(connection);
+    const tentative = this.#tentativeOutboundState(connection);
     delete tentative[contentId];
-    const result = await this._publishShareLogEntry(friend, {
+    const result = await this._publishShareLogEntry(connection, {
       type: OP_REMOVE,
       content_id: contentId,
       removed_at: Math.floor(Date.now() / 1000),
     }, { retryOn409: true, snapshotState: tentative });
-    this.#commitOutboundState(friend, tentative);
+    this.#commitOutboundState(connection, tentative);
     return result;
   }
 
   /**
    * High-level: explicitly publish a snapshot capturing the current outbound
-   * state to a friend (sharing §8.3.5 / §8.6). Apps can call this to bound
+   * state to a connection (sharing §8.3.5 / §8.6). Apps can call this to bound
    * the bootstrap cost for new readers, or after a batch of mutations to
    * checkpoint.
    *
@@ -2499,94 +2508,94 @@ export class TarnClient {
    * lazy hydration + accumulated shareContent / updateShareContent /
    * unshareContent updates from this session).
    *
-   * @param {{ share_pub: string, signing_pub: string }} friend
+   * @param {{ share_pub: string, signing_pub: string }} connection
    * @param {Object | undefined} [state] - optional explicit override
    * @returns {Promise<{ seq: number, tag: string, txid: string }>}
    */
-  async snapshotShareLog(friend, state) {
+  async snapshotShareLog(connection, state) {
     if (state === undefined) {
-      await this.#hydrateOutboundState(friend);
-      state = this.#tentativeOutboundState(friend);
+      await this.#hydrateOutboundState(connection);
+      state = this.#tentativeOutboundState(connection);
     } else if (!state || typeof state !== 'object' || Array.isArray(state)) {
       throw new Error('snapshotShareLog(): state must be an object');
     }
-    const counters = this.#getOrInitCounters(friend.share_pub);
-    const result = await this._publishShareLogEntry(friend, {
+    const counters = this.#getOrInitCounters(connection.share_pub);
+    const result = await this._publishShareLogEntry(connection, {
       type: OP_SNAPSHOT,
       state,
       snapshot_at: Math.floor(Date.now() / 1000),
       prior_seq: counters.nextOutboundSeq > 0 ? counters.nextOutboundSeq - 1 : null,
     }, { retryOn409: true, snapshotState: state });
-    this.#commitOutboundState(friend, state);
+    this.#commitOutboundState(connection, state);
     return result;
   }
 
   // ============ REVOCATION (issue #17, Section 5d, sharing §10) ============
 
   /**
-   * Unfriend (sharing §10.1). Removes the friend from the persisted friends
-   * record; subsequent share-log writes to that friend stop, and the read
-   * flow stops surfacing their outbound updates. Per-friend caches are
-   * cleared so a subsequent re-friend (§13.7) starts clean.
+   * RemoveConnection (sharing §10.1). Removes the connection from the persisted connections
+   * record; subsequent share-log writes to that connection stop, and the read
+   * flow stops surfacing their outbound updates. Per-connection caches are
+   * cleared so a subsequent re-connection (§13.7) starts clean.
    *
-   * **Direction-aware**: this is one-side. The unfriended party receives no
+   * **Direction-aware**: this is one-side. The removeConnectioned party receives no
    * cryptographic signal — they may infer from sustained inactivity, or via
-   * an app-level UX cue ("no recent activity from this friend"). Mutual
-   * unfriending requires both sides to call `unfriend` independently.
+   * an app-level UX cue ("no recent activity from this connection"). Mutual
+   * Mutual removal requires both sides to call `removeConnection` independently.
    *
    * **Optional courtesy** (`{ notify: true }`): before stopping further
-   * publication, publishes a final `remove` operation to the friend's
+   * publication, publishes a final `remove` operation to the connection's
    * outbound log for every content_id we were currently sharing with them.
    * This is a UI signal to the recipient, NOT a cryptographic enforcement.
    * The recipient may have cached prior versions locally; `remove` does not
-   * retract those. Use {@link revokeContentForFriends} for cryptographic
-   * revocation (CEK rotation) of remaining friends' access.
+   * retract those. Use {@link revokeContentFromConnections} for cryptographic
+   * revocation (CEK rotation) of remaining connections' access.
    *
-   * @param {{ share_pub: string }} friend
+   * @param {{ share_pub: string }} connection
    * @param {{ notify?: boolean }} [opts]
    * @returns {Promise<{
    *   removed: boolean,
    *   notifications?: Array<{ content_id: string, seq: number, txid: string }>,
    * }>}
    */
-  async unfriend(friend, opts = {}) {
+  async removeConnection(connection, opts = {}) {
     await this.#requireAuth();
-    if (!friend || typeof friend.share_pub !== 'string') {
-      throw new Error('unfriend(): friend.share_pub is required');
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('removeConnection(): connection.share_pub is required');
     }
 
-    const friendsState = await this.#loadFriendsRecord();
-    const present = friendsState.record.friends.some(f => f.share_pub === friend.share_pub);
+    const connectionsState = await this.#loadConnectionsRecord();
+    const present = connectionsState.record.connections.some(f => f.share_pub === connection.share_pub);
     if (!present) {
-      this.#clearFriendCaches(friend.share_pub);
+      this.#clearConnectionCaches(connection.share_pub);
       return { removed: false };
     }
 
     let notifications;
     if (opts.notify === true) {
       // Courtesy: publish a final `remove` per content_id we're currently
-      // sharing with this friend. We need the outbound state to enumerate
+      // sharing with this connection. We need the outbound state to enumerate
       // the content_ids — hydrate from the existing log if not cached.
-      const fullFriend = friendsState.record.friends.find(f => f.share_pub === friend.share_pub) || friend;
+      const fullConnection = connectionsState.record.connections.find(f => f.share_pub === connection.share_pub) || connection;
       try {
-        await this.#hydrateOutboundState(fullFriend);
+        await this.#hydrateOutboundState(fullConnection);
       } catch (err) {
         // If hydration fails (e.g., transient API error), still proceed with
-        // the unfriend — the friend record removal is the durable signal.
-        console.warn(`[TarnClient] unfriend(notify): hydrate outbound state failed: ${err.message}`);
+        // the removeConnection — the connection record removal is the durable signal.
+        console.warn(`[TarnClient] removeConnection(notify): hydrate outbound state failed: ${err.message}`);
       }
-      const tentative = this.#tentativeOutboundState(fullFriend);
+      const tentative = this.#tentativeOutboundState(fullConnection);
       const contentIds = Object.keys(tentative);
       notifications = [];
       for (const contentId of contentIds) {
         try {
-          const res = await this._publishShareLogEntry(fullFriend, {
+          const res = await this._publishShareLogEntry(fullConnection, {
             type: OP_REMOVE,
             content_id: contentId,
             removed_at: Math.floor(Date.now() / 1000),
           }, {
             retryOn409: true,
-            // After this loop we drop all outbound state for this friend; the
+            // After this loop we drop all outbound state for this connection; the
             // tentative snapshotState reflects the running removal so any
             // mid-loop auto-compaction snapshot doesn't re-include items
             // we've already removed.
@@ -2595,62 +2604,62 @@ export class TarnClient {
           delete tentative[contentId];
           notifications.push({ content_id: contentId, seq: res.seq, txid: res.txid });
         } catch (err) {
-          // Best-effort: log + continue. The friend record removal still
+          // Best-effort: log + continue. The connection record removal still
           // happens below.
-          console.warn(`[TarnClient] unfriend(notify): remove ${contentId} failed: ${err.message}`);
+          console.warn(`[TarnClient] removeConnection(notify): remove ${contentId} failed: ${err.message}`);
         }
       }
     }
 
-    const updated = removeFriend(friendsState.record, friend.share_pub);
-    await this.#saveFriendsRecord(friendsState, updated);
-    this.#clearFriendCaches(friend.share_pub);
+    const updated = removeConnection(connectionsState.record, connection.share_pub);
+    await this.#saveConnectionsRecord(connectionsState, updated);
+    this.#clearConnectionCaches(connection.share_pub);
 
     return notifications ? { removed: true, notifications } : { removed: true };
   }
 
   /**
-   * Rotate the CEK for a content_id and announce it to all remaining friends
+   * Rotate the CEK for a content_id and announce it to all remaining connections
    * with access (sharing §10.3). Going-forward only: old versions of the
    * content (encrypted under the OLD CEK) remain decryptable to anyone who
    * already has them; the new CEK is required for future versions.
    *
    * Apps drive this when a content item should become inaccessible to a
-   * just-unfriended party (or to bound side-channel risk per §10.2). The
-   * SDK fans out a signed `rotate` operation to every friend currently
+   * just-removeConnectioned party (or to bound side-channel risk per §10.2). The
+   * SDK fans out a signed `rotate` operation to every connection currently
    * sharing this content_id; the next published version of the content
    * blob (per the per-content CEK pattern from #11) wraps the new CEK
    * under the user's DEK. Apps are responsible for re-encrypting and
    * publishing the next content version under the new CEK — Tarn's SDK
    * is app-agnostic, so it returns the new CEK for the caller to use.
    *
-   * Cost: O(remaining_friends_with_access) signed log entries per content
-   * item rotated. Practical for typical Bookish-class friend counts.
+   * Cost: O(remaining_connections_with_access) signed log entries per content
+   * item rotated. Practical for typical Bookish-class connection counts.
    *
    * @param {string} contentId - app-stable content id (e.g., book id)
-   * @param {{ friends?: Array<{share_pub: string}> }} [opts] - explicit
-   *   friend list override; defaults to the current friends record. Apps
-   *   that just unfriended Bob should call `unfriend(bob)` first, then
-   *   `revokeContentForFriends(bookId)` — the friends record already excludes
+   * @param {{ connections?: Array<{share_pub: string}> }} [opts] - explicit
+   *   connection list override; defaults to the current connections record. Apps
+   *   that just removeConnectioned Bob should call `removeConnection(bob)` first, then
+   *   `revokeContentFromConnections(bookId)` — the connections record already excludes
    *   Bob by then.
    * @returns {Promise<{
    *   newCekBase64Url: string,
-   *   announcements: Array<{ friendSharePub: string, seq: number, txid: string }>,
-   *   skipped: Array<{ friendSharePub: string, reason: string }>,
+   *   announcements: Array<{ connectionSharePub: string, seq: number, txid: string }>,
+   *   skipped: Array<{ connectionSharePub: string, reason: string }>,
    * }>}
    */
-  async revokeContentForFriends(contentId, opts = {}) {
+  async revokeContentFromConnections(contentId, opts = {}) {
     await this.#requireAuth();
     if (typeof contentId !== 'string' || contentId.length === 0) {
-      throw new Error('revokeContentForFriends(): contentId is required');
+      throw new Error('revokeContentFromConnections(): contentId is required');
     }
 
-    let friends;
-    if (Array.isArray(opts.friends)) {
-      friends = opts.friends;
+    let connections;
+    if (Array.isArray(opts.connections)) {
+      connections = opts.connections;
     } else {
-      const friendsState = await this.#loadFriendsRecord();
-      friends = friendsState.record.friends;
+      const connectionsState = await this.#loadConnectionsRecord();
+      connections = connectionsState.record.connections;
     }
 
     // Generate a fresh 32-byte CEK. AES-KW unwrapped form lives client-side;
@@ -2661,34 +2670,34 @@ export class TarnClient {
 
     const announcements = [];
     const skipped = [];
-    for (const friend of friends) {
-      // Hydrate so we know whether this friend currently has access. A friend
+    for (const connection of connections) {
+      // Hydrate so we know whether this connection currently has access. A connection
       // not currently sharing this content_id gets skipped — emitting a rotate
       // for them is wasted log space (and per §8.4 idempotency, recipients
       // would log a warning and ignore it anyway).
       try {
-        await this.#hydrateOutboundState(friend);
+        await this.#hydrateOutboundState(connection);
       } catch (err) {
-        skipped.push({ friendSharePub: friend.share_pub, reason: `hydrate failed: ${err.message}` });
+        skipped.push({ connectionSharePub: connection.share_pub, reason: `hydrate failed: ${err.message}` });
         continue;
       }
-      const tentative = this.#tentativeOutboundState(friend);
+      const tentative = this.#tentativeOutboundState(connection);
       if (!tentative[contentId]) {
-        skipped.push({ friendSharePub: friend.share_pub, reason: 'not currently sharing' });
+        skipped.push({ connectionSharePub: connection.share_pub, reason: 'not currently sharing' });
         continue;
       }
       tentative[contentId] = { tx_id: tentative[contentId].tx_id, cek: newCekBase64Url };
       try {
-        const res = await this._publishShareLogEntry(friend, {
+        const res = await this._publishShareLogEntry(connection, {
           type: OP_ROTATE,
           content_id: contentId,
           cek: newCekBase64Url,
           rotated_at: rotatedAt,
         }, { retryOn409: true, snapshotState: tentative });
-        this.#commitOutboundState(friend, tentative);
-        announcements.push({ friendSharePub: friend.share_pub, seq: res.seq, txid: res.txid });
+        this.#commitOutboundState(connection, tentative);
+        announcements.push({ connectionSharePub: connection.share_pub, seq: res.seq, txid: res.txid });
       } catch (err) {
-        skipped.push({ friendSharePub: friend.share_pub, reason: err.message });
+        skipped.push({ connectionSharePub: connection.share_pub, reason: err.message });
       }
     }
 
@@ -2698,13 +2707,13 @@ export class TarnClient {
   // ============ IDENTITY ROTATION (issue #17, Section 5d, sharing §13.5) ============
 
   /**
-   * Publish a `rotate_identity` announcement to every friend's OLD outbound
+   * Publish a `rotate_identity` announcement to every connection's OLD outbound
    * log (sharing §13.5). Called by `changeCredentials` and `recoverAccount`
    * AFTER the new credential blob is published but BEFORE the local key
    * material is swapped to the new identity.
    *
    * Invariants the caller must uphold:
-   *   - `oldSharingKeyPair`, `oldSigningKeyPair`, `oldFriendsRecord` reflect
+   *   - `oldSharingKeyPair`, `oldSigningKeyPair`, `oldConnectionsRecord` reflect
    *     the pre-rotation state.
    *   - `this.#sharingKeyPair`, `this.#signingKeyPair`, `this.#pairKeyCache`
    *     all still hold OLD values (we read them via the pair-key cache to
@@ -2713,52 +2722,52 @@ export class TarnClient {
    *     re-fetches Alice's blob mid-rotation sees the NEW pubkeys
    *     (the durable indicator of in-flight rotation per §13.5).
    *
-   * Race handling: each per-friend publish uses 5c's `retryOn409` retry. If a
+   * Race handling: each per-connection publish uses 5c's `retryOn409` retry. If a
    * stale-device concurrent publish lands at `seq_max_old + 1` first, the
    * retry path advances past it and lands the rotation at `seq_max_old + 2`.
    * Recipients walking forward see the rotation in order; any further
    * entries on the OLD log after rotation are ignored per §13.5.
    *
-   * Best-effort across friends: a per-friend failure is logged and the
+   * Best-effort across connections: a per-connection failure is logged and the
    * announcement loop continues. The next session retries (the new credential
-   * blob is already published, so the next session can detect "some friends
+   * blob is already published, so the next session can detect "some connections
    * still have OLD pubkeys cached" via the rotation-in-flight signal).
    *
-   * @returns {Promise<Array<{ friendSharePub: string, seq?: number, txid?: string, error?: string }>>}
+   * @returns {Promise<Array<{ connectionSharePub: string, seq?: number, txid?: string, error?: string }>>}
    */
-  async #announceIdentityRotationToFriends({
+  async #announceIdentityRotationToConnections({
     oldSharingKeyPair,
     oldSigningKeyPair,
-    oldFriendsRecord,
+    oldConnectionsRecord,
     newSharingPublicKey,
     newSigningPublicKey,
     newCredentialLookupKey,
     rotatedAt,
   }) {
     if (!oldSharingKeyPair?.privateKey) {
-      throw new Error('#announceIdentityRotationToFriends: oldSharingKeyPair.privateKey is required');
+      throw new Error('#announceIdentityRotationToConnections: oldSharingKeyPair.privateKey is required');
     }
     if (!oldSigningKeyPair?.privateKey) {
-      throw new Error('#announceIdentityRotationToFriends: oldSigningKeyPair.privateKey is required');
+      throw new Error('#announceIdentityRotationToConnections: oldSigningKeyPair.privateKey is required');
     }
-    if (!oldFriendsRecord || !Array.isArray(oldFriendsRecord.friends)) {
-      throw new Error('#announceIdentityRotationToFriends: oldFriendsRecord is required');
+    if (!oldConnectionsRecord || !Array.isArray(oldConnectionsRecord.connections)) {
+      throw new Error('#announceIdentityRotationToConnections: oldConnectionsRecord is required');
     }
 
     const newSharePubBase64Url = encodeSharePub(newSharingPublicKey);
     const newSigningPubBase64 = await exportPublicKey(newSigningPublicKey);
 
     const results = [];
-    for (const friend of oldFriendsRecord.friends) {
+    for (const connection of oldConnectionsRecord.connections) {
       try {
         // Derive OLD per-pair keys directly (NOT via the cache; the cache
         // entry would be re-derived on the fly from the OLD share_priv but
         // we want explicit control here to keep the logic auditable).
         let peerSharePub;
         try {
-          peerSharePub = decodeSharePub(friend.share_pub);
+          peerSharePub = decodeSharePub(connection.share_pub);
         } catch (err) {
-          results.push({ friendSharePub: friend.share_pub, error: `decode share_pub: ${err.message}` });
+          results.push({ connectionSharePub: connection.share_pub, error: `decode share_pub: ${err.message}` });
           continue;
         }
         const oldSharedSecret = deriveSharedSecret(oldSharingKeyPair.privateKey, peerSharePub);
@@ -2774,7 +2783,7 @@ export class TarnClient {
         const targetSeq = oldHighestSeq + 1;
 
         const txidOrError = await this.#publishRotateIdentityAtSeq({
-          friend,
+          connection,
           oldPair,
           oldSigningPrivateKey: oldSigningKeyPair.privateKey,
           startSeq: targetSeq,
@@ -2787,16 +2796,16 @@ export class TarnClient {
         });
 
         if (txidOrError.error) {
-          results.push({ friendSharePub: friend.share_pub, error: txidOrError.error });
+          results.push({ connectionSharePub: connection.share_pub, error: txidOrError.error });
         } else {
           results.push({
-            friendSharePub: friend.share_pub,
+            connectionSharePub: connection.share_pub,
             seq: txidOrError.seq,
             txid: txidOrError.txid,
           });
         }
       } catch (err) {
-        results.push({ friendSharePub: friend.share_pub, error: err.message });
+        results.push({ connectionSharePub: connection.share_pub, error: err.message });
       }
     }
     return results;
@@ -2830,7 +2839,7 @@ export class TarnClient {
    * retries so a perpetually-busy log doesn't loop forever.
    */
   async #publishRotateIdentityAtSeq({
-    friend, oldPair, oldSigningPrivateKey, startSeq, payload,
+    connection, oldPair, oldSigningPrivateKey, startSeq, payload,
   }) {
     const MAX_RETRIES = 5;
     let seq = startSeq;
@@ -2862,32 +2871,32 @@ export class TarnClient {
    * read/sync (sharing §13.5).
    *
    * Pre-condition: the caller has already verified the operation's signature
-   * against the friend's CURRENT signing_pub (which is the OLD signing_pub
+   * against the connection's CURRENT signing_pub (which is the OLD signing_pub
    * from the rotating party's perspective — that's what makes the
    * announcement trustworthy).
    *
    * Steps (§13.5 step 4-7):
-   *   1. Update Alice's friend record entry: replace share_pub, signing_pub,
+   *   1. Update Alice's connection record entry: replace share_pub, signing_pub,
    *      credential_lookup_key. Persist.
-   *   2. Clear all per-friend caches keyed on the OLD share_pub. The NEW
+   *   2. Clear all per-connection caches keyed on the OLD share_pub. The NEW
    *      share_pub becomes the cache key going forward.
-   *   3. Return the updated friend object so the caller can re-bootstrap the
+   *   3. Return the updated connection object so the caller can re-bootstrap the
    *      read flow on the NEW log under the new keys.
    *
    * Idempotent: replaying the same announcement on a fresh device produces
-   * the same final state (the friend record's signing_pub now matches the
+   * the same final state (the connection record's signing_pub now matches the
    * announcement's `new_signing_pub` so a subsequent verify still succeeds
    * because the announcement has already been accepted; if the announcement
-   * is replayed, the friend record's `share_pub` no longer matches the
-   * incoming `friend.share_pub` so the caller's lookup short-circuits).
+   * is replayed, the connection record's `share_pub` no longer matches the
+   * incoming `connection.share_pub` so the caller's lookup short-circuits).
    *
-   * @param {Object} friend - friends-record entry (has OLD share_pub +
+   * @param {Object} connection - connections-record entry (has OLD share_pub +
    *   OLD signing_pub at call time)
    * @param {Object} operation - the parsed, signature-verified
    *   rotate_identity operation
-   * @returns {Promise<Object>} updated friend entry
+   * @returns {Promise<Object>} updated connection entry
    */
-  async #processRotateIdentityEntry(friend, operation) {
+  async #processRotateIdentityEntry(connection, operation) {
     const newSharePubBase64Url = operation.new_share_pub;
     const newSigningPubBase64 = operation.new_signing_pub;
     const newCredentialLookupKey = operation.new_credential_lookup_key;
@@ -2905,65 +2914,65 @@ export class TarnClient {
 
     // Defensive: validate the new share_pub decodes cleanly. A malformed
     // value here would explode the next pair-key derivation; better to bail
-    // now than half-update the friend record.
+    // now than half-update the connection record.
     decodeSharePub(newSharePubBase64Url);
 
-    const oldSharePub = friend.share_pub;
-    const friendsState = await this.#loadFriendsRecord();
-    const updatedRecord = rotateFriendIdentity(friendsState.record, oldSharePub, {
+    const oldSharePub = connection.share_pub;
+    const connectionsState = await this.#loadConnectionsRecord();
+    const updatedRecord = rotateConnectionIdentity(connectionsState.record, oldSharePub, {
       newSharePubBase64Url,
       newSigningPubBase64,
       newCredentialLookupKey,
       rotatedAt,
     });
 
-    if (updatedRecord !== friendsState.record) {
-      await this.#saveFriendsRecord(friendsState, updatedRecord);
+    if (updatedRecord !== connectionsState.record) {
+      await this.#saveConnectionsRecord(connectionsState, updatedRecord);
     }
 
     // Clear OLD caches — the NEW share_pub is a different cache key, so
     // explicit invalidation is mostly defensive (no entry should exist under
     // the NEW key yet). The OLD-keyed entries are now stale and must not be
     // accidentally used.
-    this.#clearFriendCaches(oldSharePub);
+    this.#clearConnectionCaches(oldSharePub);
 
     return (
-      updatedRecord.friends.find(f => f.share_pub === newSharePubBase64Url)
-      || { ...friend, share_pub: newSharePubBase64Url, signing_pub: newSigningPubBase64 }
+      updatedRecord.connections.find(f => f.share_pub === newSharePubBase64Url)
+      || { ...connection, share_pub: newSharePubBase64Url, signing_pub: newSigningPubBase64 }
     );
   }
 
   /**
-   * Drop all per-friend share-log caches for a given share_pub. Used by
-   * unfriend (§10.1) and identity rotation (§13.5) — both invalidate the
+   * Drop all per-connection share-log caches for a given share_pub. Used by
+   * removeConnection (§10.1) and identity rotation (§13.5) — both invalidate the
    * cached pair keys + state since the pair-keys derivation is now stale
-   * (the friend's share_pub no longer maps to a current relationship, or
+   * (the connection's share_pub no longer maps to a current relationship, or
    * has rotated to a new value).
    */
-  #clearFriendCaches(friendSharePubBase64Url) {
-    this.#pairKeyCache.delete(friendSharePubBase64Url);
-    this.#shareLogCounters.delete(friendSharePubBase64Url);
-    this.#readStateCache.delete(friendSharePubBase64Url);
-    this.#outboundStateCache.delete(friendSharePubBase64Url);
-    this.#publishedTxidsByFriend.delete(friendSharePubBase64Url);
+  #clearConnectionCaches(connectionSharePubBase64Url) {
+    this.#pairKeyCache.delete(connectionSharePubBase64Url);
+    this.#shareLogCounters.delete(connectionSharePubBase64Url);
+    this.#readStateCache.delete(connectionSharePubBase64Url);
+    this.#outboundStateCache.delete(connectionSharePubBase64Url);
+    this.#publishedTxidsByConnection.delete(connectionSharePubBase64Url);
   }
 
   // ---- Outbound state tracking (Section 5c) ----
 
   /**
-   * Lazily reconstruct outbound state for a friend by replaying our own
+   * Lazily reconstruct outbound state for a connection by replaying our own
    * outbound log. No-op if already hydrated this session. Invoked by the
-   * high-level write methods on first use per friend.
+   * high-level write methods on first use per connection.
    *
    * Same algorithm as {@link readShareLog} but with the OUTBOUND tag seed +
    * outbound key (we encrypted these entries; we can decrypt them with the
    * symmetric AES-GCM key) and our OWN signing pub for verification.
    */
-  async #hydrateOutboundState(friend) {
-    const existing = this.#outboundStateCache.get(friend.share_pub);
+  async #hydrateOutboundState(connection) {
+    const existing = this.#outboundStateCache.get(connection.share_pub);
     if (existing?.hydrated) return;
 
-    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const pair = await this.#getPairKeysFor(connection.share_pub);
     const ownSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
 
     const { highestSeq } = await discoverHighestSeq({
@@ -2972,13 +2981,13 @@ export class TarnClient {
     });
 
     if (highestSeq < 0) {
-      this.#outboundStateCache.set(friend.share_pub, { state: {}, hydrated: true });
+      this.#outboundStateCache.set(connection.share_pub, { state: {}, hydrated: true });
       return;
     }
 
     // Pre-fetch all entries seq=0..highestSeq into an array. Avoids the
     // double-walk shape from a naive walk-back-then-forward implementation.
-    // The per-friend cap of MAX_LOG_BLOB_PLAINTEXT_BYTES on the writer side
+    // The per-connection cap of MAX_LOG_BLOB_PLAINTEXT_BYTES on the writer side
     // bounds memory; for typical Bookish-class users (~100s of entries)
     // this is well under 1 MB total.
     const entries = new Array(highestSeq + 1);
@@ -3011,15 +3020,15 @@ export class TarnClient {
       applyOperationToState(state, e.operation);
     }
 
-    this.#outboundStateCache.set(friend.share_pub, { state, hydrated: true });
+    this.#outboundStateCache.set(connection.share_pub, { state, hydrated: true });
 
-    // Seed the per-friend known-txids set with our own outbound entries so
+    // Seed the per-connection known-txids set with our own outbound entries so
     // the multi-device retry path can detect "this 409 reports our own
     // previous publish" across cold-session boundaries.
-    let txids = this.#publishedTxidsByFriend.get(friend.share_pub);
+    let txids = this.#publishedTxidsByConnection.get(connection.share_pub);
     if (!txids) {
       txids = new Set();
-      this.#publishedTxidsByFriend.set(friend.share_pub, txids);
+      this.#publishedTxidsByConnection.set(connection.share_pub, txids);
     }
     for (const e of entries) {
       if (e?.txid) txids.add(e.txid);
@@ -3028,7 +3037,7 @@ export class TarnClient {
     // Seed the writer's nextOutboundSeq + nonSnapshotsSinceLastSnapshot from
     // the actual log tip — defends against fresh-session publishes at a
     // stale seq=0 (which would 409 immediately and trigger the retry path).
-    const counters = this.#getOrInitCounters(friend.share_pub);
+    const counters = this.#getOrInitCounters(connection.share_pub);
     counters.nextOutboundSeq = highestSeq + 1;
     if (snapshotSeq >= 0) {
       counters.nonSnapshotsSinceLastSnapshot = highestSeq - snapshotSeq;
@@ -3057,29 +3066,29 @@ export class TarnClient {
   }
 
   /**
-   * Return a SHALLOW COPY of the current outbound state for a friend, used
+   * Return a SHALLOW COPY of the current outbound state for a connection, used
    * as the working set for in-flight write methods. The returned object is
    * mutated by the caller, then committed via {@link #commitOutboundState}
    * on successful publish.
    */
-  #tentativeOutboundState(friend) {
-    const cached = this.#outboundStateCache.get(friend.share_pub);
+  #tentativeOutboundState(connection) {
+    const cached = this.#outboundStateCache.get(connection.share_pub);
     return cached ? { ...cached.state } : {};
   }
 
-  #commitOutboundState(friend, newState) {
-    this.#outboundStateCache.set(friend.share_pub, {
+  #commitOutboundState(connection, newState) {
+    this.#outboundStateCache.set(connection.share_pub, {
       state: { ...newState },
       hydrated: true,
     });
   }
 
   /**
-   * Test-only: peek at the outbound state cache for a friend. Returns null
+   * Test-only: peek at the outbound state cache for a connection. Returns null
    * if not hydrated. Used by tests asserting outbound-snapshot semantics.
    */
-  _peekOutboundStateCache(friendSharePubBase64Url) {
-    const e = this.#outboundStateCache.get(friendSharePubBase64Url);
+  _peekOutboundStateCache(connectionSharePubBase64Url) {
+    const e = this.#outboundStateCache.get(connectionSharePubBase64Url);
     if (!e) return null;
     return { state: { ...e.state }, hydrated: !!e.hydrated };
   }
@@ -3160,9 +3169,9 @@ export class TarnClient {
     );
 
     let pendingState = await this.#loadPendingRequestsRecord();
-    let friendsState = await this.#loadFriendsRecord();
+    let connectionsState = await this.#loadConnectionsRecord();
     let pendingDirty = false;
-    let friendsDirty = false;
+    let connectionsDirty = false;
 
     for (const blobs of fetched) {
       for (const blob of blobs) {
@@ -3170,26 +3179,26 @@ export class TarnClient {
         try {
           const pt = await hpkeOpen({
             sharePriv: myPriv,
-            info: INFO_FRIEND_ACCEPT,
+            info: INFO_CONNECTION_ACCEPT,
             blob: blob.ciphertext,
           });
           payload = JSON.parse(new TextDecoder().decode(pt));
         } catch {
           continue;
         }
-        const v = validateFriendAcceptPayload(payload, this.#appId);
+        const v = validateConnectionAcceptPayload(payload, this.#appId);
         if (!v.valid) continue;
 
         // Forged-accept defense (§13.9): cross-reference against outbound
-        // pending. Unmatched accepts are silently dropped — no friend record
+        // pending. Unmatched accepts are silently dropped — no connection record
         // entry created, no UI prompt. The user is not informed.
         const outbound = findOutboundForAccept(v.normalized.inReplyToNonceBase64Url, pendingState.record.outbound);
         if (!outbound) continue;
 
         // Replay protection on accepts: if we've already processed this
-        // accept (it appears in friends already), skip without re-writing.
-        const existingFriend = friendsState.record.friends.find(f => f.share_pub === v.normalized.senderSharePubBase64Url);
-        if (existingFriend) {
+        // accept (it appears in connections already), skip without re-writing.
+        const existingConnection = connectionsState.record.connections.find(f => f.share_pub === v.normalized.senderSharePubBase64Url);
+        if (existingConnection) {
           // Still clear the matched outbound — sender side already moved on.
           if (pendingState.record.outbound.some(o => o.request_nonce === outbound.request_nonce)) {
             pendingState = { ...pendingState, record: removeOutboundPending(pendingState.record, outbound.request_nonce) };
@@ -3198,18 +3207,18 @@ export class TarnClient {
           continue;
         }
 
-        const newFriend = {
+        const newConnection = {
           email: v.normalized.senderEmail,
           share_pub: v.normalized.senderSharePubBase64Url,
           signing_pub: v.normalized.senderSigningPubBase64,
           established_at: v.normalized.timestamp,
           initial_request_nonce: outbound.request_nonce,
         };
-        friendsState = {
-          ...friendsState,
-          record: upsertFriend(friendsState.record, newFriend),
+        connectionsState = {
+          ...connectionsState,
+          record: upsertConnection(connectionsState.record, newConnection),
         };
-        friendsDirty = true;
+        connectionsDirty = true;
 
         pendingState = {
           ...pendingState,
@@ -3217,14 +3226,14 @@ export class TarnClient {
         };
         pendingDirty = true;
 
-        // Publish our seq=0 snapshot to the new friend's outbound log
-        // (sharing §6.6). We're the side that originated the friend request;
+        // Publish our seq=0 snapshot to the new connection's outbound log
+        // (sharing §6.6). We're the side that originated the connection request;
         // the accepting side already published their seq=0 inside
-        // acceptFriendRequest. Empty state by default — apps that want to
+        // acceptConnectionRequest. Empty state by default — apps that want to
         // pre-populate should call _publishInitialSnapshot themselves with
         // explicit state.
         try {
-          await this._publishInitialSnapshot(newFriend);
+          await this._publishInitialSnapshot(newConnection);
         } catch (err) {
           console.warn(
             `[TarnClient] processing accept from ${v.normalized.senderEmail}: initial snapshot publish failed: ${err.message}`,
@@ -3233,25 +3242,25 @@ export class TarnClient {
       }
     }
 
-    if (friendsDirty) await this.#saveFriendsRecord(friendsState, friendsState.record);
+    if (connectionsDirty) await this.#saveConnectionsRecord(connectionsState, connectionsState.record);
     if (pendingDirty) await this.#savePendingRequestsRecord(pendingState, pendingState.record);
   }
 
   /**
-   * Load (or initialize) the friends record for the current app.
+   * Load (or initialize) the connections record for the current app.
    * Returns `{ record, txid }` — `txid` is null if we're creating it for
    * the first time, or the prior version's txid if updating.
    */
-  async #loadFriendsRecord() {
-    const entry = await this.#findShareStateEntry(FRIENDS_CONTENT_ID);
+  async #loadConnectionsRecord() {
+    const entry = await this.#findShareStateEntry(CONNECTIONS_CONTENT_ID);
     if (!entry) {
-      return { record: emptyFriendsRecord(this.#appId), txid: null };
+      return { record: emptyConnectionsRecord(this.#appId), txid: null };
     }
     return { record: entry.data, txid: entry.txid };
   }
 
-  async #saveFriendsRecord(state, newRecord) {
-    return await this.#writeShareStateEntry(FRIENDS_CONTENT_ID, state, newRecord);
+  async #saveConnectionsRecord(state, newRecord) {
+    return await this.#writeShareStateEntry(CONNECTIONS_CONTENT_ID, state, newRecord);
   }
 
   async #loadPendingRequestsRecord() {
@@ -3270,7 +3279,7 @@ export class TarnClient {
    * Find the latest (resolved) `tarn-share-state` entry for a given
    * content_id. Returns `{ txid, data }` or null if no entry exists yet.
    *
-   * The friends + pending records use type='tarn-share-state' with
+   * The connections + pending records use type='tarn-share-state' with
    * Eid=<content_id>. Resolution dedupes by Eid + Prev chain so we get the
    * single live version.
    */
@@ -3337,15 +3346,15 @@ export class TarnClient {
   _testJwt() { return this.#jwt; }
 
   /**
-   * Test-only: lower the per-friend share-log snapshot compaction interval
+   * Test-only: lower the per-connection share-log snapshot compaction interval
    * so an integration test can trigger auto-compaction without publishing
    * 100 entries. Production code should leave this at the default.
    */
-  _setShareLogCompactionIntervalForFriend(friendSharePubBase64Url, interval) {
+  _setShareLogCompactionIntervalForConnection(connectionSharePubBase64Url, interval) {
     if (!Number.isInteger(interval) || interval < 1) {
       throw new Error('interval must be a positive integer');
     }
-    const counters = this.#getOrInitCounters(friendSharePubBase64Url);
+    const counters = this.#getOrInitCounters(connectionSharePubBase64Url);
     counters.compactionInterval = interval;
   }
 

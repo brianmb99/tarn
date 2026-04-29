@@ -145,8 +145,9 @@ export default {
         return await handleShareLookup(url, request, env, cors);
       }
 
-      // Friend-handshake inbox (issue #14, Section 5a) — HPKE-sealed
-      // friend_request + friend_accept blobs, addressed by inbox tag.
+      // Connection-handshake inbox (issue #14, Section 5a; renamed in Section 6
+      // / issue #18) — HPKE-sealed connection_request + connection_accept blobs,
+      // addressed by inbox tag.
       if (path === '/api/v1/share/inbox/publish' && method === 'POST') {
         return await handleShareInboxPublish(request, env, ctx, cors);
       }

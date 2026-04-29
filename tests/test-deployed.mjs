@@ -294,9 +294,9 @@ await test('share_lookup_key is per-app isolated (cross-app probe misses)', asyn
   assert(discoverable === false, 'cross-app lookup should be opaque');
 });
 
-// ============ 8. FRIEND HANDSHAKE (issue #14, Section 5a) ============
+// ============ 8. CONNECTION HANDSHAKE (issue #14, Section 5a) ============
 
-console.log('\n=== 8. Friend handshake (HPKE inbox) ===');
+console.log('\n=== 8. Connection handshake (HPKE inbox) ===');
 
 let handshakeAlice;
 let handshakeBob;
@@ -307,12 +307,12 @@ let handshakeBobDlk;
 let handshakeRequestNonce;
 
 await test('Two test users register + complete a mutual handshake against the deployed API', async () => {
-  // Note: we don't need to set rules for the friends + pending records
+  // Note: we don't need to set rules for the connections + pending records
   // because Bookish's standard rules (max_entries with no entry_type filter,
   // max_bytes) apply per-app. The test creates only a few share-state
   // entries — well under the limit. If max_entries were lower than ~5 the
   // test would fail; the smoke-test rule set is `max_entries: 5, app:
-  // bookish` and we use 2 entries per user (friends + pending), so we have
+  // bookish` and we use 2 entries per user (connections + pending), so we have
   // headroom.
   handshakeAliceEmail = `deploy-handshake-a-${Date.now()}@test.com`;
   handshakeBobEmail = `deploy-handshake-b-${Date.now()}@test.com`;
@@ -355,8 +355,8 @@ await test('Two test users register + complete a mutual handshake against the de
     assert(r.status === 200, `Set rules failed for ${dlk}: ${r.status}`);
   }
 
-  // Alice → Bob friend request.
-  const send = await handshakeAlice.sendFriendRequest(handshakeBobEmail, { message: 'hi from deployed test' });
+  // Alice → Bob connection request.
+  const send = await handshakeAlice.sendConnectionRequest(handshakeBobEmail, { message: 'hi from deployed test' });
   assert(send.requestNonce, 'no requestNonce');
   handshakeRequestNonce = send.requestNonce;
 
@@ -367,34 +367,34 @@ await test('Two test users register + complete a mutual handshake against the de
   assert(inbox.some(r => r.requestNonce === handshakeRequestNonce), 'request nonce not in inbox');
 
   // Bob accepts.
-  await handshakeBob.acceptFriendRequest(handshakeRequestNonce);
-  const bobFriends = await handshakeBob.listFriends();
-  assert(bobFriends.some(f => f.email === handshakeAliceEmail), 'Alice not in Bob\'s friends');
+  await handshakeBob.acceptConnectionRequest(handshakeRequestNonce);
+  const bobConnections = await handshakeBob.listConnections();
+  assert(bobConnections.some(f => f.email === handshakeAliceEmail), 'Alice not in Bob\'s connections');
 
   // Alice processes the accept.
   await sleep(500);
   await handshakeAlice.listIncomingRequests();
-  const aliceFriends = await handshakeAlice.listFriends();
-  assert(aliceFriends.some(f => f.email === handshakeBobEmail), 'Bob not in Alice\'s friends');
+  const aliceConnections = await handshakeAlice.listConnections();
+  assert(aliceConnections.some(f => f.email === handshakeBobEmail), 'Bob not in Alice\'s connections');
 });
 
 // ============ 9. SHARE LOG (issue #15, Section 5b) ============
 
 console.log('\n=== 9. Share log (per-pair, signed, stealth-tagged) ===');
 
-await test('Friends from §8 can publish + fetch share log entries with verified signatures', async () => {
-  // Re-resolve the friend records on each side. Section 8 left Alice + Bob
-  // mutually friended; the seq=0 snapshots were already published by the
+await test('Connections from §8 can publish + fetch share log entries with verified signatures', async () => {
+  // Re-resolve the connection records on each side. Section 8 left Alice + Bob
+  // mutually connected; the seq=0 snapshots were already published by the
   // handshake-acceptance flow.
-  const aliceFriends = await handshakeAlice.listFriends();
-  const bobFriends = await handshakeBob.listFriends();
-  const bobFriendOfAlice = aliceFriends.find(f => f.email === handshakeBobEmail);
-  const aliceFriendOfBob = bobFriends.find(f => f.email === handshakeAliceEmail);
-  assert(bobFriendOfAlice, 'Bob missing from Alice\'s friends');
-  assert(aliceFriendOfBob, 'Alice missing from Bob\'s friends');
+  const aliceConnections = await handshakeAlice.listConnections();
+  const bobConnections = await handshakeBob.listConnections();
+  const bobConnectionOfAlice = aliceConnections.find(f => f.email === handshakeBobEmail);
+  const aliceConnectionOfBob = bobConnections.find(f => f.email === handshakeAliceEmail);
+  assert(bobConnectionOfAlice, 'Bob missing from Alice\'s connections');
+  assert(aliceConnectionOfBob, 'Alice missing from Bob\'s connections');
 
   // Bob fetches Alice's seq=0 snapshot.
-  const initial = await handshakeBob._fetchShareLogEntry(aliceFriendOfBob, 0);
+  const initial = await handshakeBob._fetchShareLogEntry(aliceConnectionOfBob, 0);
   assert(initial, 'no entry at seq=0 from Alice');
   assert(initial.operation.type === 'snapshot',
     `expected snapshot at seq=0, got ${initial.operation.type}`);
@@ -403,7 +403,7 @@ await test('Friends from §8 can publish + fetch share log entries with verified
   // Alice publishes a real `add` operation; Bob fetches + verifies.
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  const addRes = await handshakeAlice._publishShareLogEntry(bobFriendOfAlice, {
+  const addRes = await handshakeAlice._publishShareLogEntry(bobConnectionOfAlice, {
     type: 'add',
     content_id: 'deploy-share-log-' + Date.now(),
     tx_id: 'arweave-tx-deploy-' + Date.now(),
@@ -414,7 +414,7 @@ await test('Friends from §8 can publish + fetch share log entries with verified
   assert(typeof addRes.seq === 'number', 'no seq on publish');
 
   await sleep(500);
-  const fetched = await handshakeBob._fetchShareLogEntry(aliceFriendOfBob, addRes.seq);
+  const fetched = await handshakeBob._fetchShareLogEntry(aliceConnectionOfBob, addRes.seq);
   assert(fetched, `Bob found nothing at seq=${addRes.seq}`);
   assert(fetched.operation.type === 'add', 'wrong op type after fetch');
   assert(fetched.verified === true, 'add signature did not verify');
@@ -454,38 +454,38 @@ await test('Per-tag uniqueness against deployed API: re-publish at same tag → 
 console.log('\n=== 9b. Share log read flow + multi-device retry (Section 5c) ===');
 
 await test('readShareLog: Bob bootstraps Alice\'s log, sees content shared by Alice', async () => {
-  // Re-resolve friend records (handshakeAlice/Bob persist from §8/§9).
-  const aliceFriends = await handshakeAlice.listFriends();
-  const bobFriends = await handshakeBob.listFriends();
-  const bobFriendOfAlice = aliceFriends.find(f => f.email === handshakeBobEmail);
-  const aliceFriendOfBob = bobFriends.find(f => f.email === handshakeAliceEmail);
-  assert(bobFriendOfAlice && aliceFriendOfBob, 'friend records missing');
+  // Re-resolve connection records (handshakeAlice/Bob persist from §8/§9).
+  const aliceConnections = await handshakeAlice.listConnections();
+  const bobConnections = await handshakeBob.listConnections();
+  const bobConnectionOfAlice = aliceConnections.find(f => f.email === handshakeBobEmail);
+  const aliceConnectionOfBob = bobConnections.find(f => f.email === handshakeAliceEmail);
+  assert(bobConnectionOfAlice && aliceConnectionOfBob, 'connection records missing');
 
   const cek1 = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const cek2 = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-  await handshakeAlice.shareContent(bobFriendOfAlice, 'deploy-5c-A', 'tx-5c-A', cek1);
-  await handshakeAlice.shareContent(bobFriendOfAlice, 'deploy-5c-B', 'tx-5c-B', cek2);
+  await handshakeAlice.shareContent(bobConnectionOfAlice, 'deploy-5c-A', 'tx-5c-A', cek1);
+  await handshakeAlice.shareContent(bobConnectionOfAlice, 'deploy-5c-B', 'tx-5c-B', cek2);
 
   await sleep(800);
-  const bobState = await handshakeBob.readShareLog(aliceFriendOfBob, { refresh: true });
+  const bobState = await handshakeBob.readShareLog(aliceConnectionOfBob, { refresh: true });
   assert(bobState['deploy-5c-A']?.tx_id === 'tx-5c-A', 'deploy-5c-A missing or wrong tx_id');
   assert(bobState['deploy-5c-B']?.tx_id === 'tx-5c-B', 'deploy-5c-B missing or wrong tx_id');
 });
 
 await test('syncShareLog: incremental update + remove flows through to Bob', async () => {
-  const aliceFriends = await handshakeAlice.listFriends();
-  const bobFriends = await handshakeBob.listFriends();
-  const bobFriendOfAlice = aliceFriends.find(f => f.email === handshakeBobEmail);
-  const aliceFriendOfBob = bobFriends.find(f => f.email === handshakeAliceEmail);
+  const aliceConnections = await handshakeAlice.listConnections();
+  const bobConnections = await handshakeBob.listConnections();
+  const bobConnectionOfAlice = aliceConnections.find(f => f.email === handshakeBobEmail);
+  const aliceConnectionOfBob = bobConnections.find(f => f.email === handshakeAliceEmail);
 
-  await handshakeAlice.updateShareContent(bobFriendOfAlice, 'deploy-5c-A', 'tx-5c-A-v2');
-  await handshakeAlice.unshareContent(bobFriendOfAlice, 'deploy-5c-B');
+  await handshakeAlice.updateShareContent(bobConnectionOfAlice, 'deploy-5c-A', 'tx-5c-A-v2');
+  await handshakeAlice.unshareContent(bobConnectionOfAlice, 'deploy-5c-B');
 
   await sleep(800);
-  const updated = await handshakeBob.syncShareLog(aliceFriendOfBob);
+  const updated = await handshakeBob.syncShareLog(aliceConnectionOfBob);
   assert(updated['deploy-5c-A']?.tx_id === 'tx-5c-A-v2', 'update did not propagate');
   assert(updated['deploy-5c-B'] === undefined, 'remove did not propagate');
 });
@@ -532,7 +532,7 @@ console.log('\n=== 9c. Revocation + identity rotation (Section 5d) ===');
 //   1. Both accounts register + handshake.
 //   2. Pat shares a content item with Quinn.
 //   3. Pat changes credentials (issue #17 §13.5 sender flow).
-//   4. Quinn syncs and picks up the rotation: friend record updated to
+//   4. Quinn syncs and picks up the rotation: connection record updated to
 //      Pat's NEW share_pub + signing_pub; subsequent shares from Pat under
 //      the NEW pair keys reach Quinn.
 
@@ -542,7 +542,7 @@ const quinnEmail = `tarn-quinn-${Date.now()}-${Math.random().toString(36).slice(
 const quinnPassword = 'quinn-pw-' + Date.now();
 
 let pat, quinn;
-let quinnFriendOfPat, patFriendOfQuinn;
+let quinnConnectionOfPat, patConnectionOfQuinn;
 let patPhrase;
 let patSharePubBeforeRotate;
 
@@ -560,9 +560,9 @@ await test('Pat + Quinn register + handshake against deployed API', async () => 
   });
 
   // Set permissive rules on each user via the bookish app JWT (same pattern
-  // as §8). Friends + pending records + share-log entries + tarn-share-state
+  // as §8). Connections + pending records + share-log entries + tarn-share-state
   // writes need rules — the credential-change flow also writes share-state
-  // entries to publish snapshots to friends' new logs after rotation.
+  // entries to publish snapshots to connections' new logs after rotation.
   const pkcs8 = new Uint8Array(APP_KEY.length / 2);
   for (let i = 0; i < APP_KEY.length; i += 2) pkcs8[i / 2] = parseInt(APP_KEY.substr(i, 2), 16);
   const privateKey = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
@@ -590,25 +590,25 @@ await test('Pat + Quinn register + handshake against deployed API', async () => 
     assert(r.status === 200, `Set rules failed for ${dlk}: ${r.status}`);
   }
 
-  const send = await pat.sendFriendRequest(quinnEmail);
+  const send = await pat.sendConnectionRequest(quinnEmail);
   await sleep(500);
   await quinn.listIncomingRequests();
-  await quinn.acceptFriendRequest(send.requestNonce);
+  await quinn.acceptConnectionRequest(send.requestNonce);
   await sleep(500);
   await pat.listIncomingRequests();
-  quinnFriendOfPat = (await pat.listFriends()).find(f => f.email === quinnEmail);
-  patFriendOfQuinn = (await quinn.listFriends()).find(f => f.email === patEmail);
-  assert(quinnFriendOfPat, 'Pat missing Quinn after handshake');
-  assert(patFriendOfQuinn, 'Quinn missing Pat after handshake');
-  patSharePubBeforeRotate = patFriendOfQuinn.share_pub;
+  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.email === quinnEmail);
+  patConnectionOfQuinn = (await quinn.listConnections()).find(f => f.email === patEmail);
+  assert(quinnConnectionOfPat, 'Pat missing Quinn after handshake');
+  assert(patConnectionOfQuinn, 'Quinn missing Pat after handshake');
+  patSharePubBeforeRotate = patConnectionOfQuinn.share_pub;
 });
 
 await test('Pat shares a content item with Quinn', async () => {
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  await pat.shareContent(quinnFriendOfPat, 'rot-target-1', 'arweave-rot-pre', cek);
+  await pat.shareContent(quinnConnectionOfPat, 'rot-target-1', 'arweave-rot-pre', cek);
   await sleep(500);
-  const state = await quinn.readShareLog(patFriendOfQuinn, { refresh: true });
+  const state = await quinn.readShareLog(patConnectionOfQuinn, { refresh: true });
   assert(state['rot-target-1'], 'Quinn should see rot-target-1 before rotation');
 });
 
@@ -620,33 +620,33 @@ await test('Pat changes credentials → publishes rotate_identity to Quinn (depl
   assert(Array.isArray(result.rotationAnnouncements), 'expected rotationAnnouncements');
   assert(result.rotationAnnouncements.length === 1, 'expected exactly one rotation announcement');
   const ann = result.rotationAnnouncements[0];
-  assert(ann.friendSharePub === quinnFriendOfPat.share_pub, 'rotation targets the right friend');
+  assert(ann.connectionSharePub === quinnConnectionOfPat.share_pub, 'rotation targets the right connection');
   assert(typeof ann.txid === 'string', 'rotation announcement should have a txid');
 });
 
-await test('Quinn syncs against deployed API: rotate_identity processed, friend record updated', async () => {
+await test('Quinn syncs against deployed API: rotate_identity processed, connection record updated', async () => {
   await sleep(800);
-  const stateAfter = await quinn.syncShareLog(patFriendOfQuinn);
+  const stateAfter = await quinn.syncShareLog(patConnectionOfQuinn);
   assert(stateAfter['rot-target-1'], 'Quinn still sees rot-target-1 after rotation (NEW-log seq=0 snapshot)');
 
-  const updatedFriend = (await quinn.listFriends())[0];
-  assert(updatedFriend.share_pub !== patSharePubBeforeRotate,
-    'Quinn\'s friend record holds Pat\'s NEW share_pub');
-  assert(updatedFriend.prior_share_pub === patSharePubBeforeRotate,
+  const updatedConnection = (await quinn.listConnections())[0];
+  assert(updatedConnection.share_pub !== patSharePubBeforeRotate,
+    'Quinn\'s connection record holds Pat\'s NEW share_pub');
+  assert(updatedConnection.prior_share_pub === patSharePubBeforeRotate,
     'Quinn records the pre-rotation share_pub');
 });
 
 await test('Pat publishes a post-rotation share; Quinn picks it up via NEW-log keys', async () => {
-  // Refresh references — Pat's friend record was updated by the rotation
+  // Refresh references — Pat's connection record was updated by the rotation
   // (no, actually Pat's view of Quinn is unchanged; only Quinn's view of
   // Pat rotated). But re-fetch defensively.
-  quinnFriendOfPat = (await pat.listFriends()).find(f => f.email === quinnEmail);
+  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.email === quinnEmail);
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  await pat.shareContent(quinnFriendOfPat, 'rot-target-2-postrotate', 'arweave-rot-post', cek);
+  await pat.shareContent(quinnConnectionOfPat, 'rot-target-2-postrotate', 'arweave-rot-post', cek);
   await sleep(500);
-  const updatedQuinnFriend = (await quinn.listFriends())[0];
-  const stateAfter = await quinn.syncShareLog(updatedQuinnFriend);
+  const updatedQuinnConnection = (await quinn.listConnections())[0];
+  const stateAfter = await quinn.syncShareLog(updatedQuinnConnection);
   assert(stateAfter['rot-target-2-postrotate'],
     'Quinn should see post-rotation content via NEW-log keys');
 });

@@ -2,7 +2,7 @@
 //
 // Exercises against a running wrangler dev:
 //   1. Two users complete a handshake → both publish seq=0 snapshots to
-//      each other's outbound logs as part of acceptFriendRequest /
+//      each other's outbound logs as part of acceptConnectionRequest /
 //      listIncomingRequests-processing-accepts.
 //   2. The recipient can fetch the seq=0 snapshot by exact tag, decrypt it,
 //      and verify the sender's signature.
@@ -85,8 +85,8 @@ const bobPassword = 'pw-bob-' + Date.now();
 const alice = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const bob = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 
-let aliceFriendOfBob; // bob's friend record entry from alice's perspective
-let bobFriendOfAlice;
+let aliceConnectionOfBob; // bob's connection record entry from alice's perspective
+let bobConnectionOfAlice;
 
 await test('Alice + Bob register', async () => {
   await registerWithRules(alice, aliceEmail, alicePassword);
@@ -94,13 +94,13 @@ await test('Alice + Bob register', async () => {
 });
 
 let requestNonce;
-await test('Alice sends friend request, Bob accepts (publishes seq=0 snapshot)', async () => {
-  const send = await alice.sendFriendRequest(bobEmail);
+await test('Alice sends connection request, Bob accepts (publishes seq=0 snapshot)', async () => {
+  const send = await alice.sendConnectionRequest(bobEmail);
   requestNonce = send.requestNonce;
   await sleep(300);
   const incoming = await bob.listIncomingRequests();
   assert(incoming.some(r => r.requestNonce === requestNonce), 'Bob did not see request');
-  const accept = await bob.acceptFriendRequest(requestNonce);
+  const accept = await bob.acceptConnectionRequest(requestNonce);
   assert(accept.txid, 'no accept txid');
   assert(accept.initialSnapshotTxid, 'Bob should have published a seq=0 snapshot to his outbound log');
 });
@@ -108,16 +108,16 @@ await test('Alice sends friend request, Bob accepts (publishes seq=0 snapshot)',
 await test('Alice processes the accept (publishes her own seq=0 snapshot)', async () => {
   await sleep(300);
   await alice.listIncomingRequests();
-  const aliceFriends = await alice.listFriends();
-  bobFriendOfAlice = aliceFriends.find(f => f.email === bobEmail);
-  assert(bobFriendOfAlice, 'Bob not in Alice\'s friends record');
-  const bobFriends = await bob.listFriends();
-  aliceFriendOfBob = bobFriends.find(f => f.email === aliceEmail);
-  assert(aliceFriendOfBob, 'Alice not in Bob\'s friends record');
+  const aliceConnections = await alice.listConnections();
+  bobConnectionOfAlice = aliceConnections.find(f => f.email === bobEmail);
+  assert(bobConnectionOfAlice, 'Bob not in Alice\'s connections record');
+  const bobConnections = await bob.listConnections();
+  aliceConnectionOfBob = bobConnections.find(f => f.email === aliceEmail);
+  assert(aliceConnectionOfBob, 'Alice not in Bob\'s connections record');
 });
 
 await test('Bob fetches Alice\'s seq=0 snapshot, decrypts + verifies signature', async () => {
-  const fetched = await bob._fetchShareLogEntry(aliceFriendOfBob, 0);
+  const fetched = await bob._fetchShareLogEntry(aliceConnectionOfBob, 0);
   assert(fetched, 'Bob found nothing at seq=0 from Alice');
   assert(fetched.operation.type === 'snapshot', `expected snapshot, got ${fetched.operation.type}`);
   assert(fetched.operation.seq === 0, `expected seq=0, got ${fetched.operation.seq}`);
@@ -126,7 +126,7 @@ await test('Bob fetches Alice\'s seq=0 snapshot, decrypts + verifies signature',
 });
 
 await test('Alice fetches Bob\'s seq=0 snapshot, decrypts + verifies signature', async () => {
-  const fetched = await alice._fetchShareLogEntry(bobFriendOfAlice, 0);
+  const fetched = await alice._fetchShareLogEntry(bobConnectionOfAlice, 0);
   assert(fetched, 'Alice found nothing at seq=0 from Bob');
   assert(fetched.operation.type === 'snapshot');
   assert(fetched.operation.seq === 0);
@@ -196,12 +196,12 @@ const testOps = [
 
 for (const op of testOps) {
   await test(`${op.name}: Alice publishes, Bob fetches by tag, decrypts, verifies`, async () => {
-    const publishRes = await alice._publishShareLogEntry(bobFriendOfAlice, op.fields());
+    const publishRes = await alice._publishShareLogEntry(bobConnectionOfAlice, op.fields());
     assert(publishRes.txid, 'no txid returned');
     assert(typeof publishRes.seq === 'number', 'no seq returned');
     assert(publishRes.tag.length === 43, 'tag should be 43-char base64url');
 
-    const fetched = await bob._fetchShareLogEntry(aliceFriendOfBob, publishRes.seq);
+    const fetched = await bob._fetchShareLogEntry(aliceConnectionOfBob, publishRes.seq);
     assert(fetched, `Bob found nothing at seq=${publishRes.seq}`);
     assert(fetched.operation.type === op.name, `expected ${op.name}, got ${fetched.operation.type}`);
     assert(fetched.operation.seq === publishRes.seq, 'seq mismatch');
@@ -324,12 +324,12 @@ await test('Tampered ciphertext: API stores it but recipient decryption fails', 
 });
 
 await test('Honest path verifies; verified flag is propagated through SDK', async () => {
-  const r = await alice._publishShareLogEntry(bobFriendOfAlice, {
+  const r = await alice._publishShareLogEntry(bobConnectionOfAlice, {
     type: OP_REMOVE,
     content_id: 'verify-honest-' + Date.now(),
     removed_at: Math.floor(Date.now() / 1000),
   });
-  const fetched = await bob._fetchShareLogEntry(aliceFriendOfBob, r.seq);
+  const fetched = await bob._fetchShareLogEntry(aliceConnectionOfBob, r.seq);
   assert(fetched.verified === true, 'honest path should verify');
 });
 
@@ -340,7 +340,7 @@ console.log('\n=== 5. Direction-aware keys ===');
 await test('Alice cannot decrypt her own outbound stream as if it were Bob\'s', async () => {
   // Alice's _fetchShareLogEntry uses her INBOUND tag seed to look up tags
   // — so even though her seq=0 snapshot exists at her OUTBOUND tag, fetching
-  // by seq=0 with her own (Alice→Alice doesn't exist; we use the friend
+  // by seq=0 with her own (Alice→Alice doesn't exist; we use the connection
   // entry which represents Bob from her perspective) would target Bob's
   // outbound, not hers. Confirm Alice fetching seq=0 from Bob (which exists)
   // succeeds, but fetching from Alice's outbound (which is a non-existent
@@ -349,7 +349,7 @@ await test('Alice cannot decrypt her own outbound stream as if it were Bob\'s', 
   // reads BOB's outbound stream via her INBOUND keys, and signature
   // verification only succeeds if directions are aligned correctly. If the
   // directions were swapped, decryption would fail.
-  const fetched = await alice._fetchShareLogEntry(bobFriendOfAlice, 0);
+  const fetched = await alice._fetchShareLogEntry(bobConnectionOfAlice, 0);
   assert(fetched.verified === true, 'direction-aligned read should succeed');
 });
 
@@ -363,11 +363,11 @@ await test('Auto-snapshot triggers when non-snapshot count reaches K (via test h
   // without having to publish 100 entries. The unit test layer covers
   // the threshold logic itself; this test confirms the SDK's publish path
   // observes it and emits a real Arweave-bound snapshot blob.
-  alice._setShareLogCompactionIntervalForFriend(bobFriendOfAlice.share_pub, 3);
+  alice._setShareLogCompactionIntervalForConnection(bobConnectionOfAlice.share_pub, 3);
 
   let snapshotEmittedAtSeq = null;
   for (let i = 0; i < 3; i++) {
-    const r = await alice._publishShareLogEntry(bobFriendOfAlice, {
+    const r = await alice._publishShareLogEntry(bobConnectionOfAlice, {
       type: OP_REMOVE,
       content_id: `compaction-trigger-${i}`,
       removed_at: Math.floor(Date.now() / 1000),
@@ -376,7 +376,7 @@ await test('Auto-snapshot triggers when non-snapshot count reaches K (via test h
       snapshotEmittedAtSeq = r.compactionSnapshot.seq;
       // The snapshot is a regular log entry — Bob should be able to fetch
       // it by tag and verify the signature, same as any other op.
-      const fetched = await bob._fetchShareLogEntry(aliceFriendOfBob, r.compactionSnapshot.seq);
+      const fetched = await bob._fetchShareLogEntry(aliceConnectionOfBob, r.compactionSnapshot.seq);
       assert(fetched, 'compaction snapshot should be fetchable by tag');
       assert(fetched.operation.type === 'snapshot', 'compaction emitted non-snapshot');
       assert(fetched.verified === true, 'compaction snapshot signature did not verify');
@@ -394,12 +394,12 @@ console.log('\n=== 7. Read flow: bootstrap from snapshot + replay forward ===');
 // seq=0 (handshake snapshot), the five round-trip ops in §2, the tampered
 // ciphertext is a different tag (random seed) so it doesn't pollute Alice's
 // log, the verify-honest-path remove in §4, and the three remove + auto-
-// snapshot ops in §6. Bob's `readShareLog(aliceFriendOfBob)` should walk
+// snapshot ops in §6. Bob's `readShareLog(aliceConnectionOfBob)` should walk
 // back to the latest snapshot and apply forward to a defensible state map.
 
 let bobReadState;
 await test('Bob bootstraps Alice\'s log: walks back to latest snapshot, replays forward', async () => {
-  bobReadState = await bob.readShareLog(aliceFriendOfBob);
+  bobReadState = await bob.readShareLog(aliceConnectionOfBob);
   // We don't know the exact final shape (depends on which tests ran above),
   // but we DO know:
   //   - readShareLog should return a plain object
@@ -412,7 +412,7 @@ await test('Bob bootstraps Alice\'s log: walks back to latest snapshot, replays 
 });
 
 await test('Bob\'s read state is cached for incremental sync', async () => {
-  const cached = bob._peekReadStateCache(aliceFriendOfBob.share_pub);
+  const cached = bob._peekReadStateCache(aliceConnectionOfBob.share_pub);
   assert(cached, 'no read-state cache entry for Alice');
   assert(typeof cached.lastSeqSeen === 'number' && cached.lastSeqSeen >= 0,
     `lastSeqSeen should be >= 0, got ${cached.lastSeqSeen}`);
@@ -420,7 +420,7 @@ await test('Bob\'s read state is cached for incremental sync', async () => {
 
 await test('shareContent: Alice publishes a new add via the high-level method', async () => {
   const res = await alice.shareContent(
-    bobFriendOfAlice,
+    bobConnectionOfAlice,
     'sync-target-1',
     'arweave-sync-1',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
@@ -431,39 +431,39 @@ await test('shareContent: Alice publishes a new add via the high-level method', 
 });
 
 await test('syncShareLog: Bob picks up the new add at the next seq', async () => {
-  const updated = await bob.syncShareLog(aliceFriendOfBob);
+  const updated = await bob.syncShareLog(aliceConnectionOfBob);
   assert(updated['sync-target-1'], 'sync-target-1 should be in Bob\'s state after sync');
   assert(updated['sync-target-1'].tx_id === 'arweave-sync-1');
   // The cache's lastSeqSeen should have advanced past the new entry.
-  const cached = bob._peekReadStateCache(aliceFriendOfBob.share_pub);
+  const cached = bob._peekReadStateCache(aliceConnectionOfBob.share_pub);
   assert(cached, 'cache should still exist');
 });
 
 await test('syncShareLog: idempotent on no new entries (lastSeqSeen unchanged)', async () => {
-  const before = bob._peekReadStateCache(aliceFriendOfBob.share_pub);
-  await bob.syncShareLog(aliceFriendOfBob);
-  const after1 = bob._peekReadStateCache(aliceFriendOfBob.share_pub);
+  const before = bob._peekReadStateCache(aliceConnectionOfBob.share_pub);
+  await bob.syncShareLog(aliceConnectionOfBob);
+  const after1 = bob._peekReadStateCache(aliceConnectionOfBob.share_pub);
   assert(after1.lastSeqSeen === before.lastSeqSeen, 'a no-op sync should not advance lastSeqSeen');
   // Run it again — still a no-op.
-  await bob.syncShareLog(aliceFriendOfBob);
-  const after2 = bob._peekReadStateCache(aliceFriendOfBob.share_pub);
+  await bob.syncShareLog(aliceConnectionOfBob);
+  const after2 = bob._peekReadStateCache(aliceConnectionOfBob.share_pub);
   assert(after2.lastSeqSeen === before.lastSeqSeen, 'a second no-op sync should not change anything');
 });
 
 await test('updateShareContent + syncShareLog: tx_id changes, cek preserved', async () => {
-  await alice.updateShareContent(bobFriendOfAlice, 'sync-target-1', 'arweave-sync-1-v2');
-  const synced = await bob.syncShareLog(aliceFriendOfBob);
+  await alice.updateShareContent(bobConnectionOfAlice, 'sync-target-1', 'arweave-sync-1-v2');
+  const synced = await bob.syncShareLog(aliceConnectionOfBob);
   assert(synced['sync-target-1']?.tx_id === 'arweave-sync-1-v2', 'tx_id should advance');
 });
 
 await test('unshareContent + syncShareLog: entry dropped from state', async () => {
-  await alice.unshareContent(bobFriendOfAlice, 'sync-target-1');
-  const synced = await bob.syncShareLog(aliceFriendOfBob);
+  await alice.unshareContent(bobConnectionOfAlice, 'sync-target-1');
+  const synced = await bob.syncShareLog(aliceConnectionOfBob);
   assert(synced['sync-target-1'] === undefined, 'sync-target-1 should be removed from state');
 });
 
 await test('readShareLog with refresh:true ignores cache and re-bootstraps', async () => {
-  const fresh = await bob.readShareLog(aliceFriendOfBob, { refresh: true });
+  const fresh = await bob.readShareLog(aliceConnectionOfBob, { refresh: true });
   assert(typeof fresh === 'object', 'fresh read should return an object');
   // sync-target-1 was removed; the fresh read should also reflect that.
   assert(fresh['sync-target-1'] === undefined, 'fresh read should not contain removed item');
@@ -475,13 +475,13 @@ console.log('\n=== 8. Multi-device retry: 409 → re-discover → re-sign at nex
 
 await test('Sequential shareContent calls advance seq monotonically (no 409 in normal flow)', async () => {
   const r1 = await alice.shareContent(
-    bobFriendOfAlice,
+    bobConnectionOfAlice,
     'mr-target-A',
     'arweave-mr-A',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
   const r2 = await alice.shareContent(
-    bobFriendOfAlice,
+    bobConnectionOfAlice,
     'mr-target-B',
     'arweave-mr-B',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
@@ -517,13 +517,13 @@ await test('Multi-device retry: stale-counter shareContent → 409 → re-discov
   // tests cover the in-loop retry + re-sign mechanics directly, and this
   // test confirms the SDK's high-level surface is robust to ordering.
   const r1 = await alice.shareContent(
-    bobFriendOfAlice,
+    bobConnectionOfAlice,
     'multi-device-A',
     'tx-multi-A',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
   const r2 = await alice.shareContent(
-    bobFriendOfAlice,
+    bobConnectionOfAlice,
     'multi-device-B',
     'tx-multi-B',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
@@ -540,7 +540,7 @@ await test('Highest-seq discovery scales: cold readShareLog completes quickly ev
   // direct probe-count visibility from the SDK, but elapsed-time on local
   // dev is a coarse proxy.
   const start = Date.now();
-  const state = await bob.readShareLog(aliceFriendOfBob, { refresh: true });
+  const state = await bob.readShareLog(aliceConnectionOfBob, { refresh: true });
   const elapsed = Date.now() - start;
   if (typeof state !== 'object') throw new Error('cold read should return state map');
   if (elapsed > 10000) throw new Error(`cold read took ${elapsed}ms (should be <10s for a small log)`);
@@ -588,7 +588,7 @@ await test('Concurrent publish race: two parallel writers at the same tag → ex
 
 // ============ 9. Section 5d — Revocation + identity rotation (issue #17) ============
 
-console.log('\n=== 9. Revocation: unfriend (silent + notify modes) ===');
+console.log('\n=== 9. Revocation: removeConnection (silent + notify modes) ===');
 
 // Use a fresh pair so the prior tests' state doesn't pollute revocation tests.
 const charlieEmail = randomEmail();
@@ -598,86 +598,86 @@ const dianaPassword = 'pw-diana-' + Date.now();
 const charlie = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const diana = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 
-let dianaFriendOfCharlie;
-let charlieFriendOfDiana;
+let dianaConnectionOfCharlie;
+let charlieConnectionOfDiana;
 
-await test('Charlie + Diana register and friend each other', async () => {
+await test('Charlie + Diana register and connection each other', async () => {
   await registerWithRules(charlie, charlieEmail, charliePassword);
   await registerWithRules(diana, dianaEmail, dianaPassword);
-  const send = await charlie.sendFriendRequest(dianaEmail);
+  const send = await charlie.sendConnectionRequest(dianaEmail);
   await sleep(200);
   await diana.listIncomingRequests();
-  await diana.acceptFriendRequest(send.requestNonce);
+  await diana.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await charlie.listIncomingRequests();
-  charlieFriendOfDiana = (await charlie.listFriends()).find(f => f.email === dianaEmail);
-  dianaFriendOfCharlie = (await diana.listFriends()).find(f => f.email === charlieEmail);
-  assert(charlieFriendOfDiana, 'Charlie missing Diana');
-  assert(dianaFriendOfCharlie, 'Diana missing Charlie');
+  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.email === dianaEmail);
+  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.email === charlieEmail);
+  assert(charlieConnectionOfDiana, 'Charlie missing Diana');
+  assert(dianaConnectionOfCharlie, 'Diana missing Charlie');
 });
 
-await test('unfriend (silent): friend dropped from listFriends, per-friend caches cleared', async () => {
+await test('removeConnection (silent): connection dropped from listConnections, per-connection caches cleared', async () => {
   await charlie.shareContent(
-    charlieFriendOfDiana,
+    charlieConnectionOfDiana,
     'tobe-revoked-1',
     'arweave-rev-1',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
-  const before = await charlie.listFriends();
-  assert(before.some(f => f.email === dianaEmail), 'Diana should still be a friend');
-  const r = await charlie.unfriend(charlieFriendOfDiana);
-  assert(r.removed === true, 'unfriend should report removal');
-  assert(!r.notifications, 'silent unfriend should not produce notifications');
-  const after = await charlie.listFriends();
-  assert(!after.some(f => f.email === dianaEmail), 'Diana should be gone after unfriend');
+  const before = await charlie.listConnections();
+  assert(before.some(f => f.email === dianaEmail), 'Diana should still be a connection');
+  const r = await charlie.removeConnection(charlieConnectionOfDiana);
+  assert(r.removed === true, 'removeConnection should report removal');
+  assert(!r.notifications, 'silent removeConnection should not produce notifications');
+  const after = await charlie.listConnections();
+  assert(!after.some(f => f.email === dianaEmail), 'Diana should be gone after removeConnection');
 });
 
-await test('unfriend (idempotent): re-unfriending a non-friend returns removed:false', async () => {
-  const r = await charlie.unfriend(charlieFriendOfDiana);
-  assert(r.removed === false, 'second unfriend should be a no-op');
+await test('removeConnection (idempotent): re-removing a non-connection returns removed:false', async () => {
+  const r = await charlie.removeConnection(charlieConnectionOfDiana);
+  assert(r.removed === false, 'second removeConnection should be a no-op');
 });
 
-// Re-friend Charlie + Diana to test the notify-mode unfriend.
+// Re-connection Charlie + Diana to test the notify-mode removeConnection.
 await test('Re-establish Charlie+Diana for notify-mode test', async () => {
-  const send2 = await diana.sendFriendRequest(charlieEmail);
+  const send2 = await diana.sendConnectionRequest(charlieEmail);
   await sleep(200);
   await charlie.listIncomingRequests();
-  await charlie.acceptFriendRequest(send2.requestNonce);
+  await charlie.acceptConnectionRequest(send2.requestNonce);
   await sleep(200);
   await diana.listIncomingRequests();
-  charlieFriendOfDiana = (await charlie.listFriends()).find(f => f.email === dianaEmail);
-  dianaFriendOfCharlie = (await diana.listFriends()).find(f => f.email === charlieEmail);
-  assert(charlieFriendOfDiana, 'Re-friend failed for Charlie');
-  assert(dianaFriendOfCharlie, 'Re-friend failed for Diana');
+  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.email === dianaEmail);
+  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.email === charlieEmail);
+  assert(charlieConnectionOfDiana, 'Re-connection failed for Charlie');
+  assert(dianaConnectionOfCharlie, 'Re-connection failed for Diana');
   // Charlie publishes 2 add ops to have something to revoke.
   await charlie.shareContent(
-    charlieFriendOfDiana,
+    charlieConnectionOfDiana,
     'notify-target-A',
     'arweave-notify-A',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
   await charlie.shareContent(
-    charlieFriendOfDiana,
+    charlieConnectionOfDiana,
     'notify-target-B',
     'arweave-notify-B',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
 });
 
-await test('unfriend ({notify: true}): publishes a final remove for every shared content_id', async () => {
-  // Diana reads Charlie's log and confirms the items are present BEFORE notify-unfriend.
-  const beforeState = await diana.readShareLog(dianaFriendOfCharlie, { refresh: true });
+await test('removeConnection ({notify: true}): publishes a final remove for every shared content_id', async () => {
+  // Diana reads Charlie's log and confirms the items are present BEFORE notify-removeConnection.
+  const beforeState = await diana.readShareLog(dianaConnectionOfCharlie, { refresh: true });
   assert(beforeState['notify-target-A'], 'Diana should see notify-target-A');
   assert(beforeState['notify-target-B'], 'Diana should see notify-target-B');
 
-  const r = await charlie.unfriend(charlieFriendOfDiana, { notify: true });
+  const r = await charlie.removeConnection(charlieConnectionOfDiana, { notify: true });
   assert(r.removed === true);
   assert(Array.isArray(r.notifications), 'notify mode returns notifications array');
   // Notify mode emits one `remove` per content_id in the hydrated outbound
   // state. The hydrate reads from the OLD log (sharing §13.7 "continue old
-  // log" semantics — re-friending reuses the same per-pair tag stream), so
-  // a tobe-revoked-1 from the FIRST friendship may still be in the state at
-  // re-friend time. We assert >= 2 (the two notify-target items) rather than
+  // log" semantics — re-connecting reuses the same per-pair tag stream), so
+  // a tobe-revoked-1 from the FIRST connectionship may still be in the state at
+  // re-connection time. We assert >= 2 (the two notify-target items) rather than
   // pinning the exact count.
   assert(r.notifications.length >= 2, `expected at least 2 notifications, got ${r.notifications.length}`);
   const removedIds = new Set(r.notifications.map(n => n.content_id));
@@ -689,12 +689,12 @@ await test('unfriend ({notify: true}): publishes a final remove for every shared
   }
 
   // Diana syncs and sees the targeted items removed.
-  const afterState = await diana.syncShareLog(dianaFriendOfCharlie);
+  const afterState = await diana.syncShareLog(dianaConnectionOfCharlie);
   assert(!afterState['notify-target-A'], 'Diana should no longer see notify-target-A');
   assert(!afterState['notify-target-B'], 'Diana should no longer see notify-target-B');
 });
 
-console.log('\n=== 9b. Revocation: revokeContentForFriends (CEK rotation) ===');
+console.log('\n=== 9b. Revocation: revokeContentFromConnections (CEK rotation) ===');
 
 const eveEmail = randomEmail();
 const evePassword = 'pw-eve-' + Date.now();
@@ -706,71 +706,71 @@ const eve = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const frank = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const gary = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 
-let frankFriendOfEve, garyFriendOfEve;
-let eveFriendOfFrank, eveFriendOfGary;
+let frankConnectionOfEve, garyConnectionOfEve;
+let eveConnectionOfFrank, eveConnectionOfGary;
 const sharedContentId = 'book-' + Date.now();
 const originalCek = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 
-await test('Eve registers, friends Frank and Gary, shares same content with both', async () => {
+await test('Eve registers, connections Frank and Gary, shares same content with both', async () => {
   await registerWithRules(eve, eveEmail, evePassword);
   await registerWithRules(frank, frankEmail, frankPassword);
   await registerWithRules(gary, garyEmail, garyPassword);
 
-  const r1 = await eve.sendFriendRequest(frankEmail);
+  const r1 = await eve.sendConnectionRequest(frankEmail);
   await sleep(200);
   await frank.listIncomingRequests();
-  await frank.acceptFriendRequest(r1.requestNonce);
+  await frank.acceptConnectionRequest(r1.requestNonce);
   await sleep(200);
   await eve.listIncomingRequests();
 
-  const r2 = await eve.sendFriendRequest(garyEmail);
+  const r2 = await eve.sendConnectionRequest(garyEmail);
   await sleep(200);
   await gary.listIncomingRequests();
-  await gary.acceptFriendRequest(r2.requestNonce);
+  await gary.acceptConnectionRequest(r2.requestNonce);
   await sleep(200);
   await eve.listIncomingRequests();
 
-  const eveFriends = await eve.listFriends();
-  frankFriendOfEve = eveFriends.find(f => f.email === frankEmail);
-  garyFriendOfEve = eveFriends.find(f => f.email === garyEmail);
-  eveFriendOfFrank = (await frank.listFriends()).find(f => f.email === eveEmail);
-  eveFriendOfGary = (await gary.listFriends()).find(f => f.email === eveEmail);
-  assert(frankFriendOfEve && garyFriendOfEve, 'Eve\'s friend list incomplete');
-  assert(eveFriendOfFrank && eveFriendOfGary, 'Frank/Gary missing Eve');
+  const eveConnections = await eve.listConnections();
+  frankConnectionOfEve = eveConnections.find(f => f.email === frankEmail);
+  garyConnectionOfEve = eveConnections.find(f => f.email === garyEmail);
+  eveConnectionOfFrank = (await frank.listConnections()).find(f => f.email === eveEmail);
+  eveConnectionOfGary = (await gary.listConnections()).find(f => f.email === eveEmail);
+  assert(frankConnectionOfEve && garyConnectionOfEve, 'Eve\'s connection list incomplete');
+  assert(eveConnectionOfFrank && eveConnectionOfGary, 'Frank/Gary missing Eve');
 
-  await eve.shareContent(frankFriendOfEve, sharedContentId, 'arweave-orig', originalCek);
-  await eve.shareContent(garyFriendOfEve, sharedContentId, 'arweave-orig', originalCek);
+  await eve.shareContent(frankConnectionOfEve, sharedContentId, 'arweave-orig', originalCek);
+  await eve.shareContent(garyConnectionOfEve, sharedContentId, 'arweave-orig', originalCek);
 });
 
-await test('revokeContentForFriends: produces a new CEK, fans out rotate to all remaining friends', async () => {
-  // Eve unfriends Frank first, then revokes content from remaining friends
+await test('revokeContentFromConnections: produces a new CEK, fans out rotate to all remaining connections', async () => {
+  // Eve removeConnections Frank first, then revokes content from remaining connections
   // (Gary). This is the recommended §10.3 flow: drop Bob, then rotate.
-  await eve.unfriend(frankFriendOfEve);
+  await eve.removeConnection(frankConnectionOfEve);
 
-  const result = await eve.revokeContentForFriends(sharedContentId);
+  const result = await eve.revokeContentFromConnections(sharedContentId);
   assert(typeof result.newCekBase64Url === 'string', 'new CEK should be returned');
   assert(result.newCekBase64Url.length === 43, 'CEK should be 32-byte base64url');
   assert(result.newCekBase64Url !== originalCek, 'new CEK must differ from old');
   assert(Array.isArray(result.announcements), 'announcements array required');
   assert(result.announcements.length === 1, `expected 1 announcement (Gary only), got ${result.announcements.length}`);
-  assert(result.announcements[0].friendSharePub === garyFriendOfEve.share_pub);
+  assert(result.announcements[0].connectionSharePub === garyConnectionOfEve.share_pub);
 });
 
 await test('Gary syncs and sees the new CEK; Frank still has old CEK in his last-known state', async () => {
-  const garyState = await gary.syncShareLog(eveFriendOfGary);
+  const garyState = await gary.syncShareLog(eveConnectionOfGary);
   assert(garyState[sharedContentId], `Gary should still have ${sharedContentId} after rotation`);
   assert(garyState[sharedContentId].cek !== originalCek, `Gary's CEK should have rotated`);
 
   // Frank's last sync (pre-revocation) still has the original CEK. Frank
-  // would not see further updates because Eve unfriended him.
-  const frankState = await frank.readShareLog(eveFriendOfFrank, { refresh: true });
+  // would not see further updates because Eve removeConnectioned him.
+  const frankState = await frank.readShareLog(eveConnectionOfFrank, { refresh: true });
   if (frankState[sharedContentId]) {
     assert(frankState[sharedContentId].cek === originalCek,
       'Frank\'s view of the content (if any) should still hold the old CEK');
   }
 });
 
-console.log('\n=== 9c. Identity rotation: changeCredentials → friend picks up new keys ===');
+console.log('\n=== 9c. Identity rotation: changeCredentials → connection picks up new keys ===');
 
 const helenEmail = randomEmail();
 const helenPassword = 'pw-helen-' + Date.now();
@@ -778,7 +778,7 @@ const ivanEmail = randomEmail();
 const ivanPassword = 'pw-ivan-' + Date.now();
 const helen = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const ivan = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-let ivanFriendOfHelen, helenFriendOfIvan;
+let ivanConnectionOfHelen, helenConnectionOfIvan;
 let helenPhrase;
 let helenSharePubBeforeRotate;
 
@@ -791,21 +791,21 @@ await test('Helen + Ivan register + handshake; Helen shares a content item', asy
   await forceAllowRulesForAccount(reg.dataLookupKey);
   await registerWithRules(ivan, ivanEmail, ivanPassword);
 
-  const send = await helen.sendFriendRequest(ivanEmail);
+  const send = await helen.sendConnectionRequest(ivanEmail);
   await sleep(200);
   await ivan.listIncomingRequests();
-  await ivan.acceptFriendRequest(send.requestNonce);
+  await ivan.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await helen.listIncomingRequests();
 
-  ivanFriendOfHelen = (await helen.listFriends()).find(f => f.email === ivanEmail);
-  helenFriendOfIvan = (await ivan.listFriends()).find(f => f.email === helenEmail);
-  assert(ivanFriendOfHelen, 'Helen missing Ivan');
-  assert(helenFriendOfIvan, 'Ivan missing Helen');
-  helenSharePubBeforeRotate = helenFriendOfIvan.share_pub;
+  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.email === ivanEmail);
+  helenConnectionOfIvan = (await ivan.listConnections()).find(f => f.email === helenEmail);
+  assert(ivanConnectionOfHelen, 'Helen missing Ivan');
+  assert(helenConnectionOfIvan, 'Ivan missing Helen');
+  helenSharePubBeforeRotate = helenConnectionOfIvan.share_pub;
 
   await helen.shareContent(
-    ivanFriendOfHelen,
+    ivanConnectionOfHelen,
     'rotate-target-1',
     'arweave-pre-rotate',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
@@ -813,7 +813,7 @@ await test('Helen + Ivan register + handshake; Helen shares a content item', asy
 });
 
 await test('Ivan reads pre-rotation state', async () => {
-  const state = await ivan.readShareLog(helenFriendOfIvan, { refresh: true });
+  const state = await ivan.readShareLog(helenConnectionOfIvan, { refresh: true });
   assert(state['rotate-target-1'], 'Ivan should see rotate-target-1 before rotation');
 });
 
@@ -823,55 +823,55 @@ await test('Helen rotates credentials (email + password change)', async () => {
     phrase: helenPhrase,
   });
   assert(Array.isArray(result.rotationAnnouncements), 'should return rotationAnnouncements');
-  assert(result.rotationAnnouncements.length === 1, 'expected 1 friend rotated');
+  assert(result.rotationAnnouncements.length === 1, 'expected 1 connection rotated');
   const ann = result.rotationAnnouncements[0];
-  assert(ann.friendSharePub === ivanFriendOfHelen.share_pub);
+  assert(ann.connectionSharePub === ivanConnectionOfHelen.share_pub);
   assert(typeof ann.txid === 'string', 'rotation announcement should have a txid');
   assert(typeof ann.seq === 'number', 'rotation announcement should have a seq');
 });
 
-await test('Ivan syncs: detects rotate_identity, updates friend record, switches to new keys', async () => {
+await test('Ivan syncs: detects rotate_identity, updates connection record, switches to new keys', async () => {
   await sleep(300);
-  const stateAfter = await ivan.syncShareLog(helenFriendOfIvan);
-  // After rotation, the friend record now holds Helen's NEW share_pub. The
+  const stateAfter = await ivan.syncShareLog(helenConnectionOfIvan);
+  // After rotation, the connection record now holds Helen's NEW share_pub. The
   // returned state should reflect the seq=0 NEW-log snapshot Helen published
   // with her pre-rotation outbound state.
   assert(stateAfter['rotate-target-1'], 'Ivan should still see rotate-target-1 after rotation');
 
-  const ivanFriends = await ivan.listFriends();
-  const updatedFriend = ivanFriends[0];
-  assert(updatedFriend.share_pub !== helenSharePubBeforeRotate,
-    'Ivan\'s friend record should hold the NEW share_pub');
-  assert(typeof updatedFriend.rotated_at === 'number', 'Ivan should record rotated_at');
-  assert(updatedFriend.prior_share_pub === helenSharePubBeforeRotate,
+  const ivanConnections = await ivan.listConnections();
+  const updatedConnection = ivanConnections[0];
+  assert(updatedConnection.share_pub !== helenSharePubBeforeRotate,
+    'Ivan\'s connection record should hold the NEW share_pub');
+  assert(typeof updatedConnection.rotated_at === 'number', 'Ivan should record rotated_at');
+  assert(updatedConnection.prior_share_pub === helenSharePubBeforeRotate,
     'Ivan should record the pre-rotation share_pub for audit');
 });
 
 await test('Helen publishes a new share post-rotation; Ivan picks it up via sync', async () => {
-  // Helen's friends record was updated by changeCredentials: but the
-  // ivanFriendOfHelen reference is stale post-rotation. Refresh it.
-  ivanFriendOfHelen = (await helen.listFriends()).find(f => f.email === ivanEmail);
+  // Helen's connections record was updated by changeCredentials: but the
+  // ivanConnectionOfHelen reference is stale post-rotation. Refresh it.
+  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.email === ivanEmail);
   await helen.shareContent(
-    ivanFriendOfHelen,
+    ivanConnectionOfHelen,
     'post-rotate-target',
     'arweave-post-rotate',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
   await sleep(300);
-  // Refresh Ivan's friend pointer too.
-  const ivanFriends = await ivan.listFriends();
-  const helenFromIvan = ivanFriends.find(f => f.email !== helenEmail || f.share_pub) || ivanFriends[0];
+  // Refresh Ivan's connection pointer too.
+  const ivanConnections = await ivan.listConnections();
+  const helenFromIvan = ivanConnections.find(f => f.email !== helenEmail || f.share_pub) || ivanConnections[0];
   const stateAfter = await ivan.syncShareLog(helenFromIvan);
   assert(stateAfter['post-rotate-target'], 'Ivan should pick up post-rotation share via NEW-log keys');
 });
 
 await test('Re-reading rotate_identity is idempotent (replay produces same final state)', async () => {
   // Trigger a fresh refresh — readShareLog with refresh:true re-bootstraps
-  // and re-encounters the rotation announcement. The friend record is
+  // and re-encounters the rotation announcement. The connection record is
   // already at NEW keys, so the recursive read flow goes straight into the
-  // NEW log without re-mutating the friend record.
-  const ivanFriends = await ivan.listFriends();
-  const helenFromIvan = ivanFriends[0];
+  // NEW log without re-mutating the connection record.
+  const ivanConnections = await ivan.listConnections();
+  const helenFromIvan = ivanConnections[0];
   const refreshed = await ivan.readShareLog(helenFromIvan, { refresh: true });
   assert(refreshed['rotate-target-1'], 'rotate-target-1 should still be present');
   assert(refreshed['post-rotate-target'], 'post-rotate-target should still be present');

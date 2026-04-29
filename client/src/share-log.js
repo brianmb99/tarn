@@ -206,14 +206,14 @@ export function deriveSharedSecret(sharePriv, peerSharePub) {
  * Net result: A's outbound bytes equal B's inbound bytes (same forward HKDF),
  * and B's outbound bytes equal A's inbound bytes (same reverse HKDF). Both
  * parties read what the other writes. (Lex-equal share_pubs would imply the
- * same X25519 keypair on both sides, which is a friend-with-self case the
+ * same X25519 keypair on both sides, which is a connection-with-self case the
  * handshake would never produce; we throw if it happens.)
  *
  * @param {{
  *   sharedSecret: Uint8Array,    // 32 bytes from deriveSharedSecret
  *   appId: string,
  *   selfSharePub: Uint8Array,    // 32 bytes — caller's share_pub
- *   peerSharePub: Uint8Array,    // 32 bytes — friend's share_pub
+ *   peerSharePub: Uint8Array,    // 32 bytes — connection's share_pub
  * }} opts
  * @returns {Promise<{
  *   outboundKey: CryptoKey,
@@ -435,7 +435,7 @@ export function buildOperationUnsigned(fields) {
     case OP_ROTATE_IDENTITY:
       // §13.5 — emitted by the sender (5d) when the master_key changes (email
       // or password change, account recovery). Recipients verify the signature
-      // with the OLD signing_pub cached in their friend record before adopting
+      // with the OLD signing_pub cached in their connection record before adopting
       // the new pubkeys.
       requireBase64UrlBytes(fields.new_share_pub, 'new_share_pub', 32);
       requireString(fields.new_signing_pub, 'new_signing_pub');
@@ -597,7 +597,7 @@ export async function signOperation(operationUnsigned, signingPrivateKey) {
  * key import, AEAD-side verify failure, etc.) — never throws.
  *
  * @param {Object} operationSigned - the parsed JSON from a decrypted entry
- * @param {string} senderSigningPubBase64 - the signing_pub from the friends
+ * @param {string} senderSigningPubBase64 - the signing_pub from the connections
  *   record (existing Tarn ECDSA P-256 SPKI in standard base64).
  * @returns {Promise<boolean>}
  */
@@ -638,7 +638,7 @@ export async function verifyOperationSignature(operationSigned, senderSigningPub
 }
 
 async function importEcdsaP256SpkiBase64(b64) {
-  // The friends record stores `signing_pub` as standard base64 (matches the
+  // The connections record stores `signing_pub` as standard base64 (matches the
   // existing exportPublicKey output in crypto.js). Decode tolerantly to allow
   // base64url too in case a caller hands us one.
   const padded = b64.replace(/-/g, '+').replace(/_/g, '/');

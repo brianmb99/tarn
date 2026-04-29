@@ -3,7 +3,7 @@
 //
 // Covers the pure helpers + share-log type extension. The TarnClient-level
 // flows (changeCredentials → rotation announce → recipient pickup,
-// recoverAccount rotation, unfriend, revokeContentForFriends fanout) are
+// recoverAccount rotation, removeConnection, revokeContentForConnections fanout) are
 // exercised end-to-end in tests/test-share-log.mjs against a running
 // wrangler dev.
 //
@@ -11,9 +11,9 @@
 //   - rotate_identity operation construction (buildOperationUnsigned + 4 fields)
 //   - rotate_identity sign + verify under OLD signing key, fails under NEW
 //   - rotate_identity validation: rejects malformed payload
-//   - rotateFriendIdentity: replaces share_pub/signing_pub/credential_lookup_key,
-//     records prior_share_pub + rotated_at; idempotent on missing friend
-//   - removeFriend: idempotent on absent share_pub
+//   - rotateConnectionIdentity: replaces share_pub/signing_pub/credential_lookup_key,
+//     records prior_share_pub + rotated_at; idempotent on missing connection
+//   - removeConnection: idempotent on absent share_pub
 //
 // Run: node --test tests/unit/client-rotate-identity.test.js
 
@@ -36,10 +36,10 @@ import {
   deriveSharingKeyPair,
 } from '../../client/src/crypto.js';
 import {
-  removeFriend,
-  rotateFriendIdentity,
-  emptyFriendsRecord,
-  upsertFriend,
+  removeConnection,
+  rotateConnectionIdentity,
+  emptyConnectionsRecord,
+  upsertConnection,
 } from '../../client/src/sharing.js';
 
 const TEST_APP = 'bookish';
@@ -61,7 +61,7 @@ async function freshSigningKeyPair() {
   const kp = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'],
   );
-  // Export the public key as SPKI base64 (the friend record format).
+  // Export the public key as SPKI base64 (the connection record format).
   const spki = new Uint8Array(await crypto.subtle.exportKey('spki', kp.publicKey));
   const spkiBase64 = btoa(String.fromCharCode(...spki));
   return { privateKey: kp.privateKey, publicKey: kp.publicKey, spkiBase64 };
@@ -222,28 +222,28 @@ describe('rotate_identity: sign with OLD signing_priv, verify with OLD signing_p
   });
 });
 
-// ============ rotateFriendIdentity (recipient-side friend record update) ============
+// ============ rotateConnectionIdentity (recipient-side connection record update) ============
 
-describe('rotateFriendIdentity (sharing §13.5 step 4)', () => {
+describe('rotateConnectionIdentity (sharing §13.5 step 4)', () => {
   it('replaces share_pub, signing_pub, credential_lookup_key; records prior + rotated_at', () => {
-    const friend = {
+    const connection = {
       email: 'alice@example.com',
       share_pub: 'OLD_SHARE_PUB',
       signing_pub: 'OLD_SIG_PUB',
       credential_lookup_key: 'OLD_LK',
       established_at: 1714000000,
     };
-    let record = emptyFriendsRecord('bookish');
-    record = upsertFriend(record, friend);
+    let record = emptyConnectionsRecord('bookish');
+    record = upsertConnection(record, connection);
 
-    const updated = rotateFriendIdentity(record, 'OLD_SHARE_PUB', {
+    const updated = rotateConnectionIdentity(record, 'OLD_SHARE_PUB', {
       newSharePubBase64Url: 'NEW_SHARE_PUB',
       newSigningPubBase64: 'NEW_SIG_PUB',
       newCredentialLookupKey: 'NEW_LK',
       rotatedAt: 1714400000,
     });
-    assert.equal(updated.friends.length, 1);
-    const f = updated.friends[0];
+    assert.equal(updated.connections.length, 1);
+    const f = updated.connections[0];
     assert.equal(f.share_pub, 'NEW_SHARE_PUB');
     assert.equal(f.signing_pub, 'NEW_SIG_PUB');
     assert.equal(f.credential_lookup_key, 'NEW_LK');
@@ -254,13 +254,13 @@ describe('rotateFriendIdentity (sharing §13.5 step 4)', () => {
     assert.equal(f.established_at, 1714000000);
   });
 
-  it('returns the record unchanged if the friend share_pub is not present (idempotent on replay)', () => {
-    const record = upsertFriend(emptyFriendsRecord('bookish'), {
+  it('returns the record unchanged if the connection share_pub is not present (idempotent on replay)', () => {
+    const record = upsertConnection(emptyConnectionsRecord('bookish'), {
       email: 'a',
       share_pub: 'EXISTS',
       signing_pub: 'sp',
     });
-    const updated = rotateFriendIdentity(record, 'NOT_PRESENT', {
+    const updated = rotateConnectionIdentity(record, 'NOT_PRESENT', {
       newSharePubBase64Url: 'NEW',
       newSigningPubBase64: 'NEW_SP',
       newCredentialLookupKey: 'NLK',
@@ -270,15 +270,15 @@ describe('rotateFriendIdentity (sharing §13.5 step 4)', () => {
   });
 
   it('throws on malformed update payload', () => {
-    const record = upsertFriend(emptyFriendsRecord('bookish'), {
+    const record = upsertConnection(emptyConnectionsRecord('bookish'), {
       email: 'a', share_pub: 'X', signing_pub: 'Y',
     });
-    assert.throws(() => rotateFriendIdentity(record, 'X', null));
-    assert.throws(() => rotateFriendIdentity(record, 'X', {
+    assert.throws(() => rotateConnectionIdentity(record, 'X', null));
+    assert.throws(() => rotateConnectionIdentity(record, 'X', {
       // missing fields
       newSharePubBase64Url: 'A',
     }));
-    assert.throws(() => rotateFriendIdentity(record, 'X', {
+    assert.throws(() => rotateConnectionIdentity(record, 'X', {
       newSharePubBase64Url: 'A',
       newSigningPubBase64: 'B',
       newCredentialLookupKey: 'C',
@@ -287,29 +287,29 @@ describe('rotateFriendIdentity (sharing §13.5 step 4)', () => {
   });
 });
 
-// ============ removeFriend (sharing §10.1 unfriend) ============
+// ============ removeConnection (sharing §10.1 removeConnection) ============
 
-describe('removeFriend (sharing §10.1)', () => {
-  it('drops the friend by share_pub', () => {
-    let record = emptyFriendsRecord('bookish');
-    record = upsertFriend(record, { email: 'a', share_pub: 'A', signing_pub: 's' });
-    record = upsertFriend(record, { email: 'b', share_pub: 'B', signing_pub: 's' });
-    const after = removeFriend(record, 'A');
-    assert.equal(after.friends.length, 1);
-    assert.equal(after.friends[0].share_pub, 'B');
+describe('removeConnection (sharing §10.1)', () => {
+  it('drops the connection by share_pub', () => {
+    let record = emptyConnectionsRecord('bookish');
+    record = upsertConnection(record, { email: 'a', share_pub: 'A', signing_pub: 's' });
+    record = upsertConnection(record, { email: 'b', share_pub: 'B', signing_pub: 's' });
+    const after = removeConnection(record, 'A');
+    assert.equal(after.connections.length, 1);
+    assert.equal(after.connections[0].share_pub, 'B');
   });
 
   it('idempotent on absent share_pub: returns equivalent record', () => {
-    const record = upsertFriend(emptyFriendsRecord('bookish'), {
+    const record = upsertConnection(emptyConnectionsRecord('bookish'), {
       email: 'a', share_pub: 'A', signing_pub: 's',
     });
-    const after = removeFriend(record, 'NOT_PRESENT');
-    assert.equal(after.friends.length, 1);
+    const after = removeConnection(record, 'NOT_PRESENT');
+    assert.equal(after.connections.length, 1);
   });
 
   it('throws on missing share_pub argument', () => {
-    const record = emptyFriendsRecord('bookish');
-    assert.throws(() => removeFriend(record, ''));
-    assert.throws(() => removeFriend(record, null));
+    const record = emptyConnectionsRecord('bookish');
+    assert.throws(() => removeConnection(record, ''));
+    assert.throws(() => removeConnection(record, null));
   });
 });

@@ -1,4 +1,5 @@
-// Friend-handshake inbox endpoints (issue #14, Section 5a).
+// Connection-handshake inbox endpoints (issue #14, Section 5a; renamed in
+// Section 6 / issue #18).
 //
 // Two endpoints, both scoped by app:
 //   POST /api/v1/share/inbox/publish — JWT-gated, rate-limited per session
@@ -27,10 +28,10 @@ import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../tur
 
 // Per the design doc — kept generous on the accept side because a popular
 // user might receive many requests in a burst, each one prompting a 1:1
-// accept. Friend requests are the abuse-vector channel (any Bob with
+// accept. Connection requests are the abuse-vector channel (any Bob with
 // share_pub_A's email can write to Alice's inbox), so rate-limit hard.
-const MAX_FRIEND_REQUESTS_PER_HOUR = 10;
-const MAX_FRIEND_ACCEPTS_PER_HOUR = 50;
+const MAX_CONNECTION_REQUESTS_PER_HOUR = 10;
+const MAX_CONNECTION_ACCEPTS_PER_HOUR = 50;
 
 // Keep blob size small — HPKE-sealed handshake payloads are tens to low
 // hundreds of bytes; 8 KiB is a generous cap that catches accidents (someone
@@ -51,8 +52,8 @@ const MAX_INBOX_FETCHES_PER_HOUR = 1800;
 
 // Recognized blob types. Anything else is rejected up front.
 //
-// Section 6 (issue #18) renamed the wire-format types from friend-* to
-// connection-*. The old types are intentionally NOT accepted: there are no
+// Section 6 (issue #18) renamed the wire-format types from `friend-*` to
+// `connection-*`. The old types are intentionally NOT accepted: there are no
 // live v4 accounts that ever published under the old names, and treating this
 // as a clean break keeps the recognized-types set narrow.
 const VALID_BLOB_TYPES = new Set(['connection-request-v1', 'connection-accept-v1']);
@@ -63,7 +64,7 @@ export async function handleShareInboxPublish(request, env, ctx, cors) {
   const auth = await requireAuth(request, env);
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') {
-    return errorResponse('Only user accounts can publish to friend inboxes', 403, cors);
+    return errorResponse('Only user accounts can publish to connection inboxes', 403, cors);
   }
   if (!auth.app) {
     return errorResponse('JWT missing app claim', 403, cors);
@@ -118,8 +119,8 @@ export async function handleShareInboxPublish(request, env, ctx, cors) {
   // budget. Atomic INSERT...ON CONFLICT...RETURNING (same pattern as
   // checkWriteRateLimit) — single query, no TOCTOU.
   const limit = type === 'connection-request-v1'
-    ? MAX_FRIEND_REQUESTS_PER_HOUR
-    : MAX_FRIEND_ACCEPTS_PER_HOUR;
+    ? MAX_CONNECTION_REQUESTS_PER_HOUR
+    : MAX_CONNECTION_ACCEPTS_PER_HOUR;
   const hour = new Date().toISOString().slice(0, 13);
   const rateKey = `share-inbox-${type}:${auth.data_lookup_key}:${hour}`;
   const expiresAt = Date.now() + 3600_000;

@@ -29,8 +29,8 @@ import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../tur
 const MAX_LOG_BLOB_BYTES = 384 * 1024;
 
 // IP rate limit on the public fetch endpoint. Per-tag fetches are how
-// recipients pull individual entries; a power user with N friends, K writes
-// per friend per session would issue N×K reads. 1800/hour matches the
+// recipients pull individual entries; a power user with N connections, K writes
+// per connection per session would issue N×K reads. 1800/hour matches the
 // share_inbox fetch budget — both are cache reads with the same blast radius.
 const MAX_LOG_FETCHES_PER_HOUR = 1800;
 

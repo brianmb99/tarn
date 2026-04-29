@@ -2,7 +2,7 @@
 --
 -- The share log (sharing design §8) is a sequence of stealth-addressed,
 -- end-to-end encrypted entries that one user publishes for one specific
--- friend. Each entry's tag is HMAC-SHA-256 over a per-pair seed and a
+-- connection. Each entry's tag is HMAC-SHA-256 over a per-pair seed and a
 -- monotonically increasing seq, so tag values are pseudorandom from Tarn's
 -- perspective (Tarn cannot enumerate user-pairs from its own state).
 --

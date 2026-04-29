@@ -1,17 +1,17 @@
-// Unit tests for the friend handshake crypto primitives (issue #14, Section 5a).
+// Unit tests for the connection handshake crypto primitives (issue #14, Section 5a).
 //
 // Covers:
 //   - HPKE round-trip (seal + open) with raw 32-byte X25519 key bytes
 //   - HPKE info-string binding (request blob can't be opened as accept)
 //   - Inbox tag derivation: shape, determinism, per-recipient/per-app/per-window
 //     differentiation
-//   - Friend request + accept payload construction and validation, including
+//   - Connection request + accept payload construction and validation, including
 //     timestamp window enforcement (sharing §13.8) and per-app isolation
 //   - Replay-nonce cache: first hit succeeds, repeat is flagged, expired
 //     entries evicted
 //   - Forged-accept detection: cross-reference against outbound pending list
 //     (sharing §13.9)
-//   - Friends + pending records: empty initialization, idempotent upsert,
+//   - Connections + pending records: empty initialization, idempotent upsert,
 //     remove path
 //
 // Run: node --test tests/unit/client-sharing-handshake.test.js
@@ -22,29 +22,29 @@ import { deriveSharingKeyPair } from '../../client/src/crypto.js';
 import {
   hpkeSeal,
   hpkeOpen,
-  INFO_FRIEND_REQUEST,
-  INFO_FRIEND_ACCEPT,
+  INFO_CONNECTION_REQUEST,
+  INFO_CONNECTION_ACCEPT,
   deriveInboxTag,
   inboxWindowFor,
   currentInboxWindow,
   recentInboxWindows,
-  buildFriendRequestPayload,
-  validateFriendRequestPayload,
-  buildFriendAcceptPayload,
-  validateFriendAcceptPayload,
+  buildConnectionRequestPayload,
+  validateConnectionRequestPayload,
+  buildConnectionAcceptPayload,
+  validateConnectionAcceptPayload,
   makeReplayNonceCache,
   checkAndRecordNonce,
   REPLAY_PAST_WINDOW_SEC,
   REPLAY_FUTURE_WINDOW_SEC,
   findOutboundForAccept,
-  emptyFriendsRecord,
+  emptyConnectionsRecord,
   emptyPendingRequestsRecord,
-  upsertFriend,
+  upsertConnection,
   addOutboundPending,
   addInboundPending,
   removeOutboundPending,
   removeInboundPending,
-  FRIENDS_CONTENT_ID,
+  CONNECTIONS_CONTENT_ID,
   PENDING_REQUESTS_CONTENT_ID,
 } from '../../client/src/sharing.js';
 import {
@@ -91,7 +91,7 @@ describe('hpkeSeal / hpkeOpen', () => {
     const plaintext = new TextEncoder().encode('hello bob');
     const blob = await hpkeSeal({
       recipientSharePub: recipient.pub,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       plaintext,
     });
     assert.ok(blob instanceof Uint8Array);
@@ -100,7 +100,7 @@ describe('hpkeSeal / hpkeOpen', () => {
 
     const pt = await hpkeOpen({
       sharePriv: recipient.priv,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       blob,
     });
     assert.equal(new TextDecoder().decode(pt), 'hello bob');
@@ -111,12 +111,12 @@ describe('hpkeSeal / hpkeOpen', () => {
     const wrong = keypairFromSeed(3);
     const blob = await hpkeSeal({
       recipientSharePub: correct.pub,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       plaintext: new TextEncoder().encode('secret'),
     });
     await assert.rejects(() => hpkeOpen({
       sharePriv: wrong.priv,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       blob,
     }));
   });
@@ -128,12 +128,12 @@ describe('hpkeSeal / hpkeOpen', () => {
     const recipient = keypairFromSeed(4);
     const blob = await hpkeSeal({
       recipientSharePub: recipient.pub,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       plaintext: new TextEncoder().encode('hi'),
     });
     await assert.rejects(() => hpkeOpen({
       sharePriv: recipient.priv,
-      info: INFO_FRIEND_ACCEPT,
+      info: INFO_CONNECTION_ACCEPT,
       blob,
     }));
   });
@@ -142,7 +142,7 @@ describe('hpkeSeal / hpkeOpen', () => {
     const recipient = keypairFromSeed(5);
     await assert.rejects(() => hpkeOpen({
       sharePriv: recipient.priv,
-      info: INFO_FRIEND_REQUEST,
+      info: INFO_CONNECTION_REQUEST,
       blob: new Uint8Array(20),
     }), /too short/);
   });
@@ -175,7 +175,7 @@ describe('deriveInboxTag', () => {
   });
 
   it('differs across apps (same recipient + window) — per-app isolation', async () => {
-    // The acceptance criterion: a Bookish friend request cannot bootstrap a
+    // The acceptance criterion: a Bookish connection request cannot bootstrap a
     // Cellar handshake. Different app_id in the HMAC info → different tag,
     // so a Bookish-app sender would write to the wrong inbox if it tried to
     // contact the same recipient via the Cellar inbox (and vice versa).
@@ -225,13 +225,13 @@ describe('inbox windows', () => {
   });
 });
 
-// ============ Friend request payload ============
+// ============ Connection request payload ============
 
-describe('buildFriendRequestPayload', () => {
+describe('buildConnectionRequestPayload', () => {
   const senderPub = keypairFromSeed(20).pub;
 
   it('builds a well-formed payload with random nonce', () => {
-    const p = buildFriendRequestPayload({
+    const p = buildConnectionRequestPayload({
       senderEmail: 'alice@test.com',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'fake-spki-base64',
@@ -248,7 +248,7 @@ describe('buildFriendRequestPayload', () => {
   });
 
   it('omits message when not supplied', () => {
-    const p = buildFriendRequestPayload({
+    const p = buildConnectionRequestPayload({
       senderEmail: 'a@b.c',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'x',
@@ -258,7 +258,7 @@ describe('buildFriendRequestPayload', () => {
   });
 
   it('rejects oversized message', () => {
-    assert.throws(() => buildFriendRequestPayload({
+    assert.throws(() => buildConnectionRequestPayload({
       senderEmail: 'a@b.c',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'x',
@@ -268,7 +268,7 @@ describe('buildFriendRequestPayload', () => {
   });
 
   it('rejects 31-byte share_pub', () => {
-    assert.throws(() => buildFriendRequestPayload({
+    assert.throws(() => buildConnectionRequestPayload({
       senderEmail: 'a@b.c',
       senderSharePub: new Uint8Array(31),
       senderSigningPubBase64: 'x',
@@ -277,7 +277,7 @@ describe('buildFriendRequestPayload', () => {
   });
 });
 
-describe('validateFriendRequestPayload', () => {
+describe('validateConnectionRequestPayload', () => {
   const senderPub = keypairFromSeed(21).pub;
   const APP = 'bookish';
 
@@ -295,7 +295,7 @@ describe('validateFriendRequestPayload', () => {
   }
 
   it('accepts a well-formed payload and returns normalized fields', () => {
-    const v = validateFriendRequestPayload(make(), APP);
+    const v = validateConnectionRequestPayload(make(), APP);
     assert.equal(v.valid, true);
     assert.equal(v.normalized.senderEmail, 'alice@test.com');
     assert.equal(v.normalized.senderAppId, APP);
@@ -307,59 +307,59 @@ describe('validateFriendRequestPayload', () => {
   });
 
   it('rejects mismatched app_id (per-app isolation)', () => {
-    const v = validateFriendRequestPayload(make({ sender_app_id: 'cellar' }), APP);
+    const v = validateConnectionRequestPayload(make({ sender_app_id: 'cellar' }), APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /sender_app_id/);
   });
 
   it('rejects timestamp older than 7 days (replay window)', () => {
     const tooOld = Math.floor(Date.now() / 1000) - REPLAY_PAST_WINDOW_SEC - 60;
-    const v = validateFriendRequestPayload(make({ timestamp: tooOld }), APP);
+    const v = validateConnectionRequestPayload(make({ timestamp: tooOld }), APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /too old/);
   });
 
   it('rejects timestamp far in the future', () => {
     const future = Math.floor(Date.now() / 1000) + REPLAY_FUTURE_WINDOW_SEC + 60;
-    const v = validateFriendRequestPayload(make({ timestamp: future }), APP);
+    const v = validateConnectionRequestPayload(make({ timestamp: future }), APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /future/);
   });
 
   it('rejects wrong type field', () => {
-    const v = validateFriendRequestPayload(make({ type: 'something_else' }), APP);
+    const v = validateConnectionRequestPayload(make({ type: 'something_else' }), APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /wrong type/);
   });
 
   it('rejects 15-byte nonce', () => {
-    const v = validateFriendRequestPayload(make({ nonce: bytesToBase64Url(new Uint8Array(15)) }), APP);
+    const v = validateConnectionRequestPayload(make({ nonce: bytesToBase64Url(new Uint8Array(15)) }), APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /nonce must be 16/);
   });
 
   it('rejects 31-byte share_pub', () => {
-    const v = validateFriendRequestPayload(make({ sender_share_pub: bytesToBase64Url(new Uint8Array(31)) }), APP);
+    const v = validateConnectionRequestPayload(make({ sender_share_pub: bytesToBase64Url(new Uint8Array(31)) }), APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /sender_share_pub/);
   });
 
   it('rejects non-object input', () => {
-    assert.equal(validateFriendRequestPayload(null, APP).valid, false);
-    assert.equal(validateFriendRequestPayload('foo', APP).valid, false);
-    assert.equal(validateFriendRequestPayload(123, APP).valid, false);
+    assert.equal(validateConnectionRequestPayload(null, APP).valid, false);
+    assert.equal(validateConnectionRequestPayload('foo', APP).valid, false);
+    assert.equal(validateConnectionRequestPayload(123, APP).valid, false);
   });
 });
 
-// ============ Friend accept payload ============
+// ============ Connection accept payload ============
 
-describe('buildFriendAcceptPayload + validateFriendAcceptPayload', () => {
+describe('buildConnectionAcceptPayload + validateConnectionAcceptPayload', () => {
   const senderPub = keypairFromSeed(30).pub;
   const APP = 'bookish';
 
   it('round-trips through validate', () => {
     const inReplyTo = bytesToBase64Url(new Uint8Array(16).fill(2));
-    const p = buildFriendAcceptPayload({
+    const p = buildConnectionAcceptPayload({
       senderEmail: 'bob@test.com',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'spki',
@@ -369,21 +369,21 @@ describe('buildFriendAcceptPayload + validateFriendAcceptPayload', () => {
     assert.equal(p.type, 'connection_accept');
     assert.equal(p.in_reply_to, inReplyTo);
 
-    const v = validateFriendAcceptPayload(p, APP);
+    const v = validateConnectionAcceptPayload(p, APP);
     assert.equal(v.valid, true);
     assert.equal(v.normalized.inReplyToNonceBase64Url, inReplyTo);
   });
 
   it('rejects mismatched app_id', () => {
     const inReplyTo = bytesToBase64Url(new Uint8Array(16).fill(3));
-    const p = buildFriendAcceptPayload({
+    const p = buildConnectionAcceptPayload({
       senderEmail: 'bob@test.com',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'spki',
       senderAppId: 'cellar',
       inReplyToNonceBase64Url: inReplyTo,
     });
-    const v = validateFriendAcceptPayload(p, APP);
+    const v = validateConnectionAcceptPayload(p, APP);
     assert.equal(v.valid, false);
     assert.match(v.reason, /sender_app_id/);
   });
@@ -456,43 +456,43 @@ describe('findOutboundForAccept', () => {
   });
 });
 
-// ============ Friends + pending records ============
+// ============ Connections + pending records ============
 
-describe('friends record', () => {
-  it('emptyFriendsRecord() shape', () => {
-    const r = emptyFriendsRecord('bookish');
+describe('connections record', () => {
+  it('emptyConnectionsRecord() shape', () => {
+    const r = emptyConnectionsRecord('bookish');
     assert.equal(r.app_id, 'bookish');
     assert.equal(r.version, 1);
-    assert.deepEqual(r.friends, []);
+    assert.deepEqual(r.connections, []);
   });
 
-  it('upsertFriend() adds a new friend', () => {
-    const r = emptyFriendsRecord('bookish');
-    const out = upsertFriend(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's', established_at: 1, initial_request_nonce: 'n' });
-    assert.equal(out.friends.length, 1);
-    assert.equal(out.friends[0].email, 'a@x.y');
+  it('upsertConnection() adds a new connection', () => {
+    const r = emptyConnectionsRecord('bookish');
+    const out = upsertConnection(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's', established_at: 1, initial_request_nonce: 'n' });
+    assert.equal(out.connections.length, 1);
+    assert.equal(out.connections[0].email, 'a@x.y');
     // Original record is unchanged (immutability).
-    assert.equal(r.friends.length, 0);
+    assert.equal(r.connections.length, 0);
   });
 
-  it('upsertFriend() replaces by share_pub (idempotent)', () => {
-    let r = emptyFriendsRecord('bookish');
-    r = upsertFriend(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's1', established_at: 1, initial_request_nonce: 'n' });
-    r = upsertFriend(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's2', established_at: 2, initial_request_nonce: 'n' });
-    assert.equal(r.friends.length, 1);
-    assert.equal(r.friends[0].signing_pub, 's2');
+  it('upsertConnection() replaces by share_pub (idempotent)', () => {
+    let r = emptyConnectionsRecord('bookish');
+    r = upsertConnection(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's1', established_at: 1, initial_request_nonce: 'n' });
+    r = upsertConnection(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's2', established_at: 2, initial_request_nonce: 'n' });
+    assert.equal(r.connections.length, 1);
+    assert.equal(r.connections[0].signing_pub, 's2');
   });
 
-  it('upsertFriend() differentiates distinct share_pub values', () => {
-    let r = emptyFriendsRecord('bookish');
-    r = upsertFriend(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's', established_at: 1, initial_request_nonce: 'n' });
-    r = upsertFriend(r, { email: 'b@x.y', share_pub: 'pub-B', signing_pub: 's', established_at: 1, initial_request_nonce: 'n' });
-    assert.equal(r.friends.length, 2);
+  it('upsertConnection() differentiates distinct share_pub values', () => {
+    let r = emptyConnectionsRecord('bookish');
+    r = upsertConnection(r, { email: 'a@x.y', share_pub: 'pub-A', signing_pub: 's', established_at: 1, initial_request_nonce: 'n' });
+    r = upsertConnection(r, { email: 'b@x.y', share_pub: 'pub-B', signing_pub: 's', established_at: 1, initial_request_nonce: 'n' });
+    assert.equal(r.connections.length, 2);
   });
 
   it('rejects malformed input', () => {
-    assert.throws(() => upsertFriend(null, {}));
-    assert.throws(() => upsertFriend(emptyFriendsRecord('bookish'), {}));
+    assert.throws(() => upsertConnection(null, {}));
+    assert.throws(() => upsertConnection(emptyConnectionsRecord('bookish'), {}));
   });
 });
 
@@ -529,7 +529,7 @@ describe('pending requests record', () => {
   });
 
   it('content_id constants are stable', () => {
-    assert.equal(FRIENDS_CONTENT_ID, 'tarn-connections-v1');
+    assert.equal(CONNECTIONS_CONTENT_ID, 'tarn-connections-v1');
     assert.equal(PENDING_REQUESTS_CONTENT_ID, 'tarn-pending-requests-v1');
   });
 });

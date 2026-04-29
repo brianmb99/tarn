@@ -1,6 +1,7 @@
--- Friend-handshake inbox storage (issue #14, Section 5a).
+-- Connection-handshake inbox storage (issue #14, Section 5a; renamed in
+-- Section 6 / issue #18).
 --
--- The friend-handshake protocol (sharing design §6) publishes HPKE-sealed
+-- The connection-handshake protocol (sharing design §6) publishes HPKE-sealed
 -- request + accept blobs to a publicly-derivable per-recipient inbox tag.
 -- The tag is shared across all senders writing to the same recipient in a
 -- given day window, so unlike normal Tarn entries — which are scoped by
