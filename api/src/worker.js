@@ -6,6 +6,7 @@ import { handleEntries, handleEntryById } from './routes/entries.js';
 import { handleLookup } from './routes/lookup.js';
 import { handleShareLookup } from './routes/share.js';
 import { handleShareInboxPublish, handleShareInboxFetch } from './routes/share-inbox.js';
+import { handleShareLogPublish, handleShareLogFetch } from './routes/share-log.js';
 import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
 import { handleRecoveryEmail } from './routes/recovery.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
@@ -151,6 +152,15 @@ export default {
       }
       if (path === '/api/v1/share/inbox/fetch' && method === 'GET') {
         return await handleShareInboxFetch(url, request, env, cors);
+      }
+
+      // Per-pair share log (issue #15, Section 5b) — stealth-addressed
+      // encrypted entries with per-tag uniqueness on publish.
+      if (path === '/api/v1/share/log/publish' && method === 'POST') {
+        return await handleShareLogPublish(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/share/log/fetch' && method === 'GET') {
+        return await handleShareLogFetch(url, request, env, cors);
       }
 
       // Status (authenticated — app or user)

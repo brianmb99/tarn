@@ -378,14 +378,85 @@ await test('Two test users register + complete a mutual handshake against the de
   assert(aliceFriends.some(f => f.email === handshakeBobEmail), 'Bob not in Alice\'s friends');
 });
 
+// ============ 9. SHARE LOG (issue #15, Section 5b) ============
+
+console.log('\n=== 9. Share log (per-pair, signed, stealth-tagged) ===');
+
+await test('Friends from §8 can publish + fetch share log entries with verified signatures', async () => {
+  // Re-resolve the friend records on each side. Section 8 left Alice + Bob
+  // mutually friended; the seq=0 snapshots were already published by the
+  // handshake-acceptance flow.
+  const aliceFriends = await handshakeAlice.listFriends();
+  const bobFriends = await handshakeBob.listFriends();
+  const bobFriendOfAlice = aliceFriends.find(f => f.email === handshakeBobEmail);
+  const aliceFriendOfBob = bobFriends.find(f => f.email === handshakeAliceEmail);
+  assert(bobFriendOfAlice, 'Bob missing from Alice\'s friends');
+  assert(aliceFriendOfBob, 'Alice missing from Bob\'s friends');
+
+  // Bob fetches Alice's seq=0 snapshot.
+  const initial = await handshakeBob._fetchShareLogEntry(aliceFriendOfBob, 0);
+  assert(initial, 'no entry at seq=0 from Alice');
+  assert(initial.operation.type === 'snapshot',
+    `expected snapshot at seq=0, got ${initial.operation.type}`);
+  assert(initial.verified === true, 'seq=0 signature did not verify');
+
+  // Alice publishes a real `add` operation; Bob fetches + verifies.
+  const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const addRes = await handshakeAlice._publishShareLogEntry(bobFriendOfAlice, {
+    type: 'add',
+    content_id: 'deploy-share-log-' + Date.now(),
+    tx_id: 'arweave-tx-deploy-' + Date.now(),
+    cek,
+    shared_at: Math.floor(Date.now() / 1000),
+  });
+  assert(addRes.txid, 'no txid on publish');
+  assert(typeof addRes.seq === 'number', 'no seq on publish');
+
+  await sleep(500);
+  const fetched = await handshakeBob._fetchShareLogEntry(aliceFriendOfBob, addRes.seq);
+  assert(fetched, `Bob found nothing at seq=${addRes.seq}`);
+  assert(fetched.operation.type === 'add', 'wrong op type after fetch');
+  assert(fetched.verified === true, 'add signature did not verify');
+});
+
+await test('Per-tag uniqueness against deployed API: re-publish at same tag → 409', async () => {
+  // Push a synthetic tag through Alice's JWT twice — second attempt must be
+  // 409 with the existing txid.
+  const jwt = handshakeAlice._testJwt();
+  const tagSeed = crypto.getRandomValues(new Uint8Array(32));
+  // We use deriveLogTag from the SDK to keep the format consistent, but
+  // imported lazily to avoid needing share-log re-exports at file load.
+  const { deriveLogTag } = await import('../client/src/share-log.js');
+  const tag = await deriveLogTag(tagSeed, 0);
+  const dummyCipher = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(64))));
+
+  const r1 = await fetch(`${API_BASE}/api/v1/share/log/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+    body: JSON.stringify({ tag, type: 'share-log-v1', ciphertext_base64: dummyCipher }),
+  });
+  assert(r1.status === 200, `first publish must succeed: ${r1.status}`);
+  const j1 = await r1.json();
+
+  const r2 = await fetch(`${API_BASE}/api/v1/share/log/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+    body: JSON.stringify({ tag, type: 'share-log-v1', ciphertext_base64: dummyCipher }),
+  });
+  assert(r2.status === 409, `second publish must be 409: ${r2.status}`);
+  const j2 = await r2.json();
+  assert(j2.existing_txid === j1.txid, '409 must echo the original txid');
+});
+
 await test('Delete handshake test accounts', async () => {
   if (handshakeAlice) await handshakeAlice.deleteAccount();
   if (handshakeBob) await handshakeBob.deleteAccount();
 });
 
-// ============ 9. CLEANUP ============
+// ============ 10. CLEANUP ============
 
-console.log('\n=== 9. Cleanup ===');
+console.log('\n=== 10. Cleanup ===');
 
 await test('Delete test account', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);

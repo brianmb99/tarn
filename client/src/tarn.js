@@ -73,6 +73,20 @@ import {
   INFO_FRIEND_ACCEPT,
   DEFAULT_POLL_WINDOWS,
 } from './sharing.js';
+import {
+  deriveSharedSecret,
+  derivePairKeys,
+  deriveLogTag,
+  buildOperationUnsigned,
+  signOperation,
+  verifyOperationSignature,
+  encryptShareLogEntry,
+  decryptShareLogEntry,
+  shouldEmitSnapshot,
+  DEFAULT_COMPACTION_INTERVAL,
+  SHARE_LOG_TYPE,
+  OP_SNAPSHOT,
+} from './share-log.js';
 
 // Re-export the recovery-side surface so consumers can import them directly
 // from the package root without reaching into ./recovery (private path).
@@ -108,6 +122,19 @@ export class TarnClient {
   #email = null;                     // string — caller-supplied normalized email
   #sharingKeyPair = null;            // {privateKey: Uint8Array, publicKey: Uint8Array}
   #replayNonceCache = makeReplayNonceCache(); // §13.8 in-memory recent-nonce cache
+
+  // Per-friend share-log state (issue #15, Section 5b). Map keyed on the
+  // friend's `share_pub` (base64url string) — small, fast lookups by stable
+  // identifier. Each entry holds:
+  //   - keys: derived once per session via derivePairKeys()
+  //   - nextOutboundSeq: writer-side counter for our outbound-to-friend log
+  //   - nonSnapshotsSinceLastSnapshot: snapshot-compaction trigger (§8.6)
+  // Cache is in-memory only; on session restart the writer must rediscover
+  // the highest existing seq before publishing (5c work). For 5b, the
+  // counters are seeded at register/handshake time and remain authoritative
+  // for the lifetime of the session.
+  #pairKeyCache = new Map();         // sharePubBase64Url -> { sharedSecret, outboundKey, inboundKey, outboundTagSeed, inboundTagSeed }
+  #shareLogCounters = new Map();     // sharePubBase64Url -> { nextOutboundSeq, nonSnapshotsSinceLastSnapshot, compactionInterval }
 
   // v4 recovery-factor state (issue #12). Holds enough information to preserve
   // existing recovery wrappings across a credential change without requiring
@@ -501,6 +528,9 @@ export class TarnClient {
     this.#kdfVersion = kdfVersion;
     this.#email = newEmail;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
+    // Pair-key cache is derived from share_priv; recovery rotates it.
+    this.#pairKeyCache.clear();
+    this.#shareLogCounters.clear();
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
@@ -792,6 +822,13 @@ export class TarnClient {
     this.#recoveryFactorMeta = newRecoveryFactorMeta;
     this.#email = newEmail;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
+    // Per-pair S_AB is derived from share_priv, which just rotated — every
+    // cached friend's pair keys are stale. The 5d rotate_identity flow is
+    // what re-establishes per-friend keys end-to-end; for 5b we just drop
+    // the cache so the next per-friend operation throws cleanly rather than
+    // silently signing with the new key under the old K_AB.
+    this.#pairKeyCache.clear();
+    this.#shareLogCounters.clear();
 
     await this.#authenticate();
   }
@@ -842,6 +879,8 @@ export class TarnClient {
     this.#email = null;
     this.#sharingKeyPair = null;
     this.#replayNonceCache = makeReplayNonceCache();
+    this.#pairKeyCache.clear();
+    this.#shareLogCounters.clear();
   }
 
   // ============ DATA CRUD ============
@@ -1465,19 +1504,45 @@ export class TarnClient {
     // friend was added — re-running accept idempotently fixes it (the
     // friends-record upsertFriend is keyed on share_pub).
     const friendsState = await this.#loadFriendsRecord();
-    const friendsUpdated = upsertFriend(friendsState.record, {
+    const newFriend = {
       email: inbound.sender_email,
       share_pub: inbound.sender_share_pub,
       signing_pub: inbound.sender_signing_pub,
       established_at: payload.timestamp,
       initial_request_nonce: requestNonce,
-    });
+    };
+    const friendsUpdated = upsertFriend(friendsState.record, newFriend);
     await this.#saveFriendsRecord(friendsState, friendsUpdated);
 
     const pendingUpdated = removeInboundPending(pendingState.record, requestNonce);
     await this.#savePendingRequestsRecord(pendingState, pendingUpdated);
 
-    return { txid: publishRes.json.txid };
+    // Publish the seq=0 snapshot to our outbound-to-friend log (sharing §6.6).
+    // Default state is empty — apps with "share my full library" semantics
+    // should call _publishInitialSnapshot directly with their state, but the
+    // platform-layer SDK is app-agnostic so we can't enumerate content here.
+    // The snapshot is the bridge from §6 (handshake) into §8 (share log):
+    // a single-entry log exists, ready for ongoing operations to land at
+    // seq=1+.
+    let initialSnapshotTxid = null;
+    try {
+      const snap = await this._publishInitialSnapshot(newFriend);
+      initialSnapshotTxid = snap.txid;
+    } catch (err) {
+      // Don't roll back the friend addition if the snapshot publish fails —
+      // the friendship is established (durable in the friends record), and
+      // the writer can publish later operations at seq=0 on retry. Surface
+      // a warning so callers can investigate; the handshake is still useful
+      // for direction-aware reads from the friend's outbound log.
+      console.warn(
+        `[TarnClient] acceptFriendRequest: initial snapshot publish failed: ${err.message}`,
+      );
+    }
+
+    return {
+      txid: publishRes.json.txid,
+      ...(initialSnapshotTxid ? { initialSnapshotTxid } : {}),
+    };
   }
 
   /**
@@ -1510,6 +1575,270 @@ export class TarnClient {
     return {
       outbound: state.record.outbound.slice(),
       inbound: state.record.inbound.slice(),
+    };
+  }
+
+  // ============ SHARE LOG (issue #15, Section 5b) ============
+
+  /**
+   * Internal: derive (or fetch from cache) the per-pair keys for a given
+   * friend. Friend is identified by `share_pub` base64url string — that's
+   * the stable identifier in the friends record. Throws if the friend isn't
+   * recognized; the caller is responsible for ensuring the handshake
+   * completed first (acceptFriendRequest, or sendFriendRequest +
+   * listIncomingRequests-processed accept).
+   *
+   * Caches the derived AES-GCM CryptoKey handles + raw HMAC tag seeds keyed
+   * by `share_pub`. Every entry depends on the user's current `share_priv`,
+   * so the cache is invalidated wholesale on credential change / recovery.
+   */
+  async #getPairKeysFor(friendSharePubBase64Url) {
+    if (!this.#sharingKeyPair) {
+      throw new Error('share log: no sharing keypair — login as a v4 account first');
+    }
+    if (typeof friendSharePubBase64Url !== 'string' || friendSharePubBase64Url.length === 0) {
+      throw new Error('share log: friendSharePubBase64Url must be a non-empty string');
+    }
+    const cached = this.#pairKeyCache.get(friendSharePubBase64Url);
+    if (cached) return cached;
+    const peerSharePub = decodeSharePub(friendSharePubBase64Url);
+    const sharedSecret = deriveSharedSecret(this.#sharingKeyPair.privateKey, peerSharePub);
+    const keys = await derivePairKeys({
+      sharedSecret,
+      appId: this.#appId,
+      selfSharePub: this.#sharingKeyPair.publicKey,
+      peerSharePub,
+    });
+    const entry = { sharedSecret, ...keys };
+    this.#pairKeyCache.set(friendSharePubBase64Url, entry);
+    return entry;
+  }
+
+  #getOrInitCounters(friendSharePubBase64Url) {
+    let counters = this.#shareLogCounters.get(friendSharePubBase64Url);
+    if (!counters) {
+      counters = {
+        nextOutboundSeq: 0,
+        nonSnapshotsSinceLastSnapshot: 0,
+        compactionInterval: DEFAULT_COMPACTION_INTERVAL,
+      };
+      this.#shareLogCounters.set(friendSharePubBase64Url, counters);
+    }
+    return counters;
+  }
+
+  /**
+   * Look up a friend in the persisted friends record by share_pub. Used by
+   * the share-log helpers to check that we're talking to a real friend (and
+   * to grab the cached `signing_pub` for verification).
+   *
+   * @returns {Promise<Object | null>}
+   */
+  async #findFriendBySharePub(friendSharePubBase64Url) {
+    const friendsState = await this.#loadFriendsRecord();
+    return friendsState.record.friends.find(
+      f => f.share_pub === friendSharePubBase64Url,
+    ) || null;
+  }
+
+  /**
+   * Internal: publish a single signed + encrypted share-log entry to a
+   * friend's outbound log at the writer's next seq.
+   *
+   * Steps (sharing §8.1, §9.1):
+   *   1. Resolve pair keys (S_AB, outbound K_AB / T_AB_seed).
+   *   2. Allocate the next outbound seq from the per-friend counter.
+   *   3. Build the operation with that seq baked in.
+   *   4. Sign with the user's existing ECDSA P-256 signing key.
+   *   5. AES-GCM encrypt under outbound K_AB (AAD = "tarn-share-log-v1").
+   *   6. Compute the tag and POST to /share/log/publish.
+   *   7. On 409, surface the error to the caller — multi-device retry is 5c.
+   *   8. On success, advance the counters; emit a compaction snapshot if
+   *      we just crossed the threshold (sharing §8.6) — but only if the
+   *      caller didn't supply their own snapshot (`opts.skipCompaction`).
+   *
+   * Returns the final seq + tag + Arweave txid so callers (and tests) can
+   * round-trip via `_fetchShareLogEntry`.
+   *
+   * @param {Object} friend - friends-record entry (has share_pub, signing_pub)
+   * @param {{type: string, [key: string]: any}} operationFields - omit `seq`
+   * @param {{ skipCompaction?: boolean, snapshotState?: Object }} [opts]
+   * @returns {Promise<{
+   *   seq: number,
+   *   tag: string,
+   *   txid: string,
+   *   compactionSnapshot?: { seq: number, tag: string, txid: string },
+   * }>}
+   */
+  async _publishShareLogEntry(friend, operationFields, opts = {}) {
+    await this.#requireAuth();
+    if (!friend || typeof friend.share_pub !== 'string') {
+      throw new Error('_publishShareLogEntry: friend.share_pub is required');
+    }
+    if (!operationFields || typeof operationFields !== 'object') {
+      throw new Error('_publishShareLogEntry: operationFields is required');
+    }
+
+    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const counters = this.#getOrInitCounters(friend.share_pub);
+
+    const seq = counters.nextOutboundSeq;
+    const operation = buildOperationUnsigned({ ...operationFields, seq });
+    const signed = await signOperation(operation, this.#signingKeyPair.privateKey);
+    const blob = await encryptShareLogEntry(signed, pair.outboundKey);
+    const tag = await deriveLogTag(pair.outboundTagSeed, seq);
+
+    const txid = await this.#postShareLogPublish(tag, blob);
+
+    counters.nextOutboundSeq = seq + 1;
+    if (operation.type === OP_SNAPSHOT) {
+      counters.nonSnapshotsSinceLastSnapshot = 0;
+    } else {
+      counters.nonSnapshotsSinceLastSnapshot += 1;
+    }
+
+    let compactionSnapshot;
+    if (
+      !opts.skipCompaction
+      && operation.type !== OP_SNAPSHOT
+      && shouldEmitSnapshot(counters)
+    ) {
+      // Caller may pre-supply the snapshot state (e.g., the app's full
+      // current shared library). Without it we emit an empty snapshot — a
+      // no-op state-checkpoint that still satisfies §8.6's "bound bootstrap
+      // cost" intent. Apps that want richer compaction should call
+      // _publishShareLogEntry directly with a snapshot operation.
+      const snapshotFields = {
+        type: OP_SNAPSHOT,
+        state: opts.snapshotState ?? {},
+        snapshot_at: Math.floor(Date.now() / 1000),
+        prior_seq: seq,
+      };
+      const snap = await this._publishShareLogEntry(
+        friend, snapshotFields, { skipCompaction: true },
+      );
+      compactionSnapshot = { seq: snap.seq, tag: snap.tag, txid: snap.txid };
+    }
+
+    return { seq, tag, txid, ...(compactionSnapshot ? { compactionSnapshot } : {}) };
+  }
+
+  /**
+   * Internal: fetch a single share-log entry by seq from a friend's outbound
+   * log (the inbound direction from our perspective). Decrypts with the
+   * inbound K_AB, verifies the sender's ECDSA signature against the friend's
+   * cached `signing_pub`, and returns the parsed signed operation.
+   *
+   * Single-entry fetch only — full state-machine read is 5c.
+   *
+   * @param {Object} friend - friends-record entry (has share_pub, signing_pub)
+   * @param {number} seq
+   * @returns {Promise<{
+   *   txid: string,
+   *   tag: string,
+   *   operation: Object,            // operation_signed (with `signature` field)
+   *   verified: boolean,            // ECDSA verify result vs. friend.signing_pub
+   *   publishedAt: number | null,
+   * } | null>}
+   */
+  async _fetchShareLogEntry(friend, seq) {
+    await this.#requireAuth();
+    if (!friend || typeof friend.share_pub !== 'string') {
+      throw new Error('_fetchShareLogEntry: friend.share_pub is required');
+    }
+    if (typeof friend.signing_pub !== 'string') {
+      throw new Error('_fetchShareLogEntry: friend.signing_pub is required');
+    }
+
+    const pair = await this.#getPairKeysFor(friend.share_pub);
+    const tag = await deriveLogTag(pair.inboundTagSeed, seq);
+    const fetched = await this.#getShareLogBlobByTag(tag);
+    if (!fetched) return null;
+
+    let operation;
+    try {
+      operation = await decryptShareLogEntry(fetched.ciphertext, pair.inboundKey);
+    } catch (err) {
+      throw new Error(`_fetchShareLogEntry: decrypt failed at seq ${seq}: ${err.message}`);
+    }
+    const verified = await verifyOperationSignature(operation, friend.signing_pub);
+
+    return {
+      txid: fetched.txid,
+      tag,
+      operation,
+      verified,
+      publishedAt: fetched.publishedAt ?? null,
+    };
+  }
+
+  /**
+   * Internal: publish a seq=0 snapshot to a freshly-friended outbound log
+   * (sharing §6.6). Default: empty snapshot (a no-op bootstrap point). Apps
+   * that want "Bob sees Alice's current full library" pass `state` explicitly
+   * — Tarn's SDK is app-agnostic, so the platform layer doesn't know what
+   * "full library" means for any given app.
+   *
+   * Public ish — prefixed with `_` to mark it as semi-internal so the public
+   * surface stays predictable for 5c/5d. Apps will call higher-level
+   * methods once those land.
+   *
+   * @param {Object} friend
+   * @param {{ state?: Object }} [opts]
+   */
+  async _publishInitialSnapshot(friend, opts = {}) {
+    return await this._publishShareLogEntry(friend, {
+      type: OP_SNAPSHOT,
+      state: opts.state ?? {},
+      snapshot_at: Math.floor(Date.now() / 1000),
+      prior_seq: null,
+    });
+  }
+
+  // ---- Private share-log helpers ----
+
+  async #postShareLogPublish(tag, blob) {
+    const res = await this.#fetch('/api/v1/share/log/publish', {
+      method: 'POST',
+      auth: true,
+      // Per-tag uniqueness means a retry at the same tag will return 409
+      // every time — not retry-safe in the usual sense. The fetch wrapper
+      // only retries on 5xx/429 anyway, so this is just defense-in-depth
+      // signaling.
+      body: {
+        tag,
+        type: SHARE_LOG_TYPE,
+        ciphertext_base64: bytesToBase64(blob),
+      },
+    });
+    if (res.status === 409) {
+      const err = new Error(
+        `share-log publish at tag ${tag.slice(0, 8)}... collided with existing txid ${res.json?.existing_txid}`,
+      );
+      err.code = 'SHARE_LOG_TAG_CONFLICT';
+      err.existingTxid = res.json?.existing_txid ?? null;
+      err.tag = tag;
+      throw err;
+    }
+    if (res.status !== 200) {
+      throw new Error(`share-log publish failed: ${res.json?.error || res.status}`);
+    }
+    return res.json.txid;
+  }
+
+  async #getShareLogBlobByTag(tag) {
+    const url = `/api/v1/share/log/fetch?app=${encodeURIComponent(this.#appId)}&tag=${tag}&type=${encodeURIComponent(SHARE_LOG_TYPE)}`;
+    const res = await this.#fetch(url);
+    if (res.status === 404) return null;
+    if (res.status !== 200) {
+      throw new Error(`share-log fetch failed: ${res.json?.error || res.status}`);
+    }
+    const b = res.json?.blob;
+    if (!b) return null;
+    return {
+      txid: b.txid,
+      ciphertext: base64ToBytes(b.ciphertext_base64),
+      publishedAt: b.published_at ?? null,
     };
   }
 
@@ -1580,15 +1909,16 @@ export class TarnClient {
           continue;
         }
 
+        const newFriend = {
+          email: v.normalized.senderEmail,
+          share_pub: v.normalized.senderSharePubBase64Url,
+          signing_pub: v.normalized.senderSigningPubBase64,
+          established_at: v.normalized.timestamp,
+          initial_request_nonce: outbound.request_nonce,
+        };
         friendsState = {
           ...friendsState,
-          record: upsertFriend(friendsState.record, {
-            email: v.normalized.senderEmail,
-            share_pub: v.normalized.senderSharePubBase64Url,
-            signing_pub: v.normalized.senderSigningPubBase64,
-            established_at: v.normalized.timestamp,
-            initial_request_nonce: outbound.request_nonce,
-          }),
+          record: upsertFriend(friendsState.record, newFriend),
         };
         friendsDirty = true;
 
@@ -1597,6 +1927,20 @@ export class TarnClient {
           record: removeOutboundPending(pendingState.record, outbound.request_nonce),
         };
         pendingDirty = true;
+
+        // Publish our seq=0 snapshot to the new friend's outbound log
+        // (sharing §6.6). We're the side that originated the friend request;
+        // the accepting side already published their seq=0 inside
+        // acceptFriendRequest. Empty state by default — apps that want to
+        // pre-populate should call _publishInitialSnapshot themselves with
+        // explicit state.
+        try {
+          await this._publishInitialSnapshot(newFriend);
+        } catch (err) {
+          console.warn(
+            `[TarnClient] processing accept from ${v.normalized.senderEmail}: initial snapshot publish failed: ${err.message}`,
+          );
+        }
       }
     }
 
@@ -1702,6 +2046,19 @@ export class TarnClient {
    * production code; call the public methods instead.
    */
   _testJwt() { return this.#jwt; }
+
+  /**
+   * Test-only: lower the per-friend share-log snapshot compaction interval
+   * so an integration test can trigger auto-compaction without publishing
+   * 100 entries. Production code should leave this at the default.
+   */
+  _setShareLogCompactionIntervalForFriend(friendSharePubBase64Url, interval) {
+    if (!Number.isInteger(interval) || interval < 1) {
+      throw new Error('interval must be a positive integer');
+    }
+    const counters = this.#getOrInitCounters(friendSharePubBase64Url);
+    counters.compactionInterval = interval;
+  }
 
   // ============ PRIVATE ============
 
