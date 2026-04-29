@@ -605,13 +605,12 @@ CONTENT = [
     ('h2', 'Server-side session management'),
     ('p',
      "Section 7 (above) covers persistence — keeping a logged-in client "
-     "alive across page reloads on a single device. A complementary "
-     "capability, sequenced as the immediate follow-up, covers "
-     "<i>multi-device session management</i>: letting a user list active "
-     "sessions across devices and revoke any of them individually without "
-     "performing a full credential change."),
+     "alive across page reloads on a single device. Section 7.5 covers "
+     "the complementary capability across devices: <i>multi-device session "
+     "management</i> — letting a user list active sessions and revoke any "
+     "of them individually without performing a full credential change."),
     ('p',
-     "Shape of the change:"),
+     "Shape:"),
     ('b',
      "<b>Per-session identifier.</b> Every successful "
      "<code>/auth/verify</code> issues a JWT carrying a <code>sid</code> "
@@ -633,14 +632,14 @@ CONTENT = [
      "<code>sid</code> is still active. The added D1 lookup is mitigated "
      "by a short in-Worker cache to avoid hot-pathing the database."),
     ('p',
-     "Together, persistence (this section) and session management "
+     "Together, persistence (Section 7) and session management "
      "(Section 7.5) close the consumer-app session story: users stay "
      "logged in across reloads on the devices they trust, and can kill "
-     "individual sessions cleanly when they don't. Until 7.5 ships, the "
-     "available revocation path is <code>changeCredentials</code>, which "
-     "rotates the signing key and locks out every other device — a "
-     "heavy hammer that works but isn't the right tool for routine "
-     "device management."),
+     "individual sessions cleanly when they don't. <code>changeCredentials</code> "
+     "remains available as a heavy-hammer alternative — it rotates the "
+     "signing key and locks out every other device by force — but for "
+     "routine device management the granular revoke endpoints are the "
+     "right tool."),
 
     # ============ DEFERRED ============
     ('h1', '10. Deferred features'),
@@ -710,7 +709,7 @@ CONTENT = [
      "<i>why</i> certain decisions were made — particularly the trade-offs "
      "around revocation, metadata privacy, and recovery."),
     ('p',
-     "<b>Implementation history.</b> Issues 9–19 on the Tarn repository, "
+     "<b>Implementation history.</b> Issues 9–20 on the Tarn repository, "
      "filed and closed during the platform build, document the unit of work "
      "for each protocol section. Each closing comment serves as a self-"
      "contained record of what shipped under that section."),
