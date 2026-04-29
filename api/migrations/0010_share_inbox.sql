@@ -15,7 +15,8 @@
 --   txid          - Arweave DataItem id (PK).
 --   app_id        - App that produced/consumes this blob (per-app isolation).
 --   inbox_tag     - 43-char base64url (HMAC-SHA-256 output, sharing §6.1).
---   blob_type     - 'friend-request-v1' or 'friend-accept-v1' (sharing §6.2/§6.4).
+--   blob_type     - 'connection-request-v1' or 'connection-accept-v1'
+--                   (sharing §6.2/§6.4 — renamed in Section 6 / issue #18).
 --   ciphertext    - HPKE-sealed bytes (enc || ct+tag); opaque to the API.
 --   published_at  - unix ms; used both for ordering and TTL eviction.
 

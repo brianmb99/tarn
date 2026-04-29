@@ -1457,7 +1457,7 @@ export class TarnClient {
    *      error so the caller can surface "this person isn't friendable" UX.
    *   2. Build the request payload (sender_email, sender_share_pub,
    *      sender_signing_pub, sender_app_id, nonce, timestamp, optional message).
-   *   3. HPKE_Seal to the recipient under info "tarn-friend-request-v1".
+   *   3. HPKE_Seal to the recipient under info "tarn-connection-request-v1".
    *   4. Compute the recipient's current-window inbox tag.
    *   5. Publish the sealed blob to the inbox via the rate-limited endpoint.
    *   6. Append to our outbound pending list (encrypted Tarn data blob,
@@ -1523,7 +1523,7 @@ export class TarnClient {
       // explicitly; here we leave retry off so transient 5xx surfaces.
       body: {
         tag,
-        type: 'friend-request-v1',
+        type: 'connection-request-v1',
         ciphertext_base64: bytesToBase64(blob),
       },
     });
@@ -1556,7 +1556,7 @@ export class TarnClient {
    * Poll the inbox for incoming friend requests (sharing §6.3 + §13.8).
    *
    * Walks the recent N day-windows (default 30, per design), fetches all
-   * blobs at each (recipient_inbox_tag, friend-request-v1) tuple, attempts
+   * blobs at each (recipient_inbox_tag, connection-request-v1) tuple, attempts
    * HPKE_Open, validates the resulting payload, and deduplicates against
    * the recipient's recent-nonce cache. Surfaces validated requests; updates
    * the inbound pending record so subsequent calls (and accept) can see them.
@@ -1596,7 +1596,7 @@ export class TarnClient {
       recentInboxWindows(windows).map(w => deriveInboxTag(myPub, this.#appId, w)),
     );
     const fetched = await Promise.all(
-      tags.map(tag => this.#fetchInboxBlobs(tag, 'friend-request-v1')),
+      tags.map(tag => this.#fetchInboxBlobs(tag, 'connection-request-v1')),
     );
 
     const surfaced = [];
@@ -1740,7 +1740,7 @@ export class TarnClient {
       auth: true,
       body: {
         tag,
-        type: 'friend-accept-v1',
+        type: 'connection-accept-v1',
         ciphertext_base64: bytesToBase64(blob),
       },
     });
@@ -3156,7 +3156,7 @@ export class TarnClient {
       recentInboxWindows(windows).map(w => deriveInboxTag(myPub, this.#appId, w)),
     );
     const fetched = await Promise.all(
-      tags.map(tag => this.#fetchInboxBlobs(tag, 'friend-accept-v1')),
+      tags.map(tag => this.#fetchInboxBlobs(tag, 'connection-accept-v1')),
     );
 
     let pendingState = await this.#loadPendingRequestsRecord();

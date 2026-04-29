@@ -228,7 +228,7 @@ await test('Accept blob with no matching outbound is silently ignored', async ()
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${eveJwt}`,
     },
-    body: JSON.stringify({ tag, type: 'friend-accept-v1', ciphertext_base64: bytesToBase64(sealed) }),
+    body: JSON.stringify({ tag, type: 'connection-accept-v1', ciphertext_base64: bytesToBase64(sealed) }),
   });
   assert(publishRes.status === 200, `Eve\'s publish failed: ${publishRes.status}`);
   await sleep(150);

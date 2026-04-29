@@ -2,7 +2,7 @@
 //
 // Two endpoints, both scoped by app:
 //   POST /api/v1/share/inbox/publish — JWT-gated, rate-limited per session
-//     publishes an HPKE-sealed friend_request or friend_accept blob.
+//     publishes an HPKE-sealed connection_request or connection_accept blob.
 //   GET  /api/v1/share/inbox/fetch — public, IP rate-limited, returns
 //     all cached blobs for a (app, inbox_tag, blob_type) tuple.
 //
@@ -17,8 +17,8 @@
 // the normal case.
 //
 // Rate limits (sharing §9.5):
-//   - friend-request-v1: 10 per hour per data_lookup_key
-//   - friend-accept-v1:  50 per hour per data_lookup_key
+//   - connection-request-v1: 10 per hour per data_lookup_key
+//   - connection-accept-v1:  50 per hour per data_lookup_key
 // Exceeded → 429 with Retry-After.
 
 import { jsonResponse, errorResponse } from '../worker.js';
@@ -50,7 +50,12 @@ const MAX_INBOX_BLOB_BYTES = 8 * 1024;
 const MAX_INBOX_FETCHES_PER_HOUR = 1800;
 
 // Recognized blob types. Anything else is rejected up front.
-const VALID_BLOB_TYPES = new Set(['friend-request-v1', 'friend-accept-v1']);
+//
+// Section 6 (issue #18) renamed the wire-format types from friend-* to
+// connection-*. The old types are intentionally NOT accepted: there are no
+// live v4 accounts that ever published under the old names, and treating this
+// as a clean break keeps the recognized-types set narrow.
+const VALID_BLOB_TYPES = new Set(['connection-request-v1', 'connection-accept-v1']);
 
 // ============ POST /api/v1/share/inbox/publish ============
 
@@ -112,7 +117,7 @@ export async function handleShareInboxPublish(request, env, ctx, cors) {
   // with a distinct key prefix so it doesn't compete with the data-write
   // budget. Atomic INSERT...ON CONFLICT...RETURNING (same pattern as
   // checkWriteRateLimit) — single query, no TOCTOU.
-  const limit = type === 'friend-request-v1'
+  const limit = type === 'connection-request-v1'
     ? MAX_FRIEND_REQUESTS_PER_HOUR
     : MAX_FRIEND_ACCEPTS_PER_HOUR;
   const hour = new Date().toISOString().slice(0, 13);
@@ -137,7 +142,7 @@ export async function handleShareInboxPublish(request, env, ctx, cors) {
   // gateway fetch — though the standard fetch endpoint here serves the cache).
   //
   // Tags written to Arweave (sharing §6.2):
-  //   App=tarn-share, Type=<friend-request-v1|friend-accept-v1>, To=<inbox_tag>
+  //   App=tarn-share, Type=<connection-request-v1|connection-accept-v1>, To=<inbox_tag>
   // The "App" value 'tarn-share' is reserved server-side — distinct from any
   // user-app id so a (mis)matching App tag from a different consumer is
   // unambiguous.

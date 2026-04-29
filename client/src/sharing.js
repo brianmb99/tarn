@@ -30,16 +30,16 @@ const TEXT_DECODER = new TextDecoder();
 
 // HPKE info strings — bind ciphertexts to a specific protocol version + role,
 // per RFC 9180 §5.1 recommendations. Mismatched info on Open() returns
-// AEAD-level decryption failure, so a friend-request sealed under one info
+// AEAD-level decryption failure, so a connection-request sealed under one info
 // cannot be replayed as an accept (or any other future role) even if it lands
 // at the same tag.
-export const INFO_FRIEND_REQUEST = 'tarn-friend-request-v1';
-export const INFO_FRIEND_ACCEPT = 'tarn-friend-accept-v1';
+export const INFO_FRIEND_REQUEST = 'tarn-connection-request-v1';
+export const INFO_FRIEND_ACCEPT = 'tarn-connection-accept-v1';
 
 // Inbox-tag HMAC info string (sharing design §6.1):
 //   inbox_tag = B(HMAC(H(recipient_share_pub),
-//     "tarn-friend-inbox-v1-" || app_id || "-" || encode_uint64(window)))
-const INBOX_TAG_LABEL_PREFIX = 'tarn-friend-inbox-v1-';
+//     "tarn-connection-inbox-v1-" || app_id || "-" || encode_uint64(window)))
+const INBOX_TAG_LABEL_PREFIX = 'tarn-connection-inbox-v1-';
 
 // Day-granularity rolling window (sharing §6.1).
 const SECONDS_PER_DAY = 86400;
@@ -132,7 +132,7 @@ function encodeUint64BE(n) {
  * Derive an inbox tag for a recipient (sharing §6.1):
  *   inbox_tag(recipient_share_pub, app_id, window) =
  *     B(HMAC(H(recipient_share_pub),
- *       "tarn-friend-inbox-v1-" || app_id || "-" || encode_uint64(window)))
+ *       "tarn-connection-inbox-v1-" || app_id || "-" || encode_uint64(window)))
  *
  * The HMAC key is `SHA-256(share_pub)` — a stable per-recipient secret in the
  * sense that it is publicly derivable by anyone who knows the recipient's
@@ -302,7 +302,7 @@ export async function hpkeOpen({ sharePriv, info, blob }) {
  *   timestamp?: number,                // unix seconds; defaults to now
  *   nonce?: Uint8Array,                // 16 random bytes; generated if absent
  * }} opts
- * @returns {{ type: 'friend_request', sender_email: string, sender_share_pub: string, sender_signing_pub: string, sender_app_id: string, nonce: string, timestamp: number, message?: string }}
+ * @returns {{ type: 'connection_request', sender_email: string, sender_share_pub: string, sender_signing_pub: string, sender_app_id: string, nonce: string, timestamp: number, message?: string }}
  */
 export function buildFriendRequestPayload(opts) {
   const senderEmail = requireString(opts.senderEmail, 'senderEmail');
@@ -324,7 +324,7 @@ export function buildFriendRequestPayload(opts) {
   const timestamp = opts.timestamp ?? Math.floor(Date.now() / 1000);
 
   const out = {
-    type: 'friend_request',
+    type: 'connection_request',
     sender_email: senderEmail,
     sender_share_pub: bytesToBase64Url(opts.senderSharePub),
     sender_signing_pub: senderSigningPub,
@@ -356,7 +356,7 @@ export function validateFriendRequestPayload(payload, expectedAppId, now = Math.
   if (!payload || typeof payload !== 'object') {
     return { valid: false, reason: 'payload must be an object' };
   }
-  if (payload.type !== 'friend_request') {
+  if (payload.type !== 'connection_request') {
     return { valid: false, reason: `wrong type: ${payload.type}` };
   }
   if (typeof payload.sender_email !== 'string' || payload.sender_email.length === 0) {
@@ -409,7 +409,7 @@ export function validateFriendRequestPayload(payload, expectedAppId, now = Math.
   return {
     valid: true,
     normalized: {
-      type: 'friend_request',
+      type: 'connection_request',
       senderEmail: payload.sender_email,
       senderSharePub,
       senderSharePubBase64Url: payload.sender_share_pub,
@@ -444,7 +444,7 @@ export function buildFriendAcceptPayload(opts) {
     throw new Error('senderSharePub must be a 32-byte Uint8Array');
   }
   return {
-    type: 'friend_accept',
+    type: 'connection_accept',
     sender_email: senderEmail,
     sender_share_pub: bytesToBase64Url(opts.senderSharePub),
     sender_signing_pub: senderSigningPub,
@@ -465,7 +465,7 @@ export function validateFriendAcceptPayload(payload, expectedAppId, now = Math.f
   if (!payload || typeof payload !== 'object') {
     return { valid: false, reason: 'payload must be an object' };
   }
-  if (payload.type !== 'friend_accept') {
+  if (payload.type !== 'connection_accept') {
     return { valid: false, reason: `wrong type: ${payload.type}` };
   }
   if (typeof payload.sender_email !== 'string' || payload.sender_email.length === 0) {
@@ -501,7 +501,7 @@ export function validateFriendAcceptPayload(payload, expectedAppId, now = Math.f
   return {
     valid: true,
     normalized: {
-      type: 'friend_accept',
+      type: 'connection_accept',
       senderEmail: payload.sender_email,
       senderSharePub,
       senderSharePubBase64Url: payload.sender_share_pub,
@@ -597,7 +597,7 @@ export function findOutboundForAccept(inReplyToNonceBase64Url, outboundPending) 
 // issue #11 / Section 2). Operational state like `last_seq_seen` is per-
 // device, NOT in the durable record (Section 3 review).
 
-export const FRIENDS_CONTENT_ID = 'tarn-friends-v1';
+export const FRIENDS_CONTENT_ID = 'tarn-connections-v1';
 export const PENDING_REQUESTS_CONTENT_ID = 'tarn-pending-requests-v1';
 
 /**

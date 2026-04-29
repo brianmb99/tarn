@@ -122,8 +122,8 @@ describe('hpkeSeal / hpkeOpen', () => {
   });
 
   it('opening with the wrong info string fails (info binding)', async () => {
-    // Sealing under "tarn-friend-request-v1" must NOT open as
-    // "tarn-friend-accept-v1" — defense against an attacker re-tagging a
+    // Sealing under "tarn-connection-request-v1" must NOT open as
+    // "tarn-connection-accept-v1" — defense against an attacker re-tagging a
     // captured request blob and re-publishing as an accept.
     const recipient = keypairFromSeed(4);
     const blob = await hpkeSeal({
@@ -238,7 +238,7 @@ describe('buildFriendRequestPayload', () => {
       senderAppId: 'bookish',
       message: 'hi bob',
     });
-    assert.equal(p.type, 'friend_request');
+    assert.equal(p.type, 'connection_request');
     assert.equal(p.sender_email, 'alice@test.com');
     assert.equal(p.sender_app_id, 'bookish');
     assert.equal(base64UrlToBytes(p.sender_share_pub).length, 32);
@@ -283,7 +283,7 @@ describe('validateFriendRequestPayload', () => {
 
   function make(overrides = {}) {
     return {
-      type: 'friend_request',
+      type: 'connection_request',
       sender_email: 'alice@test.com',
       sender_share_pub: bytesToBase64Url(senderPub),
       sender_signing_pub: 'spki-base64',
@@ -366,7 +366,7 @@ describe('buildFriendAcceptPayload + validateFriendAcceptPayload', () => {
       senderAppId: APP,
       inReplyToNonceBase64Url: inReplyTo,
     });
-    assert.equal(p.type, 'friend_accept');
+    assert.equal(p.type, 'connection_accept');
     assert.equal(p.in_reply_to, inReplyTo);
 
     const v = validateFriendAcceptPayload(p, APP);
@@ -529,7 +529,7 @@ describe('pending requests record', () => {
   });
 
   it('content_id constants are stable', () => {
-    assert.equal(FRIENDS_CONTENT_ID, 'tarn-friends-v1');
+    assert.equal(FRIENDS_CONTENT_ID, 'tarn-connections-v1');
     assert.equal(PENDING_REQUESTS_CONTENT_ID, 'tarn-pending-requests-v1');
   });
 });
