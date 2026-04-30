@@ -784,6 +784,66 @@ await test('Cleanup §8/§9/§9d accounts (Alice + Bob)', async () => {
   await handshakeBob.deleteAccount();
 });
 
+// ============ 9e. INVITE TOKENS (issue #22, Section 8) ============
+
+console.log('\n=== 9e. Invite tokens (single-use, time-limited bootstrap) ===');
+
+let inviteInviter;
+let inviteRedeemer;
+let inviteInviterEmail;
+let inviteRedeemerEmail;
+
+await test('Invite inviter + redeemer register', async () => {
+  inviteInviter = new TarnClient(API_BASE, APP_ID);
+  inviteRedeemer = new TarnClient(API_BASE, APP_ID);
+  inviteInviterEmail = `inv-inviter-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
+  inviteRedeemerEmail = `inv-redeemer-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
+  await inviteInviter.register(inviteInviterEmail, 'pw-inv-' + Date.now(), {
+    recoveryAcknowledged: true, emailRecoveryKit: false,
+  });
+  await inviteRedeemer.register(inviteRedeemerEmail, 'pw-red-' + Date.now(), {
+    recoveryAcknowledged: true, emailRecoveryKit: false,
+  });
+});
+
+let deployedInvite;
+
+await test('createInviteToken returns a token + url + expiry', async () => {
+  deployedInvite = await inviteInviter.createInviteToken({ display_name: 'Pat', expiry_days: 1 });
+  assert(typeof deployedInvite.token_id === 'string' && deployedInvite.token_id.length === 43,
+    `bad token_id: ${deployedInvite.token_id}`);
+  assert(deployedInvite.invite_url.includes('#'), 'invite_url should include the payload_key fragment');
+  assert(typeof deployedInvite.expires_at === 'number', 'expires_at should be a number');
+});
+
+await test('previewInviteToken returns the payload (unauthenticated path)', async () => {
+  const fragment = deployedInvite.invite_url.split('#')[1];
+  const preview = await inviteRedeemer.previewInviteToken(deployedInvite.token_id, fragment);
+  assert(preview != null, 'preview should not be null on an active invite');
+  assert(preview.inviter_display_name === 'Pat', `display_name mismatch: ${preview.inviter_display_name}`);
+  assert(typeof preview.inviter_share_pub_fingerprint === 'string',
+    'fingerprint must be present on the preview');
+});
+
+await test('redeemInviteToken forms a connection on the inviter side after auto-accept', async () => {
+  const fragment = deployedInvite.invite_url.split('#')[1];
+  const redeem = await inviteRedeemer.redeemInviteToken(deployedInvite.token_id, fragment);
+  assert(typeof redeem.requestNonce === 'string', 'redeem must return requestNonce');
+
+  await new Promise(r => setTimeout(r, 500));
+  const surfaced = await inviteInviter.listIncomingRequests();
+  assert(!surfaced.some(s => s.requestNonce === redeem.requestNonce),
+    'auto-accept should consume the request from the surfaced list');
+  const conns = await inviteInviter.listConnections();
+  assert(conns.length === 1, `inviter should have 1 connection, got ${conns.length}`);
+  assert(conns[0].label === 'Pat', `label should seed from display_name, got ${conns[0].label}`);
+});
+
+await test('Cleanup invite-leg accounts', async () => {
+  await inviteInviter.deleteAccount();
+  await inviteRedeemer.deleteAccount();
+});
+
 // ============ 10. CLEANUP ============
 
 console.log('\n=== 10. Cleanup ===');
