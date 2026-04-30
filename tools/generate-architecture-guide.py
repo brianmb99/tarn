@@ -641,8 +641,113 @@ CONTENT = [
      "routine device management the granular revoke endpoints are the "
      "right tool."),
 
+    # ============ INVITE TOKENS ============
+    ('h1', '10. Invite tokens'),
+    ('p',
+     "Section 7 (sharing) lets two users form an end-to-end-encrypted "
+     "connection if and only if the sender knows the recipient's email and "
+     "the recipient is already a Tarn user with discoverability enabled. "
+     "For consumer apps the prevailing UX is the inverse: scan a QR, click "
+     "a link in a messenger, register-then-redeem. Section 10 adds an "
+     "<b>opaque, single-use, time-limited invite token</b> primitive that "
+     "lets the inviter publish a redemption slot without knowing the "
+     "recipient's identity, and lets the recipient redeem it (potentially "
+     "after signing up) without ever transmitting the inviter's identifier "
+     "through the channel that carried the link."),
+    ('h2', 'Why server-mediated'),
+    ('p',
+     "Three alternative shapes were considered and rejected:"),
+    ('b',
+     "<b>Stateless QR / link.</b> Keys baked into the URL, no server "
+     "state. Loses single-use; a leaked link in any messenger channel "
+     "exposes the inviter to arbitrary stranger redemption forever."),
+    ('b',
+     "<b>Pure-Arweave invite blob.</b> Inviter publishes an Arweave entry; "
+     "recipient reads it and sends a normal connection request. Single-use "
+     "cannot be enforced at the storage layer; app-side single-use races "
+     "between the legitimate recipient and any malicious party that "
+     "scrapes the link."),
+    ('b',
+     "<b>Reuse the existing inbox-tag mechanism.</b> The inbox is "
+     "share_pub-keyed and time-windowed; an anonymous inbox without a "
+     "share_pub doesn't fit the model, and we'd be inventing single-use "
+     "semantics on a primitive that doesn't want them."),
+    ('p',
+     "All three lose the atomic single-use property that only the server "
+     "can provide cheaply. Section 10 is server-mediated for that reason "
+     "alone — every other piece of the flow is client-side cryptography "
+     "over an opaque blob."),
+    ('h2', 'Cryptographic shape'),
+    ('p',
+     "The inviter generates two independent 32-byte secrets client-side: "
+     "<code>token_id</code> (the opaque server-side index) and "
+     "<code>payload_key</code> (the AES-256-GCM key that encrypts the "
+     "invite payload). The payload contains the inviter's "
+     "<code>share_pub</code>, <code>signing_pub</code>, "
+     "<code>display_name</code>, app id, and timestamp. The "
+     "<code>token_id</code> goes in the URL path; the "
+     "<code>payload_key</code> goes in the URL fragment, which browsers "
+     "do not include in HTTP requests."),
+    ('p',
+     "The Tarn API stores opaque ciphertext keyed on <code>token_id</code> "
+     "and never sees the inviter's keys, name, or any other payload field. "
+     "The recipient retrieves the ciphertext via an unauthenticated "
+     "<code>GET /api/v1/invite/:token_id</code> for preview, decrypts "
+     "client-side with the URL-fragment key, and then redeems via an "
+     "authenticated <code>POST /api/v1/invite/redeem/:token_id</code> "
+     "that atomically marks the token used. Both endpoints rate-limit "
+     "via the existing primitives — D1-atomic for create/redeem (per "
+     "account, per hour), KV-based for preview (per IP)."),
+    ('h2', 'No Tarn-hosted landing page'),
+    ('p',
+     "Apps own the URL surface. Each registered app records an "
+     "<code>invite_url_template</code> (e.g. "
+     "<code>https://app.bookish.example/invite/{token_id}</code>); the "
+     "SDK substitutes <code>{token_id}</code> and appends the URL "
+     "fragment. The app's web handler reads the path + hash, calls the "
+     "SDK, and renders whatever UX it wants — modal, toast, native "
+     "deep-link. Tarn does not host any landing page. Messenger preview "
+     "unfurls and install fallbacks are the app's responsibility."),
+    ('h2', 'Composes with existing connection primitives'),
+    ('p',
+     "After redeeming, the recipient's SDK sends a normal connection-"
+     "request HPKE-sealed back to the inviter using the keys retrieved "
+     "from the decrypted payload. The request carries an extra "
+     "<code>via_invite_token</code> field. The inviter's SDK, on its next "
+     "<code>listIncomingRequests</code> poll, reads its issued-invites "
+     "blob fresh and auto-accepts requests whose token matches a known "
+     "issuance. Unmatched requests stay in the pending list for the user "
+     "to act on. The end state is identical to a connection formed via "
+     "email handshake — same connection record, same share-log mechanics, "
+     "same mute and revoke primitives."),
+    ('p',
+     "Section 10 also wires up <code>Connection.label</code> as a real "
+     "primitive — previously documented as an optional field but never "
+     "implemented. Invite redemption seeds the new connection's label "
+     "from the inviter's <code>display_name</code>, so apps get an "
+     "out-of-the-box <i>This is Maya</i> tag without app-layer storage. "
+     "Apps can also set or update labels manually via "
+     "<code>setConnectionLabel</code>."),
+    ('h2', 'Threat model'),
+    ('p',
+     "The dominant risk is a leaked link (screenshot, accidental Slack "
+     "post). Mitigations: 7-day default expiry, hard 30-day max, single-"
+     "use, and a sender-visible fingerprint of the redeemer's "
+     "<code>share_pub</code> so the inviter can detect surprise "
+     "redemption and revoke + reissue. A server compromise lets an "
+     "attacker enumerate live tokens but not decrypt payloads — the "
+     "decryption keys are URL fragments held only by recipients."),
+    ('p',
+     "The server learns metadata: which account issued an invite, the "
+     "time of issuance, the time and originating IP of redemption, and "
+     "the redeemer's <code>share_pub</code> fingerprint. It does not "
+     "learn the inviter's <code>share_pub</code>, signing public key, "
+     "display name, or any payload contents — those are inside the "
+     "encrypted blob keyed by a secret the server never sees. This is "
+     "the same zero-knowledge story as the rest of the protocol."),
+
     # ============ DEFERRED ============
-    ('h1', '10. Deferred features'),
+    ('h1', '11. Deferred features'),
     ('p',
      "Several capabilities are intentionally deferred from the v1 platform. "
      "They are documented here so that future evolution paths are visible."),
@@ -672,7 +777,7 @@ CONTENT = [
      "improvement; deferred."),
 
     # ============ GLOSSARY ============
-    ('h1', '11. Glossary'),
+    ('h1', '12. Glossary'),
     ('table',
      ['Term', 'Meaning'],
      [
@@ -690,7 +795,7 @@ CONTENT = [
      ]),
 
     # ============ POINTERS ============
-    ('h1', '12. Where to learn more'),
+    ('h1', '13. Where to learn more'),
     ('p',
      "<b>Protocol specification.</b> The canonical reference is "
      "<code>docs/TARN_PROTOCOL.md</code> in the Tarn repository — full "
@@ -709,7 +814,7 @@ CONTENT = [
      "<i>why</i> certain decisions were made — particularly the trade-offs "
      "around revocation, metadata privacy, and recovery."),
     ('p',
-     "<b>Implementation history.</b> Issues 9–20 on the Tarn repository, "
+     "<b>Implementation history.</b> Issues 9–22 on the Tarn repository, "
      "filed and closed during the platform build, document the unit of work "
      "for each protocol section. Each closing comment serves as a self-"
      "contained record of what shipped under that section."),
