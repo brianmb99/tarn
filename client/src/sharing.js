@@ -307,7 +307,7 @@ export async function hpkeOpen({ sharePriv, info, blob }) {
  *   timestamp?: number,                // unix seconds; defaults to now
  *   nonce?: Uint8Array,                // 16 random bytes; generated if absent
  * }} opts
- * @returns {{ type: 'connection_request', sender_email: string, sender_share_pub: string, sender_signing_pub: string, sender_app_id: string, nonce: string, timestamp: number, message?: string }}
+ * @returns {{ type: 'connection_request', sender_email: string, sender_share_pub: string, sender_signing_pub: string, sender_app_id: string, nonce: string, timestamp: number, message?: string, via_invite_token?: string }}
  */
 export function buildConnectionRequestPayload(opts) {
   const senderEmail = requireString(opts.senderEmail, 'senderEmail');
@@ -321,6 +321,9 @@ export function buildConnectionRequestPayload(opts) {
     if (opts.message.length > MAX_REQUEST_MESSAGE_LEN) {
       throw new Error(`message exceeds ${MAX_REQUEST_MESSAGE_LEN} chars`);
     }
+  }
+  if (opts.viaInviteToken != null && typeof opts.viaInviteToken !== 'string') {
+    throw new Error('viaInviteToken must be a string when present');
   }
   const nonce = opts.nonce instanceof Uint8Array
     ? opts.nonce
@@ -338,6 +341,7 @@ export function buildConnectionRequestPayload(opts) {
     timestamp,
   };
   if (opts.message) out.message = opts.message;
+  if (opts.viaInviteToken) out.via_invite_token = opts.viaInviteToken;
   return out;
 }
 
@@ -411,6 +415,9 @@ export function validateConnectionRequestPayload(payload, expectedAppId, now = M
       return { valid: false, reason: `message exceeds ${MAX_REQUEST_MESSAGE_LEN} chars` };
     }
   }
+  if (payload.via_invite_token != null && typeof payload.via_invite_token !== 'string') {
+    return { valid: false, reason: 'via_invite_token must be a string when present' };
+  }
   return {
     valid: true,
     normalized: {
@@ -424,6 +431,7 @@ export function validateConnectionRequestPayload(payload, expectedAppId, now = M
       nonceBase64Url: payload.nonce,
       timestamp: payload.timestamp,
       message: payload.message ?? null,
+      viaInviteToken: payload.via_invite_token ?? null,
     },
   };
 }
@@ -831,4 +839,37 @@ export function isMutedInRecord(record, connectionSharePubBase64Url) {
 function requireString(v, name) {
   if (typeof v !== 'string' || v.length === 0) throw new Error(`${name} must be a non-empty string`);
   return v;
+}
+
+// ============ ISSUED-INVITES RECORD (Section 8, issue #22) ============
+
+// Mirrors the muted-connections pattern: a DEK-encrypted Tarn data blob that
+// syncs across the inviter's devices. Used by `listIssuedInvites` and by the
+// auto-accept path in `listIncomingRequests` (where we always re-read fresh
+// from the API — no in-memory cache for that match).
+
+export const ISSUED_INVITES_CONTENT_ID = 'tarn-issued-invites-v1';
+
+export function emptyIssuedInvitesRecord(appId) {
+  return { app_id: appId, version: 1, invites: [] };
+}
+
+export function addIssuedInvite(record, entry) {
+  if (!record || !Array.isArray(record.invites)) {
+    throw new Error('record must be an issued-invites record');
+  }
+  if (!entry || typeof entry.token_id !== 'string') {
+    throw new Error('entry.token_id is required');
+  }
+  if (record.invites.some(i => i.token_id === entry.token_id)) {
+    return record;
+  }
+  return { ...record, invites: [...record.invites, entry] };
+}
+
+export function removeIssuedInvite(record, tokenId) {
+  if (!record || !Array.isArray(record.invites)) {
+    throw new Error('record must be an issued-invites record');
+  }
+  return { ...record, invites: record.invites.filter(i => i.token_id !== tokenId) };
 }

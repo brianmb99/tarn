@@ -87,6 +87,10 @@ import {
   addMutedConnection,
   removeMutedConnection,
   isMutedInRecord,
+  ISSUED_INVITES_CONTENT_ID,
+  emptyIssuedInvitesRecord,
+  addIssuedInvite,
+  removeIssuedInvite,
 } from './sharing.js';
 import {
   deriveSharedSecret,
@@ -196,6 +200,13 @@ export class TarnClient {
   // sessions hydrate from Arweave. Wholly invalidated on credential change
   // / recovery / delete (re-hydrate on next mute-related call).
   #mutedConnectionsState = null;     // null | { record, txid }
+
+  // Issued-invites record (issue #22, Section 8). Mirrors the muted-
+  // connections pattern but with a critical exception: the auto-accept
+  // path in listIncomingRequests() always re-reads the blob fresh from
+  // the API (bypasses this cache) so an invite created on a different
+  // device is recognized.
+  #issuedInvitesState = null;        // null | { record, txid }
 
   // v4 recovery-factor state (issue #12). Holds enough information to preserve
   // existing recovery wrappings across a credential change without requiring
@@ -684,6 +695,7 @@ export class TarnClient {
     this.#outboundStateCache.clear();
     this.#publishedTxidsByConnection.clear();
     this.#mutedConnectionsState = null;
+    this.#issuedInvitesState = null;
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
@@ -1110,6 +1122,7 @@ export class TarnClient {
     this.#outboundStateCache.clear();
     this.#publishedTxidsByConnection.clear();
     this.#mutedConnectionsState = null;
+    this.#issuedInvitesState = null;
 
     await this.#authenticate();
 
@@ -1192,6 +1205,7 @@ export class TarnClient {
     this.#outboundStateCache.clear();
     this.#publishedTxidsByConnection.clear();
     this.#mutedConnectionsState = null;
+    this.#issuedInvitesState = null;
   }
 
   // ============ DATA CRUD ============
@@ -1718,6 +1732,7 @@ export class TarnClient {
             requestNonce: validation.normalized.nonceBase64Url,
             timestamp: validation.normalized.timestamp,
             message: validation.normalized.message,
+            viaInviteToken: validation.normalized.viaInviteToken,
             txid: blob.txid,
           });
           continue;
@@ -1732,6 +1747,7 @@ export class TarnClient {
           sender_app_id: validation.normalized.senderAppId,
           request_nonce: validation.normalized.nonceBase64Url,
           message: validation.normalized.message,
+          via_invite_token: validation.normalized.viaInviteToken,
           received_at: Math.floor(Date.now() / 1000),
         });
         pendingDirty = true;
@@ -1744,6 +1760,7 @@ export class TarnClient {
           requestNonce: validation.normalized.nonceBase64Url,
           timestamp: validation.normalized.timestamp,
           message: validation.normalized.message,
+          viaInviteToken: validation.normalized.viaInviteToken,
           txid: blob.txid,
         });
       }
@@ -1753,6 +1770,40 @@ export class TarnClient {
       await this.#savePendingRequestsRecord(pendingState, pendingRecord);
     }
 
+    // Section 8 auto-accept (issue #22). After persisting + surfacing, scan
+    // for entries with via_invite_token, re-load the issued-invites blob
+    // FRESH from the API (not the in-memory cache — the invite may have been
+    // created on a different device), and auto-accept any matches. The
+    // auto-accepted entry is removed from `surfaced` so the caller never
+    // sees it. No-match invites stay in the surfaced list — the user
+    // decides manually.
+    let autoAccepted = null;
+    const inviteCandidates = surfaced.filter(s => s.viaInviteToken);
+    if (inviteCandidates.length > 0) {
+      let issuedRecord = null;
+      try {
+        const fresh = await this.#loadIssuedInvitesFresh();
+        issuedRecord = fresh.record;
+      } catch (err) {
+        console.warn(`[TarnClient] listIncomingRequests: issued-invites fresh load failed: ${err.message}`);
+      }
+      if (issuedRecord) {
+        for (const cand of inviteCandidates) {
+          const match = (issuedRecord.invites || []).find(i => i.token_id === cand.viaInviteToken);
+          if (!match) continue;
+          try {
+            await this.acceptConnectionRequest(cand.requestNonce, { label: match.display_name || null });
+            (autoAccepted || (autoAccepted = new Set())).add(cand.requestNonce);
+          } catch (err) {
+            console.warn(`[TarnClient] listIncomingRequests: auto-accept failed for ${cand.requestNonce}: ${err.message}`);
+          }
+        }
+      }
+    }
+    const surfacedFinal = autoAccepted
+      ? surfaced.filter(s => !autoAccepted.has(s.requestNonce))
+      : surfaced;
+
     // Also poll for incoming ACCEPTS while we're at it — Bob's accept lands
     // in Alice's inbox, so Alice's listIncomingRequests is also Alice's
     // accept-poll. This keeps the SDK surface narrow (one polling primitive
@@ -1761,7 +1812,7 @@ export class TarnClient {
     // silently.
     await this.#pollAndProcessIncomingAccepts(myPriv, myPub);
 
-    return surfaced;
+    return surfacedFinal;
   }
 
   /**
@@ -1774,10 +1825,15 @@ export class TarnClient {
    * sees the accept on their next `listIncomingRequests` poll, which moves
    * the matching outbound pending into their connections record.
    *
+   * `opts.label` (Section 8) — optional per-side display label persisted on
+   * the connection record. Local to this user; the labeled party never sees
+   * what they were labeled.
+   *
    * @param {string} requestNonce - base64url nonce from the original request
+   * @param {{ label?: string | null }} [opts]
    * @returns {Promise<{ txid: string }>}
    */
-  async acceptConnectionRequest(requestNonce) {
+  async acceptConnectionRequest(requestNonce, opts = {}) {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
       throw new Error('acceptConnectionRequest(): no sharing keypair — login as a v4 account first');
@@ -1785,6 +1841,7 @@ export class TarnClient {
     if (typeof requestNonce !== 'string' || requestNonce.length === 0) {
       throw new Error('requestNonce is required');
     }
+    const labelOpt = normalizeConnectionLabel(opts?.label);
 
     const pendingState = await this.#loadPendingRequestsRecord();
     const inbound = pendingState.record.inbound.find(i => i.request_nonce === requestNonce);
@@ -1840,6 +1897,7 @@ export class TarnClient {
       signing_pub: inbound.sender_signing_pub,
       established_at: payload.timestamp,
       initial_request_nonce: requestNonce,
+      label: labelOpt,
     };
     const connectionsUpdated = upsertConnection(connectionsState.record, newConnection);
     await this.#saveConnectionsRecord(connectionsState, connectionsUpdated);
@@ -1879,19 +1937,57 @@ export class TarnClient {
    * Read the connections record (sharing §7.1). Returns an empty list for users
    * who have not completed any handshakes yet.
    *
+   * Section 8: every connection always includes `label: string | null`. Old
+   * entries (pre-Section 8) that lack the field are surfaced with `label: null`.
+   *
    * @returns {Promise<Array<{
    *   email: string,
    *   share_pub: string,
    *   signing_pub: string,
    *   established_at: number,
    *   initial_request_nonce: string,
-   *   label?: string,
+   *   label: string | null,
    * }>>}
    */
   async listConnections() {
     await this.#requireAuth();
     const state = await this.#loadConnectionsRecord();
-    return state.record.connections.slice();
+    return state.record.connections.map(c => ({
+      ...c,
+      label: c.label != null ? c.label : null,
+    }));
+  }
+
+  /**
+   * Update the persisted label on an existing connection (Section 8).
+   * Idempotent — setting the label to its existing value is a write-skip.
+   * The connection identity is matched by `share_pub`. The label is stored
+   * locally only; the connection party never sees it.
+   *
+   * @param {{ share_pub: string }} connection
+   * @param {string | null} label
+   * @returns {Promise<{ updated: boolean, label: string | null }>}
+   */
+  async setConnectionLabel(connection, label) {
+    await this.#requireAuth();
+    if (!connection || typeof connection.share_pub !== 'string') {
+      throw new Error('setConnectionLabel(): connection.share_pub is required');
+    }
+    const normalized = normalizeConnectionLabel(label);
+    const state = await this.#loadConnectionsRecord();
+    const idx = state.record.connections.findIndex(c => c.share_pub === connection.share_pub);
+    if (idx < 0) {
+      throw new Error(`setConnectionLabel(): no connection with share_pub ${connection.share_pub.slice(0, 8)}...`);
+    }
+    const current = state.record.connections[idx].label ?? null;
+    if (current === normalized) {
+      return { updated: false, label: normalized };
+    }
+    const next = state.record.connections.slice();
+    next[idx] = { ...next[idx], label: normalized };
+    const updated = { ...state.record, connections: next };
+    await this.#saveConnectionsRecord(state, updated);
+    return { updated: true, label: normalized };
   }
 
   /**
@@ -1999,6 +2095,341 @@ export class TarnClient {
     }
     const state = await this.#loadMutedConnectionsRecord();
     return isMutedInRecord(state.record, connection.share_pub);
+  }
+
+  // ============ INVITE TOKENS (Section 8, issue #22) ============
+
+  /**
+   * Create a single-use invite token. Generates `token_id` (256-bit random)
+   * and `payload_key` (AES-256-GCM key) client-side; encrypts a payload bound
+   * to the inviter's identity; uploads the ciphertext to /api/v1/invite. The
+   * payload_key NEVER leaves the device — it lives in the URL fragment.
+   *
+   * Default expiry is 7 days; server enforces a 30-day cap.
+   *
+   * @param {{ display_name?: string, expiry_days?: number }} [opts]
+   * @returns {Promise<{ token_id: string, invite_url: string, expires_at: number }>}
+   */
+  async createInviteToken(opts = {}) {
+    await this.#requireAuth();
+    if (!this.#sharingKeyPair) {
+      throw new Error('createInviteToken(): no sharing keypair — login as a v4 account first');
+    }
+    if (!this.#email) {
+      throw new Error('createInviteToken(): client missing sender email — re-login');
+    }
+    const displayName = opts.display_name == null ? '' : String(opts.display_name);
+    if (displayName.length > 64) {
+      throw new Error('createInviteToken(): display_name exceeds 64 chars');
+    }
+    const expiryDays = Number.isInteger(opts.expiry_days) ? opts.expiry_days : 7;
+    if (expiryDays < 1 || expiryDays > 30) {
+      throw new Error('createInviteToken(): expiry_days must be in [1, 30]');
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + expiryDays * 86400;
+
+    // 32-byte token_id (URL-safe base64; 43 chars after stripping padding) +
+    // 32-byte payload_key. Both are fresh-random per invite.
+    const tokenIdBytes = crypto.getRandomValues(new Uint8Array(32));
+    const tokenId = bytesToBase64Url(tokenIdBytes);
+    const payloadKeyBytes = crypto.getRandomValues(new Uint8Array(32));
+    const payloadKey = await crypto.subtle.importKey(
+      'raw', payloadKeyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
+    );
+
+    const inviterSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const inviterSharePubBase64Url = bytesToBase64Url(this.#sharingKeyPair.publicKey);
+
+    const plaintext = {
+      inviter_share_pub: inviterSharePubBase64Url,
+      inviter_signing_pub: inviterSigningPubBase64,
+      inviter_display_name: displayName,
+      app_id: this.#appId,
+      issued_at: now,
+    };
+    // encrypt() returns IV(12) || ciphertext+tag, the wire format the server
+    // expects under base64. The payload_key never appears in this body.
+    const payloadBytes = await encrypt(payloadKey, plaintext);
+    const payloadBase64 = bytesToBase64(payloadBytes);
+
+    const createRes = await this.#fetch('/api/v1/invite', {
+      method: 'POST',
+      auth: true,
+      body: {
+        token_id: tokenId,
+        app_id: this.#appId,
+        payload: payloadBase64,
+        expires_at: expiresAt,
+      },
+    });
+    if (createRes.status !== 201) {
+      throw new Error(`createInviteToken(): create failed: ${createRes.json?.error || createRes.status}`);
+    }
+
+    // Build the share URL from the app's template. Empty template → fall back
+    // to a `tarn:` scheme so the SDK still returns something usable; the app
+    // can override by setting the template pre-call.
+    let template = null;
+    try {
+      const tplRes = await this.#fetch(`/api/v1/apps/${encodeURIComponent(this.#appId)}/invite-template`, { method: 'GET' });
+      if (tplRes.status === 200) template = tplRes.json?.invite_url_template ?? null;
+    } catch {
+      // Network/Worker hiccup — fall through to the tarn: fallback.
+    }
+    const payloadKeyB64Url = bytesToBase64Url(payloadKeyBytes);
+    const inviteUrl = template
+      ? template.replace('{token_id}', encodeURIComponent(tokenId)) + '#' + payloadKeyB64Url
+      : `tarn:invite/${tokenId}#${payloadKeyB64Url}`;
+
+    // Persist to the issued-invites blob so listIssuedInvites + the auto-
+    // accept path can find it later. Best-effort — if the persist fails the
+    // invite is still on the server, but local accounting will be off.
+    try {
+      const state = await this.#loadIssuedInvitesRecord();
+      const updated = addIssuedInvite(state.record, {
+        token_id: tokenId,
+        display_name: displayName,
+        issued_at: now,
+        expires_at: expiresAt,
+        redeemed_at: null,
+        redeemer_share_pub_fingerprint: null,
+      });
+      const written = await this.#saveIssuedInvitesRecord(state, updated);
+      this.#issuedInvitesState = { record: written.record, txid: written.txid };
+    } catch (err) {
+      console.warn(`[TarnClient] createInviteToken: issued-invites blob update failed: ${err.message}`);
+    }
+
+    return { token_id: tokenId, invite_url: inviteUrl, expires_at: expiresAt };
+  }
+
+  /**
+   * Preview an invite token without consuming it. Unauthenticated to the
+   * server; the recipient app calls this from the landing page to populate
+   * "X invited you" UI before the user has even signed up. Returns null on
+   * any 4xx (expired, used, not_found) — never throws on the recoverable
+   * failure modes.
+   *
+   * @param {string} tokenId
+   * @param {string} payloadKeyB64Url - base64url of the 32-byte AES key
+   * @returns {Promise<{ inviter_display_name: string, inviter_share_pub_fingerprint: string, app_id: string, issued_at: number, expires_at: number } | null>}
+   */
+  async previewInviteToken(tokenId, payloadKeyB64Url) {
+    if (typeof tokenId !== 'string' || tokenId.length === 0) {
+      throw new Error('previewInviteToken(): tokenId is required');
+    }
+    if (typeof payloadKeyB64Url !== 'string' || payloadKeyB64Url.length === 0) {
+      throw new Error('previewInviteToken(): payloadKeyB64Url is required');
+    }
+    let res;
+    try {
+      res = await this.#fetch(`/api/v1/invite/${encodeURIComponent(tokenId)}`, { method: 'GET' });
+    } catch {
+      return null;
+    }
+    if (res.status !== 200) return null;
+    const { app_id, payload, issued_at, expires_at } = res.json || {};
+    let payloadBytes;
+    try {
+      payloadBytes = base64ToBytes(payload);
+    } catch {
+      return null;
+    }
+    let plaintext;
+    try {
+      const payloadKeyBytes = base64UrlToBytes(payloadKeyB64Url);
+      const key = await crypto.subtle.importKey('raw', payloadKeyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+      plaintext = await decrypt(key, payloadBytes);
+    } catch {
+      return null;
+    }
+    if (plaintext.app_id !== app_id) return null;
+
+    let inviterSharePub;
+    try {
+      inviterSharePub = base64UrlToBytes(plaintext.inviter_share_pub);
+    } catch {
+      return null;
+    }
+    const fingerprint = await fingerprintSharePub(inviterSharePub);
+
+    return {
+      inviter_display_name: plaintext.inviter_display_name || '',
+      inviter_share_pub_fingerprint: fingerprint,
+      app_id,
+      issued_at,
+      expires_at,
+    };
+  }
+
+  /**
+   * Redeem an invite token, then send a normal connection request back to
+   * the inviter using the existing handshake primitives. The request payload
+   * carries `via_invite_token` so the inviter's `listIncomingRequests` can
+   * recognize and auto-accept.
+   *
+   * Throws on the unrecoverable failure modes (404 / 410 / 409 / signature
+   * mismatch). The recoverable preview-only modes are exposed via
+   * previewInviteToken() returning null instead.
+   *
+   * @param {string} tokenId
+   * @param {string} payloadKeyB64Url
+   * @returns {Promise<{ requestNonce: string, recipientSharePubBase64Url: string }>}
+   */
+  async redeemInviteToken(tokenId, payloadKeyB64Url) {
+    await this.#requireAuth();
+    if (!this.#sharingKeyPair) {
+      throw new Error('redeemInviteToken(): no sharing keypair — login as a v4 account first');
+    }
+    if (!this.#email) {
+      throw new Error('redeemInviteToken(): client missing sender email — re-login');
+    }
+    if (typeof tokenId !== 'string' || tokenId.length === 0) {
+      throw new Error('redeemInviteToken(): tokenId is required');
+    }
+    if (typeof payloadKeyB64Url !== 'string' || payloadKeyB64Url.length === 0) {
+      throw new Error('redeemInviteToken(): payloadKeyB64Url is required');
+    }
+
+    const myFingerprint = await fingerprintSharePub(this.#sharingKeyPair.publicKey);
+    const res = await this.#fetch(`/api/v1/invite/redeem/${encodeURIComponent(tokenId)}`, {
+      method: 'POST',
+      auth: true,
+      body: { redeemer_share_pub_fingerprint: myFingerprint },
+    });
+    if (res.status !== 200) {
+      const code = res.status === 404 ? 'INVITE_NOT_FOUND'
+        : res.status === 410 ? 'INVITE_EXPIRED'
+        : res.status === 409 ? 'INVITE_ALREADY_USED'
+        : 'INVITE_REDEEM_FAILED';
+      const err = new Error(`redeemInviteToken(): ${res.json?.error || res.status}`);
+      err.code = code;
+      throw err;
+    }
+
+    const { app_id, payload } = res.json;
+    if (app_id !== this.#appId) {
+      const err = new Error(`redeemInviteToken(): invite app_id ${app_id} != client app_id ${this.#appId}`);
+      err.code = 'INVITE_APP_MISMATCH';
+      throw err;
+    }
+    const payloadBytes = base64ToBytes(payload);
+    const payloadKeyBytes = base64UrlToBytes(payloadKeyB64Url);
+    const key = await crypto.subtle.importKey('raw', payloadKeyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+    let plaintext;
+    try {
+      plaintext = await decrypt(key, payloadBytes);
+    } catch (err) {
+      throw new Error(`redeemInviteToken(): payload decrypt failed (wrong key?): ${err.message}`);
+    }
+    if (plaintext.app_id !== this.#appId) {
+      const err = new Error(`redeemInviteToken(): payload app_id ${plaintext.app_id} != client app_id ${this.#appId}`);
+      err.code = 'INVITE_APP_MISMATCH';
+      throw err;
+    }
+
+    const inviterSharePub = base64UrlToBytes(plaintext.inviter_share_pub);
+    if (inviterSharePub.length !== 32) {
+      throw new Error('redeemInviteToken(): inviter_share_pub is not 32 bytes');
+    }
+
+    // Build + send the connection-request HPKE-sealed back to the inviter.
+    // Same primitives as sendConnectionRequest, but addressed by the
+    // inviter's share_pub from the decrypted payload (we never knew their
+    // email) and tagged with via_invite_token so the inviter's auto-accept
+    // path matches it.
+    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const reqPayload = buildConnectionRequestPayload({
+      senderEmail: this.#email,
+      senderSharePub: this.#sharingKeyPair.publicKey,
+      senderSigningPubBase64,
+      senderAppId: this.#appId,
+      viaInviteToken: tokenId,
+    });
+    const blob = await hpkeSeal({
+      recipientSharePub: inviterSharePub,
+      info: INFO_CONNECTION_REQUEST,
+      plaintext: new TextEncoder().encode(JSON.stringify(reqPayload)),
+    });
+    const tag = await deriveInboxTag(inviterSharePub, this.#appId, currentInboxWindow());
+    const publishRes = await this.#fetch('/api/v1/share/inbox/publish', {
+      method: 'POST',
+      auth: true,
+      body: {
+        tag,
+        type: 'connection-request-v1',
+        ciphertext_base64: bytesToBase64(blob),
+      },
+    });
+    if (publishRes.status !== 200) {
+      throw new Error(`redeemInviteToken(): inbox publish failed: ${publishRes.json?.error || publishRes.status}`);
+    }
+
+    // Update outbound pending so a subsequent listIncomingRequests poll on
+    // this side can recognize the inviter's (eventual) accept.
+    const pending = await this.#loadPendingRequestsRecord();
+    const inviterSharePubBase64Url = plaintext.inviter_share_pub;
+    const outbound = {
+      recipient_email: '',
+      recipient_share_pub: inviterSharePubBase64Url,
+      request_nonce: reqPayload.nonce,
+      sent_at: reqPayload.timestamp,
+      via_invite_token: tokenId,
+    };
+    const updated = addOutboundPending(pending.record, outbound);
+    await this.#savePendingRequestsRecord(pending, updated);
+
+    return {
+      requestNonce: reqPayload.nonce,
+      recipientSharePubBase64Url: inviterSharePubBase64Url,
+    };
+  }
+
+  /**
+   * List the current user's outstanding issued invites (Section 8). Cached
+   * after the first call; refreshed by createInviteToken / revokeIssuedInvite.
+   *
+   * @returns {Promise<Array<{ token_id: string, display_name: string, issued_at: number, expires_at: number, redeemed_at: number | null, redeemer_share_pub_fingerprint: string | null }>>}
+   */
+  async listIssuedInvites() {
+    await this.#requireAuth();
+    const state = await this.#loadIssuedInvitesRecord();
+    return (state.record.invites || []).slice();
+  }
+
+  /**
+   * Revoke an issued invite. Best-effort: deletes the server-side row (so the
+   * link can no longer be redeemed) and removes the local entry. A 404 on
+   * the server-side delete is treated as success — the local cleanup still
+   * runs.
+   *
+   * @param {string} tokenId
+   * @returns {Promise<{ revoked: boolean }>}
+   */
+  async revokeIssuedInvite(tokenId) {
+    await this.#requireAuth();
+    if (typeof tokenId !== 'string' || tokenId.length === 0) {
+      throw new Error('revokeIssuedInvite(): tokenId is required');
+    }
+    let serverDeleted = false;
+    try {
+      const res = await this.#fetch(`/api/v1/invite/${encodeURIComponent(tokenId)}`, {
+        method: 'DELETE',
+        auth: true,
+      });
+      serverDeleted = res.status === 204 || res.status === 404;
+    } catch (err) {
+      console.warn(`[TarnClient] revokeIssuedInvite: server delete failed: ${err.message}`);
+    }
+    const state = await this.#loadIssuedInvitesRecord();
+    if (state.record.invites?.some(i => i.token_id === tokenId)) {
+      const updated = removeIssuedInvite(state.record, tokenId);
+      const written = await this.#saveIssuedInvitesRecord(state, updated);
+      this.#issuedInvitesState = { record: written.record, txid: written.txid };
+    }
+    return { revoked: serverDeleted };
   }
 
   // ============ SHARE LOG (issue #15, Section 5b) ============
@@ -3377,6 +3808,7 @@ export class TarnClient {
           signing_pub: v.normalized.senderSigningPubBase64,
           established_at: v.normalized.timestamp,
           initial_request_nonce: outbound.request_nonce,
+          label: null,
         };
         connectionsState = {
           ...connectionsState,
@@ -3461,6 +3893,36 @@ export class TarnClient {
 
   async #saveMutedConnectionsRecord(state, newRecord) {
     return await this.#writeShareStateEntry(MUTED_CONNECTIONS_CONTENT_ID, state, newRecord);
+  }
+
+  /**
+   * Load the issued-invites record. Cached across calls — most read paths
+   * (listIssuedInvites, revokeIssuedInvite) prefer the cached copy. The
+   * auto-accept path in listIncomingRequests() bypasses this with
+   * #loadIssuedInvitesFresh().
+   */
+  async #loadIssuedInvitesRecord() {
+    if (this.#issuedInvitesState) return this.#issuedInvitesState;
+    return await this.#loadIssuedInvitesFresh();
+  }
+
+  /**
+   * Re-fetch the issued-invites blob from the API, bypassing any in-memory
+   * cache. Used by the auto-accept path: an invite created on a different
+   * device must be recognized here even when this device's cached state is
+   * stale.
+   */
+  async #loadIssuedInvitesFresh() {
+    const entry = await this.#findShareStateEntry(ISSUED_INVITES_CONTENT_ID);
+    const state = entry
+      ? { record: entry.data, txid: entry.txid }
+      : { record: emptyIssuedInvitesRecord(this.#appId), txid: null };
+    this.#issuedInvitesState = state;
+    return state;
+  }
+
+  async #saveIssuedInvitesRecord(state, newRecord) {
+    return await this.#writeShareStateEntry(ISSUED_INVITES_CONTENT_ID, state, newRecord);
   }
 
   /**
@@ -4193,6 +4655,35 @@ function readGenTag(tags) {
 function generateIdempotencyKey() {
   // crypto.randomUUID is available in modern browsers and Node 15+.
   return crypto.randomUUID();
+}
+
+// share_pub fingerprint (Section 8): SHA-256 truncated to 4 bytes, formatted
+// as colon-separated hex pairs (e.g. "a3:b9:c7:d4"). Short enough to fit in
+// the server-side `redeemer_share_pub_fingerprint` column and recognizable
+// in UI verification flows.
+async function fingerprintSharePub(sharePub) {
+  const bytes = sharePub instanceof Uint8Array ? sharePub : base64UrlToBytes(sharePub);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const out = [];
+  for (let i = 0; i < 4; i++) out.push(digest[i].toString(16).padStart(2, '0'));
+  return out.join(':');
+}
+
+// Connection.label normalization (Section 8). null/undefined/'' all collapse
+// to null so the persisted record stays clean. Strings are trimmed and
+// bounded so an app can't accidentally write a multi-KB label.
+const MAX_CONNECTION_LABEL_LEN = 256;
+function normalizeConnectionLabel(label) {
+  if (label == null) return null;
+  if (typeof label !== 'string') {
+    throw new Error('connection label must be a string or null');
+  }
+  const trimmed = label.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.length > MAX_CONNECTION_LABEL_LEN) {
+    throw new Error(`connection label exceeds ${MAX_CONNECTION_LABEL_LEN} chars`);
+  }
+  return trimmed;
 }
 
 function sleep(ms) {
