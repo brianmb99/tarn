@@ -13,6 +13,7 @@ import {
   pruneStaleSessions,
   createOrReuseSession,
   deleteAllSessionsForAccount,
+  deleteOtherSessionsForAccount,
 } from '../sessions.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
@@ -703,12 +704,17 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     finalSharePub, finalShareDiscoverable === 1, finalShareLookupKey,
   );
 
-  // Section 7.5: rotating credentials revokes every prior session. Best-effort
-  // — a D1 hiccup here must not fail the credential operation.
+  // Section 7.5: rotating credentials revokes every OTHER prior session. The
+  // calling sid must survive the request because the SDK still has follow-up
+  // work to do under the same JWT — publishing rotate_identity announcements
+  // to each connection's outbound log via /api/v1/entries — before it
+  // re-authenticates under the new credentials. Killing the calling sid here
+  // would 401 those follow-up writes mid-flight (caught in deployed test §9c).
+  // Best-effort — a D1 hiccup must not fail the credential operation.
   try {
-    await deleteAllSessionsForAccount(env, auth.data_lookup_key);
+    await deleteOtherSessionsForAccount(env, auth.data_lookup_key, auth.sid);
   } catch (err) {
-    console.warn('[tarn-api] handleCredentialChange: deleteAllSessionsForAccount failed:', err.message);
+    console.warn('[tarn-api] handleCredentialChange: deleteOtherSessionsForAccount failed:', err.message);
   }
 
   return jsonResponse({ ok: true }, 200, cors);

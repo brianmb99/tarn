@@ -798,12 +798,40 @@ await test('Invite inviter + redeemer register', async () => {
   inviteRedeemer = new TarnClient(API_BASE, APP_ID);
   inviteInviterEmail = `inv-inviter-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
   inviteRedeemerEmail = `inv-redeemer-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
-  await inviteInviter.register(inviteInviterEmail, 'pw-inv-' + Date.now(), {
+  const inviterReg = await inviteInviter.register(inviteInviterEmail, 'pw-inv-' + Date.now(), {
     recoveryAcknowledged: true, emailRecoveryKit: false,
   });
-  await inviteRedeemer.register(inviteRedeemerEmail, 'pw-red-' + Date.now(), {
+  const redeemerReg = await inviteRedeemer.register(inviteRedeemerEmail, 'pw-red-' + Date.now(), {
     recoveryAcknowledged: true, emailRecoveryKit: false,
   });
+
+  // New accounts default to rules_json = NULL which is DENY. Set permissive
+  // free-tier-style rules for both so tarn-issued-invites-v1 / tarn-pending-
+  // requests-v1 / tarn-connections-v1 blob writes are allowed.
+  const pkcs8 = new Uint8Array(APP_KEY.length / 2);
+  for (let i = 0; i < APP_KEY.length; i += 2) pkcs8[i / 2] = parseInt(APP_KEY.substr(i, 2), 16);
+  const appPriv = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  for (const dlk of [inviterReg.dataLookupKey, redeemerReg.dataLookupKey]) {
+    const cRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential_lookup_key: APP_ID }),
+    });
+    const { nonce: appNonce } = await cRes.json();
+    const nonceBytes = new Uint8Array(appNonce.length / 2);
+    for (let i = 0; i < appNonce.length; i += 2) nonceBytes[i / 2] = parseInt(appNonce.substr(i, 2), 16);
+    const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, appPriv, nonceBytes);
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+    const vRes = await fetch(`${API_BASE}/api/v1/auth/verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential_lookup_key: APP_ID, nonce: appNonce, signature: sigB64 }),
+    });
+    const { jwt: appJwt } = await vRes.json();
+    await fetch(`${API_BASE}/api/v1/accounts/${dlk}/rules`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${appJwt}` },
+      body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 50, app: APP_ID }, { type: 'max_bytes', limit: 204800 }] }),
+    });
+  }
 });
 
 let deployedInvite;

@@ -86,9 +86,15 @@ export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaReco
 }
 
 /**
- * Delete every session row for a given account. Called from changeCredentials,
- * recoverAccount, and deleteAccount AFTER the credential blob has been
- * published — doing it earlier would 401 the very request that's running.
+ * Delete every session row for a given account. Used by deleteAccount where
+ * the account itself is going away.
+ *
+ * For changeCredentials / recoverAccount, prefer deleteOtherSessionsForAccount
+ * — the calling session must survive the request because the SDK still has
+ * follow-up work to do under the same JWT (publishing rotate_identity
+ * announcements to each connection's outbound log) before it re-authenticates
+ * under the new credentials. Killing the calling sid inside the request that
+ * triggered the rotation 401s those follow-up writes.
  */
 export async function deleteAllSessionsForAccount(env, dlk) {
   // Snapshot the sids first so we can invalidate cache entries on this isolate.
@@ -99,6 +105,32 @@ export async function deleteAllSessionsForAccount(env, dlk) {
   await env.DB.prepare(
     'DELETE FROM sessions WHERE data_lookup_key = ?1'
   ).bind(dlk).run();
+  for (const row of rows.results || []) {
+    _sessionCache.set(row.sid, { active: false, cachedAt: Date.now() });
+  }
+}
+
+/**
+ * Delete every session row for a given account EXCEPT the supplied sid.
+ * Used by changeCredentials / recoverAccount to revoke other devices while
+ * keeping the calling session alive for follow-up work (rotate_identity
+ * announcements). The SDK's subsequent re-auth under the new credentials
+ * mints a fresh sid; the surviving exceptSid eventually expires via lazy
+ * prune.
+ */
+export async function deleteOtherSessionsForAccount(env, dlk, exceptSid) {
+  if (!exceptSid) {
+    // Defensive: if for some reason we have no calling sid (pre-7.5 grandfather
+    // path), fall back to deleting everything — there's no calling session to
+    // preserve.
+    return deleteAllSessionsForAccount(env, dlk);
+  }
+  const rows = await env.DB.prepare(
+    'SELECT sid FROM sessions WHERE data_lookup_key = ?1 AND sid != ?2'
+  ).bind(dlk, exceptSid).all();
+  await env.DB.prepare(
+    'DELETE FROM sessions WHERE data_lookup_key = ?1 AND sid != ?2'
+  ).bind(dlk, exceptSid).run();
   for (const row of rows.results || []) {
     _sessionCache.set(row.sid, { active: false, cachedAt: Date.now() });
   }
