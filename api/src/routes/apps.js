@@ -1,5 +1,6 @@
 // App management endpoints
 // PUT /api/v1/accounts/:data_lookup_key/rules — set write rules for a user
+// PUT /api/v1/apps/:app_id/invite-template — set invite_url_template (Section 8)
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
@@ -7,6 +8,8 @@ import { upsertWriteThrough } from '../cache.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
+
+const MAX_INVITE_URL_TEMPLATE_LEN = 512;
 
 /**
  * Set write authorization rules for a user.
@@ -97,4 +100,55 @@ export async function handleSetRules(dataLookupKey, request, env, ctx, cors) {
   })());
 
   return jsonResponse({ ok: true }, 200, cors);
+}
+
+/**
+ * Set invite_url_template for an app (Section 8, issue #22).
+ *
+ * The caller must authenticate as the app — the JWT's app role is the
+ * authorization boundary, and `app_id` in the path must equal the JWT's
+ * subject. Empty / null body clears the template; any non-empty value is
+ * stored verbatim. The SDK's `createInviteToken` reads this back via the
+ * unauthenticated `GET /api/v1/apps/:app_id/invite-template`.
+ */
+export async function handleSetInviteTemplate(appId, request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
+  if (!auth) return errorResponse('Unauthorized', 401, cors);
+  if (auth.role !== 'app') {
+    return errorResponse('Only app identities can set invite_url_template', 403, cors);
+  }
+  if (auth.data_lookup_key !== appId) {
+    return errorResponse('app_id mismatch', 403, cors);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, cors);
+  }
+
+  const template = body?.invite_url_template;
+  if (template != null) {
+    if (typeof template !== 'string') {
+      return errorResponse('invite_url_template must be a string or null', 400, cors);
+    }
+    if (template.length > MAX_INVITE_URL_TEMPLATE_LEN) {
+      return errorResponse(`invite_url_template exceeds ${MAX_INVITE_URL_TEMPLATE_LEN} chars`, 400, cors);
+    }
+    if (!template.includes('{token_id}')) {
+      return errorResponse('invite_url_template must contain {token_id}', 400, cors);
+    }
+  }
+
+  const exists = await env.DB.prepare('SELECT 1 FROM apps WHERE app_id = ?1').bind(appId).first();
+  if (!exists) {
+    return errorResponse('App not found', 404, cors);
+  }
+
+  await env.DB.prepare(
+    'UPDATE apps SET invite_url_template = ?1 WHERE app_id = ?2'
+  ).bind(template ?? null, appId).run();
+
+  return jsonResponse({ ok: true, invite_url_template: template ?? null }, 200, cors);
 }

@@ -11,9 +11,16 @@ import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, 
 import { handleRecoveryEmail } from './routes/recovery.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
-import { handleSetRules } from './routes/apps.js';
+import { handleSetRules, handleSetInviteTemplate } from './routes/apps.js';
 import { handleStatus } from './routes/status.js';
 import { handleListSessions, handleRevokeSession, handleRevokeAllSessions } from './routes/sessions.js';
+import {
+  handleCreateInvite,
+  handleGetInvite,
+  handleRedeemInvite,
+  handleRevokeInvite,
+  handleGetAppInviteTemplate,
+} from './routes/invites.js';
 import { setSkipTurboFromEnv } from './turbo.js';
 
 // ============ CORS ============
@@ -185,6 +192,38 @@ export default {
       // Status (authenticated — app or user)
       if (path === '/api/v1/status' && method === 'GET') {
         return await handleStatus(request, env, ctx, cors);
+      }
+
+      // Invite tokens (Section 8, issue #22). Match the bare /invite POST
+      // before any parameterized /invite/:token_id so a malformed POST
+      // doesn't get captured as a redeem.
+      if (path === '/api/v1/invite' && method === 'POST') {
+        return await handleCreateInvite(request, env, ctx, cors);
+      }
+      if (path.startsWith('/api/v1/invite/redeem/') && method === 'POST') {
+        const tokenId = path.slice('/api/v1/invite/redeem/'.length);
+        return await handleRedeemInvite(request, env, ctx, tokenId, cors);
+      }
+      if (path.startsWith('/api/v1/invite/') && method === 'GET') {
+        const tokenId = path.slice('/api/v1/invite/'.length);
+        if (tokenId && !tokenId.includes('/')) {
+          return await handleGetInvite(request, env, tokenId, cors);
+        }
+      }
+      if (path.startsWith('/api/v1/invite/') && method === 'DELETE') {
+        const tokenId = path.slice('/api/v1/invite/'.length);
+        if (tokenId && !tokenId.includes('/')) {
+          return await handleRevokeInvite(request, env, ctx, tokenId, cors);
+        }
+      }
+
+      // App invite template (unauthenticated read; app-role write).
+      const inviteTemplateMatch = path.match(/^\/api\/v1\/apps\/([^/]+)\/invite-template$/);
+      if (inviteTemplateMatch && method === 'GET') {
+        return await handleGetAppInviteTemplate(request, env, inviteTemplateMatch[1], cors);
+      }
+      if (inviteTemplateMatch && method === 'PUT') {
+        return await handleSetInviteTemplate(inviteTemplateMatch[1], request, env, ctx, cors);
       }
 
       // App management — rules (authenticated, app role)

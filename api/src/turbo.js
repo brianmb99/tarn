@@ -43,7 +43,16 @@ export function setSkipTurboFromEnv(env, request) {
     } catch {
       hostname = null;
     }
-    if (hostname && TARN_SKIP_TURBO_PRODUCTION_HOSTS.has(hostname)) {
+    // wrangler dev with `routes: custom_domain` simulates the production
+    // hostname AND a realistic `request.cf` object, so we can't distinguish
+    // dev from prod via either alone. The CF-Connecting-IP header is the
+    // reliable signal: production always carries the real client's public
+    // IP; wrangler dev sets it to 127.0.0.1 (or omits it). A loopback IP on
+    // a request claiming a production hostname means we're in dev — honor
+    // the skip.
+    const cfIp = request?.headers?.get?.('CF-Connecting-IP') || '';
+    const isLoopback = !cfIp || cfIp === '127.0.0.1' || cfIp === '::1' || cfIp === '0.0.0.0';
+    if (!isLoopback && hostname && TARN_SKIP_TURBO_PRODUCTION_HOSTS.has(hostname)) {
       console.error(
         `[TARN CRITICAL] TARN_SKIP_TURBO=true detected on production host ${hostname}. ` +
         `REFUSING to skip Turbo uploads. Remove this Worker secret immediately ` +
