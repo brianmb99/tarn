@@ -1,7 +1,7 @@
 # Tarn Protocol — Working Draft
 
 **Status:** Active design discussion (Issue #69)
-**Last updated:** 2026-04-29 (Section 7.5 spec added)
+**Last updated:** 2026-04-30 (Section 7.5 spec added)
 
 Tarn is an app-agnostic platform for storing encrypted, user-owned data permanently on Arweave. This document defines the complete protocol: identity, authentication, encryption, and data operations.
 
@@ -1105,6 +1105,254 @@ client.recoverAccount({ ..., deviceLabel?: string })
 - **Revocation latency up to 5 seconds.** Bounded by the isolate cache TTL. Acceptable trade-off for amortized D1 reads. If a use case demands sub-second revocation, the cache TTL can be lowered or disabled per-environment via a config.
 - **No device-grouping heuristics.** The SDK's `previous_sid` continuity keeps it to one row per device-installation, but a single user with two browser profiles on the same physical machine has two rows. Apps that want to group by physical device must rely on app-supplied `device_label` to disambiguate.
 - **App-role JWTs are stateless.** Per-app session tracking would require a separate `app_sessions` table and is out of scope for 7.5.
+
+---
+
+## Invite tokens (Section 8, issue #22)
+
+The connection-handshake primitives shipped under Sections 5a–5d let two users form an end-to-end-encrypted connection if and only if the sender already knows the recipient's email and the recipient is a Tarn user with `share_discoverable=true`. For a large class of consumer-app flows — "scan this QR to add me", "send this link to your friend in Slack", "register and click my invite link" — those preconditions don't hold. Section 8 adds a complementary primitive: **opaque, single-use, time-limited invite tokens** that let the inviter publish a redemption slot without knowing the recipient's identity, and let the recipient redeem it (potentially after signing up) without ever transmitting the inviter's identifier through the channel that carried the link.
+
+### Why server-mediated
+
+Three alternative shapes were considered and ruled out:
+
+1. **Stateless QR / link** — keys baked into the URL, no server state. Loses single-use; a leaked link in any messenger channel exposes the inviter to arbitrary stranger redemption forever.
+2. **Pure-Arweave invite blob** — inviter publishes an Arweave entry; recipient reads it, sends a normal connection request. Single-use cannot be enforced at storage (Arweave is immutable); app-side single-use ("accept the first matching request, drop the rest") races between the legitimate recipient and any malicious party that scrapes the link.
+3. **Reuse the existing inbox-tag mechanism** — the inbox is share_pub-keyed and time-windowed; an "anonymous inbox" without a share_pub doesn't fit the model, and we'd be inventing single-use semantics on a primitive that doesn't want them.
+
+All three lose the atomic single-use property that only the server can provide cheaply. Section 8 is server-mediated for that reason and that reason alone — every other piece of the flow is client-side cryptography over an opaque blob.
+
+### Cryptographic shape
+
+The inviter generates two independent 32-byte secrets client-side:
+
+- `token_id` — opaque server-side index. 256-bit URL-safe random. Sent to the API in the path; the server stores ciphertext keyed on it.
+- `payload_key` — AES-256-GCM key that encrypts the invite payload. **Never transmitted to the API.** Carried only in the URL fragment, which browsers do not include in HTTP requests.
+
+```
+plaintext = JSON({
+  inviter_share_pub:    <base64url 32 bytes>,
+  inviter_signing_pub:  <base64url SPKI>,
+  inviter_display_name: <string ≤ 64 chars>,
+  app_id:               <string>,
+  issued_at:            <unix seconds>
+})
+ciphertext = IV(12) || AES-256-GCM(plaintext, payload_key, IV) + tag
+on-wire    = base64(ciphertext)        # what `payload` field carries
+url        = <apps.invite_url_template, with {token_id}> # base64url(payload_key) in the URL fragment
+                                                          # see "App-side URL template" below
+```
+
+The server stores `(token_id, payload, ...metadata)` and never learns the contents of `payload` — `inviter_share_pub`, `inviter_signing_pub`, and `inviter_display_name` are not visible to the API. This is the consistent zero-knowledge story across the rest of the protocol.
+
+### App-side URL template
+
+There is no Tarn-hosted landing page. Apps own the URL surface. A new column on the `apps` table records each app's invite URL template:
+
+```sql
+ALTER TABLE apps ADD COLUMN invite_url_template TEXT;
+-- e.g. "https://app.bookish.example/invite/{token_id}"
+-- {token_id} is the only supported substitution.
+```
+
+Set at app onboarding. The SDK calls `GET /api/v1/apps/:app_id/invite-template` (or returns it from `createInviteToken` directly) and constructs the final URL by substituting `{token_id}` and appending `#<base64url(payload_key)>` as the fragment.
+
+The app's web handler at that URL is responsible for:
+- Reading `token_id` from the path and `payload_key` from `window.location.hash.slice(1)`.
+- Calling `tarn.previewInviteToken(token_id, payloadKey)` to populate any "Maya invited you" UI it wants.
+- Calling `tarn.redeemInviteToken(token_id, payloadKey)` once the recipient is authenticated (signing up first if needed).
+- Server-side rendering the page with `<meta property="og:title">` etc. for messenger-preview unfurls — the app can fetch the unauthenticated preview server-side to populate them.
+- Universal Links / App Links handling for native apps.
+
+Tarn's surface stays the protocol primitive plus a per-app URL template. The UX is the app's.
+
+### D1 schema
+
+```sql
+CREATE TABLE invites (
+  token_id TEXT PRIMARY KEY,            -- 256-bit URL-safe random, client-generated
+  app_id TEXT NOT NULL,
+  inviter_dlk TEXT NOT NULL,            -- inviter's data_lookup_key
+  payload BLOB NOT NULL,                -- opaque AES-GCM ciphertext
+  issued_at INTEGER NOT NULL,           -- unix seconds
+  expires_at INTEGER NOT NULL,          -- unix seconds; default issued_at + 7d, max 30d
+  used_at INTEGER,                      -- NULL until redeemed
+  redeemer_share_pub_fingerprint TEXT   -- short hex; populated on redeem for sender display
+);
+
+CREATE INDEX idx_invites_expires ON invites(expires_at);
+CREATE INDEX idx_invites_inviter ON invites(inviter_dlk);
+```
+
+`payload` is byte-stable for the inviter's session (the same `(plaintext, payload_key)` always wraps to the same ciphertext given a fixed IV; the IV is fresh per invite, so different invites have different bytes — this property doesn't matter to retry idempotency since `token_id` is the primary key).
+
+### Lazy cleanup (no cron)
+
+Tarn has no cron infrastructure (`auth_nonces` and `write_rate_limits` both use lazy expiry; we follow the precedent):
+
+- `previewInvite` and `redeemInvite` filter by `expires_at` in the SELECT — expired rows behave as 410 Gone regardless of physical presence.
+- `redeemInvite` opportunistically issues `DELETE FROM invites WHERE expires_at < ?1` on ~5% of calls (the same probabilistic-cleanup pattern used by `write_rate_limits`).
+
+The 24-hour grace before deletion documented in the original RFC is unnecessary under this model — expired-but-undeleted rows are filtered out by the SELECT side.
+
+### Endpoints
+
+#### `POST /api/v1/invite` (authenticated, user-role)
+
+```
+Body: { token_id, app_id, payload, expires_at }
+  - token_id: 43-char base64url
+  - payload:  base64 of IV || ciphertext+tag (max 4 KiB on the wire)
+  - expires_at: unix seconds; server enforces ≤ now + 30 days
+  - app_id must equal the JWT's app claim
+
+Returns 201: { token_id, expires_at }
+Errors:
+  400 if expires_at > 30d in the future, or token_id malformed
+  409 if token_id already exists (caller retries with fresh random)
+  413 if payload > 4 KiB
+  429 if inviter has exceeded the rate limit (see below)
+```
+
+#### `GET /api/v1/invite/:token_id` (unauthenticated)
+
+```
+Returns 200: { app_id, payload, issued_at, expires_at }
+  payload is the opaque ciphertext (base64). Recipient decrypts client-side.
+Errors:
+  404 if not found
+  410 if expired
+  409 if already used (used_at IS NOT NULL)
+  429 if per-IP preview rate exceeded
+```
+
+The app_id and timestamps are unencrypted — they're already implied by the URL hosting the invite, and the recipient's app needs `app_id` to confirm scope before redeeming. Everything else (inviter_share_pub, signing_pub, display_name) is inside the encrypted payload.
+
+#### `POST /api/v1/invite/redeem/:token_id` (authenticated, user-role)
+
+```
+Body: { redeemer_share_pub_fingerprint }
+  - redeemer_share_pub_fingerprint: short hex (e.g., 8 chars) of the
+    recipient's share_pub, recorded for the inviter's listIssuedInvites
+    display.
+
+Atomicity: UPDATE invites SET used_at = ?1, redeemer_share_pub_fingerprint = ?2
+           WHERE token_id = ?3 AND used_at IS NULL AND expires_at > ?4
+         If affected_rows = 0:
+           - Lookup the row to determine error mode
+           - 410 if expired, 409 if already used, 404 otherwise
+
+Returns 200: { app_id, payload, issued_at, expires_at }
+  Same shape as preview; recipient decrypts and proceeds with the
+  connection-request HPKE handshake.
+Errors: 404 / 410 / 409 / 429 as above
+```
+
+The redemption response includes the same payload as preview because the server can't tell the difference — both responses serve opaque ciphertext. The server-side state change is `used_at` being set atomically.
+
+### Rate limiting
+
+Existing primitives, no new infrastructure:
+
+- **Create** — `checkWriteRateLimit`-style D1 atomic counter, key `invite-create:<dlk>:<hour>`, max **10/hour per inviter**. Atomic via `INSERT ... ON CONFLICT DO UPDATE`.
+- **Redeem** — same shape, key `invite-redeem:<dlk>:<hour>`, max **50/hour per redeemer**. Bounded to detect runaway redemption clients.
+- **Preview** — `checkAndIncrementRateLimit` (KV), key `invite-preview:<ip-hash>:<hour>`, max **100/hour per IP**. Defense-in-depth against token-id enumeration; the 256-bit token space already makes brute-force infeasible.
+
+All three fail open on rate-store outage (consistent with existing patterns).
+
+### Connection.label primitive
+
+The current connections record stores `share_pub`, `signing_pub`, `email`, `established_at`, `initial_request_nonce`. The `listConnections` JSDoc ([client/src/tarn.js](../client/src/tarn.js)) lists `label?: string` as an optional field, but no code reads or writes it — vestigial.
+
+Section 8 makes it a first-class primitive:
+
+- `acceptConnectionRequest(nonce, { label })` — optional label set at accept time.
+- `setConnectionLabel(connection, label)` — relabel an existing connection.
+- `listConnections()` returns `label` per entry (always present in the type, may be `null`).
+- The label persists in the connections record (`tarn-connections-v1`) blob alongside other per-connection fields. No new server-side surface.
+- The label is local to the labeling user — the labeled party does not see what they were labeled.
+
+Used by invite redemption to seed the connection's label with the inviter's `display_name` from the decrypted payload, so apps get an out-of-the-box "this is Maya" without app-layer storage.
+
+### Auto-accept on the inviter side
+
+After the recipient redeems and sends a normal connection request back, the inviter's app sees an inbound request with a new optional field, `via_invite_token: <token_id>`. The SDK's `listIncomingRequests` surfaces this; the SDK's auto-accept logic on the inviter side:
+
+1. Receives the inbound request.
+2. **Reads `tarn-issued-invites-v1` fresh from the API** (no in-memory cache — the issuer may have created the invite on a different device, and that device's write hits D1 synchronously, but the receiving device's in-memory state can be stale).
+3. If `via_invite_token` matches an entry in `tarn-issued-invites-v1`, auto-accepts (no UI prompt).
+4. If no match, the request stays in the pending list as a normal incoming request — the user sees it and decides. (Not silently dropped; that would lose legitimate redemptions during edge-case scenarios.)
+
+The `tarn-issued-invites-v1` blob is the standard encrypted-data-blob pattern (mirrors `tarn-muted-connections-v1`, `tarn-connections-v1`, etc.):
+
+```
+content_id = "tarn-issued-invites-v1"
+plaintext  = JSON({
+  app_id:  <string>,
+  version: 1,
+  invites: [
+    {
+      token_id, display_name, issued_at, expires_at,
+      redeemed_at, redeemer_share_pub_fingerprint
+    },
+    ...
+  ]
+})
+```
+
+DEK-encrypted. Synced across the inviter's devices via standard data-blob storage. Pruned locally once the matching connection is established or the entry expires.
+
+### Threat model
+
+- **Leaked invite link** (screenshot, accidental Slack post). Mitigations: 7-day default expiry, hard 30-day max, single-use, sender-visible `redeemer_share_pub_fingerprint` so inviter can detect surprise redemption and revoke + reissue.
+- **Malicious recipient redeems but refuses the handshake**. Token consumed; inviter must reissue. No worse than the email-flow case where a recipient declines.
+- **Server compromise**. Attacker can enumerate live tokens via the `invites` table but cannot decrypt payloads (the `payload_key` lives only in URL fragments held by recipients). Best they can do is mark tokens used (denial-of-service) or redirect connection-request handshakes (which fail signature verification on the inviter side because the attacker doesn't have the recipient's identity to sign as).
+- **Token enumeration**. 256-bit space is brute-force-infeasible regardless. The 100/hour/IP preview rate-limit is defense-in-depth.
+- **Inviter-identity exposure to API operators**. Operators see `(inviter_dlk, token_id, time, redeemer_fingerprint)` per row. They do **not** see `inviter_share_pub`, `inviter_signing_pub`, or `inviter_display_name` — those are inside the encrypted payload.
+
+### SDK surface
+
+```
+client.createInviteToken({
+  display_name?: string,        // shown to recipient at preview/redeem time, ≤ 64 chars
+  expiry_days?: number,         // default 7, server max 30
+}): Promise<{
+  token_id: string,
+  invite_url: string,           // app's template + #fragment, ready to share
+  expires_at: number,
+}>
+
+client.previewInviteToken(token_id, payloadKey): Promise<{
+  inviter_display_name: string,
+  inviter_share_pub_fingerprint: string,   // short hex for verification UI
+  app_id: string,
+  issued_at: number,
+  expires_at: number,
+} | null>                       // null on expired / used / not found
+
+client.redeemInviteToken(token_id, payloadKey): Promise<Connection>
+                                // Throws on expired / used / not found / app_id mismatch.
+                                // The returned connection becomes live once the inviter's
+                                // session auto-accepts the inbound request.
+
+client.listIssuedInvites(): Promise<Array<IssuedInvite>>
+
+client.revokeIssuedInvite(token_id): Promise<void>
+                                // App-side delete from tarn-issued-invites-v1, plus a
+                                // best-effort DELETE /api/v1/invite/:token_id on the server.
+
+client.acceptConnectionRequest(nonce, { label? }): Promise<Connection>   // updated
+client.setConnectionLabel(connection, label): Promise<void>              // new
+```
+
+`listConnections` return type gains `label: string | null`.
+
+### Known v1 gaps
+
+- **No multi-redeem variant.** All v1 invites are single-use. A `max_redemptions: N` flag for "invite link to a book club" use cases is plausible follow-up but has a different threat model and is deferred.
+- **No revocation propagation.** `revokeIssuedInvite` clears the inviter's local record and best-effort deletes from the server. A malicious recipient who already retrieved (but not yet redeemed) the payload via preview can still attempt redemption; the server-side delete prevents it from succeeding. Acceptable.
+- **No anonymous-inbox-style metadata privacy.** Server learns `(inviter_dlk, time)` for every issued invite and `(token_id, redemption_time, IP)` for every redemption. Acceptable disclosure given the tight binding to the inviter's account; documented in [Publicly observable metadata](#publicly-observable-metadata) below.
+- **App-onboarding.** Setting `invite_url_template` is part of the existing manual app-registration flow; no developer-portal self-service in v1.
 
 ---
 
