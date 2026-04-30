@@ -140,6 +140,55 @@ await cellar.register('user@example.com', 'password');
 // These are two separate accounts with separate encryption keys
 ```
 
+## Session lifecycle
+
+Tarn ships two complementary primitives for keeping users logged in across page reloads and across multiple devices.
+
+### Persistence (single device, "remember me")
+
+Opt-in. By default `new TarnClient(...)` + `login()` keeps everything in memory and the user re-enters their password on every tab. To persist, ask the SDK for an opaque blob and store it (typically in `localStorage`):
+
+```javascript
+const blob = await tarn.serializeSession();
+localStorage.setItem('tarn-session', blob);
+
+// Later, on a fresh page load:
+const stored = localStorage.getItem('tarn-session');
+const tarn = await TarnClient.resumeSession('https://api.tarn.dev', 'your-app-id', stored);
+if (!tarn) {
+  // Expired, tampered, or this is a different origin — fall back to login UI.
+}
+
+await tarn.clearSession();   // explicit logout: wipes the on-device wrapping key
+```
+
+The blob is encrypted under an AES-256-GCM key stored in IndexedDB with `extractable: false` — even an XSS on the origin cannot exfiltrate the raw key for offline replay. Hard 7-day max age, no refresh-on-use. `changeCredentials`, `recoverAccount`, and `deleteAccount` rotate the wrapping key as a side effect, so any persisted blob from before the rotation becomes unreadable.
+
+**Threat-model note.** Persistence is a real escalation of same-origin XSS — an attacker with code execution on the origin gains pseudo-persistent access (up to 7 days) rather than session-only access. Apps with stricter postures should not opt in. See [TARN_PROTOCOL.md § Session persistence](../docs/TARN_PROTOCOL.md#session-persistence-section-7-issue-19) for the full breakdown.
+
+### Server-side sessions (multi-device, "Manage devices")
+
+Every `/auth/verify` issues a JWT carrying a `sid` claim backed by a server-side row. Apps can list active sessions and revoke them individually — the right primitive for a Settings → Manage devices page:
+
+```javascript
+// List sessions for the current account.
+const sessions = await tarn.listSessions();
+// [{ sid, createdAt, lastSeenAt, deviceLabel, viaRecovery, isCurrent }, ...]
+
+// Revoke another device.
+await tarn.revokeSession(sessions[1].sid);
+
+// "Sign out everywhere except here".
+await tarn.revokeOtherSessions();
+
+// "Sign out everywhere including here". The SDK clears the persisted blob too.
+await tarn.revokeAllSessions();
+```
+
+Apps can attach a human-readable `deviceLabel` at login time (`tarn.login(email, password, { deviceLabel: 'Chrome on MacBook' })` — also accepted on `register` and `recoverAccount`) which surfaces on `listSessions` so users can tell their devices apart.
+
+Stateful auth: every authenticated request validates the `sid` against the server-side table, so revocation propagates within ~5 seconds (a short in-Worker isolate cache amortizes the D1 read). `changeCredentials` and `recoverAccount` revoke every OTHER session for the account but preserve the calling one — the SDK still has follow-up rotation announcements to publish under the same JWT before re-authenticating.
+
 ## Credential Management
 
 ```javascript
@@ -249,6 +298,36 @@ const results = await tarn.batchCreate('entry', [
 
 ### `tarn.deleteAccount()`
 
+### `tarn.serializeSession()` → `string` (opaque base64url ciphertext)
+
+Persistence opt-in. See [Session lifecycle](#session-lifecycle).
+
+### `TarnClient.resumeSession(apiBase, appId, blob)` → `TarnClient | null`
+
+Static. Returns null on expired / tampered / wrong-origin / schema-mismatch — never throws on a bad blob.
+
+### `tarn.clearSession()`
+
+Wipes the on-device wrapping key. Renders all previously-emitted blobs unreadable on this origin.
+
+### `tarn.listSessions()` → `[{ sid, createdAt, lastSeenAt, deviceLabel, viaRecovery, isCurrent }]`
+
+### `tarn.revokeSession(sid)` / `tarn.revokeAllSessions()` / `tarn.revokeOtherSessions()`
+
+### `tarn.createInviteToken({ display_name?, expiry_days? })` → `{ token_id, invite_url, expires_at }`
+
+### `TarnClient.previewInviteToken(apiBase, appId, token_id, payloadKey)` → `{ inviter_display_name, inviter_share_pub_fingerprint, app_id, issued_at, expires_at } | null`
+
+Static. Unauthenticated — the recipient may not have a Tarn account yet at preview time.
+
+### `tarn.redeemInviteToken(token_id, payloadKey)` → `Connection`
+
+Authenticated. Atomically marks the token used server-side, sends the connection-request handshake.
+
+### `tarn.listIssuedInvites()` / `tarn.revokeIssuedInvite(token_id)`
+
+### `tarn.setConnectionLabel(connection, label)`
+
 ## Sharing — Connections + mute filter
 
 Tarn ships a mutual-connection sharing primitive: two users mutually agree (HPKE handshake, then a per-pair stealth-addressed encrypted log), after which either side can share content with the other. The full protocol is in [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) and [the sharing design doc](../notes/2026-04-28-tarn-sharing-design.md).
@@ -274,6 +353,56 @@ await tarn.syncShareLog(bob);                        // incremental
 await tarn.removeConnection(bob);                    // §10.1 unfollow
 await tarn.revokeContentFromConnections(contentId);  // §10.3 CEK rotation
 ```
+
+Each `Connection` carries an optional `label` that apps can use as a nickname / display name. Set at accept time or later:
+
+```javascript
+await tarn.acceptConnectionRequest(nonce, { label: 'Maya' });
+await tarn.setConnectionLabel(connection, 'Maya from book club');
+// listConnections() entries now include `label: string | null`.
+```
+
+Labels are local to the labeling user — the labeled party doesn't see what they were tagged. Persisted in the same encrypted connections record blob that syncs across the user's own devices.
+
+### Invite tokens — connection bootstrap by link or QR
+
+Email-based handshake (above) requires the sender to know the recipient's email AND the recipient to be a Tarn user with `share_discoverable: true`. For consumer-app UX where neither holds — "scan this QR to add me", "send my invite link in Slack", "register and click my invite" — Tarn ships an opaque single-use invite-token primitive.
+
+```javascript
+// 1. Inviter — generate a link.
+const { token_id, invite_url, expires_at } = await tarn.createInviteToken({
+  display_name: 'Maya',
+  expiry_days: 7,        // default 7, server max 30
+});
+// invite_url is something like
+//   https://app.bookish.example/invite/<token_id>#<base64url payload_key>
+// Share it via QR / messenger / email / etc.
+
+// 2. Recipient app handler at the URL — extract token_id (path) + key (URL fragment).
+const tokenId = window.location.pathname.split('/').pop();
+const payloadKey = window.location.hash.slice(1);
+
+// Optional preview before login (unauthenticated path — recipient may not have an account yet).
+const preview = await TarnClient.previewInviteToken(API_BASE, APP_ID, tokenId, payloadKey);
+// { inviter_display_name, inviter_share_pub_fingerprint, app_id, issued_at, expires_at }
+
+// 3. Recipient redeems (after register/login if needed).
+await tarn.redeemInviteToken(tokenId, payloadKey);
+
+// 4. Inviter — on next listIncomingRequests(), the SDK auto-accepts requests
+//    whose token matches an issued invite. The new connection's label is
+//    seeded from the inviter's display_name.
+
+// Issued-invites surface (inviter side):
+const outstanding = await tarn.listIssuedInvites();
+await tarn.revokeIssuedInvite(token_id);
+```
+
+How it composes: redemption produces a normal connection-request HPKE-sealed back to the inviter, with an extra `via_invite_token` field. The inviter's SDK auto-accepts on its next poll. The end state is a regular connection — same record shape, same share-log mechanics, same mute / remove primitives. Apps consuming `listConnections()` cannot tell which path was used.
+
+Privacy posture: the URL fragment carries the AES-256-GCM payload key and is never transmitted to the API (browsers don't send fragments). The Tarn server stores opaque ciphertext keyed on `token_id` and never sees the inviter's `share_pub`, signing key, or display name. Server learns metadata: `(inviter_dlk, time_of_issuance, redemption_time, redeemer_share_pub_fingerprint, redemption_IP)`. See [TARN_PROTOCOL.md § Invite tokens](../docs/TARN_PROTOCOL.md#invite-tokens-section-8-issue-22) for the full threat model.
+
+App-hosted URLs: each registered app declares its own `invite_url_template` (e.g. `https://app.bookish.example/invite/{token_id}`) — Tarn does not host any landing page. The app's web handler reads the path + hash, calls the SDK, and renders whatever UX it wants.
 
 ### Mute / visibility
 
@@ -376,6 +505,15 @@ Which operations are safe to retry blindly:
 | `shareContent` / `updateShareContent` / `unshareContent` | Yes | Built-in 409 retry; caller can replay safely. |
 | `revokeContentFromConnections` | Yes | Repeated rotation produces successive CEKs; each is a no-op for connections that already received the previous rotate. |
 | `muteConnection` / `unmuteConnection` | Yes | Set semantics — repeated calls converge. |
+| `serializeSession` | Yes | Each call produces a fresh ciphertext (new IV) but they all decrypt to equivalent state on the same origin. |
+| `resumeSession` | Yes | Pure read on a fixed input — no server-side mutation. |
+| `clearSession` | Yes | Idempotent delete of the wrapping-key record. |
+| `revokeSession` / `revokeAllSessions` / `revokeOtherSessions` | Yes | Server-side `DELETE WHERE`; replays converge. |
+| `createInviteToken` | No (without external dedup) | Each call mints a fresh token_id + payload_key, server-side row keyed on the new token_id. |
+| `previewInviteToken` | Yes | Pure read. |
+| `redeemInviteToken` | Yes | Server enforces single-use atomically. Replays after the first success return 409. |
+| `revokeIssuedInvite` | Yes | Idempotent delete on `(token_id, inviter_dlk)`. |
+| `setConnectionLabel` | Yes | Last-write-wins on the connections record. |
 
 ### Multi-device considerations
 
