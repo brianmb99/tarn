@@ -75,8 +75,14 @@ export interface ITarnClient {
 
   // ---- Sharing primitives ----
 
-  /** Iterable of the user's connections. */
-  listConnections(): Promise<ShareConnection[]>;
+  /**
+   * Iterable of the user's connections. Returns the underlying client's
+   * record shape — the Collection layer only consumes `share_pub`,
+   * `signing_pub`, and `muted` (via `isMuted`); other fields are passed
+   * through unchanged. The `tarn.connections.*` namespace normalizes
+   * these to the public `Connection` type.
+   */
+  listConnections(): Promise<UnderlyingConnection[]>;
 
   /** Whether a connection is muted (skips share publishing). */
   isMuted(connection: ShareConnection): Promise<boolean>;
@@ -118,6 +124,14 @@ export type ShareConnection = {
   label?: string;
   muted?: boolean;
 };
+
+/**
+ * Underlying-client connection record. The JS client's `listConnections`
+ * returns rich objects; Collection<T> and the connections namespace both
+ * accept the same shape and project / normalize as needed. ShareConnection
+ * is structurally a subset.
+ */
+export type UnderlyingConnection = ShareConnection & Record<string, unknown>;
 
 /** Error class for Collection-level failures (record not found, etc.). */
 export class TarnCollectionError extends Error {

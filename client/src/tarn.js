@@ -4347,6 +4347,23 @@ export class TarnClient {
     await clearWrappingKey();
   }
 
+  /**
+   * Whether the client currently has the keys needed to perform authenticated
+   * operations. True after a successful register / login / recoverAccount /
+   * resumeSession; false on a freshly-constructed client or after clearSession
+   * / deleteAccount.
+   *
+   * Note this reflects key material possession, not JWT freshness — if the JWT
+   * has expired but signing keys are present, isLoggedIn() returns true and
+   * the next authenticated call will silently re-authenticate. Apps treat
+   * this as "the user is logged in," which matches user expectations.
+   *
+   * @returns {boolean}
+   */
+  isLoggedIn() {
+    return this.#dekByGen.size > 0 && this.#signingKeyPair != null;
+  }
+
   // ============ SERVER-SIDE SESSIONS (Section 7.5, issue #20) ============
 
   /**
