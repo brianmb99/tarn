@@ -1,0 +1,43 @@
+{
+  "compilerOptions": {
+    // Strict mode — non-negotiable for fresh-build SDK code.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+
+    // Modern target — Cloudflare Workers, modern browsers, Node 20+.
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+
+    // No build artifacts yet (step 7 of the migration plan sets up esbuild).
+    // For now: type-check only via tsc; run via tsx.
+    "noEmit": true,
+
+    // Misc.
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+
+    // Map .js extensions in import specifiers to .ts source files. This is
+    // the recommended pattern for TS-with-bundler-resolution: source uses
+    // explicit '.js' suffixes that the bundler/tsc resolves to the matching
+    // '.ts' file. Survives unchanged when we add the build step.
+    "allowImportingTsExtensions": false
+  },
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}
