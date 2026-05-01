@@ -1379,7 +1379,7 @@ export class TarnClient {
    * @param {Object} plaintext
    * @returns {Promise<{txid: string}>}
    */
-  async updateEntry(priorTxid, type, plaintext) {
+  async updateEntry(priorTxid, type, plaintext, extraTags = []) {
     await this.#requireAuth();
 
     const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(plaintext);
@@ -1390,6 +1390,7 @@ export class TarnClient {
       { name: 'Prev', value: priorTxid },
       ...cryptoTags,
       { name: 'V', value: '0.4.0' },
+      ...extraTags,
     ];
 
     const res = await this.#fetchRaw(`/api/v1/entries/${priorTxid}`, {
@@ -1417,7 +1418,7 @@ export class TarnClient {
    * @param {string} type - Entry type
    * @returns {Promise<{txid: string}>}
    */
-  async deleteEntry(targetTxid, type) {
+  async deleteEntry(targetTxid, type, extraTags = []) {
     await this.#requireAuth();
 
     const { encrypted, tags: cryptoTags } = await this.#encryptForWrite({
@@ -1432,6 +1433,7 @@ export class TarnClient {
       { name: 'Ref', value: targetTxid },
       ...cryptoTags,
       { name: 'V', value: '0.4.0' },
+      ...extraTags,
     ];
 
     const res = await this.#fetchRaw(`/api/v1/entries/${targetTxid}`, {
