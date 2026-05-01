@@ -1,13 +1,4 @@
-// @ts-nocheck — step 6d-i: file renamed .js → .ts and partially type-annotated
-// (class fields, public method signatures), but full type rigor is deferred
-// to substeps 6d-ii (entry CRUD + sharing primitives) and 6d-iii (share-log +
-// invites + sessions). The 130+ residual strict-mode errors that remain are
-// largely WebCrypto BufferSource casts, null-narrowing on private fields,
-// and `unknown`-typed catch blocks — all real work but mechanical, with
-// no behavior change. Each future substep removes a portion of the
-// nocheck scope as it tightens that section's types.
-//
-// Tarn Client — JavaScript API client for the Tarn protocol
+// Tarn Client — TypeScript API client for the Tarn protocol
 // Handles key derivation, encryption/decryption, and all API interactions.
 // Works in browsers and Node.js 15+.
 //
@@ -204,8 +195,8 @@ export class TarnClient {
   // the highest existing seq before publishing (5c work). For 5b, the
   // counters are seeded at register/handshake time and remain authoritative
   // for the lifetime of the session.
-  #pairKeyCache: Map<string, AnyRecord> = new Map();
-  #shareLogCounters: Map<string, AnyRecord> = new Map();
+  #pairKeyCache: Map<string, any> = new Map();
+  #shareLogCounters: Map<string, any> = new Map();
 
   // Per-connection reconstructed inbound state (issue #16, Section 5c).
   // Keyed on the connection's `share_pub`, holds the application's view of
@@ -214,7 +205,7 @@ export class TarnClient {
   // (or -1 if no entries yet). In-memory only; on session restart
   // `readShareLog` re-bootstraps from Arweave. Wholly invalidated on
   // credential change / recovery / delete.
-  #readStateCache: Map<string, AnyRecord> = new Map();
+  #readStateCache: Map<string, any> = new Map();
 
   // Per-connection reconstructed OUTBOUND state (issue #16, Section 5c).
   // Tracks what we've shared with each connection so the writer can emit
@@ -227,7 +218,7 @@ export class TarnClient {
   // by shareContent / updateShareContent / unshareContent / explicit
   // snapshotShareLog. Wholly invalidated on credential change / recovery /
   // delete (the per-pair keys rotate, so the cache is stale anyway).
-  #outboundStateCache: Map<string, AnyRecord> = new Map();
+  #outboundStateCache: Map<string, any> = new Map();
 
   // Per-connection set of outbound txids we've successfully published in
   // this session (issue #16, Section 5c). Used by the multi-device retry
@@ -435,7 +426,7 @@ export class TarnClient {
       try {
         await this.sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName });
         emailDelivered = true;
-      } catch (err) {
+      } catch (err: any) {
         // Surface but don't fail register: the caller still has phrase + PDF
         // bytes and can retry the email send later. The user has already
         // acknowledged saving the phrase, which is the gating requirement.
@@ -672,12 +663,12 @@ export class TarnClient {
       && !!oldSigningKeyPair?.privateKey
       && this.#dekByGen != null;
 
-    let oldConnectionsState = { record: { connections: [] }, txid: null };
+    let oldConnectionsState: { record: { connections: any[]; [k: string]: any }; txid: string | null } = { record: { connections: [] }, txid: null };
     const outboundStateByConnection = new Map();
     if (canAnnounce) {
       try {
         oldConnectionsState = await this.#loadConnectionsRecord();
-      } catch (err) {
+      } catch (err: any) {
         console.warn(
           `[TarnClient] recoverAccount: connections record load failed (no rotation announce): ${err.message}`,
         );
@@ -686,7 +677,7 @@ export class TarnClient {
         try {
           await this.#hydrateOutboundState(connection);
           outboundStateByConnection.set(connection.share_pub, this.#tentativeOutboundState(connection));
-        } catch (err) {
+        } catch (err: any) {
           console.warn(
             `[TarnClient] recoverAccount: outbound state hydration failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
@@ -732,7 +723,7 @@ export class TarnClient {
           newCredentialLookupKey: newKeys.credentialLookupKey,
           rotatedAt: Math.floor(Date.now() / 1000),
         });
-      } catch (err) {
+      } catch (err: any) {
         console.warn(`[TarnClient] recoverAccount: rotation announce failed: ${err.message}`);
       }
     }
@@ -767,7 +758,7 @@ export class TarnClient {
         const state = outboundStateByConnection.get(connection.share_pub) ?? {};
         try {
           await this._publishInitialSnapshot(connection, { state });
-        } catch (err) {
+        } catch (err: any) {
           console.warn(
             `[TarnClient] recoverAccount: NEW-log seq=0 snapshot publish failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
@@ -958,15 +949,15 @@ export class TarnClient {
     let newWrappedDataKey;
     let newDekByGen;
     let newCurrentGen;
-    let newEnvelopeVersion;
+    let newEnvelopeVersion: 1 | 2 | 3 | 4;
     let newRecoveryFactorMeta = this.#recoveryFactorMeta;
 
     if (kdfVersion === KDF_V1_PBKDF2) {
       // Legacy PBKDF2 path — keep the existing single-key envelope shape.
       // No forward-secret rotation for v1 accounts in this issue.
-      const existing = this.#dekByGen.get(this.#currentGen);
+      const existing = this.#dekByGen!.get(this.#currentGen!);
       newWrappedDataKey = await wrapDataKeyEnvelope(
-        existing.gcmKey,
+        existing!.gcmKey,
         newKeys.credentialEncryptionKey.kwKey,
         KDF_V1_PBKDF2,
       );
@@ -979,12 +970,12 @@ export class TarnClient {
       // the recovery KEK without the phrase). New gen N+1 gets a password
       // wrapping always, and a recovery wrapping iff the caller supplied the
       // phrase (allowing recovery to remain complete after the change).
-      const nextGen = this.#currentGen + 1;
+      const nextGen = this.#currentGen! + 1;
       const newDek = await generateRandomDataKey();
 
       // Build chain of {gen, key} for password-side re-wrap.
       const chain = [];
-      for (const [gen, pair] of this.#dekByGen) {
+      for (const [gen, pair] of this.#dekByGen!) {
         chain.push({ gen, key: pair.gcmKey });
       }
       chain.push({ gen: nextGen, key: newDek.gcmKey });
@@ -1021,7 +1012,7 @@ export class TarnClient {
 
       // Stitch the wire-format chain together.
       const wireChain = chain.map(({ gen }) => {
-        const wrappings = [{ factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen) }];
+        const wrappings: Array<{ factor: any; wrappedBase64: any }> = [{ factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen) }];
         if (recoveryWrappingsByGen.has(gen)) {
           wrappings.push({
             factor: FACTOR_RECOVERY_PHRASE,
@@ -1040,7 +1031,7 @@ export class TarnClient {
           : null,
       );
 
-      newDekByGen = new Map(this.#dekByGen);
+      newDekByGen = new Map(this.#dekByGen!);
       newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
       newCurrentGen = nextGen;
       newEnvelopeVersion = 4;
@@ -1056,11 +1047,11 @@ export class TarnClient {
       // v2 envelopes (single self-wrapped DEK, pre-issue-#11) are upgraded in
       // place to v3 here: the existing DEK becomes gen 1, the fresh random
       // DEK becomes gen 2.
-      const nextGen = this.#currentGen + 1;
+      const nextGen = this.#currentGen! + 1;
       const newDek = await generateRandomDataKey();
 
       const chain = [];
-      for (const [gen, pair] of this.#dekByGen) {
+      for (const [gen, pair] of this.#dekByGen!) {
         chain.push({ gen, key: pair.gcmKey });
       }
       chain.push({ gen: nextGen, key: newDek.gcmKey });
@@ -1070,7 +1061,7 @@ export class TarnClient {
         newKeys.credentialEncryptionKey.kwKey,
       );
 
-      newDekByGen = new Map(this.#dekByGen);
+      newDekByGen = new Map(this.#dekByGen!);
       newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
       newCurrentGen = nextGen;
       newEnvelopeVersion = 3;
@@ -1093,12 +1084,12 @@ export class TarnClient {
     // outbound entries from the OLD logs. Only loads the connections record
     // when we're going to announce (skipRotationAnnounce keeps test surfaces
     // clean for unit tests that mock fetch without a connections record).
-    let oldConnectionsState = { record: { connections: [] }, txid: null };
+    let oldConnectionsState: { record: { connections: any[]; [k: string]: any }; txid: string | null } = { record: { connections: [] }, txid: null };
     const outboundStateByConnection = new Map();
     if (!skipRotationAnnounce) {
       try {
         oldConnectionsState = await this.#loadConnectionsRecord();
-      } catch (err) {
+      } catch (err: any) {
         console.warn(
           `[TarnClient] changeCredentials: connections record load failed (no rotation announce): ${err.message}`,
         );
@@ -1107,7 +1098,7 @@ export class TarnClient {
         try {
           await this.#hydrateOutboundState(connection);
           outboundStateByConnection.set(connection.share_pub, this.#tentativeOutboundState(connection));
-        } catch (err) {
+        } catch (err: any) {
           console.warn(
             `[TarnClient] changeCredentials: outbound state hydration failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
@@ -1158,7 +1149,7 @@ export class TarnClient {
           newCredentialLookupKey: newKeys.credentialLookupKey,
           rotatedAt: Math.floor(Date.now() / 1000),
         });
-      } catch (err) {
+      } catch (err: any) {
         console.warn(`[TarnClient] changeCredentials: rotation announce failed: ${err.message}`);
       }
     }
@@ -1195,7 +1186,7 @@ export class TarnClient {
         const state = outboundStateByConnection.get(connection.share_pub) ?? {};
         try {
           await this._publishInitialSnapshot(connection, { state });
-        } catch (err) {
+        } catch (err: any) {
           console.warn(
             `[TarnClient] changeCredentials: NEW-log seq=0 snapshot publish failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
@@ -1617,7 +1608,7 @@ export class TarnClient {
    * envelope (no per-content CEK).
    */
   async #recoverShareKey(txid: string): Promise<string | null> {
-    const dek = this.#dekByGen.get(this.#currentGen);
+    const dek = this.#dekByGen!.get(this.#currentGen!);
     if (!dek) return null;
     const blob = await this.#fetchBlob(txid);
     if (!blob || !hasTarnBlobMagic(blob)) return null;
@@ -1631,14 +1622,14 @@ export class TarnClient {
       // we can re-encode it as base64url for the share-log wire format.
       const cekBytes = new Uint8Array(
         await crypto.subtle.unwrapKey(
-          'raw', wrappedCEK, dek.kwKey, 'AES-KW',
+          'raw', bs(wrappedCEK), dek.kwKey, 'AES-KW',
           { name: 'AES-GCM' }, true, ['decrypt'],
-        ).then((k) => crypto.subtle.exportKey('raw', k)),
+        ).then((k) => crypto.subtle.exportKey('raw', k)) as ArrayBuffer,
       );
       const shareKey = bytesToBase64Url(cekBytes);
       this.#cacheShareKey(txid, shareKey);
       return shareKey;
-    } catch (err) {
+    } catch (err: any) {
       console.warn(`[TarnClient] getShareKey: unwrap failed for ${txid}:`, err?.message || err);
       return null;
     }
@@ -1741,14 +1732,14 @@ export class TarnClient {
       // recipient doesn't exist, the recipient's account predates #13, or the
       // recipient has set discoverable=false. Surface a single-shape error
       // that callers can match on without knowing which one.
-      const err = new Error('sendConnectionRequest(): recipient is not connectable (no share_pub published, or discoverable=false)');
+      const err: any = new Error('sendConnectionRequest(): recipient is not connectable (no share_pub published, or discoverable=false)');
       err.code = 'RECIPIENT_NOT_CONNECTABLE';
       throw err;
     }
 
-    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const payload = buildConnectionRequestPayload({
-      senderEmail: this.#email,
+      senderEmail: this.#email!,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -1862,7 +1853,7 @@ export class TarnClient {
     // a security check — `upsertConnection` is idempotent on share_pub.
     const connectionsState = await this.#loadConnectionsRecord();
     const existingConnectionPubs = new Set(
-      (connectionsState.record.connections || []).map(c => c.share_pub)
+      (connectionsState.record.connections || []).map((c: any) => c.share_pub)
     );
 
     for (const blobs of fetched) {
@@ -1896,7 +1887,7 @@ export class TarnClient {
 
         // De-dup against existing inbound pending — the same nonce might
         // already be in the persisted record from a prior session.
-        if (pendingRecord.inbound.some(i => i.request_nonce === validation.normalized.nonceBase64Url)) {
+        if (pendingRecord.inbound.some((i: any) => i.request_nonce === validation.normalized.nonceBase64Url)) {
           // Surface from existing record (so the caller sees a stable view)
           // but don't duplicate-write.
           surfaced.push({
@@ -1959,17 +1950,17 @@ export class TarnClient {
       try {
         const fresh = await this.#loadIssuedInvitesFresh();
         issuedRecord = fresh.record;
-      } catch (err) {
+      } catch (err: any) {
         console.warn(`[TarnClient] listIncomingRequests: issued-invites fresh load failed: ${err.message}`);
       }
       if (issuedRecord) {
         for (const cand of inviteCandidates) {
-          const match = (issuedRecord.invites || []).find(i => i.token_id === cand.viaInviteToken);
+          const match = (issuedRecord.invites || []).find((i: any) => i.token_id === cand.viaInviteToken);
           if (!match) continue;
           try {
             await this.acceptConnectionRequest(cand.requestNonce, { label: match.display_name || null });
             (autoAccepted || (autoAccepted = new Set())).add(cand.requestNonce);
-          } catch (err) {
+          } catch (err: any) {
             console.warn(`[TarnClient] listIncomingRequests: auto-accept failed for ${cand.requestNonce}: ${err.message}`);
           }
         }
@@ -2019,7 +2010,7 @@ export class TarnClient {
     const labelOpt = normalizeConnectionLabel(opts?.label);
 
     const pendingState = await this.#loadPendingRequestsRecord();
-    const inbound = pendingState.record.inbound.find(i => i.request_nonce === requestNonce);
+    const inbound = pendingState.record.inbound.find((i: any) => i.request_nonce === requestNonce);
     if (!inbound) {
       throw new Error(`acceptConnectionRequest(): no inbound pending request with nonce ${requestNonce}`);
     }
@@ -2027,13 +2018,13 @@ export class TarnClient {
     let senderSharePub;
     try {
       senderSharePub = decodeSharePub(inbound.sender_share_pub);
-    } catch (err) {
+    } catch (err: any) {
       throw new Error(`acceptConnectionRequest(): inbound sender_share_pub is invalid: ${err.message}`);
     }
 
-    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const payload = buildConnectionAcceptPayload({
-      senderEmail: this.#email,
+      senderEmail: this.#email!,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -2091,7 +2082,7 @@ export class TarnClient {
     try {
       const snap = await this._publishInitialSnapshot(newConnection);
       initialSnapshotTxid = snap.txid;
-    } catch (err) {
+    } catch (err: any) {
       // Don't roll back the connection addition if the snapshot publish fails —
       // the connectionship is established (durable in the connections record), and
       // the writer can publish later operations at seq=0 on retry. Surface
@@ -2127,7 +2118,7 @@ export class TarnClient {
   async listConnections() {
     await this.#requireAuth();
     const state = await this.#loadConnectionsRecord();
-    return state.record.connections.map(c => ({
+    return state.record.connections.map((c: any) => ({
       ...c,
       label: c.label != null ? c.label : null,
     }));
@@ -2150,7 +2141,7 @@ export class TarnClient {
     }
     const normalized = normalizeConnectionLabel(label);
     const state = await this.#loadConnectionsRecord();
-    const idx = state.record.connections.findIndex(c => c.share_pub === connection.share_pub);
+    const idx = state.record.connections.findIndex((c: any) => c.share_pub === connection.share_pub);
     if (idx < 0) {
       throw new Error(`setConnectionLabel(): no connection with share_pub ${connection.share_pub.slice(0, 8)}...`);
     }
@@ -2311,10 +2302,10 @@ export class TarnClient {
     const tokenId = bytesToBase64Url(tokenIdBytes);
     const payloadKeyBytes = crypto.getRandomValues(new Uint8Array(32));
     const payloadKey = await crypto.subtle.importKey(
-      'raw', payloadKeyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
+      'raw', bs(payloadKeyBytes), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
     );
 
-    const inviterSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const inviterSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const inviterSharePubBase64Url = bytesToBase64Url(this.#sharingKeyPair.publicKey);
 
     const plaintext = {
@@ -2373,7 +2364,7 @@ export class TarnClient {
       });
       const written = await this.#saveIssuedInvitesRecord(state, updated);
       this.#issuedInvitesState = { record: written.record, txid: written.txid };
-    } catch (err) {
+    } catch (err: any) {
       console.warn(`[TarnClient] createInviteToken: issued-invites blob update failed: ${err.message}`);
     }
 
@@ -2412,10 +2403,10 @@ export class TarnClient {
     } catch {
       return null;
     }
-    let plaintext;
+    let plaintext: any;
     try {
       const payloadKeyBytes = base64UrlToBytes(payloadKeyB64Url);
-      const key = await crypto.subtle.importKey('raw', payloadKeyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+      const key = await crypto.subtle.importKey('raw', bs(payloadKeyBytes), { name: 'AES-GCM' }, false, ['decrypt']);
       plaintext = await decrypt(key, payloadBytes);
     } catch {
       return null;
@@ -2479,28 +2470,28 @@ export class TarnClient {
         : res.status === 410 ? 'INVITE_EXPIRED'
         : res.status === 409 ? 'INVITE_ALREADY_USED'
         : 'INVITE_REDEEM_FAILED';
-      const err = new Error(`redeemInviteToken(): ${res.json?.error || res.status}`);
+      const err: any = new Error(`redeemInviteToken(): ${res.json?.error || res.status}`);
       err.code = code;
       throw err;
     }
 
     const { app_id, payload } = res.json;
     if (app_id !== this.#appId) {
-      const err = new Error(`redeemInviteToken(): invite app_id ${app_id} != client app_id ${this.#appId}`);
+      const err: any = new Error(`redeemInviteToken(): invite app_id ${app_id} != client app_id ${this.#appId}`);
       err.code = 'INVITE_APP_MISMATCH';
       throw err;
     }
     const payloadBytes = base64ToBytes(payload);
     const payloadKeyBytes = base64UrlToBytes(payloadKeyB64Url);
-    const key = await crypto.subtle.importKey('raw', payloadKeyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
-    let plaintext;
+    const key = await crypto.subtle.importKey('raw', bs(payloadKeyBytes), { name: 'AES-GCM' }, false, ['decrypt']);
+    let plaintext: any;
     try {
       plaintext = await decrypt(key, payloadBytes);
-    } catch (err) {
+    } catch (err: any) {
       throw new Error(`redeemInviteToken(): payload decrypt failed (wrong key?): ${err.message}`);
     }
     if (plaintext.app_id !== this.#appId) {
-      const err = new Error(`redeemInviteToken(): payload app_id ${plaintext.app_id} != client app_id ${this.#appId}`);
+      const err: any = new Error(`redeemInviteToken(): payload app_id ${plaintext.app_id} != client app_id ${this.#appId}`);
       err.code = 'INVITE_APP_MISMATCH';
       throw err;
     }
@@ -2515,9 +2506,9 @@ export class TarnClient {
     // inviter's share_pub from the decrypted payload (we never knew their
     // email) and tagged with via_invite_token so the inviter's auto-accept
     // path matches it.
-    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const reqPayload = buildConnectionRequestPayload({
-      senderEmail: this.#email,
+      senderEmail: this.#email!,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -2595,11 +2586,11 @@ export class TarnClient {
         auth: true,
       });
       serverDeleted = res.status === 204 || res.status === 404;
-    } catch (err) {
+    } catch (err: any) {
       console.warn(`[TarnClient] revokeIssuedInvite: server delete failed: ${err.message}`);
     }
     const state = await this.#loadIssuedInvitesRecord();
-    if (state.record.invites?.some(i => i.token_id === tokenId)) {
+    if (state.record.invites?.some((i: any) => i.token_id === tokenId)) {
       const updated = removeIssuedInvite(state.record, tokenId);
       const written = await this.#saveIssuedInvitesRecord(state, updated);
       this.#issuedInvitesState = { record: written.record, txid: written.txid };
@@ -2666,7 +2657,7 @@ export class TarnClient {
   async #findConnectionBySharePub(connectionSharePubBase64Url: string): Promise<any> {
     const connectionsState = await this.#loadConnectionsRecord();
     return connectionsState.record.connections.find(
-      f => f.share_pub === connectionSharePubBase64Url,
+      (f: any) => f.share_pub === connectionSharePubBase64Url,
     ) || null;
   }
 
@@ -2742,14 +2733,14 @@ export class TarnClient {
     while (true) {
       seq = counters.nextOutboundSeq;
       const operation = buildOperationUnsigned({ ...operationFields, seq });
-      const signed = await signOperation(operation, this.#signingKeyPair.privateKey);
+      const signed = await signOperation(operation, this.#signingKeyPair!.privateKey);
       const blob = await encryptShareLogEntry(signed, pair.outboundKey);
       tag = await deriveLogTag(pair.outboundTagSeed, seq);
 
       try {
         txid = await this.#postShareLogPublish(tag, blob);
         break;
-      } catch (err) {
+      } catch (err: any) {
         if (err.code !== 'SHARE_LOG_TAG_CONFLICT' || !retryOn409) {
           throw err;
         }
@@ -2848,7 +2839,7 @@ export class TarnClient {
       this.#commitOutboundState(connection, snapshotState);
     }
 
-    const out = { seq, tag, txid };
+    const out: any = { seq, tag, txid };
     if (attempts > 0) out.retried = attempts;
     if (alreadyPublished) out.alreadyPublished = true;
     if (compactionSnapshot) out.compactionSnapshot = compactionSnapshot;
@@ -2928,7 +2919,7 @@ export class TarnClient {
     let operation;
     try {
       operation = await decryptShareLogEntry(fetched.ciphertext, pair.inboundKey);
-    } catch (err) {
+    } catch (err: any) {
       throw new Error(`_fetchShareLogEntry: decrypt failed at seq ${seq}: ${err.message}`);
     }
     const verified = await verifyOperationSignature(operation, connection.signing_pub);
@@ -3335,7 +3326,7 @@ export class TarnClient {
     }
 
     const connectionsState = await this.#loadConnectionsRecord();
-    const present = connectionsState.record.connections.some(f => f.share_pub === connection.share_pub);
+    const present = connectionsState.record.connections.some((f: any) => f.share_pub === connection.share_pub);
     if (!present) {
       this.#clearConnectionCaches(connection.share_pub);
       return { removed: false };
@@ -3346,10 +3337,10 @@ export class TarnClient {
       // Courtesy: publish a final `remove` per content_id we're currently
       // sharing with this connection. We need the outbound state to enumerate
       // the content_ids — hydrate from the existing log if not cached.
-      const fullConnection = connectionsState.record.connections.find(f => f.share_pub === connection.share_pub) || connection;
+      const fullConnection = connectionsState.record.connections.find((f: any) => f.share_pub === connection.share_pub) || connection;
       try {
         await this.#hydrateOutboundState(fullConnection);
-      } catch (err) {
+      } catch (err: any) {
         // If hydration fails (e.g., transient API error), still proceed with
         // the removeConnection — the connection record removal is the durable signal.
         console.warn(`[TarnClient] removeConnection(notify): hydrate outbound state failed: ${err.message}`);
@@ -3373,7 +3364,7 @@ export class TarnClient {
           });
           delete tentative[contentId];
           notifications.push({ content_id: contentId, seq: res.seq, txid: res.txid });
-        } catch (err) {
+        } catch (err: any) {
           // Best-effort: log + continue. The connection record removal still
           // happens below.
           console.warn(`[TarnClient] removeConnection(notify): remove ${contentId} failed: ${err.message}`);
@@ -3447,7 +3438,7 @@ export class TarnClient {
       // would log a warning and ignore it anyway).
       try {
         await this.#hydrateOutboundState(connection);
-      } catch (err) {
+      } catch (err: any) {
         skipped.push({ connectionSharePub: connection.share_pub, reason: `hydrate failed: ${err.message}` });
         continue;
       }
@@ -3466,7 +3457,7 @@ export class TarnClient {
         }, { retryOn409: true, snapshotState: tentative });
         this.#commitOutboundState(connection, tentative);
         announcements.push({ connectionSharePub: connection.share_pub, seq: res.seq, txid: res.txid });
-      } catch (err) {
+      } catch (err: any) {
         skipped.push({ connectionSharePub: connection.share_pub, reason: err.message });
       }
     }
@@ -3537,7 +3528,7 @@ export class TarnClient {
         let peerSharePub;
         try {
           peerSharePub = decodeSharePub(connection.share_pub);
-        } catch (err) {
+        } catch (err: any) {
           results.push({ connectionSharePub: connection.share_pub, error: `decode share_pub: ${err.message}` });
           continue;
         }
@@ -3575,7 +3566,7 @@ export class TarnClient {
             txid: txidOrError.txid,
           });
         }
-      } catch (err) {
+      } catch (err: any) {
         results.push({ connectionSharePub: connection.share_pub, error: err.message });
       }
     }
@@ -3621,7 +3612,7 @@ export class TarnClient {
       try {
         const txid = await this.#postShareLogPublish(tag, blob);
         return { seq, txid };
-      } catch (err) {
+      } catch (err: any) {
         if (err.code !== 'SHARE_LOG_TAG_CONFLICT') {
           return { error: err.message };
         }
@@ -3743,7 +3734,7 @@ export class TarnClient {
     if (existing?.hydrated) return;
 
     const pair = await this.#getPairKeysFor(connection.share_pub);
-    const ownSigningPubBase64 = await exportPublicKey(this.#signingKeyPair.publicKey);
+    const ownSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
 
     const { highestSeq } = await discoverHighestSeq({
       probe: (seq) => this.#probeOutboundTagExists(pair, seq),
@@ -3880,7 +3871,7 @@ export class TarnClient {
       },
     });
     if (res.status === 409) {
-      const err = new Error(
+      const err: any = new Error(
         `share-log publish at tag ${tag.slice(0, 8)}... collided with existing txid ${res.json?.existing_txid}`,
       );
       err.code = 'SHARE_LOG_TAG_CONFLICT';
@@ -3922,7 +3913,7 @@ export class TarnClient {
       return [];
     }
     const blobs = res.json?.blobs ?? [];
-    return blobs.map(b => ({
+    return blobs.map((b: any) => ({
       txid: b.txid,
       ciphertext: base64ToBytes(b.ciphertext_base64),
       published_at: b.published_at,
@@ -3967,11 +3958,11 @@ export class TarnClient {
 
         // Replay protection on accepts: if we've already processed this
         // accept (it appears in connections already), skip without re-writing.
-        const existingConnection = connectionsState.record.connections.find(f => f.share_pub === v.normalized.senderSharePubBase64Url);
+        const existingConnection = connectionsState.record.connections.find((f: any) => f.share_pub === v.normalized.senderSharePubBase64Url);
         if (existingConnection) {
           // Still clear the matched outbound — sender side already moved on.
-          if (pendingState.record.outbound.some(o => o.request_nonce === outbound.request_nonce)) {
-            pendingState = { ...pendingState, record: removeOutboundPending(pendingState.record, outbound.request_nonce) };
+          if (pendingState.record.outbound.some((o: any) => o.request_nonce === outbound.request_nonce)) {
+            pendingState = { ...pendingState, record: removeOutboundPending(pendingState.record, outbound.request_nonce!) };
             pendingDirty = true;
           }
           continue;
@@ -3993,7 +3984,7 @@ export class TarnClient {
 
         pendingState = {
           ...pendingState,
-          record: removeOutboundPending(pendingState.record, outbound.request_nonce),
+          record: removeOutboundPending(pendingState.record, outbound.request_nonce!),
         };
         pendingDirty = true;
 
@@ -4005,7 +3996,7 @@ export class TarnClient {
         // explicit state.
         try {
           await this._publishInitialSnapshot(newConnection);
-        } catch (err) {
+        } catch (err: any) {
           console.warn(
             `[TarnClient] processing accept from ${v.normalized.senderEmail}: initial snapshot publish failed: ${err.message}`,
           );
@@ -4111,7 +4102,7 @@ export class TarnClient {
   async #findShareStateEntry(contentId: string): Promise<any> {
     const entries = await this.getEntries('tarn-share-state');
     for (const e of entries) {
-      const eid = e.tags?.find(t => t.name === 'Eid')?.value;
+      const eid = e.tags?.find((t: any) => t.name === 'Eid')?.value;
       if (eid === contentId) return e;
     }
     return null;
@@ -4224,8 +4215,8 @@ export class TarnClient {
       dekByGen,
       signingPrivateKey: bytesToBase64(new Uint8Array(pkcs8)),
       signingPublicKey: bytesToBase64(new Uint8Array(spki)),
-      sharingPrivateKey: bytesToBase64(this.#sharingKeyPair.privateKey),
-      sharingPublicKey: bytesToBase64(this.#sharingKeyPair.publicKey),
+      sharingPrivateKey: bytesToBase64(this.#sharingKeyPair!.privateKey),
+      sharingPublicKey: bytesToBase64(this.#sharingKeyPair!.publicKey),
       recoveryFactorMeta,
       jwt: this.#jwt,
       sid: this.#sid,
@@ -4307,14 +4298,14 @@ export class TarnClient {
       // Rehydrate keys.
       const signingPrivateKey = await crypto.subtle.importKey(
         'pkcs8',
-        base64ToBytes(payload.signingPrivateKey),
+        bs(base64ToBytes(payload.signingPrivateKey)),
         { name: 'ECDSA', namedCurve: 'P-256' },
         true,
         ['sign'],
       );
       const signingPublicKey = await crypto.subtle.importKey(
         'spki',
-        base64ToBytes(payload.signingPublicKey),
+        bs(base64ToBytes(payload.signingPublicKey)),
         { name: 'ECDSA', namedCurve: 'P-256' },
         true,
         ['verify'],
@@ -4324,8 +4315,8 @@ export class TarnClient {
         if (typeof gen !== 'number' || typeof rawBytes !== 'string') return null;
         const raw = base64ToBytes(rawBytes);
         const [gcmKey, kwKey] = await Promise.all([
-          crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-          crypto.subtle.importKey('raw', raw, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+          crypto.subtle.importKey('raw', bs(raw), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+          crypto.subtle.importKey('raw', bs(raw), 'AES-KW', true, ['wrapKey', 'unwrapKey']),
         ]);
         dekByGen.set(gen, { gcmKey, kwKey });
       }
@@ -4407,7 +4398,7 @@ export class TarnClient {
    * @returns {boolean}
    */
   isLoggedIn() {
-    return this.#dekByGen.size > 0 && this.#signingKeyPair != null;
+    return (this.#dekByGen?.size ?? 0) > 0 && this.#signingKeyPair != null;
   }
 
   // ============ SERVER-SIDE SESSIONS (Section 7.5, issue #20) ============
@@ -4432,7 +4423,7 @@ export class TarnClient {
       throw new Error(`listSessions failed: ${res.json?.error || res.status}`);
     }
     const rows = Array.isArray(res.json?.sessions) ? res.json.sessions : [];
-    return rows.map(r => ({
+    return rows.map((r: any) => ({
       sid: r.sid,
       createdAt: r.created_at,
       lastSeenAt: r.last_seen_at,
@@ -4576,7 +4567,7 @@ export class TarnClient {
    * @returns {Promise<{ encrypted: Uint8Array, tags: Array<{name:string, value:string}>, shareKey: string|null }>}
    */
   async #encryptForWrite(plaintext: any): Promise<{ encrypted: Uint8Array; tags: Tag[]; shareKey: string | null }> {
-    const dek = this.#dekByGen.get(this.#currentGen);
+    const dek = this.#dekByGen!.get(this.#currentGen!);
     if (!dek) {
       throw new Error(`Internal: no DEK for gen ${this.#currentGen}`);
     }
@@ -4621,16 +4612,16 @@ export class TarnClient {
   async #decryptBlob(blobBytes: Uint8Array, tags: Tag[]): Promise<any> {
     if (hasTarnBlobMagic(blobBytes)) {
       const gen = readGenTag(tags) ?? 1;
-      const dek = this.#dekByGen.get(gen);
+      const dek = this.#dekByGen!.get(gen);
       if (!dek) {
-        throw new Error(`No DEK for blob generation ${gen} — chain has gens [${[...this.#dekByGen.keys()].join(', ')}]`);
+        throw new Error(`No DEK for blob generation ${gen} — chain has gens [${[...this.#dekByGen!.keys()].join(', ')}]`);
       }
       return await decryptWithCEK(dek.kwKey, blobBytes);
     }
 
     // Legacy blob — decrypt directly with the gen-1 DEK. For v3 accounts that
     // were upgraded from v2, gen 1 holds the original (pre-issue-#11) DEK.
-    const legacy = this.#dekByGen.get(1);
+    const legacy = this.#dekByGen!.get(1);
     if (!legacy) {
       throw new Error('No gen-1 DEK available for legacy blob decryption');
     }
@@ -4650,7 +4641,7 @@ export class TarnClient {
     if (this.#jwt) {
       try {
         const parts = this.#jwt.split('.');
-        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        const payload = JSON.parse(atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/')));
         // Refresh 30 seconds before expiry to avoid edge-case failures
         if (!payload.exp || payload.exp > Math.floor(Date.now() / 1000) + 30) {
           return; // JWT is still valid
@@ -4685,12 +4676,12 @@ export class TarnClient {
   }
 
   async #verifyChallenge(nonce: string): Promise<void> {
-    const signature = await signChallenge(this.#signingKeyPair.privateKey, nonce);
+    const signature = await signChallenge(this.#signingKeyPair!.privateKey, nonce);
 
     // Section 7.5: send the previous sid (if any) so the server reuses the
     // same sessions row across re-verify, plus an optional device label that
     // landed on listSessions output.
-    const body = {
+    const body: any = {
       credential_lookup_key: this.#credentialLookupKey,
       nonce,
       signature,
@@ -4724,7 +4715,7 @@ export class TarnClient {
     try {
       const parts = jwt.split('.');
       if (parts.length !== 3) return null;
-      const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+      const payload = JSON.parse(atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/')));
       return payload.sid || null;
     } catch {
       return null;
@@ -4822,7 +4813,7 @@ export class TarnClient {
         const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : backoffMs(attempt);
         console.warn(`[TarnClient] ${res.status} on ${url} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
         await sleep(waitMs);
-      } catch (err) {
+      } catch (err: any) {
         // Network error (fetch threw: DNS, TLS, connection reset, etc).
         lastErr = err;
         if (attempt === MAX_ATTEMPTS - 1) throw err;
@@ -4872,9 +4863,9 @@ function generateIdempotencyKey(): string {
 // in UI verification flows.
 async function fingerprintSharePub(sharePub: Uint8Array | string): Promise<string> {
   const bytes = sharePub instanceof Uint8Array ? sharePub : base64UrlToBytes(sharePub);
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bs(bytes)));
   const out = [];
-  for (let i = 0; i < 4; i++) out.push(digest[i].toString(16).padStart(2, '0'));
+  for (let i = 0; i < 4; i++) out.push(digest[i]!.toString(16).padStart(2, '0'));
   return out.join(':');
 }
 
