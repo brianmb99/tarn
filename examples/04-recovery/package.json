@@ -1,0 +1,11 @@
+{
+  "name": "tarn-example-04-recovery",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "tarn-client": "file:../../client"
+  }
+}

@@ -28,6 +28,13 @@ import { SessionNamespace, type ISessionClient } from './namespaces/session.js';
 import { RecoveryNamespace, type IRecoveryClient } from './namespaces/recovery.js';
 import { AdvancedNamespace, type IAdvancedClient } from './namespaces/advanced.js';
 
+// The bundled legacy protocol client. Now that tarn.ts is itself TypeScript
+// (steps 6a-6d), the new typed surface can default-instantiate the underlying
+// client without forcing every app to thread an `underlying` factory through
+// `TarnClient.create()`. Tests still override via `config.underlying` to
+// inject stub IUnderlyingClient implementations.
+import { TarnClient as LegacyTarnClient } from '../tarn.js';
+
 /**
  * Combined interface the underlying JS client must satisfy. Composed from
  * the per-namespace interfaces so each namespace is independently testable
@@ -49,22 +56,21 @@ export type IUnderlyingClient =
   };
 
 /**
- * Factory function — apps construct the underlying JS client and pass it
- * in. Step 6 will replace the JS client with a native TS implementation
- * conforming to `IUnderlyingClient`; nothing in this file changes.
+ * Factory function — produces the underlying protocol client given (apiBase,
+ * appId). Apps don't need to supply this in normal use; the default factory
+ * instantiates the bundled legacy client. Override only for testing
+ * (inject a stub IUnderlyingClient) or when threading a custom protocol
+ * implementation through.
  */
 export type UnderlyingFactory = (apiBase: string, appId: string) => IUnderlyingClient;
 
 export type TarnClientCreateConfig<S extends AnySchema> = ClientConfig<S> & {
   /**
-   * Function that returns the underlying JS client. Decoupled so the type
-   * layer doesn't import the JS client directly (would break tsc on the
-   * untyped JS source). Typical apps:
-   *
-   *   import { TarnClient as UnderlyingTarnClient } from 'tarn-client';
-   *   await TarnClient.create({ ..., underlying: (api, app) => new UnderlyingTarnClient(api, app) });
+   * Optional: override the underlying protocol-layer client. Defaults to
+   * the bundled legacy TarnClient (which speaks the wire protocol). Tests
+   * pass a stub here; production apps leave it unset.
    */
-  underlying: UnderlyingFactory;
+  underlying?: UnderlyingFactory;
 };
 
 const SESSION_RESUME_OPTS = {
@@ -126,7 +132,6 @@ export class TarnClient<S extends AnySchema> {
     if (typeof config?.appId !== 'string') throw new Error('TarnClient.create: appId required');
     if (!config.schema) throw new Error('TarnClient.create: schema required');
     if (!config.storage) throw new Error('TarnClient.create: storage required');
-    if (typeof config.underlying !== 'function') throw new Error('TarnClient.create: underlying factory required');
 
     if ((config.schema as { appId: string }).appId !== config.appId) {
       throw new Error(
@@ -134,7 +139,10 @@ export class TarnClient<S extends AnySchema> {
       );
     }
 
-    const underlying = config.underlying(config.apiBase, config.appId);
+    // Default to the bundled legacy client; tests inject a stub via config.underlying.
+    const underlyingFactory: UnderlyingFactory = config.underlying
+      ?? ((api, app) => new LegacyTarnClient(api, app) as unknown as IUnderlyingClient);
+    const underlying = underlyingFactory(config.apiBase, config.appId);
 
     // Build the collection namespace from the schema.
     const collections = await buildCollections<S>(underlying, config.schema, config.appId);

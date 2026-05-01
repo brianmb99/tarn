@@ -38,3 +38,11 @@ export { TarnStorage } from './storage/index.js';
 export type { TarnStorageAdapter } from './storage/index.js';
 
 export type { Connection } from './sharing/index.js';
+
+// Transitional escape hatch: the legacy protocol-layer client. Apps usually
+// don't need this — `TarnClient.create()` defaults to it under the hood.
+// Currently surfaced so the typed namespace's gap on `listIncomingRequests`
+// (and a few similar advanced sharing methods) doesn't block the
+// example-03 sharing flow. Underscore prefix marks it as private/transitional;
+// this export goes away once `tarn.connections.*` covers the full surface.
+export { TarnClient as _LegacyTarnClient } from './tarn.js';

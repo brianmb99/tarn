@@ -1,0 +1,12 @@
+{
+  "name": "tarn-example-03-sharing",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sender":    "node sender.js",
+    "recipient": "node recipient.js"
+  },
+  "dependencies": {
+    "tarn-client": "file:../../client"
+  }
+}

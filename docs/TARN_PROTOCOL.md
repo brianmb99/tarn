@@ -7,6 +7,22 @@ Tarn is an app-agnostic platform for storing encrypted, user-owned data permanen
 
 ---
 
+## App view vs. protocol view
+
+This document describes the **wire protocol** — what bytes go on Arweave, what tags identify what, what HTTP shapes the API speaks, what the encryption envelopes look like, how share-log seq mechanics work. Most app developers never need to read it.
+
+The **app-facing SDK** lives in [`client/`](../client/README.md). It exposes typed CRUD per collection, friend connections, sharing, recovery, and account management — without app code touching tags, txids, encryption envelopes, share-log sequence numbers, or HPKE handshakes.
+
+Read this document when you are:
+
+- **building a new client or server in a different language.** Everything you need to interoperate with Tarn at the wire level is here.
+- **debugging a low-level interaction.** When the SDK abstraction frays (it shouldn't, but it sometimes does), the protocol spec is the source of truth.
+- **building the "always access your data" recovery client.** The end-game promise of Tarn is that any client with the user's credentials can decrypt their data straight from Arweave with no Tarn API in the loop. That client reads schemas, content blobs, and share logs directly from Arweave gateways via GraphQL. It implements this document.
+
+For ordinary app development, start with the [SDK README](../client/README.md). Come back here when you actually need wire-level detail.
+
+---
+
 ## Key Hierarchy
 
 All sub-keys are derived using **HKDF-Expand** (RFC 5869) with structured info strings. No ad-hoc SHA-256 concatenation. The info string follows a fixed structure:

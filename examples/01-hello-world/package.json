@@ -1,0 +1,11 @@
+{
+  "name": "tarn-example-01-hello-world",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "tarn-client": "file:../../client"
+  }
+}

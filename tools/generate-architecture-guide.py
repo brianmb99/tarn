@@ -296,14 +296,56 @@ CONTENT = [
      "All cryptography happens in the SDK. Key derivation, content encryption, "
      "share-log signing, recovery PDF rendering, BIP39 phrase generation, "
      "HPKE handshakes — none of this is network-mediated. The SDK is published "
-     "as a JavaScript library and runs in browsers and Node.js."),
+     "as a TypeScript library (with full type declarations) and runs in "
+     "browsers and Node.js."),
+    ('p',
+     "The SDK exposes a <i>schema-first</i> surface. Applications declare "
+     "their collections and fields up front via <code>defineSchema()</code>. "
+     "From that declaration the SDK generates typed CRUD per collection, "
+     "plus typed namespaces for connections, sharing, recovery, account "
+     "management, and sessions. Application code never touches Arweave "
+     "txids, content-encryption keys, share-log sequence numbers, or HPKE "
+     "envelopes — those are fully encapsulated."),
+    ('code',
+     "import { TarnClient, defineSchema, TarnStorage } from 'tarn-client';\n"
+     "\n"
+     "const schema = defineSchema({\n"
+     "  appId: 'bookish', version: 1,\n"
+     "  collections: {\n"
+     "    books: {\n"
+     "      primaryKey: 'bookId',\n"
+     "      fields: { bookId: 'string', title: 'string', author: 'string?' },\n"
+     "      shareable: true,\n"
+     "    },\n"
+     "  },\n"
+     "});\n"
+     "\n"
+     "const tarn = await TarnClient.create({\n"
+     "  apiBase: 'https://api.tarn.dev',\n"
+     "  appId:   'bookish',\n"
+     "  schema,\n"
+     "  storage: TarnStorage.localStorage(),\n"
+     "  // (transitional `underlying` factory omitted)\n"
+     "});\n"
+     "\n"
+     "await tarn.login(email, password);\n"
+     "await tarn.books.create({ bookId: 'b1', title: 'Mountains' });\n"
+     "const all = await tarn.books.list();\n"
+     "await tarn.books.share(connection, 'b1');"
+    ),
+    ('p',
+     "The split between this document and the SDK README mirrors the split "
+     "between protocol and product. The protocol is what bytes go on Arweave "
+     "and what HTTP shapes the API speaks; the SDK is how application code "
+     "thinks about the system. The two evolve independently — the SDK's "
+     "shape may change between releases, but the wire protocol is stable."),
     ('h2', 'Layer 4 — Application code'),
     ('p',
      "Applications (e.g., Bookish, the first app on Tarn) build their UX on "
      "top of the SDK. The SDK is intentionally product-neutral: it exposes "
-     "primitives like \"create encrypted entry\", \"share content with a "
-     "connection\", \"read share log\". Application code decides what to call "
-     "those primitives in the user-facing UI."),
+     "typed records, connections, and sharing — not books, friends, and "
+     "follows. Application code decides what to call those primitives in "
+     "the user-facing UI."),
 
     ('pagebreak',),
 
@@ -803,9 +845,19 @@ CONTENT = [
      "flows."),
     ('p',
      "<b>SDK reference.</b> The client SDK's README "
-     "(<code>client/README.md</code>) covers the JavaScript API surface with "
-     "examples: register, login, recovery, content CRUD, connection lifecycle, "
-     "sharing primitives, mute filter."),
+     "(<code>client/README.md</code>) covers the app-facing TypeScript "
+     "API: schema declaration, typed collection CRUD, the connections / "
+     "sharing / recovery / account / session namespaces, app registration, "
+     "and the advanced escape hatches. Start there if you are building an "
+     "app on Tarn."),
+    ('p',
+     "<b>Examples.</b> Four progressive runnable examples live in "
+     "<code>examples/</code>: <code>01-hello-world</code> (register and "
+     "write one record), <code>02-crud</code> (full CRUD across two "
+     "collections), <code>03-sharing</code> (invite-token connection "
+     "handshake plus share-with-all), and <code>04-recovery</code> "
+     "(register, capture phrase, simulate password loss, recover). "
+     "Pair them with the SDK README when learning the surface."),
     ('p',
      "<b>Design history.</b> The two design notes "
      "(<code>2026-04-28-tarn-account-and-data-model.md</code> and "

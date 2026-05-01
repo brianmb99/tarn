@@ -322,12 +322,13 @@ describe('TarnClient.create', () => {
   });
 
   it('rejects missing required config fields', async () => {
+    // `underlying` is optional (defaults to the bundled legacy client) — only
+    // apiBase / appId / schema / storage are required.
     const badConfigs = [
       { apiBase: undefined as unknown as string, appId: 'bookish' },
       { apiBase: 'x', appId: undefined as unknown as string },
       { apiBase: 'x', appId: 'bookish', schema: undefined as unknown as never },
       { apiBase: 'x', appId: 'bookish', schema, storage: undefined as unknown as never },
-      { apiBase: 'x', appId: 'bookish', schema, storage: TarnStorage.memory(), underlying: undefined as unknown as never },
     ];
     for (const cfg of badConfigs) {
       await assert.rejects(() => TarnClient.create(cfg as never), /required/);
