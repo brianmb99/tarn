@@ -166,20 +166,22 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
     assert.equal(hasTarnBlobMagic(blobBytes), true);
     const writeTags = JSON.parse(writeCall.headers['X-Arweave-Tags']);
 
-    // Replay that blob through getEntries.
+    // Replay that blob through getEntries. List response carries metadata
+    // only — the SDK fetches each blob via GET /api/v1/entries/{txid}.
     mockFetch([
-      // GET /api/v1/entries paginated response
       {
         status: 200,
         body: JSON.stringify({
-          entries: [
-            {
-              txid: 'tx-x',
-              data: bytesToBase64(blobBytes),
-              tags: writeTags,
-            },
-          ],
+          entries: [{ txid: 'tx-x', tags: writeTags }],
           pagination: { hasMore: false },
+        }),
+      },
+      {
+        status: 200,
+        body: JSON.stringify({
+          txid: 'tx-x',
+          data: bytesToBase64(blobBytes),
+          tags: writeTags,
         }),
       },
     ]);
@@ -220,23 +222,26 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
     // Sanity: legacy blob should NOT have the magic prefix.
     assert.equal(hasTarnBlobMagic(legacyBlob), false);
 
+    const legacyTags = [
+      { name: 'App', value: APP },
+      { name: 'Type', value: 'entry' },
+      { name: 'Enc', value: 'aes-256-gcm' },
+      // No Gen tag — legacy blob.
+    ];
     mockFetch([
       {
         status: 200,
         body: JSON.stringify({
-          entries: [
-            {
-              txid: 'tx-legacy',
-              data: bytesToBase64(legacyBlob),
-              tags: [
-                { name: 'App', value: APP },
-                { name: 'Type', value: 'entry' },
-                { name: 'Enc', value: 'aes-256-gcm' },
-                // No Gen tag — legacy blob.
-              ],
-            },
-          ],
+          entries: [{ txid: 'tx-legacy', tags: legacyTags }],
           pagination: { hasMore: false },
+        }),
+      },
+      {
+        status: 200,
+        body: JSON.stringify({
+          txid: 'tx-legacy',
+          data: bytesToBase64(legacyBlob),
+          tags: legacyTags,
         }),
       },
     ]);
@@ -290,16 +295,38 @@ describe('TarnClient.getEntries — format detection (issue #11)', () => {
     assert.equal(gen1Tags.find(t => t.name === 'Gen').value, '1');
     assert.equal(gen2Tags.find(t => t.name === 'Gen').value, '2');
 
-    // Read both back through getEntries
+    // Read both back through getEntries. List returns metadata only;
+    // per-txid endpoint serves each blob. Order of the two per-txid fetches
+    // is not deterministic (parallel batch), so queue both responses keyed
+    // by URL pattern via the URL routing the mock harness already does
+    // (responses are popped FIFO regardless of URL — see mockFetch). The
+    // two blobs use different keys so a swap would just produce different
+    // failures, not a false pass.
     mockFetch([
       {
         status: 200,
         body: JSON.stringify({
           entries: [
-            { txid: 'tx-1', data: bytesToBase64(gen1Blob), tags: gen1Tags },
-            { txid: 'tx-2', data: bytesToBase64(gen2Blob), tags: gen2Tags },
+            { txid: 'tx-1', tags: gen1Tags },
+            { txid: 'tx-2', tags: gen2Tags },
           ],
           pagination: { hasMore: false },
+        }),
+      },
+      {
+        status: 200,
+        body: JSON.stringify({
+          txid: 'tx-1',
+          data: bytesToBase64(gen1Blob),
+          tags: gen1Tags,
+        }),
+      },
+      {
+        status: 200,
+        body: JSON.stringify({
+          txid: 'tx-2',
+          data: bytesToBase64(gen2Blob),
+          tags: gen2Tags,
         }),
       },
     ]);

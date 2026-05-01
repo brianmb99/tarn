@@ -1342,50 +1342,28 @@ export class TarnClient {
       if (!cursor) break;
     }
 
-    // Current Tarn list responses return metadata only (no blob bytes inline)
-    // because returning ~10 MB of inline base64 in a single Worker response
-    // exceeds the 128 MB per-request memory limit. Blobs are fetched per-txid
-    // below via #fetchBlob, which tries Tarn's per-entry endpoint (D1
-    // write-through) and falls back to public Arweave gateways.
-    //
-    // The inline-data branch is retained for backward-compat with older API
-    // deployments that still return entry.data — clients linked against a
-    // newer API ignore it.
+    // Tarn list responses are metadata-only (returning ~10 MB of inline base64
+    // would push the Worker past the 128 MB per-request memory limit). Fetch
+    // each blob separately via #fetchBlob, which tries Tarn's per-entry
+    // endpoint (D1 write-through, resolves pending writes) and falls back to
+    // public Arweave gateways.
     const entries = [];
-    const needsFetch = [];
+    const CONCURRENCY = 20;
 
-    for (const entry of allRawEntries) {
-      if (entry.data) {
-        try {
-          const blobBytes = base64ToBytes(entry.data);
-          const data = await this.#decryptBlob(blobBytes, entry.tags);
-          entries.push({ txid: entry.txid, data, tags: entry.tags });
-        } catch (err) {
-          console.warn(`Failed to decrypt inline entry ${entry.txid}:`, err.message);
-        }
-      } else {
-        needsFetch.push(entry);
-      }
-    }
+    for (let i = 0; i < allRawEntries.length; i += CONCURRENCY) {
+      const batch = allRawEntries.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(async (entry) => {
+        const blobBytes = await this.#fetchBlob(entry.txid);
+        if (!blobBytes) return null;
+        const data = await this.#decryptBlob(blobBytes, entry.tags);
+        return { txid: entry.txid, data, tags: entry.tags };
+      }));
 
-    // Fetch remaining entries from gateways in parallel
-    if (needsFetch.length > 0) {
-      const CONCURRENCY = 20;
-      for (let i = 0; i < needsFetch.length; i += CONCURRENCY) {
-        const batch = needsFetch.slice(i, i + CONCURRENCY);
-        const results = await Promise.allSettled(batch.map(async (entry) => {
-          const blobBytes = await this.#fetchBlob(entry.txid);
-          if (!blobBytes) return null;
-          const data = await this.#decryptBlob(blobBytes, entry.tags);
-          return { txid: entry.txid, data, tags: entry.tags };
-        }));
-
-        for (const result of results) {
-          if (result.status === 'fulfilled' && result.value) {
-            entries.push(result.value);
-          } else if (result.status === 'rejected') {
-            console.warn(`Failed to decrypt entry:`, result.reason?.message);
-          }
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) {
+          entries.push(result.value);
+        } else if (result.status === 'rejected') {
+          console.warn(`Failed to decrypt entry:`, result.reason?.message);
         }
       }
     }
@@ -4546,9 +4524,12 @@ export class TarnClient {
     // public gateways if Tarn is unavailable or the blob is missing from D1.
     try {
       const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET' });
-      if (res.ok) {
-        const json = await res.json();
-        if (json?.data) return base64ToBytes(json.data);
+      if (res.status === 200) {
+        const text = await res.text();
+        try {
+          const json = JSON.parse(text);
+          if (json?.data) return base64ToBytes(json.data);
+        } catch {}
       }
     } catch {}
 
