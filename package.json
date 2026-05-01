@@ -4,7 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:unit": "node scripts/run-unit-tests.mjs"
+    "test:unit": "node scripts/run-unit-tests.mjs",
+    "test:e2e":      "node --import tsx tests/test-e2e.mjs",
+    "test:client":   "node --import tsx tests/test-client.mjs",
+    "test:auth":     "node --import tsx tests/test-auth.mjs",
+    "test:apps-e2e": "node --import tsx tests/test-apps-e2e.mjs",
+    "test:security": "node --import tsx tests/test-security.mjs",
+    "test:share":    "node --import tsx tests/test-share.mjs",
+    "test:share-log":"node --import tsx tests/test-share-log.mjs",
+    "test:handshake":"node --import tsx tests/test-handshake.mjs",
+    "test:recovery": "node --import tsx tests/test-recovery.mjs",
+    "test:sessions": "node --import tsx tests/test-sessions.mjs",
+    "test:invites":  "node --import tsx tests/test-invites.mjs",
+    "test:deployed": "node --import tsx tests/test-deployed.mjs"
   },
   "devDependencies": {
     "tsx": "^4.0.0",

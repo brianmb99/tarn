@@ -34,8 +34,8 @@ Tarn is NOT an app. It is infrastructure. Apps are clients of Tarn. The first ap
 ## Development
 
 - API local dev: `cd api && npx wrangler dev --port 8787`
-- Unit tests: `node --test tests/unit/*.test.js`
-- Integration tests: `node tests/test-auth.mjs http://localhost:8787` (and test-e2e, test-apps-e2e, test-security, test-client)
+- Unit tests: `npm run test:unit` (routes through `tsx` so JS test files can import the in-progress `.ts` source modules in `client/src/`)
+- Integration tests: `npm run test:e2e -- http://localhost:8787` (and `test:client`, `test:auth`, `test:apps-e2e`, `test:security`, `test:share`, `test:share-log`, `test:handshake`, `test:recovery`, `test:sessions`, `test:invites`)
 - All local tests require wrangler dev running and D1 migrations applied (`cd api && npx wrangler d1 migrations apply tarn-api --local`)
 
 ## Deployment

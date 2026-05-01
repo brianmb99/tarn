@@ -12,6 +12,55 @@
 import { argon2id as argon2idHash } from 'hash-wasm';
 import { x25519 } from '@noble/curves/ed25519';
 
+// ============ BRANDED TYPES ============
+//
+// String-shaped values that the runtime can't tell apart but the type system
+// should. Keeps a base64url shareKey from being passed where a hex
+// lookup_key is expected, etc. Brands are erased at runtime — these are
+// pure type-level distinctions.
+
+declare const __brand: unique symbol;
+type Brand<T, B extends string> = T & { readonly [__brand]: B };
+
+/** 64-char lowercase hex SHA-256-derived account lookup key. */
+export type LookupKey = Brand<string, 'LookupKey'>;
+/** Base64url-encoded raw 32-byte CEK ("share key" — same bytes, different name on the wire). */
+export type ShareKey = Brand<string, 'ShareKey'>;
+/** Base64-encoded AES-KW ciphertext (40 bytes: 32-byte CEK + 8-byte AES-KW overhead). */
+export type WrappedDataKey = Brand<string, 'WrappedDataKey'>;
+/** Standard base64 (with `+/=`). */
+export type Base64 = Brand<string, 'Base64'>;
+/** Base64url (RFC 4648 §5: `-_`, no padding). */
+export type Base64Url = Brand<string, 'Base64Url'>;
+/** Lowercase hex string. */
+export type Hex = Brand<string, 'Hex'>;
+/** Wire `wrapped_data_key` field — opaque envelope, sometimes JSON, sometimes bare base64. */
+export type WrappedDataKeyEnvelope = Brand<string, 'WrappedDataKeyEnvelope'>;
+
+// Constructor helpers — these are pure casts. The brand is opt-in: passing a
+// raw `string` will fail TS, but a value originally produced by a brand-aware
+// function flows through unchanged.
+const asLookupKey = (s: string): LookupKey => s as LookupKey;
+const asShareKey = (s: string): ShareKey => s as ShareKey;
+const asWrappedDataKey = (s: string): WrappedDataKey => s as WrappedDataKey;
+const asBase64 = (s: string): Base64 => s as Base64;
+const asBase64Url = (s: string): Base64Url => s as Base64Url;
+const asHex = (s: string): Hex => s as Hex;
+const asEnvelope = (s: string): WrappedDataKeyEnvelope => s as WrappedDataKeyEnvelope;
+
+// ============ WebCrypto BufferSource helper ============
+//
+// TS 5.x narrowed `BufferSource` to require an `ArrayBuffer`-not-`SharedArrayBuffer`
+// backing buffer. Modern lib types say `Uint8Array<ArrayBufferLike>`, which
+// doesn't satisfy that constraint at the type level (runtime is fine — both
+// work). Rather than `as BufferSource` at every call site, this single helper
+// makes the boundary explicit: every WebCrypto input flows through `bs()`.
+//
+// It is a literal identity at runtime (returns the same object).
+function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
+  return b as BufferSource;
+}
+
 // ============ CONSTANTS ============
 
 // KDF versions for the master_key derivation step.
@@ -22,16 +71,18 @@ import { x25519 } from '@noble/curves/ed25519';
 // laptop, ~1–1.5s on a 3-year-old phone — well under the ~2s acceptance bar.
 // Memory-hard params neutralize GPU/ASIC parallelism on a leaked Arweave
 // credential blob, in line with the OWASP Argon2id recommendation.
-export const KDF_V1_PBKDF2 = 1;
-export const KDF_V2_ARGON2ID = 2;
+export const KDF_V1_PBKDF2 = 1 as const;
+export const KDF_V2_ARGON2ID = 2 as const;
 export const KDF_DEFAULT = KDF_V2_ARGON2ID;
+export type KdfVersion = typeof KDF_V1_PBKDF2 | typeof KDF_V2_ARGON2ID;
 
 // Wrapping factors (issue #12). Each entry in a v4 dek_chain is wrapped under
 // one or more factors; any factor's KEK independently unwraps the DEK.
 //   PASSWORD        — derived from email+password via deriveCredentialEncryptionKey
 //   RECOVERY_PHRASE — derived from BIP39 phrase via deriveRecoveryKey
-export const FACTOR_PASSWORD = 'password';
-export const FACTOR_RECOVERY_PHRASE = 'recovery_phrase';
+export const FACTOR_PASSWORD = 'password' as const;
+export const FACTOR_RECOVERY_PHRASE = 'recovery_phrase' as const;
+export type Factor = typeof FACTOR_PASSWORD | typeof FACTOR_RECOVERY_PHRASE;
 
 const PBKDF2_ITERATIONS = 600000;
 const PBKDF2_HASH = 'SHA-256';
@@ -46,7 +97,7 @@ const KEY_LENGTH_BYTES = 32;
 // Structured HKDF info: protocol || purpose || app_id || version || counter
 const PROTOCOL_ID = 'tarn';
 const DERIVATION_VERSION = '1';
-const HKDF_COUNTER = new Uint8Array([0x01]); // Single-block HKDF-Expand
+// (HKDF_COUNTER unused outside hkdfExpand; literal in the call.)
 
 // P-256 curve order (n) — for private key range validation
 // n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -89,9 +140,50 @@ const GCM_TAG_LEN_BYTES = 16;
 const MIN_NEW_FORMAT_LEN =
   TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN + IV_LEN_BYTES + GCM_TAG_LEN_BYTES;
 
+// ============ COMMON TYPES ============
+
+/** A 32-byte AES key materialized as both AES-GCM and AES-KW handles + raw bytes. */
+export type DataKeyHandles = {
+  gcmKey: CryptoKey;
+  kwKey: CryptoKey;
+  rawBytes: Uint8Array;
+};
+
+/** A 32-byte AES key materialized as both handles, no raw bytes (for unwrapped chain entries). */
+export type DataKeyPair = {
+  gcmKey: CryptoKey;
+  kwKey: CryptoKey;
+};
+
+/** ECDSA P-256 signing keypair. */
+export type SigningKeyPair = {
+  privateKey: CryptoKey;
+  publicKey: CryptoKey;
+};
+
+/** X25519 sharing keypair (raw bytes — `@noble/curves` operates on bytes, not WebCrypto). */
+export type SharingKeyPair = {
+  privateKey: Uint8Array;
+  publicKey: Uint8Array;
+};
+
+/** Argon2id parameter object as stored in envelope KDF metadata. */
+export type Argon2idParams = {
+  m_kib: number;
+  t: number;
+  p: number;
+};
+
+/** v4 envelope recovery-factor metadata. */
+export type RecoveryMetadata = {
+  kdf: 'argon2id';
+  kdfParams: Argon2idParams;
+  salt: Uint8Array;
+};
+
 // ============ EMAIL NORMALIZATION ============
 
-export function normalizeEmail(email) {
+export function normalizeEmail(email: string): string {
   if (!email || typeof email !== 'string') throw new Error('Email is required');
   return email.trim().toLowerCase();
 }
@@ -102,27 +194,31 @@ export function normalizeEmail(email) {
  * HKDF-Expand with a single 32-byte output block.
  * This is equivalent to: HMAC-SHA256(prk, info || 0x01)
  *
- * @param {Uint8Array} prk - Pseudorandom key (master_key)
- * @param {string} purpose - Key purpose: "lookup", "encrypt", or "sign"
- * @param {string} appId - App identifier
- * @param {number} [counter=1] - HKDF counter (for P-256 retry)
- * @returns {Promise<Uint8Array>} 32-byte derived key
+ * @param prk - Pseudorandom key (master_key)
+ * @param purpose - Key purpose: "lookup", "encrypt", or "sign"
+ * @param appId - App identifier
+ * @param counter - HKDF counter (for P-256 retry); defaults to 1
  */
-async function hkdfExpand(prk, purpose, appId, counter = 1) {
+async function hkdfExpand(
+  prk: Uint8Array,
+  purpose: string,
+  appId: string,
+  counter: number = 1,
+): Promise<Uint8Array> {
   const encoder = new TextEncoder();
 
   // Import master_key as HMAC key
   const hmacKey = await crypto.subtle.importKey(
-    'raw', prk, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    'raw', bs(prk), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
   );
 
   // info = protocol || purpose || app_id || version || counter_byte
   const info = concatBytes(
     encoder.encode(PROTOCOL_ID + purpose + appId + DERIVATION_VERSION),
-    new Uint8Array([counter])
+    new Uint8Array([counter]),
   );
 
-  const result = await crypto.subtle.sign('HMAC', hmacKey, info);
+  const result = await crypto.subtle.sign('HMAC', hmacKey, bs(info));
   return new Uint8Array(result);
 }
 
@@ -138,20 +234,21 @@ async function hkdfExpand(prk, purpose, appId, counter = 1) {
  *
  * Both KDFs use SHA-256(normalizedEmail) as the salt so an account's salt is
  * stable across logins regardless of which KDF was originally used.
- *
- * @param {string} email
- * @param {string} password
- * @param {number} [kdfVersion=KDF_DEFAULT] — KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
- * @returns {Promise<Uint8Array>} 32-byte master key
  */
-export async function deriveMasterKey(email, password, kdfVersion = KDF_DEFAULT) {
+export async function deriveMasterKey(
+  email: string,
+  password: string,
+  kdfVersion: KdfVersion = KDF_DEFAULT,
+): Promise<Uint8Array> {
   if (!email || !password) throw new Error('Email and password are required');
 
   const normalizedEmail = normalizeEmail(email);
   const encoder = new TextEncoder();
 
   // Salt = SHA-256(normalizedEmail) — same for both KDFs.
-  const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(normalizedEmail)));
+  const salt = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', bs(encoder.encode(normalizedEmail))),
+  );
 
   if (kdfVersion === KDF_V2_ARGON2ID) {
     const out = await argon2idHash({
@@ -168,17 +265,17 @@ export async function deriveMasterKey(email, password, kdfVersion = KDF_DEFAULT)
 
   if (kdfVersion === KDF_V1_PBKDF2) {
     const passwordKey = await crypto.subtle.importKey(
-      'raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']
+      'raw', bs(encoder.encode(password)), 'PBKDF2', false, ['deriveBits'],
     );
     const masterKeyBits = await crypto.subtle.deriveBits(
-      { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: PBKDF2_HASH },
+      { name: 'PBKDF2', salt: bs(salt), iterations: PBKDF2_ITERATIONS, hash: PBKDF2_HASH },
       passwordKey,
-      KEY_LENGTH_BITS
+      KEY_LENGTH_BITS,
     );
     return new Uint8Array(masterKeyBits);
   }
 
-  throw new Error(`Unknown KDF version: ${kdfVersion}`);
+  throw new Error(`Unknown KDF version: ${kdfVersion as number}`);
 }
 
 /**
@@ -195,13 +292,12 @@ export async function deriveMasterKey(email, password, kdfVersion = KDF_DEFAULT)
  * Returns AES-GCM and AES-KW handles (same 32 bytes, two WebCrypto views) so
  * the caller can both wrap chain entries with AES-KW and use the raw key for
  * any future per-content operations.
- *
- * @param {string} mnemonic - BIP39 mnemonic phrase (12-24 words)
- * @param {Uint8Array} salt - Per-account 16-byte salt from the credential blob
- * @param {{m_kib: number, t: number, p: number}} [params] - Argon2id params
- * @returns {Promise<{gcmKey: CryptoKey, kwKey: CryptoKey, rawBytes: Uint8Array}>}
  */
-export async function deriveRecoveryKey(mnemonic, salt, params) {
+export async function deriveRecoveryKey(
+  mnemonic: string,
+  salt: Uint8Array,
+  params?: Partial<Argon2idParams>,
+): Promise<DataKeyHandles> {
   if (!mnemonic || typeof mnemonic !== 'string') {
     throw new Error('mnemonic must be a non-empty string');
   }
@@ -227,23 +323,18 @@ export async function deriveRecoveryKey(mnemonic, salt, params) {
   const rawBytes = out instanceof Uint8Array ? out : new Uint8Array(out);
 
   const [gcmKey, kwKey] = await Promise.all([
-    crypto.subtle.importKey('raw', rawBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-    crypto.subtle.importKey('raw', rawBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+    crypto.subtle.importKey('raw', bs(rawBytes), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', bs(rawBytes), 'AES-KW', true, ['wrapKey', 'unwrapKey']),
   ]);
 
   return { gcmKey, kwKey, rawBytes };
 }
 
-/**
- * Derive credential_lookup_key from master_key for a specific app.
- * @param {Uint8Array} masterKey
- * @param {string} appId - Registered app identifier
- * @returns {Promise<string>} 64-char hex string
- */
-export async function deriveCredentialLookupKey(masterKey, appId) {
+/** Derive credential_lookup_key from master_key for a specific app. */
+export async function deriveCredentialLookupKey(masterKey: Uint8Array, appId: string): Promise<LookupKey> {
   if (!appId) throw new Error('appId is required');
   const hash = await hkdfExpand(masterKey, 'lookup', appId);
-  return bytesToHex(hash);
+  return asLookupKey(bytesToHex(hash));
 }
 
 /**
@@ -251,23 +342,14 @@ export async function deriveCredentialLookupKey(masterKey, appId) {
  * (issue #12). The recovery lookup key is a phrase-derived secondary index
  * the API uses to find an account row during the recovery flow — independent
  * of the password, so it works when the user has lost their credentials.
- *
- * Derivation uses HKDF-Expand (HMAC-SHA-256 single block) with a different
- * purpose label from the password-derived `lookup` key, ensuring the two
- * lookup keys never collide for the same account. The phrase entropy itself
- * is the PRK (256 bits, sufficient for an HMAC PRK).
- *
- * @param {Uint8Array} phraseEntropy - Raw BIP39 entropy bytes (32 for 24-word)
- * @param {string} appId
- * @returns {Promise<string>} 64-char hex string
  */
-export async function deriveRecoveryLookupKey(phraseEntropy, appId) {
+export async function deriveRecoveryLookupKey(phraseEntropy: Uint8Array, appId: string): Promise<LookupKey> {
   if (!(phraseEntropy instanceof Uint8Array) || phraseEntropy.length === 0) {
     throw new Error('phraseEntropy must be a non-empty Uint8Array');
   }
   if (!appId) throw new Error('appId is required');
   const hash = await hkdfExpand(phraseEntropy, 'recovery-lookup', appId);
-  return bytesToHex(hash);
+  return asLookupKey(bytesToHex(hash));
 }
 
 /**
@@ -278,65 +360,43 @@ export async function deriveRecoveryLookupKey(phraseEntropy, appId) {
  *
  * Mirrors {@link deriveSigningKeyPair}'s P-256 scalar validation + retry
  * (probability ~2^-128 of needing the second counter byte).
- *
- * @param {Uint8Array} phraseEntropy
- * @param {string} appId
- * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey}>}
  */
-export async function deriveRecoverySigningKeyPair(phraseEntropy, appId) {
+export async function deriveRecoverySigningKeyPair(
+  phraseEntropy: Uint8Array,
+  appId: string,
+): Promise<SigningKeyPair> {
   if (!(phraseEntropy instanceof Uint8Array) || phraseEntropy.length === 0) {
     throw new Error('phraseEntropy must be a non-empty Uint8Array');
   }
   if (!appId) throw new Error('appId is required');
 
-  let seed;
+  let seed: Uint8Array | undefined;
   for (let counter = 1; counter <= 3; counter++) {
     seed = await hkdfExpand(phraseEntropy, 'recovery-sign', appId, counter);
     const scalar = bytesToBigInt(seed);
     if (scalar > 0n && scalar < P256_ORDER) break;
     if (counter === 3) throw new Error('Failed to derive valid recovery P-256 private key (extremely unlikely)');
   }
+  if (!seed) throw new Error('Internal: P-256 seed derivation loop exited without a value');
 
-  const pkcs8 = new Uint8Array(PKCS8_P256_PREFIX.length + seed.length);
-  pkcs8.set(PKCS8_P256_PREFIX, 0);
-  pkcs8.set(seed, PKCS8_P256_PREFIX.length);
-
-  const privateKey = await crypto.subtle.importKey(
-    'pkcs8', pkcs8,
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    true,
-    ['sign']
-  );
-
-  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
-  delete jwk.d;
-  jwk.key_ops = ['verify'];
-
-  const publicKey = await crypto.subtle.importKey(
-    'jwk', jwk,
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    true,
-    ['verify']
-  );
-
-  return { privateKey, publicKey };
+  return await importP256KeyPair(seed);
 }
 
 /**
  * Derive credential encryption key material from master_key for a specific app.
  * Returns both an AES-GCM key (for data encryption) and an AES-KW key (for key wrapping).
  * Both are derived from the same raw bytes — same key, different WebCrypto usages.
- * @param {Uint8Array} masterKey
- * @param {string} appId
- * @returns {Promise<{gcmKey: CryptoKey, kwKey: CryptoKey, rawBytes: Uint8Array}>}
  */
-export async function deriveCredentialEncryptionKey(masterKey, appId) {
+export async function deriveCredentialEncryptionKey(
+  masterKey: Uint8Array,
+  appId: string,
+): Promise<DataKeyHandles> {
   if (!appId) throw new Error('appId is required');
   const keyBytes = await hkdfExpand(masterKey, 'encrypt', appId);
 
   const [gcmKey, kwKey] = await Promise.all([
-    crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-    crypto.subtle.importKey('raw', keyBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+    crypto.subtle.importKey('raw', bs(keyBytes), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', bs(keyBytes), 'AES-KW', true, ['wrapKey', 'unwrapKey']),
   ]);
 
   return { gcmKey, kwKey, rawBytes: keyBytes };
@@ -346,36 +406,42 @@ export async function deriveCredentialEncryptionKey(masterKey, appId) {
  * Derive ECDSA P-256 signing key pair from master_key for a specific app.
  * Deterministic: same master_key + appId always produces the same key pair.
  * Validates that the derived scalar is in [1, n-1] per P-256 spec.
- * @param {Uint8Array} masterKey
- * @param {string} appId
- * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey}>}
  */
-export async function deriveSigningKeyPair(masterKey, appId) {
+export async function deriveSigningKeyPair(masterKey: Uint8Array, appId: string): Promise<SigningKeyPair> {
   if (!appId) throw new Error('appId is required');
 
   // Derive seed, validate P-256 range, retry with incrementing counter if needed
-  let seed;
+  let seed: Uint8Array | undefined;
   for (let counter = 1; counter <= 3; counter++) {
     seed = await hkdfExpand(masterKey, 'sign', appId, counter);
     const scalar = bytesToBigInt(seed);
     if (scalar > 0n && scalar < P256_ORDER) break;
     if (counter === 3) throw new Error('Failed to derive valid P-256 private key (extremely unlikely)');
   }
+  if (!seed) throw new Error('Internal: P-256 seed derivation loop exited without a value');
 
-  // Build PKCS#8 DER
+  return await importP256KeyPair(seed);
+}
+
+/**
+ * Internal: build a PKCS#8 P-256 private key from a 32-byte seed and round-trip
+ * to JWK to derive the matching public key. Used by both the master-key-derived
+ * and phrase-entropy-derived signing keypair flows.
+ */
+async function importP256KeyPair(seed: Uint8Array): Promise<SigningKeyPair> {
   const pkcs8 = new Uint8Array(PKCS8_P256_PREFIX.length + seed.length);
   pkcs8.set(PKCS8_P256_PREFIX, 0);
   pkcs8.set(seed, PKCS8_P256_PREFIX.length);
 
   const privateKey = await crypto.subtle.importKey(
-    'pkcs8', pkcs8,
+    'pkcs8', bs(pkcs8),
     { name: 'ECDSA', namedCurve: 'P-256' },
     true,
-    ['sign']
+    ['sign'],
   );
 
-  // Derive public key from private key via JWK round-trip
-  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
+  // Derive public key from private key via JWK round-trip.
+  const jwk = await crypto.subtle.exportKey('jwk', privateKey) as JsonWebKey & { d?: string };
   delete jwk.d;
   jwk.key_ops = ['verify'];
 
@@ -383,20 +449,16 @@ export async function deriveSigningKeyPair(masterKey, appId) {
     'jwk', jwk,
     { name: 'ECDSA', namedCurve: 'P-256' },
     true,
-    ['verify']
+    ['verify'],
   );
 
   return { privateKey, publicKey };
 }
 
-/**
- * Export public key to base64-encoded SPKI format.
- * @param {CryptoKey} publicKey
- * @returns {Promise<string>}
- */
-export async function exportPublicKey(publicKey) {
+/** Export public key to base64-encoded SPKI format. */
+export async function exportPublicKey(publicKey: CryptoKey): Promise<Base64> {
   const der = await crypto.subtle.exportKey('spki', publicKey);
-  return bytesToBase64(new Uint8Array(der));
+  return asBase64(bytesToBase64Raw(new Uint8Array(der)));
 }
 
 // ============ SHARING KEYPAIR (issue #13) ============
@@ -416,45 +478,28 @@ export async function exportPublicKey(publicKey) {
  * Per-app isolated via the same HKDF info pattern as every other sub-key, so
  * the same email registered to Bookish and Cellar produces distinct lookup
  * keys.
- *
- * @param {string} email
- * @param {string} appId
- * @returns {Promise<string>} 64-char lowercase hex
  */
-export async function deriveShareLookupKey(email, appId) {
+export async function deriveShareLookupKey(email: string, appId: string): Promise<LookupKey> {
   if (!email) throw new Error('email is required');
   if (!appId) throw new Error('appId is required');
   const normalized = normalizeEmail(email);
   const encoder = new TextEncoder();
   const emailHash = new Uint8Array(
-    await crypto.subtle.digest('SHA-256', encoder.encode(normalized)),
+    await crypto.subtle.digest('SHA-256', bs(encoder.encode(normalized))),
   );
   const out = await hkdfExpand(emailHash, 'share-lookup', appId);
-  return bytesToHex(out);
+  return asLookupKey(bytesToHex(out));
 }
 
-
 /**
- * Derive the per-app X25519 sharing keypair from `master_key` (sharing design
- * §4.1).
+ * Derive the per-app X25519 sharing keypair from `master_key` (sharing design §4.1).
  *
  * The seed is HKDF-Expand(master_key, "tarn"||"share"||app_id||"1"||0x01) —
  * same single-block info pattern as the existing `lookup`/`encrypt`/`sign`
  * sub-keys. Per-app isolation is preserved: the same email+password registered
  * to Bookish vs. Cellar produces distinct sharing keypairs.
- *
- * X25519 private keys are arbitrary 32-byte values; the standard "clamping"
- * (clearing the low 3 bits and the high bit, setting bit 254) is performed by
- * the underlying x25519 implementation when scalar-multiplying. The raw seed is
- * stored as-is so re-derivation on a fresh login produces the same keypair.
- *
- * @param {Uint8Array} masterKey
- * @param {string} appId
- * @returns {Promise<{privateKey: Uint8Array, publicKey: Uint8Array}>}
- *   - `privateKey` — 32-byte X25519 scalar (the HKDF output, pre-clamping)
- *   - `publicKey` — 32-byte X25519 group element (clamped Curve25519 base * priv)
  */
-export async function deriveSharingKeyPair(masterKey, appId) {
+export async function deriveSharingKeyPair(masterKey: Uint8Array, appId: string): Promise<SharingKeyPair> {
   if (!appId) throw new Error('appId is required');
   const seed = await hkdfExpand(masterKey, 'share', appId);
   if (seed.length !== X25519_KEY_LEN) {
@@ -466,31 +511,24 @@ export async function deriveSharingKeyPair(masterKey, appId) {
 
 /**
  * Encode an X25519 public key (32 raw bytes) for transport in a credential
- * blob's `share_pub` field. Base64url, no padding (sharing design notation
- * `B(...)`).
- *
- * @param {Uint8Array} publicKey
- * @returns {string}
+ * blob's `share_pub` field. Base64url, no padding (sharing design notation `B(...)`).
  */
-export function encodeSharePub(publicKey) {
+export function encodeSharePub(publicKey: Uint8Array): Base64Url {
   if (!(publicKey instanceof Uint8Array) || publicKey.length !== X25519_KEY_LEN) {
     throw new Error(`share_pub must be a Uint8Array of length ${X25519_KEY_LEN}`);
   }
-  return bytesToBase64Url(publicKey);
+  return asBase64Url(bytesToBase64UrlRaw(publicKey));
 }
 
 /**
  * Decode a base64url `share_pub` string back to 32 raw bytes. Throws if the
  * input is the wrong length, so callers don't have to length-check after.
- *
- * @param {string} encoded
- * @returns {Uint8Array}
  */
-export function decodeSharePub(encoded) {
+export function decodeSharePub(encoded: string): Uint8Array {
   if (typeof encoded !== 'string' || encoded.length === 0) {
     throw new Error('share_pub must be a non-empty string');
   }
-  const bytes = base64UrlToBytes(encoded);
+  const bytes = base64UrlToBytesRaw(encoded);
   if (bytes.length !== X25519_KEY_LEN) {
     throw new Error(`share_pub must decode to ${X25519_KEY_LEN} bytes, got ${bytes.length}`);
   }
@@ -499,17 +537,12 @@ export function decodeSharePub(encoded) {
 
 // ============ AES-256-GCM ENCRYPTION (data blobs) ============
 
-/**
- * Encrypt JSON payload with AES-256-GCM.
- * @param {CryptoKey} key - AES-256-GCM key
- * @param {Object} plaintext - JSON-serializable object
- * @returns {Promise<Uint8Array>} Wire format: IV(12) || ciphertext+tag
- */
-export async function encrypt(key, plaintext) {
+/** Encrypt JSON payload with AES-256-GCM. Wire: IV(12) || ciphertext+tag. */
+export async function encrypt(key: CryptoKey, plaintext: unknown): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const data = new TextEncoder().encode(JSON.stringify(plaintext));
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv }, key, data
+    { name: 'AES-GCM', iv: bs(iv) }, key, bs(data),
   ));
 
   const result = new Uint8Array(iv.length + ciphertext.length);
@@ -518,17 +551,12 @@ export async function encrypt(key, plaintext) {
   return result;
 }
 
-/**
- * Decrypt AES-256-GCM encrypted bytes to JSON.
- * @param {CryptoKey} key - AES-256-GCM key
- * @param {Uint8Array} blob - Wire format: IV(12) || ciphertext+tag
- * @returns {Promise<Object>}
- */
-export async function decrypt(key, blob) {
+/** Decrypt AES-256-GCM bytes to JSON. Wire: IV(12) || ciphertext+tag. */
+export async function decrypt(key: CryptoKey, blob: Uint8Array): Promise<unknown> {
   if (blob.length < 13) throw new Error('Blob too short');
   const iv = blob.slice(0, 12);
   const ciphertext = blob.slice(12);
-  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bs(iv) }, key, bs(ciphertext));
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
 
@@ -538,11 +566,8 @@ export async function decrypt(key, blob) {
  * Detect whether a blob is in the new per-content CEK format.
  * Cheap O(1) prefix check; safe on legacy blobs (legacy AES-GCM IVs are random
  * 12-byte values — collision with the 5-byte magic has probability 2^-40).
- *
- * @param {Uint8Array} blob
- * @returns {boolean}
  */
-export function hasTarnBlobMagic(blob) {
+export function hasTarnBlobMagic(blob: Uint8Array): boolean {
   if (!(blob instanceof Uint8Array) || blob.length < TARN_BLOB_MAGIC.length) {
     return false;
   }
@@ -564,24 +589,21 @@ export function hasTarnBlobMagic(blob) {
  * caller can publish it through the share-log without re-deriving via an
  * AES-KW unwrap. Sharing-path callers populate the SDK's in-memory shareKey
  * cache from this; non-sharing callers simply ignore the field.
- *
- * @param {CryptoKey} dek - AES-KW wrapping key for the current generation
- * @param {Object} plaintext - JSON-serializable payload
- * @returns {Promise<{blob: Uint8Array, shareKey: string}>}
- *   `blob` wire format: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag.
- *   `shareKey` is the base64url-encoded raw CEK (32 bytes).
  */
-export async function encryptWithCEK(dek, plaintext) {
+export async function encryptWithCEK(
+  dek: CryptoKey,
+  plaintext: unknown,
+): Promise<{ blob: Uint8Array; shareKey: ShareKey }> {
   // Generate a fresh CEK and import into both AES-GCM (for content) and AES-KW
   // (so it can be wrapped). Same raw bytes, two WebCrypto handles.
   const cekBytes = crypto.getRandomValues(new Uint8Array(CEK_LEN_BYTES));
   const [cekGcm, cekKw] = await Promise.all([
-    crypto.subtle.importKey('raw', cekBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-    crypto.subtle.importKey('raw', cekBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+    crypto.subtle.importKey('raw', bs(cekBytes), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', bs(cekBytes), 'AES-KW', true, ['wrapKey', 'unwrapKey']),
   ]);
 
   const wrappedCEK = new Uint8Array(
-    await crypto.subtle.wrapKey('raw', cekKw, dek, 'AES-KW')
+    await crypto.subtle.wrapKey('raw', cekKw, dek, 'AES-KW'),
   );
   if (wrappedCEK.length !== WRAPPED_CEK_LEN) {
     throw new Error(`wrapped_CEK length ${wrappedCEK.length} != ${WRAPPED_CEK_LEN}`);
@@ -590,11 +612,11 @@ export async function encryptWithCEK(dek, plaintext) {
   const iv = crypto.getRandomValues(new Uint8Array(IV_LEN_BYTES));
   const data = new TextEncoder().encode(JSON.stringify(plaintext));
   const ciphertextAndTag = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cekGcm, data)
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: bs(iv) }, cekGcm, bs(data)),
   );
 
   const blob = new Uint8Array(
-    TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN + IV_LEN_BYTES + ciphertextAndTag.length
+    TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN + IV_LEN_BYTES + ciphertextAndTag.length,
   );
   let off = 0;
   blob.set(TARN_BLOB_MAGIC, off); off += TARN_BLOB_MAGIC.length;
@@ -602,19 +624,15 @@ export async function encryptWithCEK(dek, plaintext) {
   blob.set(iv, off); off += IV_LEN_BYTES;
   blob.set(ciphertextAndTag, off);
 
-  return { blob, shareKey: bytesToBase64Url(cekBytes) };
+  return { blob, shareKey: asShareKey(bytesToBase64UrlRaw(cekBytes)) };
 }
 
 /**
  * Decrypt a per-content CEK blob using a DEK from the chain.
  *
  * Layout: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag
- *
- * @param {CryptoKey} dek - AES-KW unwrapping key for the blob's generation
- * @param {Uint8Array} blob
- * @returns {Promise<Object>}
  */
-export async function decryptWithCEK(dek, blob) {
+export async function decryptWithCEK(dek: CryptoKey, blob: Uint8Array): Promise<unknown> {
   if (!hasTarnBlobMagic(blob)) {
     throw new Error('Blob does not have TARN magic prefix');
   }
@@ -631,12 +649,12 @@ export async function decryptWithCEK(dek, blob) {
   const ciphertextAndTag = blob.slice(ivStart + IV_LEN_BYTES);
 
   const cekGcm = await crypto.subtle.unwrapKey(
-    'raw', wrappedCEK, dek, 'AES-KW',
+    'raw', bs(wrappedCEK), dek, 'AES-KW',
     { name: 'AES-GCM' }, false, ['decrypt'],
   );
 
   const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv }, cekGcm, ciphertextAndTag,
+    { name: 'AES-GCM', iv: bs(iv) }, cekGcm, bs(ciphertextAndTag),
   );
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
@@ -649,12 +667,11 @@ export async function decryptWithCEK(dek, blob) {
  * shareKey instead and ignore bytes 5..44.
  *
  * Layout: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag
- *
- * @param {Uint8Array} blob
- * @param {string} shareKeyBase64Url - base64url-encoded raw CEK (32 bytes)
- * @returns {Promise<Object>}
  */
-export async function decryptBlobWithSharedCEK(blob, shareKeyBase64Url) {
+export async function decryptBlobWithSharedCEK(
+  blob: Uint8Array,
+  shareKeyBase64Url: string,
+): Promise<unknown> {
   if (!hasTarnBlobMagic(blob)) {
     throw new Error('Blob does not have TARN magic prefix');
   }
@@ -662,13 +679,13 @@ export async function decryptBlobWithSharedCEK(blob, shareKeyBase64Url) {
     throw new Error(`Blob too short for new format: ${blob.length} < ${MIN_NEW_FORMAT_LEN}`);
   }
 
-  const cekBytes = base64UrlToBytes(shareKeyBase64Url);
+  const cekBytes = base64UrlToBytesRaw(shareKeyBase64Url);
   if (cekBytes.length !== CEK_LEN_BYTES) {
     throw new Error(`shareKey must be ${CEK_LEN_BYTES} raw bytes; got ${cekBytes.length}`);
   }
 
   const cekGcm = await crypto.subtle.importKey(
-    'raw', cekBytes, { name: 'AES-GCM' }, false, ['decrypt'],
+    'raw', bs(cekBytes), { name: 'AES-GCM' }, false, ['decrypt'],
   );
 
   const ivStart = TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN;
@@ -676,7 +693,7 @@ export async function decryptBlobWithSharedCEK(blob, shareKeyBase64Url) {
   const ciphertextAndTag = blob.slice(ivStart + IV_LEN_BYTES);
 
   const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv }, cekGcm, ciphertextAndTag,
+    { name: 'AES-GCM', iv: bs(iv) }, cekGcm, bs(ciphertextAndTag),
   );
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
@@ -686,27 +703,21 @@ export async function decryptBlobWithSharedCEK(blob, shareKeyBase64Url) {
 /**
  * Wrap data_encryption_key using AES-KW (raw bytes only — no envelope metadata).
  * Use {@link wrapDataKeyEnvelope} for the wire format that includes KDF version.
- * @param {CryptoKey} dataKey - Key to wrap
- * @param {CryptoKey} wrappingKey - Key to wrap with (credential_encryption_key)
- * @returns {Promise<string>} Base64-encoded AES-KW ciphertext (40 bytes: 32 key + 8 overhead)
  */
-export async function wrapDataKey(dataKey, wrappingKey) {
+export async function wrapDataKey(dataKey: CryptoKey, wrappingKey: CryptoKey): Promise<WrappedDataKey> {
   const wrapped = await crypto.subtle.wrapKey('raw', dataKey, wrappingKey, 'AES-KW');
-  return bytesToBase64(new Uint8Array(wrapped));
+  return asWrappedDataKey(bytesToBase64Raw(new Uint8Array(wrapped)));
 }
 
 /**
  * Unwrap data_encryption_key from raw AES-KW ciphertext (no envelope handling).
  * Use {@link unwrapDataKeyEnvelope} for the wire format.
- * @param {string} wrappedBase64 - Base64-encoded AES-KW ciphertext
- * @param {CryptoKey} unwrappingKey - credential_encryption_key
- * @returns {Promise<CryptoKey>} Unwrapped AES-256-GCM data encryption key
  */
-export async function unwrapDataKey(wrappedBase64, unwrappingKey) {
-  const wrapped = base64ToBytes(wrappedBase64);
+export async function unwrapDataKey(wrappedBase64: string, unwrappingKey: CryptoKey): Promise<CryptoKey> {
+  const wrapped = base64ToBytesRaw(wrappedBase64);
   return await crypto.subtle.unwrapKey(
-    'raw', wrapped, unwrappingKey, 'AES-KW',
-    { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
+    'raw', bs(wrapped), unwrappingKey, 'AES-KW',
+    { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
   );
 }
 
@@ -722,66 +733,75 @@ export async function unwrapDataKey(wrappedBase64, unwrappingKey) {
 //      DEK == credential_encryption_key (self-wrapping). Pre-issue-#11.
 // v3 — JSON envelope with a single-factor DEK chain (issue #11):
 //      { v: 3, kdf, kdf_params, dek_chain: [{gen, wrapped}, ...] }.
-//      Each entry's `wrapped` is AES-KW(DEK_at_gen, credential_encryption_key).
-//      Forward-secret rotation: append a fresh DEK at gen N+1 on every
-//      credential change; old gens stay accessible for past data.
-// v4 (current default for new accounts) — JSON envelope with a multi-factor
-//      DEK chain (issue #12):
-//        { v: 4, kdf, kdf_params,
-//          recovery: { kdf, kdf_params, salt: <base64 16 bytes> } | absent,
-//          dek_chain: [{gen, wrappings: [{factor, wrapped}, ...]}, ...] }
-//      Each chain entry holds N wrappings of the same DEK under different
-//      KEKs (factors). Any factor's KEK independently unwraps the DEK at its
-//      generation. v4 envelopes without a `recovery` block are semantically
-//      equivalent to v3 (single password factor); the caller can add a
-//      recovery factor later via re-publishing.
+// v4 (current default for new accounts) — multi-factor DEK chain (issue #12):
+//      { v: 4, kdf, kdf_params,
+//        recovery: { kdf, kdf_params, salt: <base64 16 bytes> } | absent,
+//        dek_chain: [{gen, wrappings: [{factor, wrapped}, ...]}, ...] }
 //
 // Detection: if the string parses as JSON, dispatch on `v`; otherwise legacy v1.
 // Read normalization: v1/v2/v3 are coerced to a single-factor v4-shaped chain
 // (factor = "password") so callers can branch on shape, not version.
+
+export type EnvelopeVersion = 1 | 2 | 3 | 4;
+
+export type ChainWrapping = {
+  factor: string; // narrowed to Factor at the v4 layer; v1/v2/v3 use FACTOR_PASSWORD
+  wrappedBase64: string;
+};
+
+export type DekChainEntry = {
+  gen: number;
+  wrappings: ChainWrapping[];
+};
+
+export type ParsedWrappedDataKey = {
+  kdfVersion: KdfVersion;
+  envelopeVersion: EnvelopeVersion;
+  dekChain: DekChainEntry[];
+  wrappedBase64: string;
+  kdfParams: Argon2idParams | null;
+  recovery: RecoveryMetadata | null;
+};
 
 /**
  * Wrap the data encryption key and pack into the wire format for the given KDF.
  * Produces the legacy single-key shape (envelope v1 for PBKDF2, envelope v2
  * for Argon2id). For new accounts after issue #11, prefer
  * {@link wrapDataKeyChainEnvelope} which produces a v3 chain envelope.
- *
- * @param {CryptoKey} dataKey
- * @param {CryptoKey} wrappingKey
- * @param {number} kdfVersion - KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
- * @returns {Promise<string>} The `wrapped_data_key` value to send to the API
  */
-export async function wrapDataKeyEnvelope(dataKey, wrappingKey, kdfVersion) {
+export async function wrapDataKeyEnvelope(
+  dataKey: CryptoKey,
+  wrappingKey: CryptoKey,
+  kdfVersion: KdfVersion,
+): Promise<WrappedDataKeyEnvelope> {
   const wrappedBase64 = await wrapDataKey(dataKey, wrappingKey);
 
   if (kdfVersion === KDF_V1_PBKDF2) {
-    return wrappedBase64;
+    return asEnvelope(wrappedBase64);
   }
 
   if (kdfVersion === KDF_V2_ARGON2ID) {
-    return JSON.stringify({
+    return asEnvelope(JSON.stringify({
       v: 2,
       kdf: 'argon2id',
       kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
       wrapped: wrappedBase64,
-    });
+    }));
   }
 
-  throw new Error(`Unknown KDF version: ${kdfVersion}`);
+  throw new Error(`Unknown KDF version: ${kdfVersion as number}`);
 }
 
 /**
  * Generate a fresh random 32-byte DEK and import it as both an AES-GCM key
  * (for legacy/direct content encryption — and as a fallback when the chain
  * has only one entry) and an AES-KW key (for wrapping per-content CEKs).
- *
- * @returns {Promise<{gcmKey: CryptoKey, kwKey: CryptoKey, rawBytes: Uint8Array}>}
  */
-export async function generateRandomDataKey() {
+export async function generateRandomDataKey(): Promise<DataKeyHandles> {
   const rawBytes = crypto.getRandomValues(new Uint8Array(KEY_LENGTH_BYTES));
   const [gcmKey, kwKey] = await Promise.all([
-    crypto.subtle.importKey('raw', rawBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
-    crypto.subtle.importKey('raw', rawBytes, 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+    crypto.subtle.importKey('raw', bs(rawBytes), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+    crypto.subtle.importKey('raw', bs(rawBytes), 'AES-KW', true, ['wrapKey', 'unwrapKey']),
   ]);
   return { gcmKey, kwKey, rawBytes };
 }
@@ -791,31 +811,9 @@ export async function generateRandomDataKey() {
  *
  * Returns a normalized shape regardless of envelope version. v1/v2/v3 envelopes
  * are coerced into the v4-shaped multi-factor chain with a single `password`
- * wrapping per entry, so callers can branch on shape, not version:
- *   - `kdfVersion`      — KDF used to derive master_key (v1 or v2)
- *   - `envelopeVersion` — 1 (bare base64), 2 (single wrapped), 3 (DEK chain),
- *                          or 4 (multi-factor DEK chain — issue #12)
- *   - `dekChain`        — `[{gen, wrappings: [{factor, wrappedBase64}, ...]}, ...]`
- *                          (length 1 for v1/v2; single wrapping per entry for v1/v2/v3)
- *   - `wrappedBase64`   — convenience: highest-gen entry's `password` factor
- *                          wrapping (current generation, password-side)
- *   - `kdfParams`       — master_key KDF params copy (or null for v1)
- *   - `recovery`        — recovery-factor metadata for v4 envelopes that have one:
- *                          `{kdf, kdfParams, salt: Uint8Array}`. Null for v1/v2/v3
- *                          and for v4 envelopes that haven't enrolled a recovery
- *                          factor yet.
- *
- * @param {string} wireValue
- * @returns {{
- *   kdfVersion: number,
- *   envelopeVersion: number,
- *   dekChain: Array<{gen: number, wrappings: Array<{factor: string, wrappedBase64: string}>}>,
- *   wrappedBase64: string,
- *   kdfParams: object|null,
- *   recovery: { kdf: string, kdfParams: object, salt: Uint8Array } | null,
- * }}
+ * wrapping per entry, so callers can branch on shape, not version.
  */
-export function parseWrappedDataKey(wireValue) {
+export function parseWrappedDataKey(wireValue: string): ParsedWrappedDataKey {
   if (typeof wireValue !== 'string' || wireValue.length === 0) {
     throw new Error('wrapped_data_key must be a non-empty string');
   }
@@ -834,9 +832,9 @@ export function parseWrappedDataKey(wireValue) {
     };
   }
 
-  let parsed;
+  let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(wireValue);
+    parsed = JSON.parse(wireValue) as Record<string, unknown>;
   } catch {
     throw new Error('wrapped_data_key looks like an envelope but is not valid JSON');
   }
@@ -845,43 +843,44 @@ export function parseWrappedDataKey(wireValue) {
     throw new Error('wrapped_data_key envelope is missing required fields');
   }
 
-  if (parsed.v === 2 && parsed.kdf === 'argon2id') {
-    if (typeof parsed.wrapped !== 'string') {
+  if (parsed['v'] === 2 && parsed['kdf'] === 'argon2id') {
+    const wrapped = parsed['wrapped'];
+    if (typeof wrapped !== 'string') {
       throw new Error('wrapped_data_key envelope is missing required fields');
     }
     return {
       kdfVersion: KDF_V2_ARGON2ID,
       envelopeVersion: 2,
-      dekChain: [{ gen: 1, wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: parsed.wrapped }] }],
-      wrappedBase64: parsed.wrapped,
-      kdfParams: parsed.kdf_params || null,
+      dekChain: [{ gen: 1, wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: wrapped }] }],
+      wrappedBase64: wrapped,
+      kdfParams: (parsed['kdf_params'] as Argon2idParams | undefined) ?? null,
       recovery: null,
     };
   }
 
-  if (parsed.v === 3 && parsed.kdf === 'argon2id') {
-    if (!Array.isArray(parsed.dek_chain) || parsed.dek_chain.length === 0) {
+  if (parsed['v'] === 3 && parsed['kdf'] === 'argon2id') {
+    const dekChainRaw = parsed['dek_chain'];
+    if (!Array.isArray(dekChainRaw) || dekChainRaw.length === 0) {
       throw new Error('v3 wrapped_data_key envelope must have a non-empty dek_chain');
     }
-    const chain = parsed.dek_chain.map((entry, idx) => {
+    const chain: DekChainEntry[] = dekChainRaw.map((entry: unknown, idx: number) => {
+      const e = entry as Record<string, unknown> | null;
       if (
-        !entry ||
-        typeof entry !== 'object' ||
-        typeof entry.gen !== 'number' ||
-        !Number.isInteger(entry.gen) ||
-        entry.gen < 1 ||
-        typeof entry.wrapped !== 'string'
+        !e ||
+        typeof e !== 'object' ||
+        typeof e['gen'] !== 'number' ||
+        !Number.isInteger(e['gen']) ||
+        (e['gen'] as number) < 1 ||
+        typeof e['wrapped'] !== 'string'
       ) {
         throw new Error(`v3 wrapped_data_key envelope dek_chain[${idx}] is malformed`);
       }
       return {
-        gen: entry.gen,
-        wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: entry.wrapped }],
+        gen: e['gen'] as number,
+        wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: e['wrapped'] as string }],
       };
     });
-    // The current generation is the entry with the highest `gen`. We don't
-    // require chain order to be strictly ascending, but reject duplicates.
-    const seen = new Set();
+    const seen = new Set<number>();
     for (const e of chain) {
       if (seen.has(e.gen)) {
         throw new Error(`v3 wrapped_data_key envelope has duplicate gen: ${e.gen}`);
@@ -889,55 +888,59 @@ export function parseWrappedDataKey(wireValue) {
       seen.add(e.gen);
     }
     chain.sort((a, b) => a.gen - b.gen);
+    const top = chain[chain.length - 1]!;
     return {
       kdfVersion: KDF_V2_ARGON2ID,
       envelopeVersion: 3,
       dekChain: chain,
-      wrappedBase64: chain[chain.length - 1].wrappings[0].wrappedBase64,
-      kdfParams: parsed.kdf_params || null,
+      wrappedBase64: top.wrappings[0]!.wrappedBase64,
+      kdfParams: (parsed['kdf_params'] as Argon2idParams | undefined) ?? null,
       recovery: null,
     };
   }
 
-  if (parsed.v === 4 && parsed.kdf === 'argon2id') {
-    if (!Array.isArray(parsed.dek_chain) || parsed.dek_chain.length === 0) {
+  if (parsed['v'] === 4 && parsed['kdf'] === 'argon2id') {
+    const dekChainRaw = parsed['dek_chain'];
+    if (!Array.isArray(dekChainRaw) || dekChainRaw.length === 0) {
       throw new Error('v4 wrapped_data_key envelope must have a non-empty dek_chain');
     }
-    const chain = parsed.dek_chain.map((entry, idx) => {
+    const chain: DekChainEntry[] = dekChainRaw.map((entry: unknown, idx: number) => {
+      const e = entry as Record<string, unknown> | null;
       if (
-        !entry ||
-        typeof entry !== 'object' ||
-        typeof entry.gen !== 'number' ||
-        !Number.isInteger(entry.gen) ||
-        entry.gen < 1 ||
-        !Array.isArray(entry.wrappings) ||
-        entry.wrappings.length === 0
+        !e ||
+        typeof e !== 'object' ||
+        typeof e['gen'] !== 'number' ||
+        !Number.isInteger(e['gen']) ||
+        (e['gen'] as number) < 1 ||
+        !Array.isArray(e['wrappings']) ||
+        (e['wrappings'] as unknown[]).length === 0
       ) {
         throw new Error(`v4 wrapped_data_key envelope dek_chain[${idx}] is malformed`);
       }
-      const wrappings = entry.wrappings.map((w, wIdx) => {
+      const wrappings: ChainWrapping[] = (e['wrappings'] as unknown[]).map((w: unknown, wIdx: number) => {
+        const wo = w as Record<string, unknown> | null;
         if (
-          !w ||
-          typeof w !== 'object' ||
-          typeof w.factor !== 'string' ||
-          w.factor.length === 0 ||
-          typeof w.wrapped !== 'string'
+          !wo ||
+          typeof wo !== 'object' ||
+          typeof wo['factor'] !== 'string' ||
+          (wo['factor'] as string).length === 0 ||
+          typeof wo['wrapped'] !== 'string'
         ) {
           throw new Error(`v4 wrapped_data_key envelope dek_chain[${idx}].wrappings[${wIdx}] is malformed`);
         }
-        return { factor: w.factor, wrappedBase64: w.wrapped };
+        return { factor: wo['factor'] as string, wrappedBase64: wo['wrapped'] as string };
       });
       // No two wrappings in the same entry should share a factor name.
-      const factorSeen = new Set();
+      const factorSeen = new Set<string>();
       for (const w of wrappings) {
         if (factorSeen.has(w.factor)) {
           throw new Error(`v4 wrapped_data_key envelope dek_chain[${idx}] has duplicate factor: ${w.factor}`);
         }
         factorSeen.add(w.factor);
       }
-      return { gen: entry.gen, wrappings };
+      return { gen: e['gen'] as number, wrappings };
     });
-    const seen = new Set();
+    const seen = new Set<number>();
     for (const e of chain) {
       if (seen.has(e.gen)) {
         throw new Error(`v4 wrapped_data_key envelope has duplicate gen: ${e.gen}`);
@@ -946,44 +949,49 @@ export function parseWrappedDataKey(wireValue) {
     }
     chain.sort((a, b) => a.gen - b.gen);
 
-    let recovery = null;
-    if (parsed.recovery) {
-      const r = parsed.recovery;
+    let recovery: RecoveryMetadata | null = null;
+    const recoveryRaw = parsed['recovery'];
+    if (recoveryRaw) {
+      const r = recoveryRaw as Record<string, unknown>;
       if (
         !r ||
         typeof r !== 'object' ||
-        r.kdf !== 'argon2id' ||
-        !r.kdf_params ||
-        typeof r.salt !== 'string'
+        r['kdf'] !== 'argon2id' ||
+        !r['kdf_params'] ||
+        typeof r['salt'] !== 'string'
       ) {
         throw new Error('v4 wrapped_data_key envelope has malformed recovery block');
       }
-      const saltBytes = base64ToBytes(r.salt);
+      const saltBytes = base64ToBytesRaw(r['salt'] as string);
       if (saltBytes.length !== RECOVERY_SALT_LEN) {
         throw new Error(`v4 recovery.salt must decode to ${RECOVERY_SALT_LEN} bytes, got ${saltBytes.length}`);
       }
-      recovery = { kdf: r.kdf, kdfParams: r.kdf_params, salt: saltBytes };
+      recovery = {
+        kdf: 'argon2id',
+        kdfParams: r['kdf_params'] as Argon2idParams,
+        salt: saltBytes,
+      };
     }
 
     // Convenience field: highest-gen `password` wrapping (current write-side
     // wrapping). If there is no password wrapping at the current gen (would be
     // unusual — all current writers include one) fall back to the first
     // wrapping at the current gen.
-    const top = chain[chain.length - 1];
+    const top = chain[chain.length - 1]!;
     const pw = top.wrappings.find(w => w.factor === FACTOR_PASSWORD);
-    const wrappedBase64 = (pw || top.wrappings[0]).wrappedBase64;
+    const wrappedBase64 = (pw ?? top.wrappings[0]!).wrappedBase64;
 
     return {
       kdfVersion: KDF_V2_ARGON2ID,
       envelopeVersion: 4,
       dekChain: chain,
       wrappedBase64,
-      kdfParams: parsed.kdf_params || null,
+      kdfParams: (parsed['kdf_params'] as Argon2idParams | undefined) ?? null,
       recovery,
     };
   }
 
-  throw new Error(`Unsupported wrapped_data_key envelope version: v=${parsed.v} kdf=${parsed.kdf}`);
+  throw new Error(`Unsupported wrapped_data_key envelope version: v=${String(parsed['v'])} kdf=${String(parsed['kdf'])}`);
 }
 
 /**
@@ -992,16 +1000,25 @@ export function parseWrappedDataKey(wireValue) {
  *
  * For v3 envelopes, prefer {@link unwrapDataKeyChain} which returns the full
  * generation map needed to read older blobs.
- *
- * @param {string} wireValue
- * @param {CryptoKey} unwrappingKey
- * @returns {Promise<{ dataKey: CryptoKey, kdfVersion: number, kdfParams: object|null }>}
  */
-export async function unwrapDataKeyEnvelope(wireValue, unwrappingKey) {
+export async function unwrapDataKeyEnvelope(
+  wireValue: string,
+  unwrappingKey: CryptoKey,
+): Promise<{ dataKey: CryptoKey; kdfVersion: KdfVersion; kdfParams: Argon2idParams | null }> {
   const parsed = parseWrappedDataKey(wireValue);
   const dataKey = await unwrapDataKey(parsed.wrappedBase64, unwrappingKey);
   return { dataKey, kdfVersion: parsed.kdfVersion, kdfParams: parsed.kdfParams };
 }
+
+/** Result of unwrapping every DEK in a chain via a chosen factor's KEK. */
+export type UnwrappedDekChain = {
+  dekByGen: Map<number, DataKeyPair>;
+  currentGen: number;
+  envelopeVersion: EnvelopeVersion;
+  kdfVersion: KdfVersion;
+  kdfParams: Argon2idParams | null;
+  recovery: RecoveryMetadata | null;
+};
 
 /**
  * Unwrap every DEK in the chain via the named factor (defaults to
@@ -1010,48 +1027,35 @@ export async function unwrapDataKeyEnvelope(wireValue, unwrappingKey) {
  * envelopes — they expose a synthetic password wrapping per entry.
  *
  * Each value is a pair of WebCrypto handles for the same 32-byte DEK:
- *   - `gcmKey`: AES-GCM, extractable (used for legacy direct-DEK decryption,
- *               and as the key passed to AES-KW wrapKey on credential change)
+ *   - `gcmKey`: AES-GCM, extractable
  *   - `kwKey`:  AES-KW, used to wrap/unwrap per-content CEKs
- *
- * For v4 envelopes the caller passes the relevant factor's KEK (password or
- * recovery). The parser ensures every entry has at least one wrapping; if any
- * entry lacks the requested factor, this throws.
- *
- * @param {string} wireValue
- * @param {CryptoKey} unwrappingKey - AES-KW handle for the chosen factor's KEK
- * @param {string} [factor=FACTOR_PASSWORD]
- * @returns {Promise<{
- *   dekByGen: Map<number, {gcmKey: CryptoKey, kwKey: CryptoKey}>,
- *   currentGen: number,
- *   envelopeVersion: number,
- *   kdfVersion: number,
- *   kdfParams: object|null,
- *   recovery: { kdf: string, kdfParams: object, salt: Uint8Array } | null,
- * }>}
  */
-export async function unwrapDataKeyChain(wireValue, unwrappingKey, factor = FACTOR_PASSWORD) {
+export async function unwrapDataKeyChain(
+  wireValue: string,
+  unwrappingKey: CryptoKey,
+  factor: string = FACTOR_PASSWORD,
+): Promise<UnwrappedDekChain> {
   const parsed = parseWrappedDataKey(wireValue);
-  const dekByGen = new Map();
+  const dekByGen = new Map<number, DataKeyPair>();
   for (const entry of parsed.dekChain) {
     const wrapping = entry.wrappings.find(w => w.factor === factor);
     if (!wrapping) {
       throw new Error(`No '${factor}' wrapping for gen ${entry.gen}`);
     }
-    const wrapped = base64ToBytes(wrapping.wrappedBase64);
+    const wrapped = base64ToBytesRaw(wrapping.wrappedBase64);
     const [gcmKey, kwKey] = await Promise.all([
       crypto.subtle.unwrapKey(
-        'raw', wrapped, unwrappingKey, 'AES-KW',
+        'raw', bs(wrapped), unwrappingKey, 'AES-KW',
         { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
       ),
       crypto.subtle.unwrapKey(
-        'raw', wrapped, unwrappingKey, 'AES-KW',
+        'raw', bs(wrapped), unwrappingKey, 'AES-KW',
         'AES-KW', false, ['wrapKey', 'unwrapKey'],
       ),
     ]);
     dekByGen.set(entry.gen, { gcmKey, kwKey });
   }
-  const currentGen = parsed.dekChain[parsed.dekChain.length - 1].gen;
+  const currentGen = parsed.dekChain[parsed.dekChain.length - 1]!.gen;
   return {
     dekByGen,
     currentGen,
@@ -1062,44 +1066,34 @@ export async function unwrapDataKeyChain(wireValue, unwrappingKey, factor = FACT
   };
 }
 
-/**
- * Build a v3 envelope from a chain of (gen, raw_wrapped_base64) pairs.
- * Used when the chain has already been re-wrapped (e.g., after credential
- * change) and the wrapped bytes need to be packaged as a single envelope.
- *
- * @param {Array<{gen: number, wrappedBase64: string}>} chain
- * @returns {string}
- */
-export function buildV3Envelope(chain) {
+/** Build a v3 envelope from a chain of (gen, raw_wrapped_base64) pairs. */
+export function buildV3Envelope(
+  chain: ReadonlyArray<{ gen: number; wrappedBase64: string }>,
+): WrappedDataKeyEnvelope {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
   }
   const sorted = chain.slice().sort((a, b) => a.gen - b.gen);
-  return JSON.stringify({
+  return asEnvelope(JSON.stringify({
     v: 3,
     kdf: 'argon2id',
     kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
     dek_chain: sorted.map(e => ({ gen: e.gen, wrapped: e.wrappedBase64 })),
-  });
+  }));
 }
 
 /**
  * Wrap an array of DEK CryptoKeys (one per generation) under the given
  * wrapping key and pack into a v3 envelope.
- *
- * Each chain entry is `{gen, key}` where `key` is an extractable CryptoKey
- * holding the DEK bytes (any algorithm — AES-GCM or AES-KW handle both work,
- * since AES-KW wrapKey operates on raw bytes).
- *
- * @param {Array<{gen: number, key: CryptoKey}>} chain
- * @param {CryptoKey} wrappingKey
- * @returns {Promise<string>} The `wrapped_data_key` wire value (v3 envelope).
  */
-export async function wrapDataKeyChainEnvelope(chain, wrappingKey) {
+export async function wrapDataKeyChainEnvelope(
+  chain: ReadonlyArray<{ gen: number; key: CryptoKey }>,
+  wrappingKey: CryptoKey,
+): Promise<WrappedDataKeyEnvelope> {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
   }
-  const wrapped = [];
+  const wrapped: Array<{ gen: number; wrappedBase64: string }> = [];
   for (const entry of chain) {
     if (!entry || typeof entry.gen !== 'number' || !entry.key) {
       throw new Error('chain entries must be {gen: number, key: CryptoKey}');
@@ -1112,27 +1106,23 @@ export async function wrapDataKeyChainEnvelope(chain, wrappingKey) {
 
 // ============ v4 ENVELOPE — MULTI-FACTOR WRAPPING (issue #12) ============
 
-/**
- * Generate a fresh random salt for the recovery KDF (per-account, 16 bytes).
- * Stored in the v4 envelope's `recovery.salt` field.
- *
- * @returns {Uint8Array}
- */
-export function generateRecoverySalt() {
+/** Generate a fresh random salt for the recovery KDF (per-account, 16 bytes). */
+export function generateRecoverySalt(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(RECOVERY_SALT_LEN));
 }
 
+export type V4FactorInput = { name: string; wrappingKey: CryptoKey };
+export type V4ChainEntry = { gen: number; wrappings: ChainWrapping[] };
+export type V4Recovery = { salt: Uint8Array; kdfParams?: Argon2idParams } | null;
+
 /**
  * Build a v4 envelope from a chain whose entries each carry one or more
- * already-wrapped factors (raw base64 ciphertexts). Recovery metadata is
- * required when any chain entry has a `recovery_phrase` wrapping; otherwise
- * pass `null` to indicate no recovery factor is enrolled.
- *
- * @param {Array<{gen: number, wrappings: Array<{factor: string, wrappedBase64: string}>}>} chain
- * @param {{ salt: Uint8Array, kdfParams?: {m_kib: number, t: number, p: number} } | null} recovery
- * @returns {string}
+ * already-wrapped factors (raw base64 ciphertexts).
  */
-export function buildV4Envelope(chain, recovery) {
+export function buildV4Envelope(
+  chain: ReadonlyArray<V4ChainEntry>,
+  recovery: V4Recovery,
+): WrappedDataKeyEnvelope {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
   }
@@ -1148,17 +1138,18 @@ export function buildV4Envelope(chain, recovery) {
       throw new Error('chain entries must be {gen: number, wrappings: [{factor, wrappedBase64}, ...]}');
     }
   }
-  const sorted = chain.slice().sort((a, b) => a.gen - b.gen);
+  const sorted: V4ChainEntry[] = chain.slice().sort((a, b) => a.gen - b.gen);
 
   // If any entry references a recovery_phrase wrapping, the envelope MUST
-  // carry the recovery metadata block — otherwise readers can't derive the
-  // recovery KEK.
-  const hasRecoveryWrap = sorted.some(e => e.wrappings.some(w => w.factor === FACTOR_RECOVERY_PHRASE));
+  // carry the recovery metadata block.
+  const hasRecoveryWrap = sorted.some((e: V4ChainEntry) =>
+    e.wrappings.some((w: ChainWrapping) => w.factor === FACTOR_RECOVERY_PHRASE),
+  );
   if (hasRecoveryWrap && !recovery) {
     throw new Error('chain has recovery_phrase wrappings but no recovery metadata supplied');
   }
 
-  const out = {
+  const out: Record<string, unknown> = {
     v: 4,
     kdf: 'argon2id',
     kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
@@ -1167,42 +1158,32 @@ export function buildV4Envelope(chain, recovery) {
     if (!(recovery.salt instanceof Uint8Array) || recovery.salt.length !== RECOVERY_SALT_LEN) {
       throw new Error(`recovery.salt must be a Uint8Array of length ${RECOVERY_SALT_LEN}`);
     }
-    out.recovery = {
+    out['recovery'] = {
       kdf: 'argon2id',
-      kdf_params: recovery.kdfParams || {
+      kdf_params: recovery.kdfParams ?? {
         m_kib: ARGON2ID_MEMORY_KIB,
         t: ARGON2ID_ITERATIONS,
         p: ARGON2ID_PARALLELISM,
       },
-      salt: bytesToBase64(recovery.salt),
+      salt: bytesToBase64Raw(recovery.salt),
     };
   }
-  out.dek_chain = sorted.map(e => ({
+  out['dek_chain'] = sorted.map((e: V4ChainEntry) => ({
     gen: e.gen,
-    wrappings: e.wrappings.map(w => ({ factor: w.factor, wrapped: w.wrappedBase64 })),
+    wrappings: e.wrappings.map((w: ChainWrapping) => ({ factor: w.factor, wrapped: w.wrappedBase64 })),
   }));
-  return JSON.stringify(out);
+  return asEnvelope(JSON.stringify(out));
 }
 
 /**
  * Wrap a chain of DEK CryptoKeys under one or more factors and pack into a v4
  * envelope. Each chain entry is wrapped independently under every factor.
- *
- * Factors are passed as `{name, wrappingKey}` records — `name` is the factor
- * label written into the envelope (e.g., `FACTOR_PASSWORD`, `FACTOR_RECOVERY_PHRASE`)
- * and `wrappingKey` is the AES-KW handle used to wrap each entry's DEK.
- *
- * The output envelope is byte-stable for a fixed (chain, factors) input set:
- * AES-KW is deterministic, JSON.stringify is insertion-ordered, and chain +
- * wrappings are written in the input order. Callers that need register-retry
- * idempotency must call this with a stable factor order.
- *
- * @param {Array<{gen: number, key: CryptoKey}>} chain
- * @param {Array<{name: string, wrappingKey: CryptoKey}>} factors
- * @param {{ salt: Uint8Array, kdfParams?: {m_kib: number, t: number, p: number} } | null} recovery
- * @returns {Promise<string>} The `wrapped_data_key` wire value (v4 envelope).
  */
-export async function wrapDataKeyChainEnvelopeV4(chain, factors, recovery) {
+export async function wrapDataKeyChainEnvelopeV4(
+  chain: ReadonlyArray<{ gen: number; key: CryptoKey }>,
+  factors: ReadonlyArray<V4FactorInput>,
+  recovery: V4Recovery,
+): Promise<WrappedDataKeyEnvelope> {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
   }
@@ -1216,7 +1197,7 @@ export async function wrapDataKeyChainEnvelopeV4(chain, factors, recovery) {
   }
   // Forbid duplicate factor names — each entry's wrappings list must be unique
   // by factor.
-  const seenFactors = new Set();
+  const seenFactors = new Set<string>();
   for (const f of factors) {
     if (seenFactors.has(f.name)) throw new Error(`Duplicate factor name: ${f.name}`);
     seenFactors.add(f.name);
@@ -1226,12 +1207,12 @@ export async function wrapDataKeyChainEnvelopeV4(chain, factors, recovery) {
     throw new Error('recovery metadata is required when factors include recovery_phrase');
   }
 
-  const wrappedChain = [];
+  const wrappedChain: V4ChainEntry[] = [];
   for (const entry of chain) {
     if (!entry || typeof entry.gen !== 'number' || !entry.key) {
       throw new Error('chain entries must be {gen: number, key: CryptoKey}');
     }
-    const wrappings = [];
+    const wrappings: ChainWrapping[] = [];
     for (const f of factors) {
       const wrappedBase64 = await wrapDataKey(entry.key, f.wrappingKey);
       wrappings.push({ factor: f.name, wrappedBase64 });
@@ -1243,21 +1224,25 @@ export async function wrapDataKeyChainEnvelopeV4(chain, factors, recovery) {
 
 // ============ CHALLENGE SIGNING ============
 
-/**
- * Sign a nonce with the ECDSA P-256 private key.
- * @param {CryptoKey} privateKey
- * @param {string} nonceHex - 64-char hex nonce
- * @returns {Promise<string>} Base64-encoded raw ECDSA signature (64 bytes: r||s)
- */
-export async function signChallenge(privateKey, nonceHex) {
+/** Sign a nonce with the ECDSA P-256 private key. Returns base64-encoded raw signature. */
+export async function signChallenge(privateKey: CryptoKey, nonceHex: string): Promise<Base64> {
   const nonceBytes = hexToBytes(nonceHex);
   const signature = await crypto.subtle.sign(
-    { name: 'ECDSA', hash: 'SHA-256' }, privateKey, nonceBytes
+    { name: 'ECDSA', hash: 'SHA-256' }, privateKey, bs(nonceBytes),
   );
-  return bytesToBase64(new Uint8Array(signature));
+  return asBase64(bytesToBase64Raw(new Uint8Array(signature)));
 }
 
 // ============ CONVENIENCE: DERIVE ALL KEYS ============
+
+export type AllKeys = {
+  masterKey: Uint8Array;
+  credentialLookupKey: LookupKey;
+  credentialEncryptionKey: DataKeyHandles;
+  signingKeyPair: SigningKeyPair;
+  sharingKeyPair: SharingKeyPair;
+  kdfVersion: KdfVersion;
+};
 
 /**
  * Derive all keys from email + password + app in one call.
@@ -1266,21 +1251,13 @@ export async function signChallenge(privateKey, nonceHex) {
  * a `share_pub` (register, changeCredentials) get it without an extra HKDF
  * call. The keypair is per-app — `share_pub` for the same email+password
  * differs across `app_id` values, just like the existing sub-keys.
- *
- * @param {string} email
- * @param {string} password
- * @param {string} appId - Registered app identifier
- * @param {number} [kdfVersion=KDF_DEFAULT] — KDF_V1_PBKDF2 or KDF_V2_ARGON2ID
- * @returns {Promise<{
- *   masterKey: Uint8Array,
- *   credentialLookupKey: string,
- *   credentialEncryptionKey: {gcmKey, kwKey, rawBytes},
- *   signingKeyPair: {privateKey: CryptoKey, publicKey: CryptoKey},
- *   sharingKeyPair: {privateKey: Uint8Array, publicKey: Uint8Array},
- *   kdfVersion: number,
- * }>}
  */
-export async function deriveAllKeys(email, password, appId, kdfVersion = KDF_DEFAULT) {
+export async function deriveAllKeys(
+  email: string,
+  password: string,
+  appId: string,
+  kdfVersion: KdfVersion = KDF_DEFAULT,
+): Promise<AllKeys> {
   if (!appId) throw new Error('appId is required');
   const masterKey = await deriveMasterKey(email, password, kdfVersion);
   const [credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair] = await Promise.all([
@@ -1294,49 +1271,75 @@ export async function deriveAllKeys(email, password, appId, kdfVersion = KDF_DEF
 
 // ============ ENCODING HELPERS ============
 
-function concatBytes(a, b) {
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   const result = new Uint8Array(a.length + b.length);
   result.set(a, 0);
   result.set(b, a.length);
   return result;
 }
 
-function bytesToHex(bytes) {
+function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function hexToBytes(hex) {
+function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
   return bytes;
 }
 
-function bytesToBigInt(bytes) {
+function bytesToBigInt(bytes: Uint8Array): bigint {
   let result = 0n;
   for (const b of bytes) result = (result << 8n) | BigInt(b);
   return result;
 }
 
-export function bytesToBase64(bytes) {
-  return btoa(String.fromCharCode(...bytes));
+// Internal raw versions (return plain `string`, not branded). Public wrappers
+// further down brand the result.
+function bytesToBase64Raw(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(bin);
 }
 
-export function base64ToBytes(base64) {
-  const bin = atob(base64);
+function base64ToBytesRaw(b64: string): Uint8Array {
+  const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
 }
 
+function bytesToBase64UrlRaw(bytes: Uint8Array): string {
+  return bytesToBase64Raw(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlToBytesRaw(b64url: string): Uint8Array {
+  const padded = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const padLen = (4 - (padded.length % 4)) % 4;
+  return base64ToBytesRaw(padded + '='.repeat(padLen));
+}
+
+// Public encoding helpers — keep `string` returns to match the existing JS
+// surface (callers haven't been migrated to brands yet). The branded
+// constructors are available internally for new code that wants the
+// type-safety.
+export function bytesToBase64(bytes: Uint8Array): string {
+  return bytesToBase64Raw(bytes);
+}
+
+export function base64ToBytes(base64: string): Uint8Array {
+  return base64ToBytesRaw(base64);
+}
+
 // Base64url (RFC 4648 §5) — `+` → `-`, `/` → `_`, no padding. Used by the
 // sharing design's `B(x)` notation (sharing §2) for `share_pub` and other
 // share-log values where URL/tag safety matters.
-export function bytesToBase64Url(bytes) {
-  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64UrlRaw(bytes);
 }
 
-export function base64UrlToBytes(b64url) {
-  const padded = b64url.replace(/-/g, '+').replace(/_/g, '/');
-  const padLen = (4 - (padded.length % 4)) % 4;
-  return base64ToBytes(padded + '='.repeat(padLen));
+export function base64UrlToBytes(b64url: string): Uint8Array {
+  return base64UrlToBytesRaw(b64url);
 }
