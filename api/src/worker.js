@@ -11,7 +11,7 @@ import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, 
 import { handleRecoveryEmail } from './routes/recovery.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
-import { handleSetRules, handleSetInviteTemplate } from './routes/apps.js';
+import { handleSetRules, handleSetInviteTemplate, handleSetSchema } from './routes/apps.js';
 import { handleStatus } from './routes/status.js';
 import { handleListSessions, handleRevokeSession, handleRevokeAllSessions } from './routes/sessions.js';
 import {
@@ -230,6 +230,12 @@ export default {
       const rulesMatch = path.match(/^\/api\/v1\/accounts\/([a-f0-9]{64})\/rules$/);
       if (rulesMatch && method === 'PUT') {
         return await handleSetRules(rulesMatch[1], request, env, ctx, cors);
+      }
+
+      // App schema publication (authenticated, app role) — SDK redesign step 5
+      const schemaMatch = path.match(/^\/api\/v1\/apps\/([^/]+)\/schema$/);
+      if (schemaMatch && method === 'PUT') {
+        return await handleSetSchema(schemaMatch[1], request, env, ctx, cors);
       }
 
       return errorResponse('Not found', 404, cors);

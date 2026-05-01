@@ -375,6 +375,111 @@ if (appReady) {
     const res = await fetchJSON('/api/v1/status');
     assert(res.status === 401, `Expected 401, got ${res.status}`);
   });
+
+  // ============ Section 8c: schema publication (SDK redesign step 5) ============
+
+  console.log('\n=== Schema publication ===');
+
+  function makeBookishSchema(version = 4) {
+    return {
+      appId: APP_ID,
+      version,
+      collections: {
+        books: {
+          primaryKey: 'bookId',
+          fields: {
+            bookId: 'string',
+            title: 'string',
+            author: 'string?',
+          },
+          shareable: true,
+        },
+      },
+    };
+  }
+
+  await test('Publish schema: happy path', async () => {
+    const schema = makeBookishSchema(1);
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ version: 1, schema }),
+    });
+    assert(res.status === 200, `Expected 200, got ${res.status}: ${res.text}`);
+    assert(res.json.ok === true, 'Response should have ok: true');
+    assert(res.json.app_id === APP_ID, 'Response should echo app_id');
+    assert(res.json.version === 1, 'Response should echo version');
+    assert(typeof res.json.txid === 'string' && res.json.txid.length > 0, 'Response should carry a txid');
+  });
+
+  await test('Publish schema: bumping version creates a new txid', async () => {
+    const schemaA = makeBookishSchema(2);
+    const a = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ version: 2, schema: schemaA }),
+    });
+    assert(a.status === 200, `v2 failed: ${a.status} ${a.text}`);
+
+    const schemaB = makeBookishSchema(3);
+    schemaB.collections.books.fields.rating = 'number?';
+    const b = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ version: 3, schema: schemaB }),
+    });
+    assert(b.status === 200, `v3 failed: ${b.status} ${b.text}`);
+    assert(a.json.txid !== b.json.txid, 'Different versions should produce different txids');
+  });
+
+  await test('Publish schema: app_id mismatch -> 403', async () => {
+    const schema = { ...makeBookishSchema(1), appId: 'other-app' };
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ version: 1, schema }),
+    });
+    assert(res.status === 400, `Expected 400, got ${res.status}: ${res.text}`);
+  });
+
+  await test('Publish schema: version/schema.version mismatch -> 400', async () => {
+    const schema = makeBookishSchema(2);
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ version: 1, schema }), // body says 1, schema says 2
+    });
+    assert(res.status === 400, `Expected 400, got ${res.status}: ${res.text}`);
+  });
+
+  await test('Publish schema: non-app JWT -> 403', async () => {
+    const user = await registerUser();
+    const schema = makeBookishSchema(1);
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${user.jwt}` },
+      body: JSON.stringify({ version: 1, schema }),
+    });
+    assert(res.status === 403, `Expected 403, got ${res.status}: ${res.text}`);
+  });
+
+  await test('Publish schema: unauthenticated -> 401', async () => {
+    const schema = makeBookishSchema(1);
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      body: JSON.stringify({ version: 1, schema }),
+    });
+    assert(res.status === 401, `Expected 401, got ${res.status}: ${res.text}`);
+  });
+
+  await test('Publish schema: missing version -> 400', async () => {
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/schema`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ schema: makeBookishSchema(1) }),
+    });
+    assert(res.status === 400, `Expected 400, got ${res.status}: ${res.text}`);
+  });
 }
 
 // ============ SUMMARY ============
