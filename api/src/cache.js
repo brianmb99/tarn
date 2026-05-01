@@ -72,11 +72,21 @@ export async function upsertEntries(db, edges) {
 /**
  * Get resolved (live) entries for a data_lookup_key+app+type.
  * Filters tombstones, superseded Prev-chain entries, and Eid duplicates.
+ *
+ * Deliberately excludes the blob_data column — clients fetch blobs separately
+ * via /api/v1/entries/{txid}. With ~200 entries and ~10 MB of cumulative blob
+ * data, loading them all into a single Worker invocation pushes us past the
+ * 128 MB per-request memory limit and CF returns error 1102 (resource limits
+ * exceeded). Metadata-only keeps this query O(rows) in memory regardless of
+ * blob size.
  */
 export async function getResolvedEntries(db, app, type, dataLookupKey, { limit = 100, cursor = null } = {}) {
-  // Fetch all entries for this scope (including tombstones and superseded)
+  // Fetch all entry metadata for this scope (including tombstones and superseded).
+  // blob_data is intentionally omitted — see header comment.
   const all = await db.prepare(
-    'SELECT * FROM entries WHERE app = ?1 AND type = ?2 AND lookup_key = ?3'
+    `SELECT txid, app, type, wallet_addr, lookup_key, eid, prev_txid,
+            is_tombstone, tombstone_ref, block_timestamp, tags_json, cached_at
+     FROM entries WHERE app = ?1 AND type = ?2 AND lookup_key = ?3`
   ).bind(app, type, dataLookupKey).all();
 
   const rows = all.results || [];

@@ -1342,14 +1342,20 @@ export class TarnClient {
       if (!cursor) break;
     }
 
-    // Decrypt all entries — use inline blob data from API when available,
-    // fall back to gateway fetch only for entries without cached blobs
+    // Current Tarn list responses return metadata only (no blob bytes inline)
+    // because returning ~10 MB of inline base64 in a single Worker response
+    // exceeds the 128 MB per-request memory limit. Blobs are fetched per-txid
+    // below via #fetchBlob, which tries Tarn's per-entry endpoint (D1
+    // write-through) and falls back to public Arweave gateways.
+    //
+    // The inline-data branch is retained for backward-compat with older API
+    // deployments that still return entry.data — clients linked against a
+    // newer API ignore it.
     const entries = [];
     const needsFetch = [];
 
     for (const entry of allRawEntries) {
       if (entry.data) {
-        // Blob data returned inline from API (base64) — decrypt directly
         try {
           const blobBytes = base64ToBytes(entry.data);
           const data = await this.#decryptBlob(blobBytes, entry.tags);
@@ -1358,7 +1364,6 @@ export class TarnClient {
           console.warn(`Failed to decrypt inline entry ${entry.txid}:`, err.message);
         }
       } else {
-        // No inline data — need to fetch from Arweave gateway (backfill not yet done)
         needsFetch.push(entry);
       }
     }
@@ -4535,6 +4540,18 @@ export class TarnClient {
   }
 
   async #fetchBlob(txid) {
+    // Try Tarn's per-entry endpoint first. Tarn serves blob_data from D1
+    // (write-through cache), so this resolves pending entries that haven't yet
+    // confirmed on Arweave — the gateways would 404 on those. Fall back to
+    // public gateways if Tarn is unavailable or the blob is missing from D1.
+    try {
+      const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET' });
+      if (res.ok) {
+        const json = await res.json();
+        if (json?.data) return base64ToBytes(json.data);
+      }
+    } catch {}
+
     const gateways = [
       `https://turbo-gateway.com/${txid}`,
       `https://arweave.net/${txid}`,

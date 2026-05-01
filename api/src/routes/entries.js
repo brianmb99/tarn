@@ -4,7 +4,9 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { getResolvedEntries, getEntryByTxid, refreshCache } from '../cache.js';
 import { checkAndIncrementRateLimit } from '../rate-limit.js';
 
-// Convert blob_data from D1 (ArrayBuffer/Uint8Array) to base64 for JSON transport
+// Convert blob_data from D1 (ArrayBuffer/Uint8Array) to base64 for JSON transport.
+// Only used by the single-entry endpoint (handleEntryById) — the list endpoint
+// returns metadata only and clients fetch each blob via /api/v1/entries/{txid}.
 function blobToBase64(blob) {
   if (!blob) return null;
   const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
@@ -51,6 +53,11 @@ export async function handleEntries(url, env, ctx, cors, request) {
   // Resolve live entries (tombstone + Prev-chain + Eid filtering)
   const { entries, total } = await getResolvedEntries(env.DB, app, type, key, { limit, cursor });
 
+  // Metadata-only response. Blob bytes are NOT returned here — clients fetch
+  // each blob via GET /api/v1/entries/{txid} (or directly from a public Arweave
+  // gateway). Returning ~10 MB of inline base64 in a single response was pushing
+  // the Worker past the 128 MB per-request memory limit and producing CF
+  // error 1102 (resource limits exceeded) for users with ~200+ entries.
   return jsonResponse({
     entries: entries.map(e => ({
       txid: e.txid,
@@ -60,7 +67,6 @@ export async function handleEntries(url, env, ctx, cors, request) {
       tags: e.tags_json ? JSON.parse(e.tags_json) : [],
       confirmed: e.block_timestamp != null,
       cachedAt: e.cached_at,
-      data: blobToBase64(e.blob_data),
       gatewayUrl: `https://arweave.net/${e.txid}`,
     })),
     pagination: {
