@@ -31,7 +31,6 @@ import { bytesToBase64Url, base64UrlToBytes } from './crypto.js';
 // ============ CONSTANTS ============
 
 const TEXT_ENCODER = new TextEncoder();
-const TEXT_DECODER = new TextDecoder();
 
 // HPKE info strings — bind ciphertexts to a specific protocol version + role,
 // per RFC 9180 §5.1 recommendations. Mismatched info on Open() returns
@@ -87,19 +86,21 @@ const suite = new CipherSuite({
   aead: new Aes256Gcm(),
 });
 
+// ============ WebCrypto BufferSource cast (matches crypto.ts pattern) ============
+
+function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
+  return b as BufferSource;
+}
+
 // ============ INBOX TAG DERIVATION ============
 
-/**
- * Compute the rolling day window for a unix timestamp (sharing §6.1).
- * @param {number} unixSeconds
- * @returns {number}
- */
-export function inboxWindowFor(unixSeconds) {
+/** Compute the rolling day window for a unix timestamp (sharing §6.1). */
+export function inboxWindowFor(unixSeconds: number): number {
   return Math.floor(unixSeconds / SECONDS_PER_DAY);
 }
 
 /** Current inbox window — `floor(unix_timestamp / 86400)`. */
-export function currentInboxWindow(now = Date.now()) {
+export function currentInboxWindow(now: number = Date.now()): number {
   return inboxWindowFor(Math.floor(now / 1000));
 }
 
@@ -107,19 +108,15 @@ export function currentInboxWindow(now = Date.now()) {
  * Last `count` inbox windows ending at the current window, descending
  * (newest first). Used by `listIncomingRequests` to poll the recent backlog
  * (default 30 days per design §6.1).
- *
- * @param {number} count
- * @param {number} [now=Date.now()]
- * @returns {number[]}
  */
-export function recentInboxWindows(count, now = Date.now()) {
+export function recentInboxWindows(count: number, now: number = Date.now()): number[] {
   const cur = currentInboxWindow(now);
-  const out = [];
+  const out: number[] = [];
   for (let i = 0; i < count; i++) out.push(cur - i);
   return out;
 }
 
-function encodeUint64BE(n) {
+function encodeUint64BE(n: number): Uint8Array {
   // Unsigned 64-bit BE. JS numbers are safe up to 2^53; inbox windows are
   // (unix/86400) — well under 2^53 for any plausible timestamp — so a plain
   // bigint conversion at the boundary is enough without needing a BigInt
@@ -138,17 +135,12 @@ function encodeUint64BE(n) {
  *   inbox_tag(recipient_share_pub, app_id, window) =
  *     B(HMAC(H(recipient_share_pub),
  *       "tarn-connection-inbox-v1-" || app_id || "-" || encode_uint64(window)))
- *
- * The HMAC key is `SHA-256(share_pub)` — a stable per-recipient secret in the
- * sense that it is publicly derivable by anyone who knows the recipient's
- * share_pub, which is intentional: senders need to compute it.
- *
- * @param {Uint8Array} recipientSharePub - 32 raw X25519 bytes
- * @param {string} appId
- * @param {number} window - integer day window from `currentInboxWindow()`
- * @returns {Promise<string>} base64url tag value (43 chars)
  */
-export async function deriveInboxTag(recipientSharePub, appId, window) {
+export async function deriveInboxTag(
+  recipientSharePub: Uint8Array,
+  appId: string,
+  window: number,
+): Promise<string> {
   if (!(recipientSharePub instanceof Uint8Array) || recipientSharePub.length !== 32) {
     throw new Error('recipientSharePub must be a 32-byte Uint8Array');
   }
@@ -157,14 +149,11 @@ export async function deriveInboxTag(recipientSharePub, appId, window) {
     throw new Error('window must be a non-negative integer');
   }
   const hmacKeyBytes = new Uint8Array(
-    await crypto.subtle.digest('SHA-256', recipientSharePub),
+    await crypto.subtle.digest('SHA-256', bs(recipientSharePub)),
   );
   const hmacKey = await crypto.subtle.importKey(
-    'raw', hmacKeyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+    'raw', bs(hmacKeyBytes), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
   );
-  // Concatenate the label, app_id, "-", and 8-byte window. The label already
-  // ends with "-" so no extra separator before app_id; we add an explicit "-"
-  // between app_id and the window bytes to match the design notation.
   const labelPrefix = TEXT_ENCODER.encode(INBOX_TAG_LABEL_PREFIX);
   const appBytes = TEXT_ENCODER.encode(appId);
   const dash = TEXT_ENCODER.encode('-');
@@ -176,71 +165,48 @@ export async function deriveInboxTag(recipientSharePub, appId, window) {
   msg.set(dash, off); off += dash.length;
   msg.set(windowBytes, off);
 
-  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, msg));
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, bs(msg)));
   return bytesToBase64Url(sig);
 }
 
 // ============ HPKE SEAL / OPEN ============
 
-/**
- * Wire-format envelope for an HPKE-sealed handshake blob:
- *   bytes[0..32)  = enc (ephemeral pubkey, 32 bytes for X25519)
- *   bytes[32..)   = AEAD ciphertext + tag
- *
- * Total overhead vs. plaintext: 32 (enc) + 16 (AEAD tag) = 48 bytes. The two
- * pieces are concatenated so that consumers can store/transmit a single blob
- * without a separate "enc" sidecar — matching the design doc's "request_blob"
- * + "accept_blob" being single Arweave blobs.
- */
-
-/**
- * Import a 32-byte raw X25519 public key as an HPKE recipient public key.
- * @param {Uint8Array} sharePub
- */
-async function importHpkePublicKey(sharePub) {
+async function importHpkePublicKey(sharePub: Uint8Array): Promise<CryptoKey> {
   if (!(sharePub instanceof Uint8Array) || sharePub.length !== 32) {
     throw new Error('share_pub must be a 32-byte Uint8Array');
   }
-  return await suite.kem.importKey('raw', sharePub.buffer.slice(sharePub.byteOffset, sharePub.byteOffset + 32), true);
+  return await suite.kem.importKey(
+    'raw',
+    sharePub.buffer.slice(sharePub.byteOffset, sharePub.byteOffset + 32) as ArrayBuffer,
+    true,
+  );
 }
 
-/**
- * Import a 32-byte raw X25519 private key as an HPKE recipient private key,
- * and re-derive the matching public key. The HPKE library expects a CryptoKey
- * pair (`{ privateKey, publicKey }`) when opening; deriving the public from
- * the private is cheaper than re-deriving it from `master_key` here.
- *
- * @param {Uint8Array} sharePriv - 32-byte X25519 scalar
- */
-async function importHpkePrivateKeyPair(sharePriv) {
+async function importHpkePrivateKeyPair(sharePriv: Uint8Array): Promise<{ privateKey: CryptoKey; publicKey: CryptoKey }> {
   if (!(sharePriv instanceof Uint8Array) || sharePriv.length !== 32) {
     throw new Error('share_priv must be a 32-byte Uint8Array');
   }
   const privateKey = await suite.kem.importKey(
     'raw',
-    sharePriv.buffer.slice(sharePriv.byteOffset, sharePriv.byteOffset + 32),
+    sharePriv.buffer.slice(sharePriv.byteOffset, sharePriv.byteOffset + 32) as ArrayBuffer,
     false,
   );
   // The KEM exposes derivePublicKey via its primitives interface — use it via
   // the suite's kem instance. Falls back to JWK round-trip if needed.
-  const jwk = await crypto.subtle.exportKey('jwk', privateKey);
+  const jwk = await crypto.subtle.exportKey('jwk', privateKey) as JsonWebKey & { d?: string };
   delete jwk.d;
   delete jwk.key_ops;
   const publicKey = await crypto.subtle.importKey('jwk', jwk, { name: 'X25519' }, true, []);
   return { privateKey, publicKey };
 }
 
-/**
- * HPKE-Seal an arbitrary plaintext to a recipient (sharing §6.2 / §6.4).
- *
- * @param {{
- *   recipientSharePub: Uint8Array,
- *   info: string,
- *   plaintext: Uint8Array,
- * }} opts
- * @returns {Promise<Uint8Array>} Wire blob: enc(32) || ciphertext+tag
- */
-export async function hpkeSeal({ recipientSharePub, info, plaintext }) {
+/** HPKE-Seal an arbitrary plaintext to a recipient. Wire blob: enc(32) || ciphertext+tag. */
+export async function hpkeSeal(opts: {
+  recipientSharePub: Uint8Array;
+  info: string;
+  plaintext: Uint8Array;
+}): Promise<Uint8Array> {
+  const { recipientSharePub, info, plaintext } = opts;
   if (!info) throw new Error('info is required');
   if (!(plaintext instanceof Uint8Array)) {
     throw new Error('plaintext must be a Uint8Array');
@@ -251,7 +217,9 @@ export async function hpkeSeal({ recipientSharePub, info, plaintext }) {
     info: TEXT_ENCODER.encode(info),
   });
   const enc = new Uint8Array(sender.enc);
-  const ct = new Uint8Array(await sender.seal(plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength)));
+  const ct = new Uint8Array(await sender.seal(
+    plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength) as ArrayBuffer,
+  ));
   if (enc.length !== 32) {
     throw new Error(`unexpected enc length ${enc.length} (X25519 should give 32)`);
   }
@@ -264,15 +232,13 @@ export async function hpkeSeal({ recipientSharePub, info, plaintext }) {
 /**
  * HPKE-Open a wire blob with the local share_priv. Throws on AEAD failure
  * (wrong key, tampered ciphertext, or `info` mismatch).
- *
- * @param {{
- *   sharePriv: Uint8Array,
- *   info: string,
- *   blob: Uint8Array,
- * }} opts
- * @returns {Promise<Uint8Array>} plaintext
  */
-export async function hpkeOpen({ sharePriv, info, blob }) {
+export async function hpkeOpen(opts: {
+  sharePriv: Uint8Array;
+  info: string;
+  blob: Uint8Array;
+}): Promise<Uint8Array> {
+  const { sharePriv, info, blob } = opts;
   if (!info) throw new Error('info is required');
   if (!(blob instanceof Uint8Array) || blob.length < 32 + 16) {
     throw new Error('blob too short for HPKE envelope');
@@ -285,31 +251,39 @@ export async function hpkeOpen({ sharePriv, info, blob }) {
   const recipientKey = await importHpkePrivateKeyPair(sharePriv);
   const recipient = await suite.createRecipientContext({
     recipientKey,
-    enc: enc.buffer.slice(enc.byteOffset, enc.byteOffset + enc.byteLength),
+    enc: enc.buffer.slice(enc.byteOffset, enc.byteOffset + enc.byteLength) as ArrayBuffer,
     info: TEXT_ENCODER.encode(info),
   });
-  const ptBuf = await recipient.open(ct.buffer.slice(ct.byteOffset, ct.byteOffset + ct.byteLength));
+  const ptBuf = await recipient.open(ct.buffer.slice(ct.byteOffset, ct.byteOffset + ct.byteLength) as ArrayBuffer);
   return new Uint8Array(ptBuf);
 }
 
 // ============ CONNECTION REQUEST / ACCEPT PAYLOADS ============
 
-/**
- * Build a connection-request payload (sharing §6.2). Returns the JSON object —
- * caller will serialize, HPKE-seal, and publish.
- *
- * @param {{
- *   senderEmail: string,
- *   senderSharePub: Uint8Array,
- *   senderSigningPubBase64: string,    // existing Tarn ECDSA P-256 SPKI base64
- *   senderAppId: string,
- *   message?: string,
- *   timestamp?: number,                // unix seconds; defaults to now
- *   nonce?: Uint8Array,                // 16 random bytes; generated if absent
- * }} opts
- * @returns {{ type: 'connection_request', sender_email: string, sender_share_pub: string, sender_signing_pub: string, sender_app_id: string, nonce: string, timestamp: number, message?: string, via_invite_token?: string }}
- */
-export function buildConnectionRequestPayload(opts) {
+export type BuildConnectionRequestOpts = {
+  senderEmail: string;
+  senderSharePub: Uint8Array;
+  senderSigningPubBase64: string;
+  senderAppId: string;
+  message?: string;
+  timestamp?: number;
+  nonce?: Uint8Array;
+  viaInviteToken?: string;
+};
+
+export type ConnectionRequestPayload = {
+  type: 'connection_request';
+  sender_email: string;
+  sender_share_pub: string;
+  sender_signing_pub: string;
+  sender_app_id: string;
+  nonce: string;
+  timestamp: number;
+  message?: string;
+  via_invite_token?: string;
+};
+
+export function buildConnectionRequestPayload(opts: BuildConnectionRequestOpts): ConnectionRequestPayload {
   const senderEmail = requireString(opts.senderEmail, 'senderEmail');
   const senderSigningPub = requireString(opts.senderSigningPubBase64, 'senderSigningPubBase64');
   const senderAppId = requireString(opts.senderAppId, 'senderAppId');
@@ -331,7 +305,7 @@ export function buildConnectionRequestPayload(opts) {
   if (nonce.length !== 16) throw new Error('nonce must be 16 bytes');
   const timestamp = opts.timestamp ?? Math.floor(Date.now() / 1000);
 
-  const out = {
+  const out: ConnectionRequestPayload = {
     type: 'connection_request',
     sender_email: senderEmail,
     sender_share_pub: bytesToBase64Url(opts.senderSharePub),
@@ -345,110 +319,129 @@ export function buildConnectionRequestPayload(opts) {
   return out;
 }
 
+export type NormalizedConnectionRequest = {
+  type: 'connection_request';
+  senderEmail: string;
+  senderSharePub: Uint8Array;
+  senderSharePubBase64Url: string;
+  senderSigningPubBase64: string;
+  senderAppId: string;
+  nonce: Uint8Array;
+  nonceBase64Url: string;
+  timestamp: number;
+  message: string | null;
+  viaInviteToken: string | null;
+};
+
+export type ValidationResult<T> =
+  | { valid: true; normalized: T }
+  | { valid: false; reason: string };
+
 /**
  * Validate a decoded connection-request payload (sharing §6.3 + §13.8).
  *
  * Returns `{ valid: false, reason }` on any structural problem, replay-window
  * violation, or wrong-app mismatch. Returns `{ valid: true, normalized }` on
- * success — `normalized` is a typed view (with `senderSharePub` and `nonce`
- * already decoded to bytes) suitable for storing in the inbound pending list.
- *
- * Replay protection (the recent-nonce cache check) is performed by
- * {@link checkAndRecordNonce}, *not* here — we want callers to validate the
- * payload first (cheap) before consulting the cache.
- *
- * @param {*} payload - Anything that decoded out of HPKE-Open + JSON.parse
- * @param {string} expectedAppId - app_id of the recipient's TarnClient
- * @param {number} [now=Date.now()/1000] - unix seconds, override for tests
+ * success.
  */
-export function validateConnectionRequestPayload(payload, expectedAppId, now = Math.floor(Date.now() / 1000)) {
+export function validateConnectionRequestPayload(
+  payload: unknown,
+  expectedAppId: string,
+  now: number = Math.floor(Date.now() / 1000),
+): ValidationResult<NormalizedConnectionRequest> {
   if (!payload || typeof payload !== 'object') {
     return { valid: false, reason: 'payload must be an object' };
   }
-  if (payload.type !== 'connection_request') {
-    return { valid: false, reason: `wrong type: ${payload.type}` };
+  const p = payload as Record<string, unknown>;
+  if (p['type'] !== 'connection_request') {
+    return { valid: false, reason: `wrong type: ${String(p['type'])}` };
   }
-  if (typeof payload.sender_email !== 'string' || payload.sender_email.length === 0) {
+  if (typeof p['sender_email'] !== 'string' || (p['sender_email'] as string).length === 0) {
     return { valid: false, reason: 'sender_email missing or invalid' };
   }
-  if (typeof payload.sender_app_id !== 'string' || payload.sender_app_id !== expectedAppId) {
-    // Per-app isolation (sharing §1.4): a request originating in app X must
-    // not be processable as an app-Y request even if it lands at the wrong
-    // inbox tag (tags differ across apps but defense-in-depth is cheap).
-    return { valid: false, reason: `sender_app_id ${payload.sender_app_id} != ${expectedAppId}` };
+  if (typeof p['sender_app_id'] !== 'string' || p['sender_app_id'] !== expectedAppId) {
+    return { valid: false, reason: `sender_app_id ${String(p['sender_app_id'])} != ${expectedAppId}` };
   }
-  let senderSharePub;
+  let senderSharePub: Uint8Array;
   try {
-    senderSharePub = base64UrlToBytes(payload.sender_share_pub);
+    senderSharePub = base64UrlToBytes(p['sender_share_pub'] as string);
     if (senderSharePub.length !== 32) {
       return { valid: false, reason: `sender_share_pub must be 32 bytes, got ${senderSharePub.length}` };
     }
   } catch {
     return { valid: false, reason: 'sender_share_pub is not valid base64url' };
   }
-  if (typeof payload.sender_signing_pub !== 'string' || payload.sender_signing_pub.length === 0) {
+  if (typeof p['sender_signing_pub'] !== 'string' || (p['sender_signing_pub'] as string).length === 0) {
     return { valid: false, reason: 'sender_signing_pub missing or invalid' };
   }
-  let nonce;
+  let nonce: Uint8Array;
   try {
-    nonce = base64UrlToBytes(payload.nonce);
+    nonce = base64UrlToBytes(p['nonce'] as string);
     if (nonce.length !== 16) {
       return { valid: false, reason: `nonce must be 16 bytes, got ${nonce.length}` };
     }
   } catch {
     return { valid: false, reason: 'nonce is not valid base64url' };
   }
-  if (!Number.isFinite(payload.timestamp) || !Number.isInteger(payload.timestamp)) {
+  if (!Number.isFinite(p['timestamp']) || !Number.isInteger(p['timestamp'])) {
     return { valid: false, reason: 'timestamp must be an integer' };
   }
-  if (payload.timestamp < now - REPLAY_PAST_WINDOW_SEC) {
+  const ts = p['timestamp'] as number;
+  if (ts < now - REPLAY_PAST_WINDOW_SEC) {
     return { valid: false, reason: 'timestamp too old (>7 days)' };
   }
-  if (payload.timestamp > now + REPLAY_FUTURE_WINDOW_SEC) {
+  if (ts > now + REPLAY_FUTURE_WINDOW_SEC) {
     return { valid: false, reason: 'timestamp too far in the future' };
   }
-  if (payload.message != null) {
-    if (typeof payload.message !== 'string') {
+  if (p['message'] != null) {
+    if (typeof p['message'] !== 'string') {
       return { valid: false, reason: 'message must be a string when present' };
     }
-    if (payload.message.length > MAX_REQUEST_MESSAGE_LEN) {
+    if ((p['message'] as string).length > MAX_REQUEST_MESSAGE_LEN) {
       return { valid: false, reason: `message exceeds ${MAX_REQUEST_MESSAGE_LEN} chars` };
     }
   }
-  if (payload.via_invite_token != null && typeof payload.via_invite_token !== 'string') {
+  if (p['via_invite_token'] != null && typeof p['via_invite_token'] !== 'string') {
     return { valid: false, reason: 'via_invite_token must be a string when present' };
   }
   return {
     valid: true,
     normalized: {
       type: 'connection_request',
-      senderEmail: payload.sender_email,
+      senderEmail: p['sender_email'] as string,
       senderSharePub,
-      senderSharePubBase64Url: payload.sender_share_pub,
-      senderSigningPubBase64: payload.sender_signing_pub,
-      senderAppId: payload.sender_app_id,
+      senderSharePubBase64Url: p['sender_share_pub'] as string,
+      senderSigningPubBase64: p['sender_signing_pub'] as string,
+      senderAppId: p['sender_app_id'] as string,
       nonce,
-      nonceBase64Url: payload.nonce,
-      timestamp: payload.timestamp,
-      message: payload.message ?? null,
-      viaInviteToken: payload.via_invite_token ?? null,
+      nonceBase64Url: p['nonce'] as string,
+      timestamp: ts,
+      message: (p['message'] as string | undefined) ?? null,
+      viaInviteToken: (p['via_invite_token'] as string | undefined) ?? null,
     },
   };
 }
 
-/**
- * Build an accept payload (sharing §6.4).
- *
- * @param {{
- *   senderEmail: string,
- *   senderSharePub: Uint8Array,
- *   senderSigningPubBase64: string,
- *   senderAppId: string,
- *   inReplyToNonceBase64Url: string,
- *   timestamp?: number,
- * }} opts
- */
-export function buildConnectionAcceptPayload(opts) {
+export type BuildConnectionAcceptOpts = {
+  senderEmail: string;
+  senderSharePub: Uint8Array;
+  senderSigningPubBase64: string;
+  senderAppId: string;
+  inReplyToNonceBase64Url: string;
+  timestamp?: number;
+};
+
+export type ConnectionAcceptPayload = {
+  type: 'connection_accept';
+  sender_email: string;
+  sender_share_pub: string;
+  sender_signing_pub: string;
+  sender_app_id: string;
+  in_reply_to: string;
+  timestamp: number;
+};
+
+export function buildConnectionAcceptPayload(opts: BuildConnectionAcceptOpts): ConnectionAcceptPayload {
   const senderEmail = requireString(opts.senderEmail, 'senderEmail');
   const senderSigningPub = requireString(opts.senderSigningPubBase64, 'senderSigningPubBase64');
   const senderAppId = requireString(opts.senderAppId, 'senderAppId');
@@ -467,98 +460,88 @@ export function buildConnectionAcceptPayload(opts) {
   };
 }
 
-/**
- * Validate a decoded accept payload. Same shape as
- * {@link validateConnectionRequestPayload} except for `in_reply_to`.
- * Forged-accept defense (sharing §13.9) is performed by callers
- * cross-referencing the returned `inReplyTo` against their outbound pending
- * list — see {@link findOutboundForAccept}.
- */
-export function validateConnectionAcceptPayload(payload, expectedAppId, now = Math.floor(Date.now() / 1000)) {
+export type NormalizedConnectionAccept = {
+  type: 'connection_accept';
+  senderEmail: string;
+  senderSharePub: Uint8Array;
+  senderSharePubBase64Url: string;
+  senderSigningPubBase64: string;
+  senderAppId: string;
+  inReplyToNonceBase64Url: string;
+  timestamp: number;
+};
+
+export function validateConnectionAcceptPayload(
+  payload: unknown,
+  expectedAppId: string,
+  now: number = Math.floor(Date.now() / 1000),
+): ValidationResult<NormalizedConnectionAccept> {
   if (!payload || typeof payload !== 'object') {
     return { valid: false, reason: 'payload must be an object' };
   }
-  if (payload.type !== 'connection_accept') {
-    return { valid: false, reason: `wrong type: ${payload.type}` };
+  const p = payload as Record<string, unknown>;
+  if (p['type'] !== 'connection_accept') {
+    return { valid: false, reason: `wrong type: ${String(p['type'])}` };
   }
-  if (typeof payload.sender_email !== 'string' || payload.sender_email.length === 0) {
+  if (typeof p['sender_email'] !== 'string' || (p['sender_email'] as string).length === 0) {
     return { valid: false, reason: 'sender_email missing or invalid' };
   }
-  if (typeof payload.sender_app_id !== 'string' || payload.sender_app_id !== expectedAppId) {
-    return { valid: false, reason: `sender_app_id ${payload.sender_app_id} != ${expectedAppId}` };
+  if (typeof p['sender_app_id'] !== 'string' || p['sender_app_id'] !== expectedAppId) {
+    return { valid: false, reason: `sender_app_id ${String(p['sender_app_id'])} != ${expectedAppId}` };
   }
-  let senderSharePub;
+  let senderSharePub: Uint8Array;
   try {
-    senderSharePub = base64UrlToBytes(payload.sender_share_pub);
+    senderSharePub = base64UrlToBytes(p['sender_share_pub'] as string);
     if (senderSharePub.length !== 32) {
       return { valid: false, reason: `sender_share_pub must be 32 bytes, got ${senderSharePub.length}` };
     }
   } catch {
     return { valid: false, reason: 'sender_share_pub is not valid base64url' };
   }
-  if (typeof payload.sender_signing_pub !== 'string' || payload.sender_signing_pub.length === 0) {
+  if (typeof p['sender_signing_pub'] !== 'string' || (p['sender_signing_pub'] as string).length === 0) {
     return { valid: false, reason: 'sender_signing_pub missing or invalid' };
   }
-  if (typeof payload.in_reply_to !== 'string' || payload.in_reply_to.length === 0) {
+  if (typeof p['in_reply_to'] !== 'string' || (p['in_reply_to'] as string).length === 0) {
     return { valid: false, reason: 'in_reply_to missing' };
   }
-  if (!Number.isFinite(payload.timestamp) || !Number.isInteger(payload.timestamp)) {
+  if (!Number.isFinite(p['timestamp']) || !Number.isInteger(p['timestamp'])) {
     return { valid: false, reason: 'timestamp must be an integer' };
   }
-  if (payload.timestamp < now - REPLAY_PAST_WINDOW_SEC) {
+  const ts = p['timestamp'] as number;
+  if (ts < now - REPLAY_PAST_WINDOW_SEC) {
     return { valid: false, reason: 'timestamp too old (>7 days)' };
   }
-  if (payload.timestamp > now + REPLAY_FUTURE_WINDOW_SEC) {
+  if (ts > now + REPLAY_FUTURE_WINDOW_SEC) {
     return { valid: false, reason: 'timestamp too far in the future' };
   }
   return {
     valid: true,
     normalized: {
       type: 'connection_accept',
-      senderEmail: payload.sender_email,
+      senderEmail: p['sender_email'] as string,
       senderSharePub,
-      senderSharePubBase64Url: payload.sender_share_pub,
-      senderSigningPubBase64: payload.sender_signing_pub,
-      senderAppId: payload.sender_app_id,
-      inReplyToNonceBase64Url: payload.in_reply_to,
-      timestamp: payload.timestamp,
+      senderSharePubBase64Url: p['sender_share_pub'] as string,
+      senderSigningPubBase64: p['sender_signing_pub'] as string,
+      senderAppId: p['sender_app_id'] as string,
+      inReplyToNonceBase64Url: p['in_reply_to'] as string,
+      timestamp: ts,
     },
   };
 }
 
 // ============ REPLAY-NONCE CACHE (sharing §13.8) ============
 
-/**
- * In-memory recent-nonce cache. Each device keeps one cache; entries expire
- * after `REPLAY_NONCE_TTL_SEC`. Replay defense is best-effort — it does not
- * survive client restart, so an attacker re-publishing a captured request
- * after the recipient's session ends would still be re-surfaced. The
- * timestamp window check (which the recipient performs on every payload) is
- * the primary defense; the cache is the runtime tightening for the live
- * session.
- *
- * The cache is keyed by `nonceBase64Url` only — same payload, same nonce,
- * same key. We do NOT scope by sender, so an attacker swapping `sender_email`
- * but keeping `nonce` still gets dropped. (Sender swap can't pass HPKE_Open
- * anyway — the recipient's private key is what unwraps, and the inner
- * sender_share_pub is what gets compared during connection establishment — but the cache
- * dedupe is one extra layer.)
- */
+export type ReplayNonceCache = { entries: Map<string, number> };
 
-/** @returns {{ entries: Map<string, number> }} */
-export function makeReplayNonceCache() {
+export function makeReplayNonceCache(): ReplayNonceCache {
   return { entries: new Map() };
 }
 
-/**
- * Record a nonce as seen, OR reject as a replay if already present.
- *
- * @param {{ entries: Map<string, number> }} cache
- * @param {string} nonceBase64Url - the request's nonce in base64url
- * @param {number} [now=Date.now()/1000] - unix seconds
- * @returns {{ replay: boolean }}
- */
-export function checkAndRecordNonce(cache, nonceBase64Url, now = Math.floor(Date.now() / 1000)) {
+export function checkAndRecordNonce(
+  cache: ReplayNonceCache,
+  nonceBase64Url: string,
+  now: number = Math.floor(Date.now() / 1000),
+): { replay: boolean } {
   if (!cache || !(cache.entries instanceof Map)) {
     throw new Error('cache must be a replay-nonce cache (use makeReplayNonceCache)');
   }
@@ -581,19 +564,16 @@ export function checkAndRecordNonce(cache, nonceBase64Url, now = Math.floor(Date
 
 /**
  * Cross-reference an incoming accept's `in_reply_to` nonce against the local
- * outbound pending list. Unmatched accepts are silently ignored — the user
- * is not prompted, no connection record entry is created.
+ * outbound pending list. Unmatched accepts are silently ignored.
  *
  * Accepts entries that expose either `request_nonce` (the on-the-wire record
  * shape per §7.2) or `requestNonce` (the camelCase view typically used in
- * UI/SDK code). Test fixtures and the real persisted record can mix shapes
- * cheaply this way without forcing a normalization step at every call site.
- *
- * @param {string} inReplyToNonceBase64Url
- * @param {Iterable<{request_nonce?: string, requestNonce?: string}>} outboundPending
- * @returns {object | null} the matching outbound pending entry, or null on forgery
+ * UI/SDK code).
  */
-export function findOutboundForAccept(inReplyToNonceBase64Url, outboundPending) {
+export function findOutboundForAccept<T extends { request_nonce?: string; requestNonce?: string }>(
+  inReplyToNonceBase64Url: string,
+  outboundPending: Iterable<T>,
+): T | null {
   if (typeof inReplyToNonceBase64Url !== 'string') return null;
   for (const entry of outboundPending) {
     if (!entry) continue;
@@ -605,56 +585,73 @@ export function findOutboundForAccept(inReplyToNonceBase64Url, outboundPending) 
 
 // ============ CONNECTIONS + PENDING-REQUESTS RECORD SHAPES ============
 
-// Empty initial record bodies (sharing §7.1, §7.2). The connections + pending
-// records live as encrypted Tarn data blobs (per-content CEK pattern from
-// issue #11 / Section 2). Operational state like `last_seq_seen` is per-
-// device, NOT in the durable record (Section 3 review).
-
 export const CONNECTIONS_CONTENT_ID = 'tarn-connections-v1';
 export const PENDING_REQUESTS_CONTENT_ID = 'tarn-pending-requests-v1';
 
-/**
- * Shape: an empty connections record for a fresh account.
- * @param {string} appId
- */
-export function emptyConnectionsRecord(appId) {
+/** A single durable connection entry, as stored in the connections record. */
+export type ConnectionEntry = {
+  share_pub: string;
+  signing_pub: string;
+  credential_lookup_key?: string;
+  rotated_at?: number;
+  prior_share_pub?: string;
+  // Apps may attach additional fields (label, etc.); pass-through.
+  [key: string]: unknown;
+};
+
+export type ConnectionsRecord = {
+  app_id: string;
+  version: 1;
+  connections: ConnectionEntry[];
+};
+
+export type PendingEntry = {
+  request_nonce: string;
+  // Other fields (peer_share_pub, peer_email, message, timestamp, ...) flow through.
+  [key: string]: unknown;
+};
+
+export type PendingRequestsRecord = {
+  app_id: string;
+  version: 1;
+  outbound: PendingEntry[];
+  inbound: PendingEntry[];
+};
+
+export function emptyConnectionsRecord(appId: string): ConnectionsRecord {
   return { app_id: appId, version: 1, connections: [] };
 }
 
-/** Shape: an empty pending-requests record. */
-export function emptyPendingRequestsRecord(appId) {
+export function emptyPendingRequestsRecord(appId: string): PendingRequestsRecord {
   return { app_id: appId, version: 1, outbound: [], inbound: [] };
 }
 
 /**
  * Append a connection (idempotent on `share_pub`) to the connections record.
  * Replaces an existing entry with the same share_pub if present.
- *
- * Inputs are de-typed (base64url strings + JSON numbers) so the record can
- * be JSON-serialized verbatim.
  */
-export function upsertConnection(record, connection) {
+export function upsertConnection(record: ConnectionsRecord, connection: ConnectionEntry): ConnectionsRecord {
   if (!record || !Array.isArray(record.connections)) {
     throw new Error('record must be a connections record');
   }
   if (!connection || typeof connection.share_pub !== 'string') {
     throw new Error('connection.share_pub is required');
   }
-  const idx = record.connections.findIndex(c => c.share_pub === connection.share_pub);
-  const out = { ...record, connections: record.connections.slice() };
+  const idx = record.connections.findIndex((c: ConnectionEntry) => c.share_pub === connection.share_pub);
+  const out: ConnectionsRecord = { ...record, connections: record.connections.slice() };
   if (idx >= 0) out.connections[idx] = connection;
   else out.connections.push(connection);
   return out;
 }
 
 /**
- * Remove a connection (idempotent on `share_pub`) from the connections
- * record. Used by the §10.1 removeConnection flow. Returns the record
- * unchanged if no entry matched. Direction-aware: this is one-side; the
- * removed party retains their own connections record entry until they
- * independently remove back.
+ * Remove a connection (idempotent on `share_pub`) from the connections record.
+ * Returns the record unchanged if no entry matched.
  */
-export function removeConnection(record, connectionSharePubBase64Url) {
+export function removeConnection(
+  record: ConnectionsRecord,
+  connectionSharePubBase64Url: string,
+): ConnectionsRecord {
   if (!record || !Array.isArray(record.connections)) {
     throw new Error('record must be a connections record');
   }
@@ -663,9 +660,16 @@ export function removeConnection(record, connectionSharePubBase64Url) {
   }
   return {
     ...record,
-    connections: record.connections.filter(c => c.share_pub !== connectionSharePubBase64Url),
+    connections: record.connections.filter((c: ConnectionEntry) => c.share_pub !== connectionSharePubBase64Url),
   };
 }
+
+export type RotateIdentityUpdate = {
+  newSharePubBase64Url: string;
+  newSigningPubBase64: string;
+  newCredentialLookupKey: string;
+  rotatedAt: number;
+};
 
 /**
  * Apply a `rotate_identity` announcement (sharing §13.5) to a connection's
@@ -673,22 +677,12 @@ export function removeConnection(record, connectionSharePubBase64Url) {
  * the announcement's ECDSA signature against the connection's
  * currently-cached `signing_pub` BEFORE calling this — the helper itself
  * does no crypto.
- *
- * Replaces share_pub, signing_pub, and credential_lookup_key with the values
- * carried in the announcement. Records the rotation timestamp and the
- * pre-rotation share_pub for audit. Returns the record unchanged if the
- * connection isn't found (defensive — should not happen in normal flow).
- *
- * @param {Object} record - connections record
- * @param {string} connectionSharePubBase64Url - the connection's CURRENT share_pub
- * @param {{
- *   newSharePubBase64Url: string,
- *   newSigningPubBase64: string,
- *   newCredentialLookupKey: string,
- *   rotatedAt: number,
- * }} update
  */
-export function rotateConnectionIdentity(record, connectionSharePubBase64Url, update) {
+export function rotateConnectionIdentity(
+  record: ConnectionsRecord,
+  connectionSharePubBase64Url: string,
+  update: RotateIdentityUpdate,
+): ConnectionsRecord {
   if (!record || !Array.isArray(record.connections)) {
     throw new Error('record must be a connections record');
   }
@@ -703,10 +697,10 @@ export function rotateConnectionIdentity(record, connectionSharePubBase64Url, up
   ) {
     throw new Error('rotateConnectionIdentity: update must have newSharePubBase64Url, newSigningPubBase64, newCredentialLookupKey, rotatedAt');
   }
-  const idx = record.connections.findIndex(c => c.share_pub === connectionSharePubBase64Url);
+  const idx = record.connections.findIndex((c: ConnectionEntry) => c.share_pub === connectionSharePubBase64Url);
   if (idx < 0) return record;
-  const prior = record.connections[idx];
-  const rotated = {
+  const prior = record.connections[idx]!;
+  const rotated: ConnectionEntry = {
     ...prior,
     share_pub: update.newSharePubBase64Url,
     signing_pub: update.newSigningPubBase64,
@@ -720,42 +714,42 @@ export function rotateConnectionIdentity(record, connectionSharePubBase64Url, up
 }
 
 /** Add an outbound pending request (idempotent on request_nonce). */
-export function addOutboundPending(record, entry) {
+export function addOutboundPending(record: PendingRequestsRecord, entry: PendingEntry): PendingRequestsRecord {
   ensurePendingShape(record);
   if (!entry || typeof entry.request_nonce !== 'string') {
     throw new Error('entry.request_nonce is required');
   }
-  if (record.outbound.some(o => o.request_nonce === entry.request_nonce)) {
-    return record; // already there
+  if (record.outbound.some((o: PendingEntry) => o.request_nonce === entry.request_nonce)) {
+    return record;
   }
   return { ...record, outbound: [...record.outbound, entry] };
 }
 
 /** Add an inbound pending request (idempotent on request_nonce). */
-export function addInboundPending(record, entry) {
+export function addInboundPending(record: PendingRequestsRecord, entry: PendingEntry): PendingRequestsRecord {
   ensurePendingShape(record);
   if (!entry || typeof entry.request_nonce !== 'string') {
     throw new Error('entry.request_nonce is required');
   }
-  if (record.inbound.some(i => i.request_nonce === entry.request_nonce)) {
+  if (record.inbound.some((i: PendingEntry) => i.request_nonce === entry.request_nonce)) {
     return record;
   }
   return { ...record, inbound: [...record.inbound, entry] };
 }
 
 /** Remove an outbound pending entry by request_nonce. */
-export function removeOutboundPending(record, requestNonce) {
+export function removeOutboundPending(record: PendingRequestsRecord, requestNonce: string): PendingRequestsRecord {
   ensurePendingShape(record);
-  return { ...record, outbound: record.outbound.filter(o => o.request_nonce !== requestNonce) };
+  return { ...record, outbound: record.outbound.filter((o: PendingEntry) => o.request_nonce !== requestNonce) };
 }
 
 /** Remove an inbound pending entry by request_nonce. */
-export function removeInboundPending(record, requestNonce) {
+export function removeInboundPending(record: PendingRequestsRecord, requestNonce: string): PendingRequestsRecord {
   ensurePendingShape(record);
-  return { ...record, inbound: record.inbound.filter(i => i.request_nonce !== requestNonce) };
+  return { ...record, inbound: record.inbound.filter((i: PendingEntry) => i.request_nonce !== requestNonce) };
 }
 
-function ensurePendingShape(record) {
+function ensurePendingShape(record: PendingRequestsRecord): void {
   if (!record || !Array.isArray(record.outbound) || !Array.isArray(record.inbound)) {
     throw new Error('record must be a pending-requests record');
   }
@@ -763,36 +757,24 @@ function ensurePendingShape(record) {
 
 // ============ MUTED-CONNECTIONS RECORD (Section 6, issue #18) ============
 
-// Per-side, per-user visibility filter on top of the mutual-connection
-// primitive. Muted state has no protocol-level effect — it does NOT stop the
-// muted party from publishing share-log entries to us, and it does NOT alter
-// what they can read on their side. It is purely a local "should this
-// connection's content show up in the default feed" toggle, persisted as a
-// DEK-encrypted Tarn data blob so it syncs across the user's own devices.
-//
-// Apps decide when to filter. The SDK exposes `isMuted(connection)` and
-// `listMutedConnections()` so an app can render a muted connection in a
-// "Muted" tab even while excluding them from the main feed.
-
 export const MUTED_CONNECTIONS_CONTENT_ID = 'tarn-muted-connections-v1';
 
-/**
- * Shape: an empty muted-connections record for a fresh account.
- * @param {string} appId
- */
-export function emptyMutedConnectionsRecord(appId) {
+export type MutedEntry = { share_pub: string; muted_at: number };
+export type MutedConnectionsRecord = {
+  app_id: string;
+  version: 1;
+  muted: MutedEntry[];
+};
+
+export function emptyMutedConnectionsRecord(appId: string): MutedConnectionsRecord {
   return { app_id: appId, version: 1, muted: [] };
 }
 
-/**
- * Add a muted entry (idempotent on `share_pub`). Existing entries' `muted_at`
- * are preserved — re-muting an already-muted connection is a no-op.
- *
- * @param {Object} record
- * @param {string} connectionSharePubBase64Url
- * @param {number} mutedAt - unix seconds
- */
-export function addMutedConnection(record, connectionSharePubBase64Url, mutedAt) {
+export function addMutedConnection(
+  record: MutedConnectionsRecord,
+  connectionSharePubBase64Url: string,
+  mutedAt: number,
+): MutedConnectionsRecord {
   if (!record || !Array.isArray(record.muted)) {
     throw new Error('record must be a muted-connections record');
   }
@@ -802,7 +784,7 @@ export function addMutedConnection(record, connectionSharePubBase64Url, mutedAt)
   if (!Number.isInteger(mutedAt)) {
     throw new Error('mutedAt must be an integer (unix seconds)');
   }
-  if (record.muted.some(m => m.share_pub === connectionSharePubBase64Url)) {
+  if (record.muted.some((m: MutedEntry) => m.share_pub === connectionSharePubBase64Url)) {
     return record;
   }
   return {
@@ -811,11 +793,10 @@ export function addMutedConnection(record, connectionSharePubBase64Url, mutedAt)
   };
 }
 
-/**
- * Remove a muted entry (idempotent on `share_pub`). Returns the record
- * unchanged if the connection wasn't muted.
- */
-export function removeMutedConnection(record, connectionSharePubBase64Url) {
+export function removeMutedConnection(
+  record: MutedConnectionsRecord,
+  connectionSharePubBase64Url: string,
+): MutedConnectionsRecord {
   if (!record || !Array.isArray(record.muted)) {
     throw new Error('record must be a muted-connections record');
   }
@@ -824,52 +805,58 @@ export function removeMutedConnection(record, connectionSharePubBase64Url) {
   }
   return {
     ...record,
-    muted: record.muted.filter(m => m.share_pub !== connectionSharePubBase64Url),
+    muted: record.muted.filter((m: MutedEntry) => m.share_pub !== connectionSharePubBase64Url),
   };
 }
 
-/** True if `connectionSharePubBase64Url` appears in the muted record. */
-export function isMutedInRecord(record, connectionSharePubBase64Url) {
+export function isMutedInRecord(record: MutedConnectionsRecord, connectionSharePubBase64Url: string): boolean {
   if (!record || !Array.isArray(record.muted)) {
     throw new Error('record must be a muted-connections record');
   }
-  return record.muted.some(m => m.share_pub === connectionSharePubBase64Url);
+  return record.muted.some((m: MutedEntry) => m.share_pub === connectionSharePubBase64Url);
 }
 
-function requireString(v, name) {
+function requireString(v: unknown, name: string): string {
   if (typeof v !== 'string' || v.length === 0) throw new Error(`${name} must be a non-empty string`);
   return v;
 }
 
 // ============ ISSUED-INVITES RECORD (Section 8, issue #22) ============
 
-// Mirrors the muted-connections pattern: a DEK-encrypted Tarn data blob that
-// syncs across the inviter's devices. Used by `listIssuedInvites` and by the
-// auto-accept path in `listIncomingRequests` (where we always re-read fresh
-// from the API — no in-memory cache for that match).
-
 export const ISSUED_INVITES_CONTENT_ID = 'tarn-issued-invites-v1';
 
-export function emptyIssuedInvitesRecord(appId) {
+export type IssuedInviteEntry = {
+  token_id: string;
+  // Other fields (created_at, expires_at, ...) flow through.
+  [key: string]: unknown;
+};
+
+export type IssuedInvitesRecord = {
+  app_id: string;
+  version: 1;
+  invites: IssuedInviteEntry[];
+};
+
+export function emptyIssuedInvitesRecord(appId: string): IssuedInvitesRecord {
   return { app_id: appId, version: 1, invites: [] };
 }
 
-export function addIssuedInvite(record, entry) {
+export function addIssuedInvite(record: IssuedInvitesRecord, entry: IssuedInviteEntry): IssuedInvitesRecord {
   if (!record || !Array.isArray(record.invites)) {
     throw new Error('record must be an issued-invites record');
   }
   if (!entry || typeof entry.token_id !== 'string') {
     throw new Error('entry.token_id is required');
   }
-  if (record.invites.some(i => i.token_id === entry.token_id)) {
+  if (record.invites.some((i: IssuedInviteEntry) => i.token_id === entry.token_id)) {
     return record;
   }
   return { ...record, invites: [...record.invites, entry] };
 }
 
-export function removeIssuedInvite(record, tokenId) {
+export function removeIssuedInvite(record: IssuedInvitesRecord, tokenId: string): IssuedInvitesRecord {
   if (!record || !Array.isArray(record.invites)) {
     throw new Error('record must be an issued-invites record');
   }
-  return { ...record, invites: record.invites.filter(i => i.token_id !== tokenId) };
+  return { ...record, invites: record.invites.filter((i: IssuedInviteEntry) => i.token_id !== tokenId) };
 }
