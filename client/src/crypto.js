@@ -80,7 +80,9 @@ const X25519_KEY_LEN = 32;
 // offsets stable so a recipient (Section 5 work) can skip bytes 5..44
 // without parsing tags.
 export const TARN_BLOB_MAGIC = new Uint8Array([0x54, 0x41, 0x52, 0x4e, 0x02]);
-const WRAPPED_CEK_LEN = 40; // 32-byte CEK + 8-byte AES-KW overhead
+export const TARN_BLOB_MAGIC_LEN = TARN_BLOB_MAGIC.length;
+export const TARN_WRAPPED_CEK_LEN = 40; // 32-byte CEK + 8-byte AES-KW overhead
+const WRAPPED_CEK_LEN = TARN_WRAPPED_CEK_LEN; // internal alias for the existing call sites
 const CEK_LEN_BYTES = 32;
 const IV_LEN_BYTES = 12;
 const GCM_TAG_LEN_BYTES = 16;
@@ -558,9 +560,16 @@ export function hasTarnBlobMagic(blob) {
  * This keeps the byte layout from the design doc unchanged so a recipient
  * who only has the CEK can skip bytes 5..44 without parsing tags.
  *
+ * The raw CEK is returned alongside the blob (base64url-encoded) so the
+ * caller can publish it through the share-log without re-deriving via an
+ * AES-KW unwrap. Sharing-path callers populate the SDK's in-memory shareKey
+ * cache from this; non-sharing callers simply ignore the field.
+ *
  * @param {CryptoKey} dek - AES-KW wrapping key for the current generation
  * @param {Object} plaintext - JSON-serializable payload
- * @returns {Promise<Uint8Array>} Wire format: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag
+ * @returns {Promise<{blob: Uint8Array, shareKey: string}>}
+ *   `blob` wire format: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag.
+ *   `shareKey` is the base64url-encoded raw CEK (32 bytes).
  */
 export async function encryptWithCEK(dek, plaintext) {
   // Generate a fresh CEK and import into both AES-GCM (for content) and AES-KW
@@ -584,15 +593,16 @@ export async function encryptWithCEK(dek, plaintext) {
     await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cekGcm, data)
   );
 
-  const out = new Uint8Array(
+  const blob = new Uint8Array(
     TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN + IV_LEN_BYTES + ciphertextAndTag.length
   );
   let off = 0;
-  out.set(TARN_BLOB_MAGIC, off); off += TARN_BLOB_MAGIC.length;
-  out.set(wrappedCEK, off); off += WRAPPED_CEK_LEN;
-  out.set(iv, off); off += IV_LEN_BYTES;
-  out.set(ciphertextAndTag, off);
-  return out;
+  blob.set(TARN_BLOB_MAGIC, off); off += TARN_BLOB_MAGIC.length;
+  blob.set(wrappedCEK, off); off += WRAPPED_CEK_LEN;
+  blob.set(iv, off); off += IV_LEN_BYTES;
+  blob.set(ciphertextAndTag, off);
+
+  return { blob, shareKey: bytesToBase64Url(cekBytes) };
 }
 
 /**
@@ -624,6 +634,46 @@ export async function decryptWithCEK(dek, blob) {
     'raw', wrappedCEK, dek, 'AES-KW',
     { name: 'AES-GCM' }, false, ['decrypt'],
   );
+
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv }, cekGcm, ciphertextAndTag,
+  );
+  return JSON.parse(new TextDecoder().decode(decrypted));
+}
+
+/**
+ * Decrypt a per-content CEK blob using a shareKey directly (skipping the
+ * wrapped CEK slot). This is the recipient path: a friend has fetched the
+ * shareKey via the share-log and the blob bytes via the gateway, but does
+ * NOT have the writer's DEK to unwrap the in-blob slot. We use the supplied
+ * shareKey instead and ignore bytes 5..44.
+ *
+ * Layout: magic(5) || wrapped_CEK(40) || iv(12) || ciphertext+tag
+ *
+ * @param {Uint8Array} blob
+ * @param {string} shareKeyBase64Url - base64url-encoded raw CEK (32 bytes)
+ * @returns {Promise<Object>}
+ */
+export async function decryptBlobWithSharedCEK(blob, shareKeyBase64Url) {
+  if (!hasTarnBlobMagic(blob)) {
+    throw new Error('Blob does not have TARN magic prefix');
+  }
+  if (blob.length < MIN_NEW_FORMAT_LEN) {
+    throw new Error(`Blob too short for new format: ${blob.length} < ${MIN_NEW_FORMAT_LEN}`);
+  }
+
+  const cekBytes = base64UrlToBytes(shareKeyBase64Url);
+  if (cekBytes.length !== CEK_LEN_BYTES) {
+    throw new Error(`shareKey must be ${CEK_LEN_BYTES} raw bytes; got ${cekBytes.length}`);
+  }
+
+  const cekGcm = await crypto.subtle.importKey(
+    'raw', cekBytes, { name: 'AES-GCM' }, false, ['decrypt'],
+  );
+
+  const ivStart = TARN_BLOB_MAGIC.length + WRAPPED_CEK_LEN;
+  const iv = blob.slice(ivStart, ivStart + IV_LEN_BYTES);
+  const ciphertextAndTag = blob.slice(ivStart + IV_LEN_BYTES);
 
   const decrypted = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv }, cekGcm, ciphertextAndTag,

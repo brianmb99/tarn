@@ -30,22 +30,29 @@ export type DecryptedEntry = {
 /**
  * The slice of TarnClient that Collection<T> needs. Step 6 will replace the
  * JS implementation behind this interface with a native TS implementation.
+ *
+ * Writes return the freshly-issued `shareKey` alongside the `txid` so
+ * sharing-path callers can publish through the share-log without an extra
+ * blob fetch + AES-KW unwrap. `shareKey` is null on legacy v1/v2 accounts
+ * (no per-content CEK); sharing primitives reject null shareKeys.
  */
 export interface ITarnClient {
   isLoggedIn(): boolean;
+
+  // ---- Entry CRUD ----
 
   createEntry(
     type: string,
     plaintext: Record<string, unknown>,
     extraTags?: Tag[],
-  ): Promise<{ txid: string }>;
+  ): Promise<{ txid: string; shareKey: string | null }>;
 
   updateEntry(
     priorTxid: string,
     type: string,
     plaintext: Record<string, unknown>,
     extraTags?: Tag[],
-  ): Promise<{ txid: string }>;
+  ): Promise<{ txid: string; shareKey: string | null }>;
 
   deleteEntry(
     targetTxid: string,
@@ -54,7 +61,63 @@ export interface ITarnClient {
   ): Promise<{ txid: string }>;
 
   getEntries(type: string): Promise<DecryptedEntry[]>;
+
+  // ---- Blob / shareKey helpers ----
+
+  /** Resolve the shareKey for a txid (cache + fallback unwrap). Null on miss. */
+  getShareKey(txid: string): Promise<string | null>;
+
+  /** Fetch encrypted blob bytes for a txid. Null if unavailable. */
+  fetchBlob(txid: string): Promise<Uint8Array | null>;
+
+  /** Decrypt a blob using a known shareKey directly (the recipient path). */
+  decryptSharedBlob(blob: Uint8Array, shareKey: string): Promise<Record<string, unknown>>;
+
+  // ---- Sharing primitives ----
+
+  /** Iterable of the user's connections. */
+  listConnections(): Promise<ShareConnection[]>;
+
+  /** Whether a connection is muted (skips share publishing). */
+  isMuted(connection: ShareConnection): Promise<boolean>;
+
+  /**
+   * Publish a (contentId, txid, shareKey) triple to a connection's share-log.
+   * The §8.4 idempotency rules ensure a re-share with the same contentId
+   * supersedes the prior entry.
+   */
+  shareContent(
+    connection: ShareConnection,
+    contentId: string,
+    txid: string,
+    shareKey: string,
+  ): Promise<unknown>;
+
+  /** Publish a remove op for a contentId on a connection's share-log. */
+  unshareContent(connection: ShareConnection, contentId: string): Promise<unknown>;
+
+  /**
+   * Read a connection's share-log and return the resolved state map:
+   * `{ [contentId]: { tx_id, cek } }`.
+   */
+  readShareLog(
+    connection: ShareConnection,
+    opts?: { refresh?: boolean },
+  ): Promise<Record<string, { tx_id: string; cek: string }>>;
 }
+
+/**
+ * Minimal connection shape consumed by Collection<T>. The public sharing
+ * module uses a richer `Connection` type (in `../sharing/types.ts`) but
+ * Collection only depends on the two stable identifiers — any object with
+ * those two fields satisfies the contract.
+ */
+export type ShareConnection = {
+  share_pub: string;
+  signing_pub: string;
+  label?: string;
+  muted?: boolean;
+};
 
 /** Error class for Collection-level failures (record not found, etc.). */
 export class TarnCollectionError extends Error {

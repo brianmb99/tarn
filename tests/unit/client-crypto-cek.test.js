@@ -14,9 +14,11 @@ import {
   buildV3Envelope,
   encryptWithCEK,
   decryptWithCEK,
+  decryptBlobWithSharedCEK,
   hasTarnBlobMagic,
   encrypt,
   TARN_BLOB_MAGIC,
+  bytesToBase64Url,
   KDF_V2_ARGON2ID,
 } from '../../client/src/crypto.js';
 
@@ -262,13 +264,17 @@ describe('encryptWithCEK <-> decryptWithCEK', () => {
     const dek = await generateRandomDataKey();
     const payload = { hello: 'world', n: 42, list: [1, 2, 3] };
 
-    const blob = await encryptWithCEK(dek.kwKey, payload);
+    const { blob, shareKey } = await encryptWithCEK(dek.kwKey, payload);
 
     // Layout sanity: starts with magic, total len matches spec
     assert.equal(hasTarnBlobMagic(blob), true);
     // 5 (magic) + 40 (wrapped_CEK) + 12 (iv) + 16 (tag) = 73 fixed overhead
     const expectedMin = 73;
     assert.ok(blob.length >= expectedMin);
+
+    // shareKey is base64url, ~43 chars for 32 raw bytes (no padding)
+    assert.equal(typeof shareKey, 'string');
+    assert.ok(shareKey.length >= 42 && shareKey.length <= 44);
 
     const recovered = await decryptWithCEK(dek.kwKey, blob);
     assert.deepEqual(recovered, payload);
@@ -278,16 +284,18 @@ describe('encryptWithCEK <-> decryptWithCEK', () => {
     const dek = await generateRandomDataKey();
     const a = await encryptWithCEK(dek.kwKey, { x: 1 });
     const b = await encryptWithCEK(dek.kwKey, { x: 1 });
-    assert.notDeepEqual(Array.from(a), Array.from(b));
+    assert.notDeepEqual(Array.from(a.blob), Array.from(b.blob));
     // The wrapped_CEK portion (bytes 5..44) must differ — proves CEK rotation
     // per blob, not just IV reuse.
-    assert.notDeepEqual(Array.from(a.slice(5, 45)), Array.from(b.slice(5, 45)));
+    assert.notDeepEqual(Array.from(a.blob.slice(5, 45)), Array.from(b.blob.slice(5, 45)));
+    // shareKeys must also differ (each is a fresh random CEK).
+    assert.notEqual(a.shareKey, b.shareKey);
   });
 
   it('decrypting a CEK blob with the wrong DEK fails', async () => {
     const dek1 = await generateRandomDataKey();
     const dek2 = await generateRandomDataKey();
-    const blob = await encryptWithCEK(dek1.kwKey, { secret: true });
+    const { blob } = await encryptWithCEK(dek1.kwKey, { secret: true });
     await assert.rejects(() => decryptWithCEK(dek2.kwKey, blob));
   });
 
@@ -312,9 +320,9 @@ describe('encryptWithCEK <-> decryptWithCEK', () => {
     const chain = new Map([[1, dek1], [2, dek2], [3, dek3]]);
 
     const blobs = [
-      { gen: 1, blob: await encryptWithCEK(dek1.kwKey, { from: 'gen-1' }) },
-      { gen: 2, blob: await encryptWithCEK(dek2.kwKey, { from: 'gen-2' }) },
-      { gen: 3, blob: await encryptWithCEK(dek3.kwKey, { from: 'gen-3' }) },
+      { gen: 1, blob: (await encryptWithCEK(dek1.kwKey, { from: 'gen-1' })).blob },
+      { gen: 2, blob: (await encryptWithCEK(dek2.kwKey, { from: 'gen-2' })).blob },
+      { gen: 3, blob: (await encryptWithCEK(dek3.kwKey, { from: 'gen-3' })).blob },
     ];
 
     for (const { gen, blob } of blobs) {
@@ -322,5 +330,46 @@ describe('encryptWithCEK <-> decryptWithCEK', () => {
       const recovered = await decryptWithCEK(dek.kwKey, blob);
       assert.equal(recovered.from, `gen-${gen}`);
     }
+  });
+});
+
+// ============ decryptBlobWithSharedCEK (recipient path) ============
+
+describe('decryptBlobWithSharedCEK', () => {
+  it('round-trips a payload using the shareKey directly (no DEK)', async () => {
+    const dek = await generateRandomDataKey();
+    const payload = { friend: 'shared', count: 7 };
+    const { blob, shareKey } = await encryptWithCEK(dek.kwKey, payload);
+
+    // Recipient does NOT have the writer's DEK — only the shareKey from
+    // the share-log. They should still recover the plaintext.
+    const recovered = await decryptBlobWithSharedCEK(blob, shareKey);
+    assert.deepEqual(recovered, payload);
+  });
+
+  it('rejects a blob without the magic prefix', async () => {
+    const fakeShareKey = bytesToBase64Url(new Uint8Array(32));
+    const legacy = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]); // no magic
+    await assert.rejects(
+      () => decryptBlobWithSharedCEK(legacy, fakeShareKey),
+      /magic prefix/,
+    );
+  });
+
+  it('rejects a wrong-sized shareKey', async () => {
+    const dek = await generateRandomDataKey();
+    const { blob } = await encryptWithCEK(dek.kwKey, { x: 1 });
+    const tooShort = bytesToBase64Url(new Uint8Array(16));
+    await assert.rejects(
+      () => decryptBlobWithSharedCEK(blob, tooShort),
+      /must be 32 raw bytes/,
+    );
+  });
+
+  it('rejects decryption with the wrong shareKey', async () => {
+    const dek = await generateRandomDataKey();
+    const { blob } = await encryptWithCEK(dek.kwKey, { x: 1 });
+    const wrongKey = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+    await assert.rejects(() => decryptBlobWithSharedCEK(blob, wrongKey));
   });
 });

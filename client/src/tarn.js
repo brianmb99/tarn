@@ -29,7 +29,10 @@ import {
   decrypt,
   encryptWithCEK,
   decryptWithCEK,
+  decryptBlobWithSharedCEK,
   hasTarnBlobMagic,
+  TARN_BLOB_MAGIC_LEN,
+  TARN_WRAPPED_CEK_LEN,
   generateRandomDataKey,
   generateRecoverySalt,
   parseWrappedDataKey,
@@ -207,6 +210,16 @@ export class TarnClient {
   // the API (bypasses this cache) so an invite created on a different
   // device is recognized.
   #issuedInvitesState = null;        // null | { record, txid }
+
+  // Recently-written content keys, keyed by Arweave txid. Populated by
+  // createEntry / updateEntry / batchCreate so a subsequent share() call
+  // resolves the shareKey without an extra blob fetch + AES-KW unwrap.
+  // Bounded LRU (newest at end of insertion order; evicts the oldest entry
+  // when over cap) — keeps memory predictable without making it the SDK's
+  // job to track every shareKey forever. Cold path (sharing an entry from
+  // a prior session) falls back to fetch + unwrap via getShareKey().
+  #shareKeyCache = new Map();        // txid -> base64url shareKey
+  #shareKeyCacheCap = 64;
 
   // v4 recovery-factor state (issue #12). Holds enough information to preserve
   // existing recovery wrappings across a credential change without requiring
@@ -1220,7 +1233,7 @@ export class TarnClient {
   async createEntry(type, plaintext, extraTags = []) {
     await this.#requireAuth();
 
-    const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(plaintext);
+    const { encrypted, tags: cryptoTags, shareKey } = await this.#encryptForWrite(plaintext);
     const tags = [
       { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
@@ -1246,7 +1259,10 @@ export class TarnClient {
       throw new Error(`Create failed: ${json?.error || res.status}`);
     }
 
-    return { txid: json.id };
+    // shareKey is null on legacy v1/v2 accounts (no per-content CEK). Sharing
+    // primitives reject null shareKeys; non-sharing flows ignore the field.
+    this.#cacheShareKey(json.id, shareKey);
+    return { txid: json.id, shareKey };
   }
 
   /**
@@ -1266,10 +1282,13 @@ export class TarnClient {
       throw new Error('items max 25 per batch');
     }
 
-    // Encrypt each item and build the batch payload
+    // Encrypt each item and build the batch payload. Capture per-item shareKeys
+    // in the same order so we can pair them with the server-issued txids on
+    // response.
     const entries = [];
+    const shareKeys = [];
     for (const item of items) {
-      const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(item);
+      const { encrypted, tags: cryptoTags, shareKey } = await this.#encryptForWrite(item);
       const tags = [
         { name: 'App', value: this.#appId },
         { name: 'Type', value: type },
@@ -1280,6 +1299,7 @@ export class TarnClient {
       // Base64-encode the encrypted bytes for JSON transport
       const data = btoa(String.fromCharCode(...encrypted));
       entries.push({ data, tags });
+      shareKeys.push(shareKey);
     }
 
     // Batch idempotency: one key for the whole batch. Server stores the full
@@ -1291,7 +1311,17 @@ export class TarnClient {
       throw new Error(`Batch create failed: ${res.json?.error || res.status}`);
     }
 
-    return res.json.entries;
+    // Pair each returned txid with its shareKey, populate the cache, and
+    // return both to the caller.
+    const out = [];
+    const returned = res.json.entries || [];
+    for (let i = 0; i < returned.length; i++) {
+      const txid = returned[i].txid;
+      const shareKey = shareKeys[i] ?? null;
+      this.#cacheShareKey(txid, shareKey);
+      out.push({ txid, shareKey });
+    }
+    return out;
   }
 
   async #fetchBatch(entries, idempotencyKey) {
@@ -1382,7 +1412,7 @@ export class TarnClient {
   async updateEntry(priorTxid, type, plaintext, extraTags = []) {
     await this.#requireAuth();
 
-    const { encrypted, tags: cryptoTags } = await this.#encryptForWrite(plaintext);
+    const { encrypted, tags: cryptoTags, shareKey } = await this.#encryptForWrite(plaintext);
     const tags = [
       { name: 'App', value: this.#appId },
       { name: 'Type', value: type },
@@ -1409,7 +1439,10 @@ export class TarnClient {
       throw new Error(`Update failed: ${json?.error || res.status}`);
     }
 
-    return { txid: json.id };
+    // Each update generates a fresh shareKey (CEK is per-content); cache it
+    // so a subsequent share() call resolves without an unwrap round trip.
+    this.#cacheShareKey(json.id, shareKey);
+    return { txid: json.id, shareKey };
   }
 
   /**
@@ -1453,6 +1486,116 @@ export class TarnClient {
     }
 
     return { txid: json.id };
+  }
+
+  // ============ Public blob / shareKey helpers (Section 6) ============
+
+  /**
+   * Fetch the encrypted blob bytes for a single Arweave txid via Tarn's
+   * per-entry endpoint. Returns null if Tarn has no record of the entry
+   * or the response is malformed; throws only on out-of-band protocol
+   * errors (auth, network) that the retry layer couldn't recover.
+   *
+   * Tarn lazy-loads from a public Arweave gateway internally if its D1 cache
+   * doesn't have the blob, so this method covers both freshly-written
+   * (pending) entries and confirmed historical entries with a single
+   * round trip per blob.
+   *
+   * @param {string} txid
+   * @returns {Promise<Uint8Array | null>}
+   */
+  async fetchBlob(txid) {
+    return this.#fetchBlob(txid);
+  }
+
+  /**
+   * Decrypt a v3-format blob using a shareKey supplied directly (the share-
+   * recipient path). The wrapped CEK slot in bytes 5..44 is ignored; the
+   * caller's shareKey is used to decrypt bytes 57..end as AES-256-GCM.
+   *
+   * Apps using the typed Collection API call `tarn.<collection>.listShared`
+   * instead of this primitive. Exposed here for advanced use and direct
+   * recovery-client consumption.
+   *
+   * @param {Uint8Array} blobBytes
+   * @param {string} shareKeyBase64Url - 32-byte raw CEK, base64url
+   * @returns {Promise<Object>} JSON-decoded plaintext
+   */
+  async decryptSharedBlob(blobBytes, shareKeyBase64Url) {
+    return await decryptBlobWithSharedCEK(blobBytes, shareKeyBase64Url);
+  }
+
+  /**
+   * Resolve a shareKey for an entry we wrote. Looks up the in-memory cache
+   * first (populated by createEntry / updateEntry / batchCreate); falls
+   * back to fetching the blob from Tarn and AES-KW-unwrapping the in-blob
+   * slot using the writer's DEK. Returns null on legacy v1/v2 accounts
+   * (no per-content CEK) or if the blob is not in the Tarn-owned format.
+   *
+   * @param {string} txid
+   * @returns {Promise<string | null>} base64url shareKey or null
+   */
+  async getShareKey(txid) {
+    const cached = this.#shareKeyCache.get(txid);
+    if (cached !== undefined) {
+      // Touch for LRU recency.
+      this.#shareKeyCache.delete(txid);
+      this.#shareKeyCache.set(txid, cached);
+      return cached;
+    }
+    return await this.#recoverShareKey(txid);
+  }
+
+  /**
+   * Internal: cache a freshly-issued shareKey for a write. No-op if the
+   * value is null (legacy account). Evicts the oldest entry on overflow.
+   */
+  #cacheShareKey(txid, shareKey) {
+    if (!txid || shareKey == null) return;
+    if (this.#shareKeyCache.has(txid)) {
+      this.#shareKeyCache.delete(txid);
+    }
+    this.#shareKeyCache.set(txid, shareKey);
+    while (this.#shareKeyCache.size > this.#shareKeyCacheCap) {
+      // Map iteration order is insertion order; first key is oldest.
+      const oldest = this.#shareKeyCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.#shareKeyCache.delete(oldest);
+    }
+  }
+
+  /**
+   * Internal cold-path: fetch the blob and unwrap its CEK slot using the
+   * writer's DEK. Used by getShareKey() on cache miss. Returns null if
+   * the blob is unfetchable, malformed, or this account uses the legacy
+   * envelope (no per-content CEK).
+   */
+  async #recoverShareKey(txid) {
+    const dek = this.#dekByGen.get(this.#currentGen);
+    if (!dek) return null;
+    const blob = await this.#fetchBlob(txid);
+    if (!blob || !hasTarnBlobMagic(blob)) return null;
+
+    try {
+      const wrappedCEK = blob.slice(
+        TARN_BLOB_MAGIC_LEN,
+        TARN_BLOB_MAGIC_LEN + TARN_WRAPPED_CEK_LEN,
+      );
+      // Unwrap as raw bytes — we want the CEK material, not a CryptoKey, so
+      // we can re-encode it as base64url for the share-log wire format.
+      const cekBytes = new Uint8Array(
+        await crypto.subtle.unwrapKey(
+          'raw', wrappedCEK, dek.kwKey, 'AES-KW',
+          { name: 'AES-GCM' }, true, ['decrypt'],
+        ).then((k) => crypto.subtle.exportKey('raw', k)),
+      );
+      const shareKey = bytesToBase64Url(cekBytes);
+      this.#cacheShareKey(txid, shareKey);
+      return shareKey;
+    } catch (err) {
+      console.warn(`[TarnClient] getShareKey: unwrap failed for ${txid}:`, err?.message || err);
+      return null;
+    }
   }
 
   // ============ SHARING (issue #13) ============
@@ -4367,7 +4510,7 @@ export class TarnClient {
    * tag, no magic prefix. v2 accounts upgrade to v3 on next changeCredentials.
    *
    * @param {Object} plaintext - JSON-serializable payload
-   * @returns {Promise<{ encrypted: Uint8Array, tags: Array<{name:string, value:string}> }>}
+   * @returns {Promise<{ encrypted: Uint8Array, tags: Array<{name:string, value:string}>, shareKey: string|null }>}
    */
   async #encryptForWrite(plaintext) {
     const dek = this.#dekByGen.get(this.#currentGen);
@@ -4378,22 +4521,27 @@ export class TarnClient {
     // v3 and v4 use the per-content CEK format with the same `Enc: tarn-cek-1`
     // tag and `Gen: N` indicator. The two versions differ only in the credential
     // envelope's wrapping shape — the on-the-wire blob layout is identical.
+    // The encryption call surfaces the raw CEK so the caller can publish it
+    // through the share-log (see createEntry / updateEntry / shareEntry).
     if (this.#envelopeVersion === 3 || this.#envelopeVersion === 4) {
-      const encrypted = await encryptWithCEK(dek.kwKey, plaintext);
+      const { blob, shareKey } = await encryptWithCEK(dek.kwKey, plaintext);
       return {
-        encrypted,
+        encrypted: blob,
         tags: [
           { name: 'Enc', value: 'tarn-cek-1' },
           { name: 'Gen', value: String(this.#currentGen) },
         ],
+        shareKey,
       };
     }
 
     // Legacy v1/v2 envelope path — direct AES-GCM with the (only) DEK.
+    // No per-content key here; sharing is not supported on legacy accounts.
     const encrypted = await encrypt(dek.gcmKey, plaintext);
     return {
       encrypted,
       tags: [{ name: 'Enc', value: 'aes-256-gcm' }],
+      shareKey: null,
     };
   }
 

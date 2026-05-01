@@ -21,7 +21,7 @@ import type { CollectionDef, CollectionRecord } from '../schema/index.js';
 import { validateRecordForCreate, validateRecordForUpdate } from '../schema/index.js';
 import { deriveEid } from './eid.js';
 import { TarnCollectionError } from './types.js';
-import type { DecryptedEntry, ITarnClient, Tag } from './types.js';
+import type { DecryptedEntry, ITarnClient, ShareConnection, Tag } from './types.js';
 
 /**
  * Options bag accepted by `list()`. Reserved for forward compatibility (e.g.,
@@ -125,6 +125,111 @@ export class Collection<TRecord extends Record<string, unknown>> {
     return out;
   }
 
+  // ============ Sharing (only present if collection is shareable) ============
+
+  /**
+   * Publish this record to a connection's share-log so the friend can read it.
+   *
+   * The shareKey is resolved from the SDK's in-memory cache (populated by
+   * the most recent create/update) or fetched + AES-KW-unwrapped on cache
+   * miss. Apps don't see the shareKey.
+   *
+   * Re-sharing a contentId that's already in the connection's share-log
+   * supersedes the prior entry — that's how update flows propagate to
+   * friends. Apps that update a record and want friends to see the new
+   * version simply call share() again.
+   */
+  async share(connection: ShareConnection, primaryKey: string): Promise<void> {
+    this.#assertShareable('share');
+    const { entry } = await this.#findCurrent(primaryKey);
+    const shareKey = await this.#client.getShareKey(entry.txid);
+    if (!shareKey) {
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': no shareKey available for record '${primaryKey}' ` +
+        `(legacy account or unrecoverable blob)`,
+      );
+    }
+    await this.#client.shareContent(connection, this.#contentIdFor(primaryKey), entry.txid, shareKey);
+  }
+
+  /**
+   * Publish this record to every connection that isn't muted. Returns counts
+   * of successes and the per-connection failures (if any) — failures don't
+   * stop the loop; a flaky one connection shouldn't block the others.
+   */
+  async shareWithAll(
+    primaryKey: string,
+  ): Promise<{ ok: number; failed: Array<{ connection: ShareConnection; error: string }> }> {
+    this.#assertShareable('shareWithAll');
+    const { entry } = await this.#findCurrent(primaryKey);
+    const shareKey = await this.#client.getShareKey(entry.txid);
+    if (!shareKey) {
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': no shareKey available for record '${primaryKey}' ` +
+        `(legacy account or unrecoverable blob)`,
+      );
+    }
+    const contentId = this.#contentIdFor(primaryKey);
+    const connections = await this.#client.listConnections();
+    let ok = 0;
+    const failed: Array<{ connection: ShareConnection; error: string }> = [];
+    for (const conn of connections) {
+      if (await this.#client.isMuted(conn)) continue;
+      try {
+        await this.#client.shareContent(conn, contentId, entry.txid, shareKey);
+        ok++;
+      } catch (err) {
+        failed.push({
+          connection: conn,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { ok, failed };
+  }
+
+  /** Revoke a previously-shared record from one connection's view. */
+  async unshare(connection: ShareConnection, primaryKey: string): Promise<void> {
+    this.#assertShareable('unshare');
+    await this.#client.unshareContent(connection, this.#contentIdFor(primaryKey));
+  }
+
+  /**
+   * Fetch and decrypt every record this connection has shared with us under
+   * this collection. Reads the connection's share-log (one request per page),
+   * fetches each blob from Tarn, decrypts with the shareKey, and returns the
+   * decrypted records.
+   *
+   * Records that fail to fetch or decrypt are logged and skipped — partial
+   * results are returned rather than aborting the whole call.
+   */
+  async listShared(connection: ShareConnection): Promise<TRecord[]> {
+    this.#assertShareable('listShared');
+    const state = await this.#client.readShareLog(connection);
+    const collectionPrefix = this.#contentIdPrefix();
+    const out: TRecord[] = [];
+    for (const [contentId, entry] of Object.entries(state)) {
+      if (!contentId.startsWith(collectionPrefix)) continue;
+      try {
+        const blob = await this.#client.fetchBlob(entry.tx_id);
+        if (!blob) {
+          console.warn(
+            `[TarnClient] Collection.listShared: blob ${entry.tx_id} unavailable; skipping`,
+          );
+          continue;
+        }
+        const plaintext = await this.#client.decryptSharedBlob(blob, entry.cek);
+        out.push(plaintext as TRecord);
+      } catch (err) {
+        console.warn(
+          `[TarnClient] Collection.listShared: decrypt failed for ${entry.tx_id}: `,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    return out;
+  }
+
   // ============ Internal helpers ============
 
   /** Build the protocol-level extra tags applied to every write. */
@@ -133,6 +238,33 @@ export class Collection<TRecord extends Record<string, unknown>> {
       { name: 'Eid', value: eid },
       { name: 'SchemaV', value: String(this.#schemaVersion) },
     ];
+  }
+
+  /**
+   * Throw if the collection is not declared shareable. Apps see this as a
+   * usage error; the schema is the source of truth for what can be shared.
+   */
+  #assertShareable(method: string): void {
+    if (!this.#def.shareable) {
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': ${method}() requires the collection to declare shareable: true`,
+      );
+    }
+  }
+
+  /**
+   * Compose a globally-unique content id for the share-log layer. Sharing
+   * happens per-connection; a single connection might have multiple
+   * collections shared (books, notes, etc.). Prefixing the primaryKey with
+   * the collection name keeps the share-log namespace clean and lets
+   * listShared() filter by collection.
+   */
+  #contentIdFor(primaryKey: string): string {
+    return `${this.#name}:${primaryKey}`;
+  }
+
+  #contentIdPrefix(): string {
+    return `${this.#name}:`;
   }
 
   /** Locate the live txid + decoded record for a primaryKey, or throw. */

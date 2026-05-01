@@ -9,4 +9,4 @@ export { Collection, createCollection } from './collection.js';
 export type { ListOpts } from './collection.js';
 export { deriveEid } from './eid.js';
 export { TarnCollectionError } from './types.js';
-export type { ITarnClient, DecryptedEntry, Tag } from './types.js';
+export type { ITarnClient, DecryptedEntry, Tag, ShareConnection } from './types.js';

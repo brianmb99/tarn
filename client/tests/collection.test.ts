@@ -22,21 +22,32 @@ import {
   deriveEid,
   TarnCollectionError,
 } from '../src/collections/index.js';
-import type { DecryptedEntry, ITarnClient, Tag } from '../src/collections/index.js';
+import type { DecryptedEntry, ITarnClient, ShareConnection, Tag } from '../src/collections/index.js';
 
 // ============ Mock underlying client ============
 
 type CreateCall = { type: string; plaintext: Record<string, unknown>; extraTags: Tag[] };
 type UpdateCall = { priorTxid: string; type: string; plaintext: Record<string, unknown>; extraTags: Tag[] };
 type DeleteCall = { targetTxid: string; type: string; extraTags: Tag[] };
+type ShareCall = { connection: ShareConnection; contentId: string; txid: string; shareKey: string };
+type UnshareCall = { connection: ShareConnection; contentId: string };
 
 class MockTarnClient implements ITarnClient {
   entries: DecryptedEntry[] = [];
+  shareKeysByTxid = new Map<string, string>();
   createCalls: CreateCall[] = [];
   updateCalls: UpdateCall[] = [];
   deleteCalls: DeleteCall[] = [];
   getEntriesCalls: string[] = [];
+  shareCalls: ShareCall[] = [];
+  unshareCalls: UnshareCall[] = [];
+  shareLogStateByConnection = new Map<string, Record<string, { tx_id: string; cek: string }>>();
+  connections: ShareConnection[] = [];
+  mutedSharePubs = new Set<string>();
+  blobsByTxid = new Map<string, Uint8Array>();
+  decryptedBySharedBlob = new Map<string, Record<string, unknown>>();
   #txidCounter = 0;
+  #shareKeyCounter = 0;
 
   isLoggedIn(): boolean {
     return true;
@@ -46,15 +57,17 @@ class MockTarnClient implements ITarnClient {
     type: string,
     plaintext: Record<string, unknown>,
     extraTags: Tag[] = [],
-  ): Promise<{ txid: string }> {
+  ): Promise<{ txid: string; shareKey: string | null }> {
     this.createCalls.push({ type, plaintext, extraTags });
     const txid = this.#nextTxid();
+    const shareKey = this.#nextShareKey();
     this.entries.push({
       txid,
       data: { ...plaintext },
       tags: [{ name: 'Type', value: type }, ...extraTags],
     });
-    return { txid };
+    this.shareKeysByTxid.set(txid, shareKey);
+    return { txid, shareKey };
   }
 
   async updateEntry(
@@ -62,17 +75,18 @@ class MockTarnClient implements ITarnClient {
     type: string,
     plaintext: Record<string, unknown>,
     extraTags: Tag[] = [],
-  ): Promise<{ txid: string }> {
+  ): Promise<{ txid: string; shareKey: string | null }> {
     this.updateCalls.push({ priorTxid, type, plaintext, extraTags });
-    // Replace the prior entry to mimic the API's Prev-chain resolution.
     this.entries = this.entries.filter((e) => e.txid !== priorTxid);
     const txid = this.#nextTxid();
+    const shareKey = this.#nextShareKey();
     this.entries.push({
       txid,
       data: { ...plaintext },
       tags: [{ name: 'Type', value: type }, ...extraTags],
     });
-    return { txid };
+    this.shareKeysByTxid.set(txid, shareKey);
+    return { txid, shareKey };
   }
 
   async deleteEntry(
@@ -81,7 +95,6 @@ class MockTarnClient implements ITarnClient {
     extraTags: Tag[] = [],
   ): Promise<{ txid: string }> {
     this.deleteCalls.push({ targetTxid, type, extraTags });
-    // Remove the target to mimic tombstone resolution.
     this.entries = this.entries.filter((e) => e.txid !== targetTxid);
     return { txid: this.#nextTxid() };
   }
@@ -91,9 +104,87 @@ class MockTarnClient implements ITarnClient {
     return this.entries.filter((e) => e.tags.some((t) => t.name === 'Type' && t.value === type));
   }
 
+  // ---- Blob / shareKey helpers ----
+
+  async getShareKey(txid: string): Promise<string | null> {
+    return this.shareKeysByTxid.get(txid) ?? null;
+  }
+
+  async fetchBlob(txid: string): Promise<Uint8Array | null> {
+    return this.blobsByTxid.get(txid) ?? null;
+  }
+
+  async decryptSharedBlob(blob: Uint8Array, _shareKey: string): Promise<Record<string, unknown>> {
+    // Mock decrypt: look up by blob bytes (using length+first byte as key
+    // to avoid Uint8Array identity issues).
+    const key = `${blob.length}:${blob[0] ?? 0}`;
+    const found = this.decryptedBySharedBlob.get(key);
+    if (!found) throw new Error('mock decryptSharedBlob: blob not registered');
+    return found;
+  }
+
+  // ---- Sharing primitives ----
+
+  async listConnections(): Promise<ShareConnection[]> {
+    return this.connections;
+  }
+
+  async isMuted(connection: ShareConnection): Promise<boolean> {
+    return this.mutedSharePubs.has(connection.share_pub);
+  }
+
+  async shareContent(
+    connection: ShareConnection,
+    contentId: string,
+    txid: string,
+    shareKey: string,
+  ): Promise<unknown> {
+    this.shareCalls.push({ connection, contentId, txid, shareKey });
+    let state = this.shareLogStateByConnection.get(connection.share_pub);
+    if (!state) {
+      state = {};
+      this.shareLogStateByConnection.set(connection.share_pub, state);
+    }
+    state[contentId] = { tx_id: txid, cek: shareKey };
+    return { ok: true };
+  }
+
+  async unshareContent(connection: ShareConnection, contentId: string): Promise<unknown> {
+    this.unshareCalls.push({ connection, contentId });
+    const state = this.shareLogStateByConnection.get(connection.share_pub);
+    if (state) delete state[contentId];
+    return { ok: true };
+  }
+
+  async readShareLog(
+    connection: ShareConnection,
+  ): Promise<Record<string, { tx_id: string; cek: string }>> {
+    return this.shareLogStateByConnection.get(connection.share_pub) ?? {};
+  }
+
+  // ---- Helpers for tests ----
+
+  #blobCounter = 0;
+
+  /** Register a (blob, plaintext) pair so decryptSharedBlob can resolve it. */
+  registerSharedBlob(txid: string, plaintext: Record<string, unknown>): Uint8Array {
+    this.#blobCounter++;
+    // First byte uniquely identifies this blob in the mock-decrypt map.
+    const bytes = new Uint8Array([this.#blobCounter, 1, 2, 3, 4]);
+    this.blobsByTxid.set(txid, bytes);
+    const key = `${bytes.length}:${bytes[0] ?? 0}`;
+    this.decryptedBySharedBlob.set(key, plaintext);
+    return bytes;
+  }
+
   #nextTxid(): string {
     this.#txidCounter++;
     return `mock-tx-${this.#txidCounter}`;
+  }
+
+  #nextShareKey(): string {
+    this.#shareKeyCounter++;
+    return `mock-sk-${this.#shareKeyCounter}`;
   }
 }
 
@@ -395,5 +486,198 @@ describe('Collection.get / list', () => {
     const all = await books.list();
     assert.equal(all.length, 1);
     assert.equal(all[0]!.bookId, 'b2');
+  });
+});
+
+// ============ Sharing — share / shareWithAll / unshare / listShared ============
+
+const conn1: ShareConnection = { share_pub: 'sp-conn1', signing_pub: 'sg-conn1' };
+const conn2: ShareConnection = { share_pub: 'sp-conn2', signing_pub: 'sg-conn2' };
+const conn3: ShareConnection = { share_pub: 'sp-conn3', signing_pub: 'sg-conn3' };
+
+describe('Collection.share', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(async () => {
+    mock = new MockTarnClient();
+    mock.connections = [conn1, conn2];
+    books = makeBooks(mock);
+    await books.create({ bookId: 'b1', title: 'Foo', isPrivate: false });
+  });
+
+  it('publishes (contentId, txid, shareKey) to one connection', async () => {
+    await books.share(conn1, 'b1');
+    assert.equal(mock.shareCalls.length, 1);
+    const call = mock.shareCalls[0]!;
+    assert.equal(call.connection, conn1);
+    assert.equal(call.contentId, 'books:b1');
+    assert.equal(call.txid, 'mock-tx-1');
+    assert.equal(call.shareKey, 'mock-sk-1');
+  });
+
+  it('throws when the record does not exist', async () => {
+    await assert.rejects(() => books.share(conn1, 'does-not-exist'), TarnCollectionError);
+  });
+
+  it('throws when the collection is not shareable', async () => {
+    const settingsCol = createCollection<{ key: string; value: unknown }>({
+      client: mock,
+      appId: 'bookish',
+      name: 'settings',
+      def: {
+        primaryKey: 'key',
+        fields: { key: 'string', value: 'json' },
+        shareable: false,
+      },
+      schemaVersion: 4,
+    });
+    await assert.rejects(() => settingsCol.share(conn1, 'theme'), /requires the collection to declare shareable: true/);
+  });
+
+  it('after update, share emits the new (txid, shareKey) — supersedes prior', async () => {
+    await books.share(conn1, 'b1');                            // emits mock-tx-1 / mock-sk-1
+    await books.update('b1', { rating: 5 });                   // mock-tx-2 / mock-sk-2
+    await books.share(conn1, 'b1');                            // should emit mock-tx-2 / mock-sk-2
+
+    assert.equal(mock.shareCalls.length, 2);
+    assert.equal(mock.shareCalls[0]!.txid, 'mock-tx-1');
+    assert.equal(mock.shareCalls[0]!.shareKey, 'mock-sk-1');
+    assert.equal(mock.shareCalls[1]!.txid, 'mock-tx-2');
+    assert.equal(mock.shareCalls[1]!.shareKey, 'mock-sk-2');
+  });
+});
+
+describe('Collection.shareWithAll', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(async () => {
+    mock = new MockTarnClient();
+    mock.connections = [conn1, conn2, conn3];
+    books = makeBooks(mock);
+    await books.create({ bookId: 'b1', title: 'Foo', isPrivate: false });
+  });
+
+  it('publishes to every connection', async () => {
+    const result = await books.shareWithAll('b1');
+    assert.equal(result.ok, 3);
+    assert.equal(result.failed.length, 0);
+    assert.equal(mock.shareCalls.length, 3);
+    const sharePubs = mock.shareCalls.map((c) => c.connection.share_pub).sort();
+    assert.deepEqual(sharePubs, ['sp-conn1', 'sp-conn2', 'sp-conn3']);
+  });
+
+  it('skips muted connections', async () => {
+    mock.mutedSharePubs.add(conn2.share_pub);
+    const result = await books.shareWithAll('b1');
+    assert.equal(result.ok, 2);
+    const sharePubs = mock.shareCalls.map((c) => c.connection.share_pub).sort();
+    assert.deepEqual(sharePubs, ['sp-conn1', 'sp-conn3']);
+  });
+
+  it('records per-connection failures without aborting the loop', async () => {
+    const orig = mock.shareContent.bind(mock);
+    let failOnce = true;
+    mock.shareContent = async (conn, cid, txid, sk) => {
+      if (failOnce && conn.share_pub === conn2.share_pub) {
+        failOnce = false;
+        throw new Error('simulated transient');
+      }
+      return orig(conn, cid, txid, sk);
+    };
+    const result = await books.shareWithAll('b1');
+    assert.equal(result.ok, 2);
+    assert.equal(result.failed.length, 1);
+    assert.equal(result.failed[0]!.connection.share_pub, 'sp-conn2');
+    assert.match(result.failed[0]!.error, /simulated transient/);
+  });
+});
+
+describe('Collection.unshare', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(async () => {
+    mock = new MockTarnClient();
+    mock.connections = [conn1];
+    books = makeBooks(mock);
+    await books.create({ bookId: 'b1', title: 'Foo', isPrivate: false });
+    await books.share(conn1, 'b1');
+  });
+
+  it('publishes a remove op for the contentId', async () => {
+    await books.unshare(conn1, 'b1');
+    assert.equal(mock.unshareCalls.length, 1);
+    assert.equal(mock.unshareCalls[0]!.contentId, 'books:b1');
+  });
+});
+
+describe('Collection.listShared', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(() => {
+    mock = new MockTarnClient();
+    books = makeBooks(mock);
+  });
+
+  it('returns [] when the connection has no share-log state', async () => {
+    const result = await books.listShared(conn1);
+    assert.deepEqual(result, []);
+  });
+
+  it('fetches and decrypts every shared record', async () => {
+    // Set up two shared books on conn1's share-log.
+    mock.shareLogStateByConnection.set(conn1.share_pub, {
+      'books:b1': { tx_id: 'tx-friend-1', cek: 'sk-friend-1' },
+      'books:b2': { tx_id: 'tx-friend-2', cek: 'sk-friend-2' },
+    });
+    mock.registerSharedBlob('tx-friend-1', { bookId: 'b1', title: 'Friend Book 1', isPrivate: false });
+    mock.registerSharedBlob('tx-friend-2', { bookId: 'b2', title: 'Friend Book 2', isPrivate: false });
+
+    const result = await books.listShared(conn1);
+    assert.equal(result.length, 2);
+    const titles = result.map((r) => r.title).sort();
+    assert.deepEqual(titles, ['Friend Book 1', 'Friend Book 2']);
+  });
+
+  it('filters by collection (ignores share-log entries for other collections)', async () => {
+    mock.shareLogStateByConnection.set(conn1.share_pub, {
+      'books:b1': { tx_id: 'tx-friend-1', cek: 'sk-friend-1' },
+      'notes:n1': { tx_id: 'tx-friend-9', cek: 'sk-friend-9' }, // different collection
+    });
+    mock.registerSharedBlob('tx-friend-1', { bookId: 'b1', title: 'Book', isPrivate: false });
+    mock.registerSharedBlob('tx-friend-9', { noteId: 'n1', body: 'Note' });
+
+    const result = await books.listShared(conn1);
+    assert.equal(result.length, 1);
+    assert.equal(result[0]!.bookId, 'b1');
+  });
+
+  it('skips entries whose blob is unavailable', async () => {
+    mock.shareLogStateByConnection.set(conn1.share_pub, {
+      'books:b1': { tx_id: 'tx-friend-1', cek: 'sk-friend-1' },
+      'books:b2': { tx_id: 'tx-missing', cek: 'sk-friend-2' },
+    });
+    mock.registerSharedBlob('tx-friend-1', { bookId: 'b1', title: 'Book 1', isPrivate: false });
+    // tx-missing has no blob registered.
+
+    const result = await books.listShared(conn1);
+    assert.equal(result.length, 1);
+    assert.equal(result[0]!.bookId, 'b1');
+  });
+
+  it('skips entries whose decrypt fails', async () => {
+    mock.shareLogStateByConnection.set(conn1.share_pub, {
+      'books:b1': { tx_id: 'tx-friend-1', cek: 'sk-friend-1' },
+    });
+    // Don't register the blob with the mock decrypter — fetchBlob returns
+    // bytes but decryptSharedBlob will throw because the (length, first-byte)
+    // key isn't registered.
+    mock.blobsByTxid.set('tx-friend-1', new Uint8Array([99, 99, 99]));
+
+    const result = await books.listShared(conn1);
+    assert.equal(result.length, 0);
   });
 });
