@@ -1,7 +1,13 @@
 // Entry listing and single-entry endpoints (read-only, unauthenticated, IP rate-limited)
 
 import { jsonResponse, errorResponse } from '../worker.js';
-import { getResolvedEntries, getEntryByTxid, refreshCache } from '../cache.js';
+import {
+  getResolvedEntries,
+  getEntryByTxid,
+  refreshCache,
+  fetchBlobFromGateway,
+  persistBlob,
+} from '../cache.js';
 import { checkAndIncrementRateLimit } from '../rate-limit.js';
 
 // Convert blob_data from D1 (ArrayBuffer/Uint8Array) to base64 for JSON transport.
@@ -98,6 +104,27 @@ export async function handleEntryById(txid, url, env, ctx, cors, request) {
     return errorResponse('Entry not found', 404, cors);
   }
 
+  // Lazy-load blob bytes from a public gateway if D1 is missing them. This
+  // happens during the cold-bootstrap window: refreshCache imports metadata
+  // for a (dlk, app, type) tuple but does NOT eagerly backfill blobs (doing so
+  // synchronously inside the list endpoint risked CF Worker resource limits
+  // for users with many entries — see issue notes on error 1102). Tombstones
+  // legitimately have no blob, so skip those.
+  let blobData = entry.blob_data;
+  if (!blobData && !entry.is_tombstone) {
+    const fetched = await fetchBlobFromGateway(entry.txid);
+    if (fetched) {
+      blobData = fetched;
+      // Write-through so the next reader hits warm D1. Errors here are
+      // non-fatal — we still serve the bytes we just fetched.
+      try {
+        await persistBlob(env.DB, entry.txid, fetched);
+      } catch (err) {
+        console.warn(`[tarn-api] persistBlob failed for ${entry.txid}: ${err.message}`);
+      }
+    }
+  }
+
   return jsonResponse({
     txid: entry.txid,
     app: entry.app,
@@ -106,7 +133,7 @@ export async function handleEntryById(txid, url, env, ctx, cors, request) {
     tags: entry.tags_json ? JSON.parse(entry.tags_json) : [],
     confirmed: entry.block_timestamp != null,
     cachedAt: entry.cached_at,
-    data: blobToBase64(entry.blob_data),
+    data: blobToBase64(blobData),
     gatewayUrl: `https://arweave.net/${entry.txid}`,
   }, 200, cors);
 }

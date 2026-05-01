@@ -1344,9 +1344,10 @@ export class TarnClient {
 
     // Tarn list responses are metadata-only (returning ~10 MB of inline base64
     // would push the Worker past the 128 MB per-request memory limit). Fetch
-    // each blob separately via #fetchBlob, which tries Tarn's per-entry
-    // endpoint (D1 write-through, resolves pending writes) and falls back to
-    // public Arweave gateways.
+    // each blob separately via #fetchBlob, which calls Tarn's per-entry
+    // endpoint. Tarn serves the blob from D1 if present and lazy-loads from
+    // an Arweave gateway if not, so this single round trip covers both
+    // recently-written and cold-bootstrap entries.
     const entries = [];
     const CONCURRENCY = 20;
 
@@ -4518,10 +4519,17 @@ export class TarnClient {
   }
 
   async #fetchBlob(txid) {
-    // Try Tarn's per-entry endpoint first. Tarn serves blob_data from D1
-    // (write-through cache), so this resolves pending entries that haven't yet
-    // confirmed on Arweave — the gateways would 404 on those. Fall back to
-    // public gateways if Tarn is unavailable or the blob is missing from D1.
+    // Single source of truth: Tarn's per-entry endpoint. Tarn serves
+    // blob_data from D1 (populated via write-through on writes, lazy-loaded
+    // from a public Arweave gateway on cold-bootstrap reads), so it covers
+    // both pending and confirmed entries with one round trip per blob.
+    //
+    // No client-side gateway fallback by design: the SDK already cannot
+    // function without Tarn (the list of live entries lives there exclusively),
+    // so a partial fallback for blobs only would mask Tarn outages without
+    // delivering availability. A separate, deliberate "always access your
+    // data" recovery path — direct GraphQL + gateway reads with no Tarn
+    // dependency — belongs in its own artifact, not here.
     try {
       const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET' });
       if (res.status === 200) {
@@ -4532,18 +4540,6 @@ export class TarnClient {
         } catch {}
       }
     } catch {}
-
-    const gateways = [
-      `https://turbo-gateway.com/${txid}`,
-      `https://arweave.net/${txid}`,
-    ];
-
-    for (const url of gateways) {
-      try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-        if (res.ok) return new Uint8Array(await res.arrayBuffer());
-      } catch {}
-    }
     return null;
   }
 

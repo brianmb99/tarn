@@ -216,11 +216,15 @@ export async function markLookupBootstrapped(db, lookupKey, app, type) {
 /**
  * Ensure the (dlk, app, type) tuple is bootstrapped. If a marker already exists,
  * returns immediately — D1 is authoritative. Otherwise runs a one-time GraphQL
- * query against Arweave to ingest any pre-existing on-chain entries, backfills
- * their blob_data, then sets the marker.
+ * query against Arweave to ingest any pre-existing on-chain entry metadata,
+ * then sets the marker.
  *
- * This replaces the previous stale-while-revalidate refresh loop, which fired
- * a GraphQL query every 60s per polling tuple and added no safety benefit.
+ * Blob bytes are NOT fetched here. They warm into D1 lazily as clients request
+ * specific txids via /api/v1/entries/{txid} (handleEntryById fills blob_data
+ * from the gateway on miss). This keeps the cold-bootstrap path on the list
+ * endpoint cheap and predictable: one GraphQL query + one D1 batch upsert,
+ * regardless of how many entries the user has — no chains of sequential
+ * gateway fetches that risk tripping CF Worker resource limits.
  */
 export async function refreshCache(env, ctx, app, type, dataLookupKey) {
   const cacheKey = DATA_BOOTSTRAP_KEY(dataLookupKey, app, type);
@@ -232,10 +236,6 @@ export async function refreshCache(env, ctx, app, type, dataLookupKey) {
   const { edges, error } = await searchEntriesByLookupKey(dataLookupKey, { app, type });
   if (edges.length > 0) {
     await upsertEntries(env.DB, edges);
-    // Backfill blobs for what we just ingested. Cold bootstrap only — this path
-    // runs at most once per (dlk, app, type), so the subrequest cost is bounded
-    // and acceptable.
-    await backfillBlobs(env.DB, dataLookupKey, app, type);
   }
 
   // Only set the marker if GraphQL succeeded — a transient Arweave error should
@@ -268,51 +268,39 @@ export async function refreshLookupCache(env, ctx, app, type, lookupKey) {
   }
 }
 
-// ============ BLOB BACKFILL ============
+// ============ BLOB LAZY-LOAD ============
 
 const TURBO_GW = 'https://turbo-gateway.com';
 const ARWEAVE_GW = 'https://arweave.net';
-const BACKFILL_BATCH_SIZE = 10; // Stay well under Workers subrequest limit
+const GATEWAY_TIMEOUT_MS = 10_000;
 
 /**
- * Backfill blob_data for entries that don't have it yet. Called only from the
- * cold bootstrap path in refreshCache (one-shot per dlk/app/type). For larger
- * migrations (D1 wipe, new Tarn instance with pre-existing Arweave data),
- * use tools/backfill-blobs.mjs from the operator's workstation — the runtime
- * path caps at BACKFILL_BATCH_SIZE to stay under the Workers subrequest limit.
+ * Fetch a single entry's encrypted blob from a public Arweave gateway. Tries
+ * Turbo first (fast CDN-fronted gateway) then arweave.net L1. Returns the
+ * raw bytes or null if both gateways failed (404, timeout, network error).
+ *
+ * Used by handleEntryById to warm D1's blob_data column on miss. This is the
+ * sole runtime path for hydrating blobs from Arweave; refreshCache does
+ * metadata-only bootstrap, and clients no longer fetch from gateways
+ * directly. For wholesale post-migration backfill, see tools/backfill-blobs.mjs.
  */
-async function backfillBlobs(db, lookupKey, app, type) {
-  const missing = await db.prepare(
-    'SELECT txid FROM entries WHERE lookup_key = ?1 AND app = ?2 AND type = ?3 AND blob_data IS NULL AND is_tombstone = 0 LIMIT ?4'
-  ).bind(lookupKey, app, type, BACKFILL_BATCH_SIZE).all();
-
-  const txids = (missing.results || []).map(r => r.txid);
-  if (txids.length === 0) return;
-
-  console.log(`[tarn-api] Backfilling ${txids.length} blobs for ${lookupKey.slice(0, 12)}...`);
-
-  for (const txid of txids) {
+export async function fetchBlobFromGateway(txid) {
+  for (const gw of [TURBO_GW, ARWEAVE_GW]) {
     try {
-      // Try Turbo first, then Arweave L1
-      let blobData = null;
-      for (const gw of [TURBO_GW, ARWEAVE_GW]) {
-        try {
-          const res = await fetch(`${gw}/${txid}`, { signal: AbortSignal.timeout(10000) });
-          if (res.ok) {
-            blobData = new Uint8Array(await res.arrayBuffer());
-            break;
-          }
-        } catch {}
-      }
-
-      if (blobData) {
-        await db.prepare('UPDATE entries SET blob_data = ?1 WHERE txid = ?2')
-          .bind(blobData, txid).run();
-      }
-    } catch (err) {
-      console.warn(`[tarn-api] Backfill failed for ${txid}: ${err.message}`);
-    }
+      const res = await fetch(`${gw}/${txid}`, { signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS) });
+      if (res.ok) return new Uint8Array(await res.arrayBuffer());
+    } catch {}
   }
+  return null;
+}
+
+/**
+ * Persist freshly-fetched blob bytes into D1 so subsequent reads for the same
+ * txid hit the cache.
+ */
+export async function persistBlob(db, txid, blobBytes) {
+  await db.prepare('UPDATE entries SET blob_data = ?1 WHERE txid = ?2')
+    .bind(blobBytes, txid).run();
 }
 
 // ============ WRITE-THROUGH ============
