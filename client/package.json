@@ -2,15 +2,27 @@
   "name": "tarn-client",
   "version": "0.3.0",
   "type": "module",
-  "main": "src/tarn.js",
+  "main": "./dist/cjs/index.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
   "exports": {
-    ".": "./src/tarn.js",
-    "./crypto": "./src/crypto.js",
-    "./recovery": "./src/recovery.js"
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "default": "./dist/cjs/index.cjs"
+    }
   },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md"
+  ],
   "scripts": {
     "test": "node scripts/run-tests.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "clean": "node -e \"import('node:fs/promises').then(fs => fs.rm('dist', {recursive:true,force:true}))\"",
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@hpke/core": "^1.9.0",
@@ -20,6 +32,8 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "esbuild": "^0.27.7",
+    "glob": "^11.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   }
