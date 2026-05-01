@@ -20,12 +20,15 @@ const PHRASE_STRENGTH_BITS = 256;
 /**
  * Generate a fresh 24-word BIP39 mnemonic phrase using cryptographically
  * secure randomness. Returns a single space-separated string.
- *
- * @returns {string}
  */
-export function generateRecoveryPhrase() {
+export function generateRecoveryPhrase(): string {
   return generateMnemonic(wordlist, PHRASE_STRENGTH_BITS);
 }
+
+/** Result of phrase validation. `normalized` is filled even on failure (best-effort). */
+export type PhraseValidation =
+  | { valid: true; normalized: string }
+  | { valid: false; normalized: string; reason: string };
 
 /**
  * Validate a phrase against the BIP39 English wordlist (word membership +
@@ -33,11 +36,8 @@ export function generateRecoveryPhrase() {
  * whitespace trimmed, internal whitespace collapsed, lowercased — before
  * validation, mirroring the normalization applied during recovery KEK
  * derivation.
- *
- * @param {string} phrase
- * @returns {{ valid: boolean, normalized: string, reason?: string }}
  */
-export function validateRecoveryPhrase(phrase) {
+export function validateRecoveryPhrase(phrase: string): PhraseValidation {
   if (!phrase || typeof phrase !== 'string') {
     return { valid: false, normalized: '', reason: 'phrase must be a non-empty string' };
   }
@@ -57,17 +57,14 @@ export function validateRecoveryPhrase(phrase) {
  * sharing-protocol §14.11 work where the recovery phrase will derive an
  * additional sub-key — the entropy is the canonical seed, not the derived
  * recovery KEK.
- *
- * @param {string} phrase
- * @returns {Uint8Array} 32 bytes (for a 24-word phrase)
  */
-export function recoveryPhraseToEntropy(phrase) {
-  const { valid, normalized, reason } = validateRecoveryPhrase(phrase);
-  if (!valid) throw new Error(`Invalid recovery phrase: ${reason}`);
-  return mnemonicToEntropy(normalized, wordlist);
+export function recoveryPhraseToEntropy(phrase: string): Uint8Array {
+  const v = validateRecoveryPhrase(phrase);
+  if (!v.valid) throw new Error(`Invalid recovery phrase: ${v.reason}`);
+  return mnemonicToEntropy(v.normalized, wordlist);
 }
 
-function normalizePhrase(phrase) {
+function normalizePhrase(phrase: string): string {
   // Match the BIP39 spec normalization used in deriveRecoveryKey: NFKD,
   // lowercase, collapse whitespace to single spaces, trim.
   return phrase.normalize('NFKD').toLowerCase().trim().split(/\s+/).join(' ');
@@ -89,6 +86,24 @@ const PAGE_W = 612;
 const PAGE_H = 792;
 const MARGIN = 54; // 0.75"
 
+type FontId = 'F1' | 'F2' | 'F3';
+
+type TextRun = {
+  /** Optional explicit x-coordinate; defaults to MARGIN. */
+  x?: number;
+  y: number;
+  font: FontId;
+  size: number;
+  text: string;
+};
+
+export type RenderRecoveryOpts = {
+  phrase: string;
+  appName?: string;
+  /** ISO date (YYYY-MM-DD) or other display string; defaults to today. */
+  generatedAt?: string;
+};
+
 /**
  * Render the recovery PDF for a phrase + optional branding metadata.
  * Returns the raw PDF bytes (Uint8Array) suitable for download or for
@@ -97,15 +112,8 @@ const MARGIN = 54; // 0.75"
  * The output is deterministic for the same (phrase, branding, generatedAt)
  * tuple — so tests can byte-compare. Pass `generatedAt: '<fixed>'` to make
  * the rendered date stable.
- *
- * @param {{
- *   phrase: string,
- *   appName?: string,
- *   generatedAt?: string,
- * }} opts
- * @returns {Uint8Array}
  */
-export function renderRecoveryPDF({ phrase, appName, generatedAt }) {
+export function renderRecoveryPDF({ phrase, appName, generatedAt }: RenderRecoveryOpts): Uint8Array {
   if (!phrase || typeof phrase !== 'string') {
     throw new Error('phrase is required');
   }
@@ -115,10 +123,14 @@ export function renderRecoveryPDF({ phrase, appName, generatedAt }) {
     throw new Error(`expected 24-word phrase, got ${words.length} words`);
   }
 
-  const branding = appName ? `Recovery kit for your ${appName} account (powered by Tarn).` : 'Tarn account recovery kit.';
-  const dateLine = generatedAt ? `Generated: ${generatedAt}` : `Generated: ${new Date().toISOString().slice(0, 10)}`;
+  const branding = appName
+    ? `Recovery kit for your ${appName} account (powered by Tarn).`
+    : 'Tarn account recovery kit.';
+  const dateLine = generatedAt
+    ? `Generated: ${generatedAt}`
+    : `Generated: ${new Date().toISOString().slice(0, 10)}`;
 
-  const lines = [
+  const lines: TextRun[] = [
     { y: 730, font: 'F1', size: 24, text: 'Recovery phrase' },
     { y: 700, font: 'F2', size: 11, text: branding },
     { y: 684, font: 'F2', size: 11, text: dateLine },
@@ -151,13 +163,13 @@ export function renderRecoveryPDF({ phrase, appName, generatedAt }) {
     const row = Math.floor(i / 4);
     const x = MARGIN + col * colWidth + 4;
     const y = 600 - row * 40;
-    lines.push({ x, y, font: 'F3', size: 12, text: `${pad2(i + 1)}. ${words[i]}` });
+    lines.push({ x, y, font: 'F3', size: 12, text: `${pad2(i + 1)}. ${words[i]!}` });
   }
 
   return buildSinglePagePDF(lines);
 }
 
-function pad2(n) {
+function pad2(n: number): string {
   return n < 10 ? ` ${n}` : String(n);
 }
 
@@ -172,7 +184,7 @@ function pad2(n) {
  *   4. Content stream
  *   5/6/7. Helvetica + Helvetica-Bold + Courier (built-in, no embedding)
  */
-function buildSinglePagePDF(textRuns) {
+function buildSinglePagePDF(textRuns: readonly TextRun[]): Uint8Array {
   const stream = textRunsToContentStream(textRuns);
   const streamBytes = new TextEncoder().encode(stream);
 
@@ -182,20 +194,23 @@ function buildSinglePagePDF(textRuns) {
   const page = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + PAGE_W + ' ' + PAGE_H + ']'
     + ' /Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >>'
     + ' /Contents 4 0 R >>';
-  const content = '<< /Length ' + streamBytes.length + ' >>\nstream\n' + stream + '\nendstream';
+  // Note: object 4's body is built inline below (it interleaves the binary
+  // stream bytes), so we don't precompute it here.
   const fontHelveticaBold = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
   const fontHelvetica = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
   const fontCourier = '<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>';
 
-  const objs = [catalog, pages, page, content, fontHelveticaBold, fontHelvetica, fontCourier];
+  // Indices align with the PDF object numbers (1-indexed minus 1).
+  // Index 3 is the content-stream object; we handle it specially.
+  const objs: string[] = [catalog, pages, page, '', fontHelveticaBold, fontHelvetica, fontCourier];
 
   // Assemble file.
   const enc = new TextEncoder();
-  const parts = [];
+  const parts: Uint8Array[] = [];
   let offset = 0;
-  const xref = [0]; // index 0 is the special free entry
+  const xref: number[] = [0]; // index 0 is the special free entry
 
-  function push(s) {
+  function push(s: string | Uint8Array): void {
     const b = s instanceof Uint8Array ? s : enc.encode(s);
     parts.push(b);
     offset += b.length;
@@ -214,7 +229,7 @@ function buildSinglePagePDF(textRuns) {
       push(streamBytes);
       push('\nendstream\nendobj\n');
     } else {
-      push(objs[i]);
+      push(objs[i]!);
       push('\nendobj\n');
     }
   }
@@ -242,10 +257,10 @@ function buildSinglePagePDF(textRuns) {
   return out;
 }
 
-function textRunsToContentStream(runs) {
+function textRunsToContentStream(runs: readonly TextRun[]): string {
   // Each run is one BT/ET text block. Helvetica/Helvetica-Bold/Courier are
   // built-in PDF fonts, so we don't need to embed glyph data.
-  const out = [];
+  const out: string[] = [];
   for (const r of runs) {
     const x = r.x ?? MARGIN;
     out.push('BT');
@@ -257,7 +272,7 @@ function textRunsToContentStream(runs) {
   return out.join('\n');
 }
 
-function escapePDFString(s) {
+function escapePDFString(s: string): string {
   // PDF literal strings escape: \ ( ) and non-ASCII via octal. We restrict to
   // ASCII (BIP39 English wordlist + branding strings + ASCII punctuation), so
   // octal escapes aren't required — the strings should round-trip 1:1.

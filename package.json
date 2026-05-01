@@ -2,5 +2,12 @@
   "name": "tarn",
   "version": "0.1.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "test:unit": "node scripts/run-unit-tests.mjs"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
 }

@@ -18,13 +18,23 @@ const IV_LEN = 12;
  * Encrypt a plaintext byte buffer under an AES-256-GCM key. Generates a fresh
  * 12-byte IV. Returns IV || ciphertext+tag concatenated.
  *
- * @param {Uint8Array} plaintextBytes
- * @param {CryptoKey} key — AES-256-GCM, usages must include 'encrypt'
- * @returns {Promise<Uint8Array>}
+ * @param plaintextBytes
+ * @param key — AES-256-GCM, usages must include 'encrypt'
  */
-export async function encryptSessionBlob(plaintextBytes, key) {
+export async function encryptSessionBlob(
+  plaintextBytes: Uint8Array,
+  key: CryptoKey,
+): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintextBytes);
+  // Cast at the WebCrypto boundary: TS 5.x narrows BufferSource to require
+  // an ArrayBuffer (not SharedArrayBuffer) backing, but Uint8Array's buffer
+  // is the lib-level union. Runtime accepts either; the cast just smooths
+  // the type layer.
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource },
+    key,
+    plaintextBytes as BufferSource,
+  );
   const ctBytes = new Uint8Array(ct);
   const out = new Uint8Array(IV_LEN + ctBytes.length);
   out.set(iv, 0);
@@ -37,24 +47,28 @@ export async function encryptSessionBlob(plaintextBytes, key) {
  * length-too-short, or any underlying WebCrypto error. The caller in tarn.js
  * wraps this in try/catch so the public `resumeSession()` surface returns
  * `null` for any decrypt failure.
- *
- * @param {Uint8Array} blobBytes
- * @param {CryptoKey} key
- * @returns {Promise<Uint8Array>}
  */
-export async function decryptSessionBlob(blobBytes, key) {
+export async function decryptSessionBlob(
+  blobBytes: Uint8Array,
+  key: CryptoKey,
+): Promise<Uint8Array> {
   if (!(blobBytes instanceof Uint8Array) || blobBytes.length <= IV_LEN) {
     throw new Error('session blob too short');
   }
   const iv = blobBytes.subarray(0, IV_LEN);
   const ct = blobBytes.subarray(IV_LEN);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  // TS 5.x narrowed BufferSource to require ArrayBuffer-not-SharedArrayBuffer
+  // backing storage; subarray() returns Uint8Array<ArrayBufferLike>. The
+  // runtime is fine — WebCrypto accepts either backing — but we need to
+  // smooth this at the type layer. Casting via `as BufferSource` is the
+  // narrow approach.
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv as BufferSource }, key, ct as BufferSource);
   return new Uint8Array(pt);
 }
 
 // ============ IndexedDB layer (browser-only) ============
 
-function openDb() {
+function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
       reject(new Error('IndexedDB not available'));
@@ -68,34 +82,34 @@ function openDb() {
       }
     };
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB open failed'));
   });
 }
 
-function dbGet(db, storeName, id) {
+function dbGet<T = unknown>(db: IDBDatabase, storeName: string, id: string): Promise<T | undefined> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readonly');
     const req = tx.objectStore(storeName).get(id);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error('IndexedDB get failed'));
+    req.onsuccess = () => resolve(req.result as T | undefined);
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB get failed'));
   });
 }
 
-function dbPut(db, storeName, value, id) {
+function dbPut(db: IDBDatabase, storeName: string, value: unknown, id: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
     const req = tx.objectStore(storeName).put(value, id);
     req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error || new Error('IndexedDB put failed'));
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB put failed'));
   });
 }
 
-function dbDelete(db, storeName, id) {
+function dbDelete(db: IDBDatabase, storeName: string, id: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
     const req = tx.objectStore(storeName).delete(id);
     req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error || new Error('IndexedDB delete failed'));
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB delete failed'));
   });
 }
 
@@ -105,13 +119,11 @@ function dbDelete(db, storeName, id) {
  * The non-extractable flag is the load-bearing piece of the threat model
  * (Section 7) — even an XSS that reads IndexedDB cannot exfiltrate raw bytes
  * for offline replay; it can only invoke the key in-page.
- *
- * @returns {Promise<CryptoKey>}
  */
-export async function getOrCreateWrappingKey() {
+export async function getOrCreateWrappingKey(): Promise<CryptoKey> {
   const db = await openDb();
   try {
-    const existing = await dbGet(db, STORE_NAME, KEY_RECORD_ID);
+    const existing = await dbGet<unknown>(db, STORE_NAME, KEY_RECORD_ID);
     if (existing instanceof CryptoKey) return existing;
     const key = await crypto.subtle.generateKey(
       { name: 'AES-GCM', length: 256 },
@@ -128,10 +140,8 @@ export async function getOrCreateWrappingKey() {
 /**
  * Delete the wrapping-key record. Renders all previously-emitted session
  * blobs unreadable on this origin.
- *
- * @returns {Promise<void>}
  */
-export async function clearWrappingKey() {
+export async function clearWrappingKey(): Promise<void> {
   const db = await openDb();
   try {
     await dbDelete(db, STORE_NAME, KEY_RECORD_ID);
