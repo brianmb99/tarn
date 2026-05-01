@@ -204,8 +204,8 @@ Pick the most recent (or a specific `V` if requested), fetch the blob, parse JSO
 
 ### What the SDK does not do
 
-- The SDK never publishes schemas. It accepts the schema as a value in `TarnClient.create({ schema })` and uses it locally. Schema publication is a deployment-time operator action.
-- The SDK does not validate at runtime that its in-process schema matches what's on Arweave. (Open question — see end of doc.)
+- The SDK never publishes schemas. It accepts the schema as a value in `TarnClient.create({ schema })` and uses it locally. Schema publication is a deployment-time concern owned by the app — `tools/publish-schema.mjs` is a starting primitive, but apps may build custom flows (CI hooks, in-app admin UI for schema versioning, etc.).
+- The SDK does not validate at runtime that its in-process schema matches what's on Arweave. Apps own that consistency.
 
 ---
 
@@ -312,7 +312,6 @@ type ClientConfig<S extends Schema> = {
   storage: TarnStorageAdapter;        // required — no opinionated default
   // optional:
   fetchImpl?: typeof fetch;            // for testing
-  onSchemaMismatch?: 'warn' | 'throw' | 'ignore';  // default: 'warn'
 };
 ```
 
@@ -387,7 +386,7 @@ namespace tarn.session {
 }
 ```
 
-The recovery PDF rendering moves into the SDK (today it's app-side). Apps that want a custom PDF layout pass a renderer; the SDK supplies a sane default.
+The recovery PDF rendering moves into the SDK (today it's app-side). The SDK supplies a default Tarn-branded layout. Custom layouts are not supported in this iteration; we add a renderer-injection hook only when an app actually needs to override the default. PDF library (likely `pdf-lib` — ESM-first, ~150KB minified) chosen at implementation time.
 
 ### `tarn.advanced.*`
 
@@ -467,16 +466,16 @@ No production deploys until the end. No protocol changes. Bookish stays on the c
 
 ---
 
-## Open questions for review
+## Resolved decisions
 
-1. **Schema-mismatch detection at init.** Should `TarnClient.create()` round-trip to Arweave to verify the in-process schema matches what the app published, with `onSchemaMismatch: 'warn' | 'throw' | 'ignore'`? Pro: catches "I shipped v4 client but forgot to publish v4 schema." Con: extra round trip on every init. *Lean: ship without it; add later if it becomes a real problem.*
+Five questions surfaced during the design conversation. All are locked in; the doc above reflects the resolutions. Recorded here for traceability.
 
-2. **Recovery PDF rendering inside the SDK.** Today Bookish renders the PDF and ships it to the email-forwarder endpoint. Pulling rendering into the SDK requires bundling a PDF library — meaningful weight. Alternative: SDK provides the recovery data structure (`tarn.recovery.export({ format: 'json' })`) and apps render their own PDF. *Lean: SDK provides JSON; apps that want a default PDF import a separate `@tarn/recovery-pdf` add-on package.*
+1. **Schema-mismatch detection at init: NO.** The SDK does not round-trip to Arweave on init to verify its in-process schema matches what's published. Schema publication is the app's responsibility — apps will likely build custom UI / CI flows around it (the `tools/publish-schema.mjs` script is a starting primitive, not a constraint). Revisit if a real "shipped v4 client but forgot to publish v4 schema" footgun materializes in practice.
 
-3. **Operator vs developer for `tools/publish-schema.mjs`.** Today operator tools run from the maintainer's workstation. Schema publication is more of a "developer build step" — could plausibly be a CI hook or an `npm run publish-schema` in the app repo. *Lean: ship the tool; let app teams decide where it runs.*
+2. **Recovery PDF rendering inside the SDK: YES.** `tarn.recovery.export({ format: 'pdf' })` returns a PDF Blob with a default Tarn-supplied layout. The PDF library cost (~150–250KB depending on choice) is accepted; rendering server-side is a non-starter because recovery PDFs contain master key material that must never leave the device unencrypted. Apps cannot customize the PDF layout in this iteration — if/when an app needs a custom layout, we add a renderer-injection hook. Library choice (likely `pdf-lib` for ESM-first + smaller bundle) decided at implementation time.
 
-4. **`tarn.<collection>.update(id, patch)` — partial vs full record.** Partial (merge with prior) is more ergonomic; full-replace is conceptually simpler. *Lean: partial. The full-replace path is `update(id, { ...currentRecord, ...patch })`, available as a one-liner.*
+3. **`tools/publish-schema.mjs` ships as an operator-style tool.** Symmetric to `tools/set-rules.mjs`. App teams can wire it into CI as `npm run publish-schema` or run it manually from a workstation; the script doesn't care.
 
-5. **TypeScript strictness on `noPropertyAccessFromIndexSignature`.** This rule rejects `obj.foo` where the type is `Record<string, X>`, requiring `obj['foo']`. It catches real bugs but is annoying in app code. *Lean: enable in SDK source, let app `tsconfig`s decide.*
+4. **`tarn.<collection>.update(id, patch)` is partial.** SDK reads the current record, merges the patch, encrypts, writes a new entry. Apps pass only what's changing. Full-replace is `update(id, { ...currentRecord, ...patch })` when explicitly wanted.
 
-Each of these can be answered now, defaulted, or punted to during-implementation. Defaults shown.
+5. **TypeScript strictness:** SDK source enables `noPropertyAccessFromIndexSignature` along with the rest of the strictest sensible config. App `tsconfig`s are not required to inherit this — Bookish picks its own strictness level.
