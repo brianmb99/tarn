@@ -21,6 +21,17 @@
 import { writeFile } from 'node:fs/promises';
 import { TarnClient, TarnStorage, defineSchema } from 'tarn-client';
 
+async function maybeGrantLocalRules(apiBase, dlk) {
+  if (!/^http:\/\/(localhost|127\.0\.0\.1)/.test(apiBase)) return;
+  if (!dlk) return;
+  const { execSync } = await import('node:child_process');
+  const sql = `UPDATE accounts SET rules_json = '[]' WHERE data_lookup_key = '${dlk}'`;
+  execSync(`npx wrangler d1 execute tarn-api --local --command "${sql}"`, {
+    cwd: new URL('../../api', import.meta.url),
+    stdio: 'pipe',
+  });
+}
+
 const API_BASE = process.env.TARN_API ?? 'http://localhost:8787';
 const APP_ID   = 'bookish';
 
@@ -54,6 +65,8 @@ const reg = await tarn1.register(email, password, {
   emailRecoveryKit:     false,    // skip the email forwarder for this example
   appName:              'Tarn Example 04',
 });
+
+await maybeGrantLocalRules(API_BASE, reg.dataLookupKey);
 
 console.log('  recoveryPhrase: <captured, not logged for safety>');
 console.log('  pdfBytes:       Uint8Array of', reg.pdfBytes.length, 'bytes');
