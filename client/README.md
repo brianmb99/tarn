@@ -91,6 +91,39 @@ export const schema = defineSchema({
 
 **Validation:** `tarn.<collection>.create()` and `update()` validate against the schema synchronously, before any network or crypto work. Missing required fields, wrong types, unknown fields, or enum violations throw `TarnSchemaError`.
 
+### Schema versioning and field evolution
+
+Schemas carry a numeric `version`. Bumping it republishes the schema (via `tools/publish-schema.mjs`) under a new `V=` Arweave tag so the recovery client can pick the version that matches each record's `SchemaV` tag.
+
+Three rules cover the common cases:
+
+| Change | Backward-compat? | What you do |
+|---|---|---|
+| **Add a new optional field** | yes | Bump `version`, republish. Older records read with the field absent; new writes include it. |
+| **Add a new required field with a default** | yes | Bump `version`, republish. The default fills in for older records on read. |
+| **Add a new required field without a default** | **no** | Older records fail validation on read. Either supply a default, or migrate (see below). |
+| **Remove a field** | **no** | Older records still carry the field on disk; the strict validator rejects unknown fields on read. Either keep the field declared as deprecated (still accepted, no longer used), or migrate. |
+| **Rename a field** | **no** | Same as remove + add. Migrate, don't rename in place. |
+| **Change a field's type** | **no** | Always a breaking change. Migrate. |
+| **Tighten an enum** (drop a value) | **no** | Older records carrying the dropped value fail. Don't drop; deprecate. |
+| **Loosen an enum** (add a value) | yes | Older records still satisfy the union. |
+
+**Migration pattern.** Tarn doesn't ship a `migrate()` helper — apps write their own walk because the right semantics (one-shot vs. lazy, error handling, partial-failure recovery) are app-specific. The pattern is straightforward:
+
+```js
+// One-shot migration: read all, transform, re-write under the new schema.
+const all = await tarn.books.list();
+for (const book of all) {
+  if (book.author == null) {
+    await tarn.books.update(book.bookId, { author: 'Unknown' });
+  }
+}
+```
+
+Validation runs on `update()`, so the migration loop fails fast if the transform is wrong. Re-running is safe — `update()` is idempotent on identical inputs.
+
+**Forward-looking — relaxed validation.** The current validator is strict by design: unknown fields throw. A future option (`onUnknownField: 'strip' | 'preserve' | 'error'`) will let apps opt into laxer behaviour for upgrade paths — read with extra fields, log a warning, drop them on the next write. Default stays `'error'` so the schema-first commitment isn't watered down. Not shipped yet; track the issue if it matters for your migration plan.
+
 ---
 
 ## Collections

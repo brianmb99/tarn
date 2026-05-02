@@ -5,22 +5,16 @@
  *   1. Register a fresh Tarn account.
  *   2. Create a few books.
  *   3. Generate a single-use invite token + URL. Print it for the recipient.
- *   4. Poll until the recipient redeems and the connection auto-accepts.
+ *   4. Poll `tarn.connections.listIncomingRequests()` until the recipient
+ *      redeems and the connection auto-accepts.
  *   5. Share-with-all, so the new connection sees every book.
  *
- * The auto-accept happens inside the underlying client's listIncomingRequests
- * (it processes the inbox each call, auto-accepting requests whose token
- * matches an issued invite). Until the typed namespace exposes a method for
- * this, we hold a reference to the underlying and poll it directly.
+ * The auto-accept happens inside `tarn.connections.listIncomingRequests()`:
+ * it processes the inbox, and any inbound connection-request whose token
+ * matches an issued invite is auto-accepted as a side effect.
  */
 
-// Note: this example uses the explicit `underlying` factory to keep a
-// reference to the protocol-layer client. The typed `tarn.connections.*`
-// namespace doesn't yet expose a method that triggers the inbox poll
-// (where redeemed-invite auto-accepts happen). The reference lets us
-// call `listIncomingRequests()` directly. This goes away once that
-// method lands on `tarn.connections`.
-import { TarnClient, TarnStorage, _LegacyTarnClient } from 'tarn-client';
+import { TarnClient, TarnStorage } from 'tarn-client';
 import { schema } from './schema.js';
 
 async function maybeGrantLocalRules(apiBase, dlk) {
@@ -40,18 +34,11 @@ const APP_ID   = 'bookish';
 const email    = `sender+${Date.now()}@example.com`;
 const password = 'p@ssw0rd-example-03-sender';
 
-// Hold a reference to the underlying so we can call listIncomingRequests().
-let underlyingRef = null;
-
 const tarn = await TarnClient.create({
   apiBase: API_BASE,
   appId:   APP_ID,
   schema,
   storage: TarnStorage.memory(),
-  underlying: (api, app) => {
-    underlyingRef = new _LegacyTarnClient(api, app);
-    return underlyingRef;
-  },
 });
 
 console.log('[sender] registering', email);
@@ -92,10 +79,11 @@ const TIMEOUT_MS = 5 * 60 * 1000;
 let connection = null;
 
 while (Date.now() - start < TIMEOUT_MS) {
-  // Trigger the inbox poll on the underlying client. Side effect: if a
-  // connection-request matching an issued invite has arrived, auto-accept.
+  // Trigger the inbox poll. Side effect: if a connection-request matching
+  // an issued invite has arrived, auto-accept (the SDK's invite-token flow
+  // handles that internally).
   try {
-    await underlyingRef.listIncomingRequests();
+    await tarn.connections.listIncomingRequests();
   } catch (err) {
     console.warn('[sender] poll failed:', err.message);
   }
@@ -112,7 +100,7 @@ if (!connection) {
   process.exit(1);
 }
 
-console.log('[sender] connected to', connection.label ?? '(no label)');
+console.log('[sender] connected to', connection.label ?? connection.email ?? '(no label)');
 console.log('[sender] sharing all books with the new connection');
 const result = await tarn.books.shareWithAll('b1');
 console.log('  b1 shareWithAll:', result);

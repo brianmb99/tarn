@@ -186,7 +186,7 @@ client/src/
 
 The cut between `client/` (lifecycle namespaces over an injected protocol client) and `tarn.ts` (the protocol-layer client itself) is the redesign's core seam. `tarn.ts` is the converted-to-TS version of the original SDK — the wire-format speaker. The new code in `client/` is a thin typed layer that takes a schema and delegates to `tarn.ts` for everything that touches the network or the crypto material. `TarnClient.create()` constructs both halves and holds them together; tests inject a stub via the `underlying` factory option to drive the typed surface without standing up the full crypto stack.
 
-`underlying` is optional (defaults to a fresh protocol-layer client). The transitional `_LegacyTarnClient` export in the public barrel exists because one example (03-sharing) still needs to call `listIncomingRequests()` to drive the auto-accept poll, and the typed `tarn.connections.*` namespace doesn't yet expose that method. The export goes away when the gap is closed.
+`underlying` is optional (defaults to a fresh protocol-layer client). When supplied, `TarnClient.create()` skips session resume (the SDK can't resume an arbitrary stub-shaped client). When unsupplied — the production path — `create()` peeks at the storage adapter and, if a persisted blob is present, calls the legacy client's static `resumeSession()` to rehydrate the DEK chain, signing keys, and sharing keys before returning. Stale or corrupt blobs return null from resume and are cleared so the SDK doesn't retry on every page load.
 
 ---
 
@@ -236,7 +236,7 @@ This is the structural reason for the schema-first design. A wire-protocol-only 
 
 ## 8. What stayed the same
 
-The wire protocol is unchanged. `tarn.ts` (the protocol-layer client) was converted from JavaScript to TypeScript with no public-API changes — every byte that hits Arweave or the Tarn API is identical to what shipped before the redesign. The SDK redesign is API-shape-only at the SDK boundary. Nothing on Arweave, nothing in D1, no migration on either side. Apps that talk directly to `tarn.ts` (via the `_LegacyTarnClient` escape hatch) get exactly the pre-redesign behaviour, plus stricter types.
+The wire protocol is unchanged. `tarn.ts` (the protocol-layer client) was converted from JavaScript to TypeScript with no public-API changes — every byte that hits Arweave or the Tarn API is identical to what shipped before the redesign. The SDK redesign is API-shape-only at the SDK boundary. Nothing on Arweave, nothing in D1, no migration on either side.
 
 This matters for the Bookish migration: Bookish does not need to re-encrypt or re-publish anything. The migration is a swap of the import statement and a rewrite of the call sites against the new typed surface. Existing data continues to decrypt under the new SDK because the new SDK reads the same envelopes it wrote.
 
@@ -255,4 +255,4 @@ The redesign was scoped to one app to migrate (Bookish, the reference app). With
 - **Bookish migration.** The pre-redesign SDK shape (`createEntry`/`getEntries`/etc. on a plain `TarnClient` instance) is still what Bookish depends on. The migration is the next deliverable; this document is the pitch artifact for it.
 - **Recovery client.** The "always access your data" client described in §7 is on the roadmap. The protocol-level pieces are done; the client itself is a separate deliverable.
 - **`tarn.ts` public-method types.** The protocol-layer client's public methods accept `: any` parameters in places where the typed surface above already constrains the inputs. Tightening those is a follow-up; the new typed surface is what apps see, and it's fully constrained.
-- **Closing the `_LegacyTarnClient` escape hatch.** When `tarn.connections.*` covers the full incoming-request surface (specifically `listIncomingRequests` to drive auto-accept polling), example 03 collapses to the same shape as the others and the export goes away.
+- **Schema-evolution helpers.** `defineSchema({ ..., onUnknownField: 'strip' | 'preserve' | 'error' })` for opt-in laxer reads, and an opinion on whether a `migrate()` helper belongs in the SDK or in app code. The current SDK is strict-only ('error' equivalent); the field-evolution rules in `client/README.md` are the explicit answer for now. Apps write their own migration loops with `list()` + `update()`.

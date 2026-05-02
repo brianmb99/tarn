@@ -130,8 +130,18 @@ export type ShareConnection = {
  * returns rich objects; Collection<T> and the connections namespace both
  * accept the same shape and project / normalize as needed. ShareConnection
  * is structurally a subset.
+ *
+ * The four optional fields below are part of the protocol record (see
+ * sharing.ts `ConnectionEntry` and the upsertConnection sites) and are
+ * surfaced on the typed `Connection` shape. They're declared here so the
+ * connections namespace can reach them without going through the index
+ * signature.
  */
-export type UnderlyingConnection = ShareConnection & Record<string, unknown>;
+export type UnderlyingConnection = ShareConnection & {
+  email?: string | null;
+  established_at?: number | null;
+  initial_request_nonce?: string | null;
+} & Record<string, unknown>;
 
 /** Error class for Collection-level failures (record not found, etc.). */
 export class TarnCollectionError extends Error {

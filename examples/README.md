@@ -31,12 +31,6 @@ Four progressive examples for the [Tarn client SDK](../client/README.md). Each i
 
    The `tarn-client` dependency uses `file:../../client`, so npm symlinks the local SDK source. There is no published-to-npm step.
 
-## Note on example 03 (sharing)
-
-The sharing example uses an `_LegacyTarnClient` import — that's a transitional escape hatch for one specific gap: the typed `tarn.connections.*` namespace doesn't yet expose a method that triggers the inbox poll where redeemed-invite auto-accepts happen. The example holds a reference to the protocol-layer client and calls `listIncomingRequests()` on it directly. Examples 01, 02, and 04 don't need this — they use the clean `TarnClient.create({ apiBase, appId, schema, storage })` shape with no `underlying` factory.
-
-When the typed namespace gets the missing method, example 03 collapses to the same shape as the others and the `_LegacyTarnClient` export goes away.
-
 ## App registration
 
 Examples assume the `bookish` app is already registered in your local D1 (it is by default in the workspace's local wrangler dev setup, since Bookish is the reference app). If you want to run examples against a different app, follow the [App registration](../client/README.md#app-registration) section of the SDK README.

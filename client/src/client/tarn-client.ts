@@ -69,13 +69,24 @@ export type TarnClientCreateConfig<S extends AnySchema> = ClientConfig<S> & {
    * Optional: override the underlying protocol-layer client. Defaults to
    * the bundled legacy TarnClient (which speaks the wire protocol). Tests
    * pass a stub here; production apps leave it unset.
+   *
+   * Note: when this is supplied, session resume is skipped — the SDK
+   * doesn't know how to resume an arbitrary stub-shaped client. Tests that
+   * want to exercise the resume path use the default factory.
    */
   underlying?: UnderlyingFactory;
 };
 
-const SESSION_RESUME_OPTS = {
-  // Pass through to the JS resumeSession; placeholder for future tunables.
-};
+/**
+ * Hook signature for the resume path: given the persisted session blob,
+ * produce a logged-in underlying client, or null if the blob is stale /
+ * corrupt / for a different account.
+ *
+ * The default resumer wraps the bundled legacy client's static
+ * `resumeSession`. Tests use the helper `resolveUnderlying()` directly to
+ * inject mocks.
+ */
+type Resumer = (apiBase: string, appId: string, blob: string) => Promise<IUnderlyingClient | null>;
 
 /**
  * The typed client. Generic over the schema so `tarn.<collection>` is fully
@@ -139,10 +150,28 @@ export class TarnClient<S extends AnySchema> {
       );
     }
 
-    // Default to the bundled legacy client; tests inject a stub via config.underlying.
-    const underlyingFactory: UnderlyingFactory = config.underlying
-      ?? ((api, app) => new LegacyTarnClient(api, app) as unknown as IUnderlyingClient);
-    const underlying = underlyingFactory(config.apiBase, config.appId);
+    // Resolve the underlying client: if a factory is provided (test path),
+    // instantiate via the factory and skip resume. Otherwise: read storage,
+    // try to resume a persisted session via the bundled legacy client's
+    // static `resumeSession`, fall back to a fresh instance on miss /
+    // failure (clearing the stale blob so we don't retry on every reload).
+    const fresh = (): IUnderlyingClient => {
+      if (config.underlying) return config.underlying(config.apiBase, config.appId);
+      return new LegacyTarnClient(config.apiBase, config.appId) as unknown as IUnderlyingClient;
+    };
+    const resume: Resumer | null = config.underlying
+      ? null
+      : async (api, app, blob) => {
+          const resumed = await LegacyTarnClient.resumeSession(api, app, blob);
+          return resumed ? (resumed as unknown as IUnderlyingClient) : null;
+        };
+    const underlying = await resolveUnderlying({
+      apiBase: config.apiBase,
+      appId: config.appId,
+      storage: config.storage,
+      resume,
+      fresh,
+    });
 
     // Build the collection namespace from the schema.
     const collections = await buildCollections<S>(underlying, config.schema, config.appId);
@@ -154,11 +183,6 @@ export class TarnClient<S extends AnySchema> {
       appId: config.appId,
       collections,
     });
-
-    // Try to restore a persisted session before returning. Failures here
-    // are non-fatal — corrupt or stale blobs result in "not logged in"
-    // and the app proceeds to `login()` / `register()`.
-    await client.#tryResumeSession();
 
     // Compose the public shape: the class instance plus the
     // tarn.<collection> properties from `collections`. The cast carries
@@ -208,27 +232,6 @@ export class TarnClient<S extends AnySchema> {
 
   // ============ Internal ============
 
-  async #tryResumeSession(): Promise<void> {
-    try {
-      const blob = await this.#storage.read();
-      if (!blob) return;
-      // The underlying client's static `resumeSession` is a class method on
-      // the JS prototype; we delegate to instance-level resume by invoking
-      // through the underlying. The factory shape doesn't expose static
-      // resumes, so callers expecting classic behaviour use the underlying
-      // client directly via `tarn.advanced.*` if they need it. For now, the
-      // resume path is implicit — once the underlying TS client lands in
-      // step 6 we'll wire this through cleanly.
-      // Step-4 limitation: explicit instance-level `resumeSession()` is not
-      // exposed by the legacy JS client (it's static). Apps that need
-      // explicit session restore call the underlying's static helper before
-      // constructing the TarnClient. This will get cleaner in step 6.
-      void SESSION_RESUME_OPTS;
-    } catch (err) {
-      console.warn('[TarnClient] resume session failed:', err instanceof Error ? err.message : err);
-    }
-  }
-
   async #persistSession(): Promise<void> {
     try {
       const blob = await this.#underlying.serializeSession();
@@ -269,4 +272,56 @@ async function buildCollections<S extends AnySchema>(
   }
 
   return out as unknown as CollectionsOf<S>;
+}
+
+// ============ Underlying-resolution helper ============
+
+/**
+ * Pick the underlying client for a new TarnClient: try to resume a persisted
+ * session; on miss / failure, build a fresh instance and clear any stale blob.
+ *
+ * Exported (under a `_` prefix) so unit tests can drive it directly with
+ * mock storage adapters and a stub resumer — the production path through
+ * `TarnClient.create()` does not let tests inject a custom resumer.
+ *
+ * @internal
+ */
+export async function resolveUnderlying(args: {
+  apiBase: string;
+  appId: string;
+  storage: TarnStorageAdapter;
+  /** Null disables resume entirely (e.g., when a test factory is in use). */
+  resume: ((apiBase: string, appId: string, blob: string) => Promise<IUnderlyingClient | null>) | null;
+  fresh: () => IUnderlyingClient;
+}): Promise<IUnderlyingClient> {
+  if (!args.resume) return args.fresh();
+
+  let blob: string | null = null;
+  try {
+    blob = await args.storage.read();
+  } catch (err) {
+    // Storage backends can fail (quota, permission). Treat as "no blob"
+    // and construct fresh — the user re-authenticates and the next
+    // login() persists, which surfaces any persistent storage failure.
+    console.warn('[TarnClient] storage read failed:', err instanceof Error ? err.message : err);
+    return args.fresh();
+  }
+  if (!blob) return args.fresh();
+
+  let resumed: IUnderlyingClient | null = null;
+  try {
+    resumed = await args.resume(args.apiBase, args.appId, blob);
+  } catch (err) {
+    console.warn('[TarnClient] resume failed:', err instanceof Error ? err.message : err);
+  }
+  if (resumed) return resumed;
+
+  // Blob was stale, corrupt, expired, or for a different account. Clear
+  // it so we don't re-attempt resume on every page load.
+  try {
+    await args.storage.clear();
+  } catch {
+    // Non-fatal — the next persistSession() will overwrite anyway.
+  }
+  return args.fresh();
 }

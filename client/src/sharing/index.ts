@@ -7,4 +7,15 @@
  * `tarn.connections.*` namespace in step 4.
  */
 
-export type { Connection, ShareLogEntry, ShareWithAllResult } from './types.js';
+export type {
+  Connection,
+  ShareLogEntry,
+  ShareWithAllResult,
+  InviteToken,
+  CreateInviteOpts,
+  InvitePreview,
+  IssuedInvite,
+  RedeemedInvite,
+  IncomingRequest,
+  ListIncomingOpts,
+} from './types.js';
