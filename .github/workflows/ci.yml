@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  test:
+    name: Typecheck + tests + build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+
+      # Root has a small toolchain (tsx + typescript) used to run the JS unit
+      # tests via `node --import tsx --test`. Client has the full SDK + build
+      # toolchain. Both lockfiles are checked into the repo; `npm ci` enforces
+      # exact-version installs from them.
+      - name: Install root devDependencies
+        run: npm ci
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      # Strict-mode typecheck across the whole SDK source tree. Catches the
+      # kind of issues `noUncheckedIndexedAccess` /
+      # `exactOptionalPropertyTypes` flag — the strictness profile that's
+      # meaningfully bug-preventing for the protocol/crypto layer.
+      - name: Typecheck SDK
+        working-directory: client
+        run: npm run typecheck
+
+      # 96 TS tests covering schema, collections, sharing helpers, client
+      # namespaces, storage adapters, and the TarnClient class wiring (via a
+      # MockTarnClient). Pure logic — no live API needed.
+      - name: TS unit tests
+        working-directory: client
+        run: npm test
+
+      # 418 JS unit tests in tests/unit/ covering the underlying client's
+      # crypto + sharing + auth flows. Run via tsx so .js import specifiers in
+      # the test files resolve to .ts source modules.
+      - name: JS unit tests
+        run: npm run test:unit
+
+      # Verify the build produces both ESM + CJS + .d.ts cleanly. Catches
+      # regressions in the build pipeline (esbuild, .js → .cjs specifier
+      # rewrite, tsconfig.build inclusion). The build itself is part of
+      # `prepublishOnly` so a green build here means the package would
+      # publish cleanly.
+      - name: Build SDK
+        working-directory: client
+        run: npm run build
+
+      # Confirm the built package would pack cleanly (catches stale dist/,
+      # missing files, etc.). Doesn't actually publish.
+      - name: npm pack dry-run
+        working-directory: client
+        run: npm pack --dry-run
