@@ -182,10 +182,19 @@ describe('JWT', () => {
     const token = await signJWT({ sub: 'x' }, TEST_SECRET);
     const parts = token.split('.');
 
-    // Flip last char of signature
-    const lastChar = parts[2].slice(-1);
-    const flipped = lastChar === 'A' ? 'B' : 'A';
-    const tampered = `${parts[0]}.${parts[1]}.${parts[2].slice(0, -1)}${flipped}`;
+    // Tamper a char in the FIRST half of the signature. Don't tamper the
+    // last char: an 86-char base64url encoding of a 64-byte ECDSA signature
+    // has only 2 significant bits in its final char (the other 4 bits are
+    // ignored padding). Flipping between 'A' (000000) and 'B' (000001) only
+    // toggles a padding bit, so the decoded signature is unchanged and
+    // verify (correctly) succeeds — making the test flaky depending on
+    // what the last char happened to be. Position 10 is solidly in
+    // significant-bit territory.
+    const TAMPER_POS = 10;
+    const c = parts[2][TAMPER_POS];
+    const replacement = c === 'A' ? 'B' : 'A';
+    const tampered =
+      `${parts[0]}.${parts[1]}.${parts[2].slice(0, TAMPER_POS)}${replacement}${parts[2].slice(TAMPER_POS + 1)}`;
 
     const result = await verifyJWT(tampered, TEST_SECRET);
     assert.equal(result, null, 'Tampered signature should not verify');
