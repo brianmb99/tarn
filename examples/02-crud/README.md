@@ -34,4 +34,4 @@ TARN_API=https://api.tarn.dev npm start
 
 ## Note
 
-Uses `TarnStorage.memory()` — nothing persists across runs. The transitional `underlying` factory pattern is the same as in `01-hello-world` and goes away in a later SDK step.
+Uses `TarnStorage.memory()` — nothing persists across runs. Constructs the client via the clean `TarnClient.create({ apiBase, appId, schema, storage })` shape; no `underlying` factory needed.

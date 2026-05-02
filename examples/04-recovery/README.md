@@ -35,4 +35,4 @@ TARN_API=https://api.tarn.dev npm start
 
 This example passes `emailRecoveryKit: false` to skip the Resend-based email forwarder. To enable it in production you must configure two Worker secrets (`EMAIL_FORWARDER_API_KEY`, `EMAIL_FORWARDER_FROM`) — see the main [Tarn CLAUDE.md](../../CLAUDE.md#worker-secrets-issue-12--recovery-email-forwarder). When configured, `emailRecoveryKit: true` (the default) forwards the rendered PDF without persisting it; the `pdfBytes` field is still returned so apps can offer a download as well.
 
-The `underlying` factory is the same transitional pattern as the other examples and goes away in a later SDK step.
+This example uses the clean `TarnClient.create({ apiBase, appId, schema, storage })` shape — no `underlying` factory needed. (Example 03 still threads `underlying` to reach `listIncomingRequests()`; everything else is on the typed surface.)

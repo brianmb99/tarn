@@ -1,0 +1,258 @@
+# Tarn SDK — Implementation Architecture
+
+**Audience:** developers evaluating Tarn for use, including the Bookish team for the migration off the pre-redesign client.
+**Companion docs:** [`client/README.md`](../client/README.md) is the app-facing API reference; [`docs/TARN_PROTOCOL.md`](./TARN_PROTOCOL.md) is the wire-protocol spec; [`docs/SDK_REDESIGN.md`](./SDK_REDESIGN.md) is the design doc this document describes the implementation of.
+
+---
+
+## 1. Summary
+
+The Tarn SDK is a TypeScript library that gives apps typed CRUD over encrypted, user-owned data on Arweave. Apps declare collections and fields via `defineSchema()`; that declaration drives compile-time autocomplete, runtime validation, and the lifecycle namespaces hanging off the client. The crypto layer underneath uses branded types pervasively so primitives that are all "strings" at runtime — lookup keys, share keys, wrapped data keys, base64 vs. base64url vs. hex — cannot be confused at compile time. The SDK is built strict (`strict: true` plus `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, and `noPropertyAccessFromIndexSignature`), with no `@ts-nocheck` anywhere in the source. Schemas are published to Arweave under `Type='app-schema'` so a future "always access your data" recovery client can decode entries without depending on the Tarn API at all — that recovery property is the structural reason for the schema-first design.
+
+---
+
+## 2. The shape apps see
+
+```ts
+import { TarnClient, defineSchema, TarnStorage } from 'tarn-client';
+
+const schema = defineSchema({
+  appId: 'bookish',
+  version: 1,
+  collections: {
+    books: {
+      primaryKey: 'bookId',
+      fields: {
+        bookId: 'string',
+        title:  'string',
+        author: 'string?',
+        rating: 'integer?',
+      },
+      shareable: true,
+    },
+  },
+});
+
+const tarn = await TarnClient.create({
+  apiBase: 'https://api.tarn.dev',
+  appId:   'bookish',
+  schema,
+  storage: TarnStorage.localStorage(),
+});
+
+await tarn.login(email, password);
+await tarn.books.create({ bookId: 'b1', title: 'Mountains' });
+const all = await tarn.books.list();
+await tarn.books.share(connection, 'b1');
+```
+
+`tarn` carries six top-level namespaces, plus one typed namespace per collection in the schema:
+
+- **`tarn.<collection>`** — typed CRUD per collection (`create`, `update`, `get`, `list`, `delete`). Collections marked `shareable: true` also get `share`, `shareWithAll`, `unshare`, `listShared`. Updates are partial-merge: the SDK reads, merges the patch, re-validates the full record, and writes a chained entry. Apps work in primary-key space and never see Arweave txids.
+- **`tarn.connections`** — the connection lifecycle: `invite` (email handshake), `createInvite`/`redeemInvite` (link/QR token flow), `accept`, `list`, `mute`/`unmute`, `setLabel`, `remove`. Connections are SDK objects (`{ share_pub, signing_pub, label?, muted? }`); apps pass them around without touching the underlying X25519 keys.
+- **`tarn.account`** — `changeCredentials(newEmail, newPassword, { phrase? })`, `delete()`. Routine credential rotation; `phrase` extends the recovery factor to the new generation.
+- **`tarn.session`** — `isLoggedIn()`, `clear()`, plus the multi-device server-side surface (`listDevices`, `revokeDevice`, `revokeAllOthers`, `revokeAll`).
+- **`tarn.recovery`** — `export({ format: 'pdf' | 'json' })` to re-render the recovery kit, `emailKit({ to, pdfBytes })` to forward a kit through Tarn's email relay (no persistence). Account recovery itself is on the top-level client (`tarn.recoverAccount({ phrase, newEmail, newPassword })`) since it's pre-auth.
+- **`tarn.advanced`** — schema-less entry CRUD, raw blob fetch, direct share-log access. Power-user escape hatches; most apps never reach for these.
+
+Lifecycle methods that don't fit a noun namespace stay on the top-level client: `login`, `register`, `recoverAccount`, plus the `serializeSession` / `resumeSession` static for at-rest session persistence (Section 7 of the protocol).
+
+---
+
+## 3. What the type system is doing
+
+This is the meat of the redesign — the layer that makes the schema-first surface ergonomic.
+
+### Schema-first with compile-time inference
+
+`defineSchema()` is generic over its argument and uses `<const S>` capture so the literal shape of the input flows into the type system:
+
+```ts
+export function defineSchema<const S>(input: S): Schema<S extends SchemaInput ? S : never>
+```
+
+The input is intentionally not constrained at the parameter level — constraining to `SchemaInput` would widen literal types like `'string'` to `string`, which would defeat downstream record-type derivation. Instead, the constraint moves into the return type, runtime validation enforces structural validity at module load, and the `<const>` capture preserves the literal shape so `tarn.books.create({ ... })` autocompletes from the schema and rejects unknown fields and type mismatches.
+
+```ts
+const tarn = await TarnClient.create({ schema: bookishSchema, /* ... */ });
+
+await tarn.books.create({
+  bookId: 'b1',
+  title:  'Foo',
+  // titel: 'typo'    // ✗ TS error: unknown field
+});
+
+const book = await tarn.books.get('b1');
+//    ^? { bookId: string; title: string; author?: string; rating?: number; ... }
+```
+
+Plain JavaScript callers get the same runtime validation; only the autocomplete and the type-error surface are compile-time.
+
+### Branded types in the crypto layer
+
+The crypto layer carries a fleet of distinct-but-string-shaped values. Branded types keep them apart at compile time:
+
+```ts
+declare const __brand: unique symbol;
+type Brand<T, B extends string> = T & { readonly [__brand]: B };
+
+export type LookupKey       = Brand<string, 'LookupKey'>;        // hex, 32 bytes
+export type ShareKey        = Brand<string, 'ShareKey'>;         // base64url, 32 raw bytes
+export type WrappedDataKey  = Brand<string, 'WrappedDataKey'>;   // base64 AES-KW ciphertext or v3/v4 envelope JSON
+export type Base64          = Brand<string, 'Base64'>;
+export type Base64Url       = Brand<string, 'Base64Url'>;
+export type Hex             = Brand<string, 'Hex'>;
+```
+
+Constructors live next to format validators (`asLookupKey`, `asBase64Url`, etc.) and throw on malformed input. The brands erase to plain strings at runtime — no overhead — but a function that takes a `LookupKey` will not accept a `Base64`, and vice versa. The protocol layer is exactly the layer where mixing those up costs the most.
+
+### Strict-mode profile
+
+```jsonc
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"]
+  }
+}
+```
+
+`noUncheckedIndexedAccess` flags `array[i]` as `T | undefined` rather than `T`, which catches off-by-one and missing-key bugs at compile time. `exactOptionalPropertyTypes` distinguishes "absent property" from "property explicitly set to `undefined`" — important when an envelope JSON's missing-vs-null distinction is load-bearing (e.g., the v4 wrapped-data-key envelope's `recovery` block: absent means no recovery factor; present means one is enrolled). `noPropertyAccessFromIndexSignature` forces `obj[key]` rather than `obj.key` on dynamically-keyed maps, which keeps the type system honest about which accesses are checked literals and which are user-supplied strings.
+
+### No `@ts-nocheck`
+
+Every file in `client/src/` typechecks under the strict profile. There are no escape-hatch suppressions. The one place that could plausibly need them — WebCrypto's `BufferSource` boundary, where TypeScript's lib types disagree with the runtime contract — is handled by a single small helper:
+
+```ts
+// makes the boundary explicit: every WebCrypto input flows through `bs()`.
+function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
+  return b as BufferSource;
+}
+```
+
+`bs()` is the only `as` cast that crosses that line. Every WebCrypto call (`crypto.subtle.sign`, `digest`, `wrapKey`, etc.) wraps its inputs in `bs()`. The convention is a one-line audit point rather than a sprinkling of suppressions.
+
+### Discriminated unions for protocol shapes
+
+The share-log operation types are a tagged union:
+
+```ts
+type ShareLogOp =
+  | { op: 'add';             content_id: ContentId; txid: Txid; share_key: ShareKey }
+  | { op: 'update';          content_id: ContentId; txid: Txid }
+  | { op: 'rotate';          content_id: ContentId; txid: Txid; share_key: ShareKey }
+  | { op: 'remove';          content_id: ContentId }
+  | { op: 'snapshot';        state: ShareLogSnapshot }
+  | { op: 'rotate_identity'; new_share_pub: ShareKey; new_signing_pub: Base64; ... };
+```
+
+The discriminant (`op`) lets the consumer narrow exhaustively with `noFallthroughCasesInSwitch` catching forgotten cases. Same pattern for envelope versions (`v: 1 | 2 | 3 | 4`) on the wrapped-data-key envelope, and for collection-validation results (`{ ok: true, value: T } | { ok: false, errors: ValidationError[] }`).
+
+---
+
+## 4. Module layout
+
+```
+client/src/
+  schema/                — DSL: defineSchema, validators, reserved-namespace enforcement
+    define.ts, types.ts, validate.ts, reserved.ts, index.ts
+  collections/           — typed CRUD wrapper over the protocol-layer client
+    collection.ts, eid.ts, types.ts, index.ts
+  sharing/               — Connection types and sharing helpers (public types)
+    types.ts, index.ts
+  storage/               — TarnStorageAdapter interface + memory/localStorage/custom built-ins
+    adapter.ts, memory.ts, local-storage.ts, custom.ts, index.ts
+  client/                — TarnClient class + lifecycle namespaces
+    tarn-client.ts, types.ts, index.ts
+    namespaces/
+      connections.ts, account.ts, session.ts, recovery.ts, advanced.ts
+  crypto.ts              — KDFs, key derivation, AES-KW wrap/unwrap, ECDSA helpers
+  sharing.ts             — HPKE handshake, per-pair K_AB derivation
+  share-log.ts           — append-only share-log read/write, op-type discriminated union
+  recovery.ts            — BIP39 phrase generation, recovery KEK derivation, PDF rendering
+  session-persistence.ts — at-rest serialize/resume + IndexedDB wrapping key
+  tarn.ts                — protocol-layer client (the "underlying" — used internally by default)
+  index.ts               — public barrel
+```
+
+The cut between `client/` (lifecycle namespaces over an injected protocol client) and `tarn.ts` (the protocol-layer client itself) is the redesign's core seam. `tarn.ts` is the converted-to-TS version of the original SDK — the wire-format speaker. The new code in `client/` is a thin typed layer that takes a schema and delegates to `tarn.ts` for everything that touches the network or the crypto material. `TarnClient.create()` constructs both halves and holds them together; tests inject a stub via the `underlying` factory option to drive the typed surface without standing up the full crypto stack.
+
+`underlying` is optional (defaults to a fresh protocol-layer client). The transitional `_LegacyTarnClient` export in the public barrel exists because one example (03-sharing) still needs to call `listIncomingRequests()` to drive the auto-accept poll, and the typed `tarn.connections.*` namespace doesn't yet expose that method. The export goes away when the gap is closed.
+
+---
+
+## 5. Build pipeline
+
+`esbuild` for ESM + CJS, `tsc --emitDeclarationOnly` for `.d.ts`. Per-file output, no bundling — apps' bundlers tree-shake what they don't use:
+
+```
+client/dist/
+  esm/        ESM with .js extensions, source maps
+    schema/, collections/, sharing/, storage/, client/
+    crypto.js, sharing.js, share-log.js, recovery.js, session-persistence.js, tarn.js
+    index.js
+  cjs/        CJS with .cjs extensions; require() specifiers rewritten ./X.js → ./X.cjs
+    (mirror of esm/)
+  types/      .d.ts declaration files
+    (mirror of src/)
+```
+
+The `package.json` `exports` map points to `dist/types/index.d.ts` for types, `dist/esm/index.js` for `import`, `dist/cjs/index.cjs` for `require`. Source ships in the package too (`files: ['dist/', 'src/', 'README.md']`) so consumers can step into TS source via source maps without unpacking the build.
+
+`prepublishOnly: typecheck && test && build` gates publishes — a broken typecheck or test, or a missing dist/ entry, blocks the publish before anything reaches npm.
+
+---
+
+## 6. Testing layers
+
+Four layers, each catching different things:
+
+- **96 TypeScript unit tests** in `client/tests/{schema,collection,client}.test.ts`. Schema validation (reserved-namespace enforcement, optional-vs-required, enum membership), collection wrapping (the partial-merge update path, primary-key-to-Eid mapping, `share()` only existing on `shareable: true` collections), namespace delegation (each lifecycle method calls through to the right underlying method) via a `MockTarnClient` that satisfies `IUnderlyingClient`. Pure logic; no network.
+- **418 JavaScript unit tests** in `tests/unit/*.test.js`. Crypto primitives (HKDF derivation, AES-KW wrap/unwrap byte stability, P-256 retry rule), per-content CEK handling, KDF dispatch (Argon2id default + PBKDF2 fallback), share-log read/write under simulated Arweave, session persistence round-trips, recovery factor unwrap, invite-token redemption. These run via `tsx` so the JS test files import the in-progress `.ts` source modules directly.
+- **Integration tests** against `wrangler dev` in `tests/test-*.mjs`. Full HTTP round-trip: register → app auth → set rules → login → write → read → share → recover → delete. Catches contract drift between SDK and API.
+- **Four runnable examples** in `examples/`. Manually executed against a real API; catches end-to-end issues that mocks don't (real Arweave gateway responses, real Turbo upload latency, real CORS).
+- **GitHub Actions CI** on every push to `dev`/`main`: typecheck + TS unit tests + JS unit tests + build + `npm pack --dry-run`. Green CI is the required precondition for any merge.
+
+---
+
+## 7. The recovery property
+
+Schemas are published to Arweave under `Type='app-schema', App=<app_id>, V=<version>` via `tools/publish-schema.mjs`. Anyone with read access to Arweave (i.e., everyone, via a public gateway) can fetch the schema by app and version. Combined with the v4 wrapped-data-key envelope being recoverable from `Type='cred'` blobs and content blobs being recoverable from `Type='entry'` blobs, this means: a "Tarn recovery" client could be built that reads everything it needs straight from Arweave gateways via GraphQL, with no Tarn API in the loop, given only the user's email + password (or recovery phrase) and the app id.
+
+That client is on the roadmap, not shipped. The protocol-level enabling work — schema publication endpoint, fixed `Type` tag, deterministic envelope formats — is done. Apps inherit the property by virtue of using the SDK; nothing app-side needs to change to make it true.
+
+This is the structural reason for the schema-first design. A wire-protocol-only client could never decode Bookish's books into the user-readable shape; the schema is what turns "decrypted opaque JSON" into "a record with named fields and types". Publishing it to the same permanent ledger as the data closes the recovery loop.
+
+---
+
+## 8. What stayed the same
+
+The wire protocol is unchanged. `tarn.ts` (the protocol-layer client) was converted from JavaScript to TypeScript with no public-API changes — every byte that hits Arweave or the Tarn API is identical to what shipped before the redesign. The SDK redesign is API-shape-only at the SDK boundary. Nothing on Arweave, nothing in D1, no migration on either side. Apps that talk directly to `tarn.ts` (via the `_LegacyTarnClient` escape hatch) get exactly the pre-redesign behaviour, plus stricter types.
+
+This matters for the Bookish migration: Bookish does not need to re-encrypt or re-publish anything. The migration is a swap of the import statement and a rewrite of the call sites against the new typed surface. Existing data continues to decrypt under the new SDK because the new SDK reads the same envelopes it wrote.
+
+---
+
+## 9. Net new lines
+
+The cumulative diff across the redesign is large — roughly 35,000 insertions across 155 files — but most of that is `.js` → `.ts` renames where Git counts every line of the renamed file as new. Real net new content is closer to 10,000 lines: the new TS modules (`schema/`, `collections/`, `client/`, `sharing/`, `storage/`), the schema publication endpoint and `tools/publish-schema.mjs`, the TS test suite, the four example apps, the build pipeline, the CI workflow, the rewritten README, and this document.
+
+The redesign was scoped to one app to migrate (Bookish, the reference app). With one consumer and the protocol unchanged, the rip-and-replace was the right call: parallel APIs would have doubled the maintenance surface for the duration of the migration window, and the breaking-change cost is paid once.
+
+---
+
+## 10. What's not done
+
+- **Bookish migration.** The pre-redesign SDK shape (`createEntry`/`getEntries`/etc. on a plain `TarnClient` instance) is still what Bookish depends on. The migration is the next deliverable; this document is the pitch artifact for it.
+- **Recovery client.** The "always access your data" client described in §7 is on the roadmap. The protocol-level pieces are done; the client itself is a separate deliverable.
+- **`tarn.ts` public-method types.** The protocol-layer client's public methods accept `: any` parameters in places where the typed surface above already constrains the inputs. Tightening those is a follow-up; the new typed surface is what apps see, and it's fully constrained.
+- **Closing the `_LegacyTarnClient` escape hatch.** When `tarn.connections.*` covers the full incoming-request surface (specifically `listIncomingRequests` to drive auto-accept polling), example 03 collapses to the same shape as the others and the export goes away.

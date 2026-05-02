@@ -325,7 +325,6 @@ CONTENT = [
      "  appId:   'bookish',\n"
      "  schema,\n"
      "  storage: TarnStorage.localStorage(),\n"
-     "  // (transitional `underlying` factory omitted)\n"
      "});\n"
      "\n"
      "await tarn.login(email, password);\n"
@@ -818,8 +817,159 @@ CONTENT = [
      "from observable wrapping patterns. Substantial cost for marginal "
      "improvement; deferred."),
 
+    # ============ SDK IMPLEMENTATION ============
+    ('h1', '12. Inside the SDK'),
+    ('p',
+     "Sections 1–11 describe the protocol that hits Arweave and the API "
+     "endpoints clients speak to. This section describes the client SDK "
+     "itself — the TypeScript library application code links against. The "
+     "wire protocol is unchanged by anything below; this section is about "
+     "the shape of the code above it."),
+    ('h2', 'Schema-first surface'),
+    ('p',
+     "Apps declare collections and fields up front via "
+     "<code>defineSchema()</code>. From that declaration the SDK generates "
+     "typed CRUD per collection and typed namespaces for connections, "
+     "sharing, recovery, account management, and sessions. Application code "
+     "never touches Arweave txids, content-encryption keys, share-log "
+     "sequence numbers, or HPKE handshakes — those stay encapsulated."),
+    ('code',
+     "import { TarnClient, defineSchema, TarnStorage } from 'tarn-client';\n"
+     "\n"
+     "const schema = defineSchema({\n"
+     "  appId: 'bookish', version: 1,\n"
+     "  collections: {\n"
+     "    books: {\n"
+     "      primaryKey: 'bookId',\n"
+     "      fields: { bookId: 'string', title: 'string', author: 'string?' },\n"
+     "      shareable: true,\n"
+     "    },\n"
+     "  },\n"
+     "});\n"
+     "\n"
+     "const tarn = await TarnClient.create({\n"
+     "  apiBase: 'https://api.tarn.dev', appId: 'bookish',\n"
+     "  schema, storage: TarnStorage.localStorage(),\n"
+     "});\n"
+     "\n"
+     "await tarn.login(email, password);\n"
+     "await tarn.books.create({ bookId: 'b1', title: 'Mountains' });\n"
+     "await tarn.books.share(connection, 'b1');"
+    ),
+    ('p',
+     "Six top-level namespaces, plus one typed namespace per "
+     "<code>shareable: true</code> collection in the schema: "
+     "<code>tarn.&lt;collection&gt;</code> (typed CRUD plus sharing), "
+     "<code>tarn.connections</code>, <code>tarn.account</code>, "
+     "<code>tarn.session</code>, <code>tarn.recovery</code>, and "
+     "<code>tarn.advanced</code> (escape hatches for the rare cases the "
+     "typed surface doesn't cover)."),
+    ('h2', 'What the type system is doing'),
+    ('p',
+     "<code>defineSchema()</code> uses <code>&lt;const S&gt;</code> capture so "
+     "the literal shape of its input flows into the type system; "
+     "<code>tarn.books.create({ ... })</code> autocompletes from the schema "
+     "and rejects unknown fields and type mismatches at compile time. "
+     "The crypto layer carries a fleet of distinct-but-string-shaped values "
+     "— <code>LookupKey</code>, <code>ShareKey</code>, "
+     "<code>WrappedDataKey</code>, <code>Base64</code>, <code>Base64Url</code>, "
+     "<code>Hex</code> — as branded (phantom-tagged) string types. They erase "
+     "to plain strings at runtime but keep apart at compile time, which is "
+     "the protocol layer's main accident-prevention property."),
+    ('p',
+     "Strict-mode profile: <code>strict: true</code> plus "
+     "<code>noUncheckedIndexedAccess</code> (catches <code>array[i]</code> "
+     "as <code>T | undefined</code>), <code>exactOptionalPropertyTypes</code> "
+     "(distinguishes absent-property from explicitly-undefined — load-bearing "
+     "for the v4 envelope's optional <code>recovery</code> block), and "
+     "<code>noPropertyAccessFromIndexSignature</code> (forces "
+     "<code>obj[key]</code> over <code>obj.key</code> on dynamic maps). No "
+     "<code>@ts-nocheck</code> anywhere. The one TypeScript-vs-runtime "
+     "boundary that could plausibly need a suppression — WebCrypto's "
+     "<code>BufferSource</code> contract — is handled by a single "
+     "<code>bs()</code> helper that every WebCrypto input flows through. "
+     "It is the only <code>as</code> cast crossing that line."),
+    ('p',
+     "Discriminated unions for protocol shapes: share-log operations "
+     "(<code>OpAddFields</code> | <code>OpUpdate</code> | "
+     "<code>OpRotate</code> | <code>OpRemove</code> | "
+     "<code>OpSnapshot</code> | <code>OpRotateIdentity</code>), envelope "
+     "versions (<code>v: 1 | 2 | 3 | 4</code>), and validation results "
+     "(<code>{ ok: true, value: T } | { ok: false, errors: ... }</code>) all "
+     "narrow exhaustively; <code>noFallthroughCasesInSwitch</code> catches "
+     "the forgotten case."),
+    ('h2', 'Module layout'),
+    ('code',
+     "client/src/\n"
+     "  schema/        DSL: defineSchema, validators, reserved namespace\n"
+     "  collections/   typed CRUD wrapper over the protocol-layer client\n"
+     "  sharing/       Connection types and sharing helpers (public types)\n"
+     "  storage/       TarnStorageAdapter + memory/localStorage/custom built-ins\n"
+     "  client/        TarnClient class + lifecycle namespaces\n"
+     "    namespaces/  connections, account, session, recovery, advanced\n"
+     "  crypto.ts, sharing.ts, share-log.ts, recovery.ts,\n"
+     "  session-persistence.ts                       protocol primitives\n"
+     "  tarn.ts        protocol-layer client (used internally by default)\n"
+     "  index.ts       public barrel"
+    ),
+    ('p',
+     "The cut between <code>client/</code> (lifecycle namespaces over an "
+     "injected protocol client) and <code>tarn.ts</code> (the protocol-layer "
+     "client itself) is the redesign's core seam. <code>tarn.ts</code> "
+     "speaks the wire format; the new code in <code>client/</code> is a thin "
+     "typed layer that takes a schema and delegates everything that touches "
+     "the network or crypto material. <code>TarnClient.create()</code> "
+     "constructs both halves and holds them together."),
+    ('h2', 'Build and test'),
+    ('p',
+     "<code>esbuild</code> for ESM + CJS (per-file, no bundling — apps' "
+     "bundlers tree-shake what they don't use); <code>tsc --emitDeclaration"
+     "Only</code> for <code>.d.ts</code>. Output is "
+     "<code>dist/{esm,cjs,types}/</code>, mirrored from <code>src/</code>. "
+     "<code>prepublishOnly: typecheck &amp;&amp; test &amp;&amp; build</code> "
+     "gates publishes — a broken typecheck or test, or a missing dist/ entry, "
+     "blocks the publish before anything reaches npm."),
+    ('p',
+     "Four testing layers: 96 TypeScript unit tests (schema validation, "
+     "collection wrapping, namespace delegation via a "
+     "<code>MockTarnClient</code>); 418 JavaScript unit tests covering "
+     "crypto primitives, KDF dispatch, per-content CEK handling, share-log "
+     "round-trips, session persistence, recovery factor unwrap, invite "
+     "redemption (run via <code>tsx</code> so they import the "
+     "<code>.ts</code> source directly); integration tests against "
+     "<code>wrangler dev</code> for full HTTP round-trips; four runnable "
+     "examples for end-to-end coverage including real Arweave gateway and "
+     "Turbo upload paths. GitHub Actions CI runs typecheck + both unit "
+     "suites + build + <code>npm pack --dry-run</code> on every push."),
+    ('h2', 'The recovery property'),
+    ('p',
+     "Schemas are published to Arweave under "
+     "<code>Type='app-schema', App=&lt;app_id&gt;, V=&lt;version&gt;</code> "
+     "via <code>tools/publish-schema.mjs</code>. Combined with credential "
+     "blobs (<code>Type='cred'</code>) and content blobs "
+     "(<code>Type='entry'</code>) being recoverable from Arweave directly, "
+     "this means a future \"always access your data\" client can decode "
+     "everything from raw Arweave gateways via GraphQL, with no Tarn API in "
+     "the loop, given only the user's email + password (or recovery phrase) "
+     "and the app id. That client is on the roadmap; the protocol-level "
+     "enabling work is done. The schema-first design is the structural "
+     "reason: a wire-only client could never turn decrypted opaque JSON into "
+     "user-readable typed records without the schema, so the schema must be "
+     "on the same permanent ledger as the data."),
+    ('h2', 'What stayed the same'),
+    ('p',
+     "The wire protocol is unchanged. <code>tarn.ts</code> was converted "
+     "from JavaScript to TypeScript without changing any public behaviour — "
+     "every byte hitting Arweave or the API is identical to the "
+     "pre-redesign SDK. The redesign is API-shape-only at the SDK boundary. "
+     "Apps using the new SDK read existing data without re-encrypting or "
+     "re-publishing anything; the new SDK reads the same envelopes it "
+     "writes."),
+
+    ('pagebreak',),
+
     # ============ GLOSSARY ============
-    ('h1', '12. Glossary'),
+    ('h1', '13. Glossary'),
     ('table',
      ['Term', 'Meaning'],
      [
@@ -837,7 +987,7 @@ CONTENT = [
      ]),
 
     # ============ POINTERS ============
-    ('h1', '13. Where to learn more'),
+    ('h1', '14. Where to learn more'),
     ('p',
      "<b>Protocol specification.</b> The canonical reference is "
      "<code>docs/TARN_PROTOCOL.md</code> in the Tarn repository — full "
@@ -850,6 +1000,12 @@ CONTENT = [
      "sharing / recovery / account / session namespaces, app registration, "
      "and the advanced escape hatches. Start there if you are building an "
      "app on Tarn."),
+    ('p',
+     "<b>SDK architecture.</b> <code>docs/SDK_ARCHITECTURE.md</code> goes "
+     "deeper than Section 12 above — the full TypeScript strategy, branded "
+     "types, module layout, build pipeline, testing layers, and what "
+     "stayed the same vs. what changed in the redesign. Read it when "
+     "evaluating the SDK as an implementation rather than as an API."),
     ('p',
      "<b>Examples.</b> Four progressive runnable examples live in "
      "<code>examples/</code>: <code>01-hello-world</code> (register and "

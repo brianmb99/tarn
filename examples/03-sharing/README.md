@@ -39,8 +39,8 @@ The recipient registers a separate account, redeems the invite, then waits for t
 - The sender prints an invite URL like `tarn:invite/<token_id>#<payload_key>`. The fragment after `#` is the AES-GCM payload key — it never leaves the recipient's device.
 - After the recipient redeems, the sender's polling loop finds a new connection and runs `tarn.books.shareWithAll(...)` for each book.
 - The recipient's `tarn.books.listShared(sender)` returns the decrypted books — proof the per-pair share-log + per-content CEK round-trip works end-to-end.
-- The auto-acceptance is handled by the underlying client's `listIncomingRequests()` poll. The new typed `connections` namespace doesn't yet expose this method directly, so both scripts hold a reference to the underlying client and call it from there. This goes away in a later SDK step.
+- The auto-acceptance is handled by the underlying client's `listIncomingRequests()` poll. The typed `connections` namespace doesn't yet expose this method directly, so both scripts hold a reference to the underlying client (via the `_LegacyTarnClient` escape hatch) and call it from there. This goes away once `tarn.connections.*` covers the full incoming-request surface.
 
 ## Note
 
-Both scripts use `TarnStorage.memory()` — accounts and connections vanish when the processes exit. Re-running creates fresh accounts on each side. The transitional `underlying` factory pattern is the same as in the other examples.
+Both scripts use `TarnStorage.memory()` — accounts and connections vanish when the processes exit. Re-running creates fresh accounts on each side. Examples 01, 02, and 04 use the clean `TarnClient.create({ apiBase, appId, schema, storage })` shape; only this example threads `underlying`, and only because of the missing-method gap above.
