@@ -1,0 +1,9 @@
+# Binary file types — never run line-ending conversion or text diff on these.
+# Without this, core.autocrlf=true on Windows checkouts emits noisy warnings
+# about LF/CRLF on the doc PDFs and could in theory corrupt them.
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary

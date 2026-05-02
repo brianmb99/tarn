@@ -49,13 +49,13 @@ await tarn.books.share(connection, 'b1');
 `tarn` carries six top-level namespaces, plus one typed namespace per collection in the schema:
 
 - **`tarn.<collection>`** — typed CRUD per collection (`create`, `update`, `get`, `list`, `delete`). Collections marked `shareable: true` also get `share`, `shareWithAll`, `unshare`, `listShared`. Updates are partial-merge: the SDK reads, merges the patch, re-validates the full record, and writes a chained entry. Apps work in primary-key space and never see Arweave txids.
-- **`tarn.connections`** — the connection lifecycle: `invite` (email handshake), `createInvite`/`redeemInvite` (link/QR token flow), `accept`, `list`, `mute`/`unmute`, `setLabel`, `remove`. Connections are SDK objects (`{ share_pub, signing_pub, label?, muted? }`); apps pass them around without touching the underlying X25519 keys.
+- **`tarn.connections`** — the full connection lifecycle: `invite` (email handshake), `createInvite`/`previewInvite`/`redeemInvite` (link/QR token flow with non-consuming preview), `accept`, `list`/`listIncomingRequests`, `listIssuedInvites`/`revokeIssuedInvite`, `mute`/`unmute`, `setLabel`, `remove`. Connections are SDK objects (`{ share_pub, signing_pub, email?, label?, muted?, established_at?, initial_request_nonce? }`); apps pass them around without touching the underlying X25519 keys. Invite-flow returns are typed too — `InviteToken`, `InvitePreview`, `IssuedInvite`, `RedeemedInvite`, `IncomingRequest`.
 - **`tarn.account`** — `changeCredentials(newEmail, newPassword, { phrase? })`, `delete()`. Routine credential rotation; `phrase` extends the recovery factor to the new generation.
 - **`tarn.session`** — `isLoggedIn()`, `clear()`, plus the multi-device server-side surface (`listDevices`, `revokeDevice`, `revokeAllOthers`, `revokeAll`).
 - **`tarn.recovery`** — `export({ format: 'pdf' | 'json' })` to re-render the recovery kit, `emailKit({ to, pdfBytes })` to forward a kit through Tarn's email relay (no persistence). Account recovery itself is on the top-level client (`tarn.recoverAccount({ phrase, newEmail, newPassword })`) since it's pre-auth.
 - **`tarn.advanced`** — schema-less entry CRUD, raw blob fetch, direct share-log access. Power-user escape hatches; most apps never reach for these.
 
-Lifecycle methods that don't fit a noun namespace stay on the top-level client: `login`, `register`, `recoverAccount`, plus the `serializeSession` / `resumeSession` static for at-rest session persistence (Section 7 of the protocol).
+Lifecycle methods that don't fit a noun namespace stay on the top-level client: `login`, `register`, `recoverAccount`. Session persistence is automatic — `TarnClient.create()` reads the configured storage adapter and rehydrates a logged-in client when a valid blob is present, so PWAs and re-opened tabs come back already authenticated. `tarn.session.clear()` (or any logout-equivalent path) wipes the persisted blob.
 
 ---
 

@@ -15,7 +15,18 @@ Tarn is NOT an app. It is infrastructure. Apps are clients of Tarn. The first ap
 
 ## Key Documents
 
-- `docs/TARN_PROTOCOL.md` — The complete protocol spec: key hierarchy, auth flows, data CRUD, Arweave tag scheme. **Read this first** when working on any Tarn issue.
+The three canonical docs live as markdown; nicely-formatted PDFs in `docs/` are generated from them. Markdown is always the source of truth — edit the `.md`, then re-run the generator if you also need the PDF refreshed.
+
+- `docs/TARN_PROTOCOL.md` — The complete wire-protocol spec: key hierarchy, auth flows, data CRUD, Arweave tag scheme. **Read this first** when working on any protocol/API issue.
+- `docs/SDK_ARCHITECTURE.md` — Implementation architecture of the SDK: how the typed surface is built, what the type system is doing, build pipeline, what's deferred.
+- `client/README.md` — App-developer reference: defineSchema, collections, sharing, recovery, sessions, security model. **Read this first** when working on SDK ergonomics.
+
+PDFs (regenerable via `python tools/generate-docs-pdf.py`):
+- `docs/tarn-sdk-guide.pdf` ← `client/README.md`
+- `docs/tarn-architecture-guide.pdf` ← `docs/SDK_ARCHITECTURE.md`
+- `docs/tarn-protocol.pdf` ← `docs/TARN_PROTOCOL.md`
+
+The generator requires Python with `reportlab` and `markdown-it-py` (`python -m pip install reportlab markdown-it-py`).
 
 ## Git Workflow
 
