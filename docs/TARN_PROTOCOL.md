@@ -156,7 +156,7 @@ recovery_KEK             = Argon2id(phrase, recovery_salt, m=64MiB, t=3, p=1)
 
 `recovery_lookup_key` and `recovery_signing_key` derive from the raw phrase entropy directly (no salt), so they are stable across credential changes — the phrase remains the same secret regardless of how many times the password rotates. The `recovery_KEK` derives via Argon2id with the per-account salt, providing the slow-brute-force defense at unwrap time.
 
-The recovery phrase is **mandatory at signup** (the SDK enforces this with a synchronous `recoveryAcknowledged: true` flag on `register()`) and is also optionally emailed to the user via the [Recovery email forwarder](#recovery-email-forwarder).
+The recovery phrase is **mandatory at signup** — the SDK enforces this with a synchronous `recoveryAcknowledged: true` flag on `register()`. The kit (PDF or structured JSON) is rendered entirely on the client; Tarn never sees the phrase, the entropy, the KEK, or the rendered PDF. Apps are responsible for surfacing the kit to the user (download, print, or any out-of-band channel the app implements). Tarn does not provide email delivery or any other transport for recovery material — that would require Tarn to handle plaintext kit bytes, which is incompatible with the zero-knowledge framing.
 
 ### Data lookup key
 
@@ -622,31 +622,13 @@ DELETE /api/v1/auth
   Auth: JWT
   Returns: 200 OK
   Errors: 401
-
-POST /api/v1/recovery/email
-  Body: { recipient_email, pdf_base64, app_name?, subject? }
-  Auth: JWT (user)
-  Returns: { ok: true }
-  Errors: 400 (validation), 401, 413 (PDF too large), 429 (5/hour/account),
-          502 (relay rejected), 503 (relay not configured)
 ```
 
-#### Recovery email forwarder
+#### Recovery-kit delivery is not a Tarn responsibility
 
-`POST /api/v1/recovery/email` forwards a client-rendered recovery PDF (containing the user's BIP39 phrase) to the named recipient via the configured email relay (Resend by default).
+Tarn intentionally does **not** expose a recovery-kit transport endpoint. Earlier protocol drafts included `POST /api/v1/recovery/email` as a "no-storage, brief in-memory visibility" forwarder; that endpoint has been removed. Even ephemeral handling of plaintext recovery material on Tarn-operated infrastructure was a violation of the zero-knowledge framing the rest of the protocol enforces, and any operational compromise (logs, supply-chain, subpoena, future bug introducing persistence) would have exposed the most sensitive payload in the entire system.
 
-**No-storage guarantee, brief in-memory visibility.** The Tarn API holds the PDF bytes in memory only for the duration of the relay request and discards them on response. No D1 row, no KV entry, no Arweave write. The honest framing is "no storage, brief in-memory visibility during the forward" — Tarn briefly sees the bytes because forwarding requires it; persistence does not happen.
-
-**Configuration.** Two Cloudflare Worker secrets must be set on the API:
-
-```
-EMAIL_FORWARDER_API_KEY   # Resend API key (re_...)
-EMAIL_FORWARDER_FROM      # Verified sender, e.g. "Tarn <recovery@tarn.dev>"
-```
-
-If either is missing the endpoint returns 503 with `{error: "Email forwarder not configured"}`. Apps can opt out of email delivery at registration (`emailRecoveryKit: false`) and let the user save the PDF locally instead.
-
-**Rate limit.** 5 sends/hour per `data_lookup_key`, enforced via the `write_rate_limits` D1 table with the key prefix `recovery-email:`.
+The kit is rendered client-side by the SDK (`renderRecoveryPDF`) and delivery is the application's responsibility — typically a download, optionally a print, optionally a transport that the application itself operates. Applications that want email delivery must run their own forwarder; Tarn will not host one.
 
 ### App endpoints
 

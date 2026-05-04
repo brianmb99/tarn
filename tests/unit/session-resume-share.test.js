@@ -91,7 +91,7 @@ describe('Gap D — share-key cold-path recovery after session resume', () => {
     ]);
 
     const clientA = new TarnClient('https://api.tarn.dev', APP);
-    await clientA.register(EMAIL, PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await clientA.register(EMAIL, PASSWORD, { recoveryAcknowledged: true });
     await clientA.createEntry('entry', { title: 'Mountains of the Mind' });
 
     // Capture the v3 blob the client wrote — that's what the cold-path must
@@ -169,7 +169,7 @@ describe('Gap D — share-key cold-path recovery after session resume', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register('gap-d-2@example.com', 'pw', { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await client.register('gap-d-2@example.com', 'pw', { recoveryAcknowledged: true });
 
     // Unknown txid — fetch returns 404.
     pushFetch([

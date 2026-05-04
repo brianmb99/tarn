@@ -1,6 +1,6 @@
 # 04 — Account recovery
 
-Register a Tarn account, capture the 24-word recovery phrase + rendered PDF, simulate password loss, and recover the account on a fresh client. Demonstrates the full recovery lifecycle without touching the email forwarder.
+Register a Tarn account, capture the 24-word recovery phrase + rendered PDF, simulate password loss, and recover the account on a fresh client. Demonstrates the full recovery lifecycle.
 
 ## Setup
 
@@ -31,8 +31,8 @@ TARN_API=https://api.tarn.dev npm start
 - `phase 2` constructs a brand-new `TarnClient` (simulating a different device with no session state), calls `recoverAccount({ phrase, newEmail, newPassword })`, and reads the same note back. This proves the recovery factor independently unwraps the DEK chain.
 - `phase 3` constructs a third fresh client and logs in with the **new password**, demonstrating the credential rotation took effect.
 
-## Note on the email path
+## Note on kit delivery
 
-This example passes `emailRecoveryKit: false` to skip the Resend-based email forwarder. To enable it in production you must configure two Worker secrets (`EMAIL_FORWARDER_API_KEY`, `EMAIL_FORWARDER_FROM`) — see the main [Tarn CLAUDE.md](../../CLAUDE.md#worker-secrets-issue-12--recovery-email-forwarder). When configured, `emailRecoveryKit: true` (the default) forwards the rendered PDF without persisting it; the `pdfBytes` field is still returned so apps can offer a download as well.
+Tarn renders the recovery kit entirely on the client — `reg.pdfBytes` is the rendered PDF and `reg.recoveryPhrase` is the 24-word string, and neither leaves the device on Tarn's account. Delivery to the user is the application's responsibility: download (the simplest and most secure default — what this example does), print, or any transport the application itself operates. Tarn does not host an email forwarder for recovery material, because routing plaintext kit bytes through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
 
 This example uses the clean `TarnClient.create({ apiBase, appId, schema, storage })` shape — no `underlying` factory needed. (Example 03 still threads `underlying` to reach `listIncomingRequests()`; everything else is on the typed surface.)

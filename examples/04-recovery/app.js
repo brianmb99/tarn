@@ -6,15 +6,13 @@
  * independent of the password. This example:
  *   1. Registers a new account.
  *   2. Captures the phrase + the recovery PDF bytes (writes the PDF to disk).
- *   3. Skips the email-recovery-kit forwarder via emailRecoveryKit: false —
- *      the local wrangler dev usually doesn't have an email forwarder
- *      configured, and demo'ing the email path on a real account is awkward
- *      anyway. Apps that DO want email forwarding pass emailRecoveryKit: true.
- *   4. Writes a record under the original account.
- *   5. Constructs a FRESH client (simulating the user being on a different
+ *      The kit never leaves the device — Tarn does not deliver it for you;
+ *      apps decide how to surface it (download, print, app-specific channel).
+ *   3. Writes a record under the original account.
+ *   4. Constructs a FRESH client (simulating the user being on a different
  *      device or having forgotten their password) and recovers using the
  *      phrase + new credentials.
- *   6. Lists records on the recovered client — proving the data is still
+ *   5. Lists records on the recovered client — proving the data is still
  *      decryptable under the new credentials.
  */
 
@@ -62,7 +60,6 @@ const tarn1 = await TarnClient.create({
 
 const reg = await tarn1.register(email, password, {
   recoveryAcknowledged: true,
-  emailRecoveryKit:     false,    // skip the email forwarder for this example
   appName:              'Tarn Example 04',
 });
 

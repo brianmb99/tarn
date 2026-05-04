@@ -52,7 +52,6 @@ function assert(condition, message) {
 async function registerWithRules(client, email, password) {
   const { dataLookupKey } = await client.register(email, password, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
   await forceAllowRulesForAccount(dataLookupKey);
   return dataLookupKey;

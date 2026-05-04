@@ -47,7 +47,6 @@ class StubUnderlying implements IUnderlyingClient {
   createInviteTokenCalls = 0;
   redeemInviteTokenCalls = 0;
   regenerateRecoveryKitCalls = 0;
-  sendRecoveryKitEmailCalls = 0;
 
   entries: DecryptedEntry[] = [];
   shareKeyByTxid = new Map<string, string>();
@@ -123,15 +122,6 @@ class StubUnderlying implements IUnderlyingClient {
       phrase: 'one two three four five six seven eight nine ten eleven twelve',
       pdfBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]), // %PDF
     };
-  }
-  async sendRecoveryKitEmail(_args: {
-    recipientEmail: string;
-    pdfBytes: Uint8Array;
-    appName?: string;
-    subject?: string;
-  }) {
-    this.sendRecoveryKitEmailCalls++;
-    return { ok: true };
   }
 
   // ---- Connections ----
@@ -857,12 +847,6 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     assert.ok(json.phrase.length > 0);
     assert.equal(json.appName, 'Bookish');
     assert.ok(json.generatedAt);
-  });
-
-  it('recovery.emailKit forwards', async () => {
-    const pdfBytes = new Uint8Array([1, 2, 3]);
-    await tarn.recovery.emailKit({ to: 'r@e.com', pdfBytes });
-    assert.equal(stub.sendRecoveryKitEmailCalls, 1);
   });
 
   it('session.listDevices delegates', async () => {

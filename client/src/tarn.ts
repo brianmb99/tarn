@@ -285,31 +285,27 @@ export class TarnClient {
    *
    * The phrase is returned to the caller in the result payload alongside the
    * rendered PDF bytes. The TarnClient instance does NOT cache the phrase —
-   * the caller is responsible for handing it to the user (PDF download or
-   * email forward) and dropping the in-memory copy promptly. Re-rendering a
-   * fresh PDF later requires the user to provide the phrase again.
+   * the caller is responsible for surfacing it to the user (download, print,
+   * or any out-of-band delivery the app wants to wire up) and dropping the
+   * in-memory copy promptly. Re-rendering a fresh PDF later requires the user
+   * to provide the phrase again.
    *
    * @param {string} email
    * @param {string} password
    * @param {{
    *   recoveryAcknowledged: boolean,
-   *   emailRecoveryKit?: boolean,         // default true
-   *   recipientEmail?: string,            // defaults to email param
-   *   appName?: string,                   // PDF + email branding
+   *   appName?: string,                   // PDF branding
    * }} [opts]
    * @returns {Promise<{
    *   dataLookupKey: string,
    *   recoveryPhrase: string,
    *   pdfBytes: Uint8Array,
-   *   emailDelivered: boolean,
-   * }>}
+   *   }>}
    */
   async register(email: string, password: string, opts: any = {}): Promise<any> {
     if (!opts || opts.recoveryAcknowledged !== true) {
       throw new Error('register(): recoveryAcknowledged: true is required (issue #12)');
     }
-    const emailRecoveryKit = opts.emailRecoveryKit !== false;
-    const recipientEmail = opts.recipientEmail || email;
     const appName = opts.appName;
     // Sharing keypair publication (issue #13). Defaults to discoverable so a
     // new social-app user can connect by email out of the box. Apps that
@@ -401,100 +397,36 @@ export class TarnClient {
 
     await this.#authenticate();
 
-    // Render the PDF after auth so the JWT is ready in case the caller wants
-    // us to email it. PDF rendering is synchronous and cheap.
     const pdfBytes = renderRecoveryPDF({ phrase, appName });
-
-    let emailDelivered = false;
-    if (emailRecoveryKit) {
-      try {
-        await this.sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName });
-        emailDelivered = true;
-      } catch (err: any) {
-        // Surface but don't fail register: the caller still has phrase + PDF
-        // bytes and can retry the email send later. The user has already
-        // acknowledged saving the phrase, which is the gating requirement.
-        console.warn(`[TarnClient] register: recovery email delivery failed: ${err.message}`);
-      }
-    }
 
     return {
       dataLookupKey: this.#dataLookupKey,
       recoveryPhrase: phrase,
       pdfBytes,
-      emailDelivered,
     };
   }
 
   /**
-   * Render a fresh recovery PDF for the same phrase the user already holds,
-   * and (optionally) email it. The phrase is unchanged — Tarn does not store
-   * it, so the caller must provide it.
-   *
-   * Requires an authenticated session if `emailRecoveryKit` is true (the
-   * email forwarder endpoint is JWT-gated). Pure rendering (no email) does
-   * not require a session.
+   * Render a fresh recovery PDF for the phrase the user already holds. The
+   * phrase is unchanged — Tarn does not store it, so the caller must provide
+   * it. Pure client-side rendering — no network call, no auth requirement.
    *
    * @param {{
    *   phrase: string,
-   *   emailRecoveryKit?: boolean,        // default true
-   *   recipientEmail?: string,           // required if emailRecoveryKit is true
    *   appName?: string,
    * }} opts
-   * @returns {Promise<{ pdfBytes: Uint8Array, emailDelivered: boolean }>}
+   * @returns {Promise<{ pdfBytes: Uint8Array }>}
    */
   async regenerateRecoveryKit(opts: any = {}): Promise<any> {
-    const { phrase, recipientEmail, appName } = opts;
-    const emailRecoveryKit = opts.emailRecoveryKit !== false;
+    const { phrase, appName } = opts;
 
     const validation = validateRecoveryPhrase(phrase);
     if (!validation.valid) {
       throw new Error(`regenerateRecoveryKit(): ${validation.reason}`);
     }
-    if (emailRecoveryKit && !recipientEmail) {
-      throw new Error('regenerateRecoveryKit(): recipientEmail is required when emailRecoveryKit is true');
-    }
 
     const pdfBytes = renderRecoveryPDF({ phrase: validation.normalized, appName });
-
-    let emailDelivered = false;
-    if (emailRecoveryKit) {
-      await this.#requireAuth();
-      await this.sendRecoveryKitEmail({ recipientEmail, pdfBytes, appName });
-      emailDelivered = true;
-    }
-    return { pdfBytes, emailDelivered };
-  }
-
-  /**
-   * Forward an already-rendered PDF to the named recipient via the Tarn
-   * email-forwarder endpoint. Requires an authenticated session.
-   *
-   * @param {{ recipientEmail: string, pdfBytes: Uint8Array, appName?: string, subject?: string }} opts
-   * @returns {Promise<void>}
-   */
-  async sendRecoveryKitEmail(
-    { recipientEmail, pdfBytes, appName, subject }:
-    { recipientEmail: string; pdfBytes: Uint8Array; appName?: string; subject?: string },
-  ): Promise<void> {
-    if (!recipientEmail) throw new Error('recipientEmail is required');
-    if (!(pdfBytes instanceof Uint8Array) || pdfBytes.length === 0) {
-      throw new Error('pdfBytes must be a non-empty Uint8Array');
-    }
-    await this.#requireAuth();
-    const res = await this.#fetch('/api/v1/recovery/email', {
-      method: 'POST',
-      auth: true,
-      body: {
-        recipient_email: recipientEmail,
-        pdf_base64: bytesToBase64(pdfBytes),
-        ...(appName ? { app_name: appName } : {}),
-        ...(subject ? { subject } : {}),
-      },
-    });
-    if (res.status !== 200) {
-      throw new Error(`Recovery email send failed: ${res.json?.error || res.status}`);
-    }
+    return { pdfBytes };
   }
 
   /**
@@ -4641,8 +4573,8 @@ export class TarnClient {
         const retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
         // Don't honor Retry-After values longer than 60 seconds — the server
         // is telling us to back off for a budget window we can't realistically
-        // wait for (recovery email rate limit, share-inbox fetch limit, etc.
-        // all return Retry-After: 3600). Surface the 429 to the caller with
+        // wait for (e.g. the share-inbox fetch limit returns Retry-After: 3600).
+        // Surface the 429 to the caller with
         // its body intact so they can decide what to do, rather than blocking
         // the test or the UX for an hour.
         //

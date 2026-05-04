@@ -77,7 +77,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true });
 
     // Snapshot the wrapped_data_key sent at registration so we can compare gen 1.
     // Issue #12: new accounts register with v4 multi-factor envelopes.
@@ -156,7 +156,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true });
 
     // Capture the gen 1 DEK as wrapped under the OLD credential_encryption_key.
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
@@ -206,7 +206,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     mockFetch(responses);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true });
 
     await client.changeCredentials('e1@x.com', 'p1', { acceptRecoveryGap: true, skipRotationAnnounce: true });
     await client.changeCredentials('e2@x.com', 'p2', { acceptRecoveryGap: true, skipRotationAnnounce: true });
@@ -241,7 +241,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', APP);
-    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await client.register(OLD_EMAIL, OLD_PASSWORD, { recoveryAcknowledged: true });
     await client.changeCredentials(NEW_EMAIL, NEW_PASSWORD, { acceptRecoveryGap: true, skipRotationAnnounce: true });
 
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');

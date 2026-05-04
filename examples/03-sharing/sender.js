@@ -44,7 +44,6 @@ const tarn = await TarnClient.create({
 console.log('[sender] registering', email);
 const reg = await tarn.register(email, password, {
   recoveryAcknowledged: true,
-  emailRecoveryKit: false,
 });
 
 await maybeGrantLocalRules(API_BASE, reg.dataLookupKey);

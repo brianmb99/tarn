@@ -77,7 +77,7 @@ console.log('\n=== Section 7.5 — sessions ===');
 await test('1. fresh /auth/verify mints a sid; listSessions shows it (isCurrent: true)', async () => {
   await resetClientState();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(randomEmail(), 'pw', { recoveryAcknowledged: true, emailRecoveryKit: false, deviceLabel: 'laptop' });
+  await client.register(randomEmail(), 'pw', { recoveryAcknowledged: true, deviceLabel: 'laptop' });
   const sessions = await client.listSessions();
   assert(sessions.length === 1, `expected 1 session, got ${sessions.length}`);
   assert(sessions[0].isCurrent === true, 'session should be marked isCurrent');
@@ -94,7 +94,7 @@ await test('2. re-verify with valid previous_sid reuses the same sid', async () 
   const email = randomEmail();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c1.register(email, password, { recoveryAcknowledged: true });
   const before = await c1.listSessions();
   const sidBefore = before[0].sid;
 
@@ -113,7 +113,7 @@ await test('3. re-verify with stale previous_sid mints a fresh sid + new row', a
   const email = randomEmail();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c1.register(email, password, { recoveryAcknowledged: true });
   const sidBefore = (await c1.listSessions())[0].sid;
 
   // Revoke the only session — simulates the "previous_sid is no longer valid"
@@ -136,7 +136,7 @@ await test('4. revokeSession on a peer device 401s the peer immediately on this 
   const email = randomEmail();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false, deviceLabel: 'A' });
+  await c1.register(email, password, { recoveryAcknowledged: true, deviceLabel: 'A' });
 
   // "Other device" — fresh client, login from scratch. This produces a second
   // session row with a distinct sid.
@@ -167,7 +167,7 @@ await test('4. revokeSession on a peer device 401s the peer immediately on this 
 await test('5. revokeAllSessions kills the calling session too', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
   await c.revokeAllSessions();
 
   // Force a re-auth attempt via the cached keypair — the server should mint a
@@ -185,7 +185,7 @@ await test('5. revokeAllSessions kills the calling session too', async () => {
 await test('5b. old JWT after revokeAllSessions 401s on a raw replay', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
   const oldJwt = c._testJwt();
   assert(oldJwt, 'should have a JWT before revoke');
   await c.revokeAllSessions();
@@ -204,7 +204,7 @@ await test('6. revokeOtherSessions preserves the calling sid', async () => {
   const email = randomEmail();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c1.register(email, password, { recoveryAcknowledged: true });
 
   await resetClientState();
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
@@ -230,7 +230,7 @@ await test('7. changeCredentials revokes all sessions for the dlk', async () => 
   const email = randomEmail();
   const password = 'pw1';
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { recoveryPhrase } = await c.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { recoveryPhrase } = await c.register(email, password, { recoveryAcknowledged: true });
 
   // Build a peer session; we'll observe it disappear post-change.
   await resetClientState();
@@ -259,7 +259,7 @@ await test('8. recoverAccount revokes all sessions', async () => {
   const email = randomEmail();
   const password = 'pw';
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { recoveryPhrase } = await c.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { recoveryPhrase } = await c.register(email, password, { recoveryAcknowledged: true });
 
   await resetClientState();
   const peer = new TarnClient(API_BASE, DEFAULT_APP_ID);
@@ -290,7 +290,7 @@ await test('9. deleteAccount revokes all sessions', async () => {
   const email = randomEmail();
   const password = 'pw';
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c.register(email, password, { recoveryAcknowledged: true });
 
   await resetClientState();
   const peer = new TarnClient(API_BASE, DEFAULT_APP_ID);
@@ -312,7 +312,7 @@ await test('9. deleteAccount revokes all sessions', async () => {
 await test('10. pre-7.5 JWT (no sid claim) authenticates via grandfather path', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey } = await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
 
   // Hand-mint a JWT for the same dlk WITHOUT a sid claim using the same
   // JWT_SECRET wrangler dev uses (loaded from api/.dev.vars).
@@ -352,7 +352,7 @@ await test('10. pre-7.5 JWT (no sid claim) authenticates via grandfather path', 
 await test('11. lazy-prune removes stale rows on next /auth/verify', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey } = await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
 
   // Insert a stale row directly (last_seen_at = 1, well past 24h).
   const { execSync } = await import('child_process');
@@ -379,7 +379,6 @@ await test('12a. deviceLabel oversize → 400 from /auth/verify', async () => {
     // 65 chars (1 over MAX_DEVICE_LABEL_LEN).
     await c.register(randomEmail(), 'pw', {
       recoveryAcknowledged: true,
-      emailRecoveryKit: false,
       deviceLabel: 'x'.repeat(65),
     });
   } catch (err) {
@@ -395,7 +394,6 @@ await test('12b. deviceLabel control chars → 400', async () => {
   try {
     await c.register(randomEmail(), 'pw', {
       recoveryAcknowledged: true,
-      emailRecoveryKit: false,
       deviceLabel: 'has\nnewline',
     });
   } catch (err) {

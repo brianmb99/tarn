@@ -374,7 +374,8 @@ namespace tarn.account {
 
 namespace tarn.recovery {
   function export(opts: { format: 'pdf' | 'json' }): Promise<Blob | RecoveryData>;
-  function emailKit(opts: { to: string }): Promise<void>;   // forwards via /api/v1/recovery/email
+  // Delivery (download/print/app-operated email/etc.) is the app's job;
+  // Tarn never handles plaintext kit material.
 }
 
 namespace tarn.session {

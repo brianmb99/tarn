@@ -68,7 +68,6 @@ function assert(condition, message) {
 async function registerWithRules(client, email, password) {
   const { dataLookupKey } = await client.register(email, password, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
   await forceAllowRulesForAccount(dataLookupKey);
   return dataLookupKey;
@@ -785,7 +784,6 @@ let helenSharePubBeforeRotate;
 await test('Helen + Ivan register + handshake; Helen shares a content item', async () => {
   const reg = await helen.register(helenEmail, helenPassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
   helenPhrase = reg.recoveryPhrase;
   await forceAllowRulesForAccount(reg.dataLookupKey);

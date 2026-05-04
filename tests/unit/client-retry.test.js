@@ -61,7 +61,7 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
-    const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true, emailRecoveryKit: false });
+    const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
     assert.equal(result.dataLookupKey.length, 64);
     assert.equal(registerCountFrom(fetchCalls), 2, 'register should retry exactly once');
   });
@@ -70,7 +70,7 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
     mockFetch([{ status: 400, body: JSON.stringify({ error: 'bad payload' }) }]);
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
-    await assert.rejects(() => client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true, emailRecoveryKit: false }));
+    await assert.rejects(() => client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true }));
     assert.equal(registerCountFrom(fetchCalls), 1, 'should not retry 400');
   });
 
@@ -78,7 +78,7 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
     mockFetch([{ status: 409, body: JSON.stringify({ error: 'in use' }) }]);
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
-    await assert.rejects(() => client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true, emailRecoveryKit: false }));
+    await assert.rejects(() => client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true }));
     assert.equal(registerCountFrom(fetchCalls), 1, 'should not retry 409');
   });
 
@@ -90,7 +90,7 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
-    await assert.rejects(() => client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true, emailRecoveryKit: false }));
+    await assert.rejects(() => client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true }));
     assert.equal(registerCountFrom(fetchCalls), 3, 'should stop at MAX_ATTEMPTS');
   });
 
@@ -102,7 +102,7 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
-    const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true, emailRecoveryKit: false });
+    const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
     assert.equal(result.dataLookupKey.length, 64);
     assert.equal(registerCountFrom(fetchCalls), 2, 'should retry after network error');
   });
@@ -116,7 +116,7 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
     const t0 = Date.now();
-    const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true, emailRecoveryKit: false });
+    const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
     const elapsed = Date.now() - t0;
     assert.equal(result.dataLookupKey.length, 64);
     assert.ok(elapsed >= 900, `should wait ≥1s per Retry-After (waited ${elapsed}ms)`);

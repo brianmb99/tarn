@@ -82,7 +82,7 @@ console.log('\n=== 2. Registration ===');
 
 await test('Register new user', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  const { dataLookupKey } = await tarn.register(testEmail, testPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey } = await tarn.register(testEmail, testPassword, { recoveryAcknowledged: true });
   assert(dataLookupKey, 'No dataLookupKey');
   assert(dataLookupKey.length === 64, 'Bad dataLookupKey length');
   assert(tarn.isAuthenticated, 'Not authenticated');
@@ -385,8 +385,8 @@ await test('Two test users register + complete a mutual handshake against the de
 
   handshakeAlice = new TarnClient(API_BASE, APP_ID);
   handshakeBob = new TarnClient(API_BASE, APP_ID);
-  const a = await handshakeAlice.register(handshakeAliceEmail, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
-  const b = await handshakeBob.register(handshakeBobEmail, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const a = await handshakeAlice.register(handshakeAliceEmail, password, { recoveryAcknowledged: true });
+  const b = await handshakeBob.register(handshakeBobEmail, password, { recoveryAcknowledged: true });
   handshakeAliceDlk = a.dataLookupKey;
   handshakeBobDlk = b.dataLookupKey;
 
@@ -614,12 +614,10 @@ await test('Pat + Quinn register + handshake against deployed API', async () => 
   quinn = new TarnClient(API_BASE, APP_ID);
   const patReg = await pat.register(patEmail, patPassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
   patPhrase = patReg.recoveryPhrase;
   const quinnReg = await quinn.register(quinnEmail, quinnPassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
 
   // Set permissive rules on each user via the bookish app JWT (same pattern
@@ -799,10 +797,10 @@ await test('Invite inviter + redeemer register', async () => {
   inviteInviterEmail = `inv-inviter-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
   inviteRedeemerEmail = `inv-redeemer-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
   const inviterReg = await inviteInviter.register(inviteInviterEmail, 'pw-inv-' + Date.now(), {
-    recoveryAcknowledged: true, emailRecoveryKit: false,
+    recoveryAcknowledged: true,
   });
   const redeemerReg = await inviteRedeemer.register(inviteRedeemerEmail, 'pw-red-' + Date.now(), {
-    recoveryAcknowledged: true, emailRecoveryKit: false,
+    recoveryAcknowledged: true,
   });
 
   // New accounts default to rules_json = NULL which is DENY. Set permissive

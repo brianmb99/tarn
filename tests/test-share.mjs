@@ -59,7 +59,6 @@ await test('register() publishes share_pub by default', async () => {
   aliceClient = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   await aliceClient.register(aliceEmail, alicePassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
   // Re-derive offline to assert the published value matches what the SDK
   // computed locally.
@@ -111,7 +110,6 @@ await test('register({ shareDiscoverable: false }) hides share_pub from lookup',
   const carol = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   await carol.register(carolEmail, carolPassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
     shareDiscoverable: false,
   });
 
@@ -131,7 +129,6 @@ await test('same email+password registered to a different app produces a differe
   const altApp = new TarnClient(BASE_URL, SECONDARY_APP_ID);
   await altApp.register(aliceEmail, alicePassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
 
   // Look up via the secondary app's id.
@@ -159,7 +156,6 @@ await test('cross-app probe: share_lookup_key from app A does not match account 
   const bob = new TarnClient(BASE_URL, DEFAULT_APP_ID);
   await bob.register(bobEmail, bobPassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
 
   const wrongAppLookup = new TarnClient(BASE_URL, SECONDARY_APP_ID);
@@ -177,7 +173,7 @@ await test('changeCredentials() rotates share_pub (master_key change)', async ()
   const dEmail = randomEmail();
   const dPassword = 'pw-d-' + Date.now();
   const d = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  const dReg = await d.register(dEmail, dPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const dReg = await d.register(dEmail, dPassword, { recoveryAcknowledged: true });
 
   const before = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(dEmail);
   assert(before.sharePubBase64Url, 'no initial share_pub');
@@ -203,7 +199,7 @@ await test('changeCredentials() rotates share_lookup_key on email change', async
   const eEmail = randomEmail();
   const ePassword = 'pw-e-' + Date.now();
   const e = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  const eReg = await e.register(eEmail, ePassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const eReg = await e.register(eEmail, ePassword, { recoveryAcknowledged: true });
 
   // Lookup at the OLD email should work.
   const before = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(eEmail);

@@ -3,14 +3,12 @@
 // Requires: wrangler dev running (cd api && npx wrangler dev --port 8787)
 //
 // What this exercises against a real (local or remote) Tarn API:
-//   - register() publishes a v4 envelope with both factors
-//   - login() reads back the v4 envelope and recovers the DEK chain
-//   - createEntry/getEntries round-trip works under v4 (per-content CEK)
+//   - register() publishes a v1 envelope with both factors
+//   - login() reads back the v1 envelope and recovers the DEK chain
+//   - createEntry/getEntries round-trip works under v1 (per-content CEK)
 //   - recoverAccount() with the phrase recovers the DEK chain via the
 //     recovery factor and rotates credentials
 //   - Post-recovery login() with new credentials reads pre-recovery data
-//   - Email forwarder endpoint: 400 on invalid input, 401 unauthenticated,
-//     503 if EMAIL_FORWARDER_API_KEY is not configured (acceptable in dev)
 
 import { TarnClient } from '../client/src/tarn.js';
 import { seedTestApp, DEFAULT_APP_ID } from './helpers.mjs';
@@ -61,12 +59,11 @@ async function openWriteGate(dataLookupKey) {
 
 console.log('\n=== Recovery round trip ===');
 
-await test('register publishes v4 envelope with both factors', async () => {
+await test('register publishes v1 envelope with both factors', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
   const result = await client.register(email, 'orig-password-2026', {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
   assert(result.dataLookupKey, 'should return dataLookupKey');
   assert(result.recoveryPhrase, 'should return recoveryPhrase');
@@ -79,21 +76,20 @@ await test('register publishes v4 envelope with both factors', async () => {
   }
 });
 
-await test('login → fresh client reads back v4 envelope chain', async () => {
+await test('login → fresh client reads back v1 envelope chain', async () => {
   // No createEntry here — local dev's Turbo wallet is Forbidden, and writing
   // is exercised by the existing test-client.mjs via the same code path. This
-  // test focuses on what's NEW for issue #12: the v4 envelope is correctly
+  // test focuses on what's NEW for issue #12: the v1 envelope is correctly
   // round-trippable through the API + login.
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
   const password = 'test-password-2026';
   await client.register(email, password, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
 
   // Fresh client logs in successfully — proves the API stored + returned the
-  // v4 wrapped_data_key intact and the password factor unwraps the chain.
+  // v1 wrapped_data_key intact and the password factor unwraps the chain.
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const r = await c2.login(email, password);
   if (!r.dataLookupKey || r.dataLookupKey.length !== 64) {
@@ -108,7 +104,6 @@ await test('recoverAccount with phrase rotates credentials (no writes)', async (
   const oldPassword = 'old-password-2026';
   const reg = await c1.register(oldEmail, oldPassword, {
     recoveryAcknowledged: true,
-    emailRecoveryKit: false,
   });
 
   // 2. Simulate "user lost their password" — fresh client, only the phrase.
@@ -179,57 +174,15 @@ await test('recoverAccount with wrong phrase fails (404 from API)', async () => 
   if (!threw) throw new Error('recoverAccount should have thrown for unregistered phrase');
 });
 
-console.log('\n=== Email forwarder endpoint ===');
-
-await test('POST /api/v1/recovery/email rejects unauthenticated requests', async () => {
+await test('POST /api/v1/recovery/email is gone (404) — Tarn no longer touches recovery material', async () => {
+  // The endpoint was removed — Tarn must never see plaintext recovery PDFs,
+  // even ephemerally. Recovery-kit delivery is an app-layer concern.
   const res = await fetch(`${API_BASE}/api/v1/recovery/email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ recipient_email: 'a@b.com', pdf_base64: 'xx' }),
   });
-  if (res.status !== 401) throw new Error(`expected 401, got ${res.status}`);
-});
-
-await test('POST /api/v1/recovery/email rejects malformed pdf_base64 with 400', async () => {
-  // Need an authenticated client first.
-  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const email = randomEmail();
-  await client.register(email, 'pw-2026', {
-    recoveryAcknowledged: true,
-    emailRecoveryKit: false,
-  });
-  const jwt = client._testJwt();
-  const res = await fetch(`${API_BASE}/api/v1/recovery/email`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
-    body: JSON.stringify({ recipient_email: 'a@b.com', pdf_base64: 'bm90LWEtcGRm' }), // "not-a-pdf" base64
-  });
-  if (res.status !== 400) throw new Error(`expected 400, got ${res.status}`);
-});
-
-await test('POST /api/v1/recovery/email returns 503 OR 200 depending on relay config', async () => {
-  // We don't assume the dev environment has EMAIL_FORWARDER_API_KEY set.
-  // 503: no relay configured (acceptable in dev).
-  // 200: relay configured + accepted (would actually send an email — accept).
-  // 502: relay configured but rejected (network / quota / etc).
-  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const email = randomEmail();
-  const reg = await client.register(email, 'pw-2026', {
-    recoveryAcknowledged: true,
-    emailRecoveryKit: false,
-  });
-  const jwt = client._testJwt();
-  // Build a base64 PDF.
-  const pdfBase64 = btoa(String.fromCharCode(...reg.pdfBytes));
-  const res = await fetch(`${API_BASE}/api/v1/recovery/email`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
-    body: JSON.stringify({ recipient_email: 'noreply@example.com', pdf_base64: pdfBase64 }),
-  });
-  if (![200, 502, 503].includes(res.status)) {
-    const txt = await res.text();
-    throw new Error(`unexpected status ${res.status}: ${txt}`);
-  }
+  if (res.status !== 404) throw new Error(`expected 404 (route removed), got ${res.status}`);
 });
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);

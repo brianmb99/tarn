@@ -44,7 +44,7 @@ function decodeBase64(str) {
 
 async function ipHash(request) {
   // Hash the IP so the rate-limit key isn't a raw PII identifier in KV. Same
-  // pattern as share-inbox fetch + recovery email forwarder.
+  // pattern as share-inbox fetch.
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const data = new TextEncoder().encode(ip + '-tarn-invite-preview-salt');
   const hash = await crypto.subtle.digest('SHA-256', data);

@@ -47,7 +47,7 @@ console.log('\n=== Registration ===');
 await test('Register: happy path', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
-  const { dataLookupKey } = await client.register(email, 'test-password-123', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey } = await client.register(email, 'test-password-123', { recoveryAcknowledged: true });
 
   assert(dataLookupKey, 'Should return dataLookupKey');
   assert(dataLookupKey.length === 64, 'dataLookupKey should be 64-char hex');
@@ -57,11 +57,11 @@ await test('Register: happy path', async () => {
 await test('Register: duplicate email produces 409', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const email = randomEmail();
-  await client.register(email, 'password', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, 'password', { recoveryAcknowledged: true });
 
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
-    await client2.register(email, 'password', { recoveryAcknowledged: true, emailRecoveryKit: false });
+    await client2.register(email, 'password', { recoveryAcknowledged: true });
     assert(false, 'Should have thrown');
   } catch (err) {
     assert(err.message.includes('409') || err.message.includes('already'), `Expected 409 error, got: ${err.message}`);
@@ -78,7 +78,7 @@ await test('Login: happy path', async () => {
 
   // Register first
   const client1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await client1.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey } = await client1.register(email, password, { recoveryAcknowledged: true });
 
   // Login from "another device"
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
@@ -91,7 +91,7 @@ await test('Login: happy path', async () => {
 await test('Login: wrong password fails', async () => {
   const email = randomEmail();
   const client1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client1.register(email, 'correct-password', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client1.register(email, 'correct-password', { recoveryAcknowledged: true });
 
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   try {
@@ -174,7 +174,7 @@ await test('Change credentials: new login works, old fails', async () => {
 
   // Register + login
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey, recoveryPhrase } = await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey, recoveryPhrase } = await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true });
 
   // Change credentials. v4 accounts require the phrase (issue #17 follow-up:
   // close the recovery-wrapping gap by default).
@@ -206,7 +206,7 @@ await test('Delete account: login fails after', async () => {
   const password = 'delete-me';
 
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, password, { recoveryAcknowledged: true });
   assert(client.isAuthenticated, 'Should be authenticated');
 
   await client.deleteAccount();
@@ -234,7 +234,7 @@ await test('serializeSession + resumeSession: end-to-end without re-prompting pa
   const email = randomEmail();
   const password = 'session-persist-1';
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { dataLookupKey } = await client.register(email, password, { recoveryAcknowledged: true });
   // Allow reads locally without an app JWT — same pattern as test-e2e.
   await forceAllowRulesForAccount(dataLookupKey);
 
@@ -263,7 +263,7 @@ await test('resumeSession: tampered blob returns null', async () => {
   const email = randomEmail();
   const password = 'session-persist-tamper';
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, password, { recoveryAcknowledged: true });
 
   const blob = await client.serializeSession();
   // Flip one base64url char somewhere past the IV region.
@@ -282,7 +282,7 @@ await test('resumeSession: malformed (non-base64url) blob returns null', async (
   // Force the wrapping key to exist so the failure path is JSON, not key.
   const email = randomEmail();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await c.register(email, 'x', { recoveryAcknowledged: true });
   await c.serializeSession();
 
   // A short random string that decodes to a too-short blob.
@@ -296,7 +296,7 @@ await test('resumeSession: schema-mismatch (unknown v) returns null', async () =
   await clearWrappingKey();
   const email = randomEmail();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, 'x', { recoveryAcknowledged: true });
 
   // Hand-build a blob with an unknown schema version (v: 99) by encrypting
   // under the same wrapping key. v1 (Section 7) and v2 (Section 7.5) are
@@ -319,7 +319,7 @@ await test('resumeSession: missing required field returns null', async () => {
   await clearWrappingKey();
   const email = randomEmail();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, 'x', { recoveryAcknowledged: true });
 
   const { encryptSessionBlob, getOrCreateWrappingKey } = await import('../client/src/session-persistence.js');
   const { bytesToBase64Url } = await import('../client/src/crypto.js');
@@ -339,7 +339,7 @@ await test('resumeSession: wrong appId / apiBase returns null', async () => {
   await clearWrappingKey();
   const email = randomEmail();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, 'x', { recoveryAcknowledged: true });
   const blob = await client.serializeSession();
 
   const wrongApp = await TarnClient.resumeSession(API_BASE, 'some-other-app', blob);
@@ -354,7 +354,7 @@ await test('resumeSession: expired blob (via _nowSeconds) returns null', async (
   await clearWrappingKey();
   const email = randomEmail();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, 'x', { recoveryAcknowledged: true });
   const blob = await client.serializeSession();
 
   // Pretend it's 8 days from now — past the 7-day cap baked into expiresAt.
@@ -374,7 +374,7 @@ await test('resumeSession: wrong wrapping key (clearSession between) returns nul
   await clearWrappingKey();
   const email = randomEmail();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(email, 'x', { recoveryAcknowledged: true, emailRecoveryKit: false });
+  await client.register(email, 'x', { recoveryAcknowledged: true });
   const blob = await client.serializeSession();
 
   // Resume works first.
@@ -395,7 +395,7 @@ await test('changeCredentials: prior blob resumes as null; fresh blob after chan
   const email = randomEmail();
   const password = 'pre-change';
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { recoveryPhrase } = await client.register(email, password, { recoveryAcknowledged: true, emailRecoveryKit: false });
+  const { recoveryPhrase } = await client.register(email, password, { recoveryAcknowledged: true });
 
   const oldBlob = await client.serializeSession();
 

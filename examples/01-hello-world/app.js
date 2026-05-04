@@ -29,7 +29,6 @@ const tarn = await TarnClient.create({
 console.log('Registering', email);
 const reg = await tarn.register(email, password, {
   recoveryAcknowledged: true,
-  emailRecoveryKit: false,
 });
 
 // Local dev only: seed rules_json='[]' so writes aren't denied. In a real

@@ -1,7 +1,7 @@
 // rate-limit.js — shared per-bucket counter via Cloudflare KV.
 //
 // Used by every route that does abuse-prevention rate limiting (register,
-// share-lookup, inbox publish/fetch, share-log fetch, recovery email, etc.).
+// share-lookup, inbox publish/fetch, share-log fetch, etc.).
 //
 // Fails open: if KV is unavailable (e.g., free-tier daily put limit
 // exceeded), the rate limit is not enforced and requests pass through with

@@ -1,11 +1,15 @@
 /**
- * `tarn.recovery.*` — generate recovery kits and forward them via email.
+ * `tarn.recovery.*` — generate recovery kits.
  *
  * The kit format options:
  *   - 'pdf'  → PDF Blob with the default Tarn-branded layout (uses the
  *     existing `renderRecoveryPDF` from the recovery module).
  *   - 'json' → structured object with `phrase` and `appName` for apps
  *     that want to render their own format. Bytes only — no PDF library.
+ *
+ * Tarn never delivers the kit anywhere — apps are responsible for surfacing
+ * the bytes to the user (download, print, or any other channel the app
+ * decides is appropriate).
  */
 
 export type RecoveryFormat = 'pdf' | 'json';
@@ -18,12 +22,6 @@ export type RecoveryJson = {
 
 export interface IRecoveryClient {
   regenerateRecoveryKit(opts?: Record<string, unknown>): Promise<{ phrase: string; pdfBytes: Uint8Array }>;
-  sendRecoveryKitEmail(args: {
-    recipientEmail: string;
-    pdfBytes: Uint8Array;
-    appName?: string;
-    subject?: string;
-  }): Promise<unknown>;
 }
 
 export class RecoveryNamespace {
@@ -57,24 +55,5 @@ export class RecoveryNamespace {
       appName,
       generatedAt: new Date().toISOString(),
     };
-  }
-
-  /**
-   * Forward a previously-generated PDF kit through Tarn's email forwarder.
-   * Tarn does not persist the PDF — it's posted, the email is sent, the
-   * bytes are dropped.
-   */
-  async emailKit(args: {
-    to: string;
-    pdfBytes: Uint8Array;
-    appName?: string;
-    subject?: string;
-  }): Promise<void> {
-    await this.#client.sendRecoveryKitEmail({
-      recipientEmail: args.to,
-      pdfBytes: args.pdfBytes,
-      ...(args.appName !== undefined ? { appName: args.appName } : { appName: this.#appId }),
-      ...(args.subject !== undefined ? { subject: args.subject } : {}),
-    });
   }
 }

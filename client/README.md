@@ -234,8 +234,7 @@ Tarn issues every account a 24-word BIP39 recovery phrase at signup. The phrase 
 ```js
 const reg = await tarn.register('me@example.com', 'p@ssw0rd', {
   recoveryAcknowledged: true,
-  emailRecoveryKit: false,        // skip the email forwarder; default true
-  appName: 'My App',              // PDF + email branding
+  appName: 'My App',              // PDF branding
 });
 // reg.recoveryPhrase   — 24-word string
 // reg.pdfBytes         — Uint8Array of the rendered PDF
@@ -245,10 +244,9 @@ const reg = await tarn.register('me@example.com', 'p@ssw0rd', {
 const pdfBytes = await tarn.recovery.export({ format: 'pdf' });
 // or: structured JSON for apps rendering their own format.
 const { phrase, appName, generatedAt } = await tarn.recovery.export({ format: 'json' });
-
-// Forward an already-rendered PDF via Tarn's email relay (no persistence).
-await tarn.recovery.emailKit({ to: 'me@example.com', pdfBytes, appName: 'My App' });
 ```
+
+**Delivery is the app's job.** Tarn renders the kit entirely on the client and never sees the phrase or the PDF — there is no Tarn endpoint that handles plaintext recovery material, even ephemerally. Apps decide how to surface the bytes: a download is the recommended default (universally available, no third party); print and app-operated email are also fine. If the application wants to email the kit, it must operate the forwarder itself — Tarn will not host one, since routing recovery material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
 
 Recovery itself goes through the top-level `tarn.recoverAccount()` (auth lifecycle):
 

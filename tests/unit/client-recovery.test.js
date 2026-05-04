@@ -5,7 +5,9 @@
 //   - Recovery KEK derivation (Argon2id over phrase + per-account salt)
 //   - v1 envelope shape (multi-factor wrappings, recovery metadata block)
 //   - register() requires recoveryAcknowledged: true
-//   - register() emits v4 with both password and recovery_phrase wrappings
+//   - register() emits v1 with both password and recovery_phrase wrappings
+//   - register() makes no recovery-email network call (kit delivery is the
+//     app's responsibility — Tarn never handles plaintext kit material)
 //   - PDF rendering (basic structure, deterministic output for fixed inputs)
 //   - recoverAccount() round-trip (register → simulate forget password → recover with phrase → re-login)
 //   - regenerateRecoveryKit() returns a fresh PDF for the same phrase
@@ -338,7 +340,6 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     const client = new TarnClient('https://api.tarn.dev', APP);
     const result = await client.register('rec-test@example.com', 'password-2026', {
       recoveryAcknowledged: true,
-      emailRecoveryKit: false,
     });
     assert.ok(result.recoveryPhrase);
     assert.equal(result.recoveryPhrase.split(' ').length, 24);
@@ -346,7 +347,6 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     assert.ok(result.pdfBytes.length > 0);
     // First 5 bytes are the PDF header "%PDF-".
     assert.deepEqual(Array.from(result.pdfBytes.slice(0, 5)), [0x25, 0x50, 0x44, 0x46, 0x2d]);
-    assert.equal(result.emailDelivered, false);
 
     // Inspect the envelope sent to /auth/register.
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
@@ -361,45 +361,19 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     assert.ok(body.recovery_public_key);
   });
 
-  it('attempts email forward when emailRecoveryKit is true (default)', async () => {
+  it('register makes no recovery-email network call (kit delivery is the app\'s job)', async () => {
     mockFetch([
       { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
       { status: 200, body: JSON.stringify({ nonce: 'b'.repeat(64) }) },
       { status: 200, body: JSON.stringify({ jwt: fakeJwt('reg') }) },
-      // /api/v1/recovery/email POST
-      { status: 200, body: JSON.stringify({ ok: true }) },
     ]);
     const client = new TarnClient('https://api.tarn.dev', APP);
-    const result = await client.register('rec-test@example.com', 'password-2026', {
+    await client.register('rec-test@example.com', 'password-2026', {
       recoveryAcknowledged: true,
-      // emailRecoveryKit defaults to true
       appName: 'Bookish',
     });
-    assert.equal(result.emailDelivered, true);
-
-    const emailCall = fetchCalls.find(c => c.url.endsWith('/recovery/email'));
-    assert.ok(emailCall, 'should POST /api/v1/recovery/email when emailRecoveryKit is true');
-    const body = JSON.parse(emailCall.body);
-    assert.equal(body.recipient_email, 'rec-test@example.com');
-    assert.equal(body.app_name, 'Bookish');
-    assert.ok(body.pdf_base64);
-  });
-
-  it('register succeeds even when email forward fails (does not throw)', async () => {
-    mockFetch([
-      { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
-      { status: 200, body: JSON.stringify({ nonce: 'b'.repeat(64) }) },
-      { status: 200, body: JSON.stringify({ jwt: fakeJwt('reg') }) },
-      // email send fails
-      { status: 502, body: JSON.stringify({ error: 'relay error' }) },
-    ]);
-    const client = new TarnClient('https://api.tarn.dev', APP);
-    const result = await client.register('rec-test@example.com', 'password-2026', {
-      recoveryAcknowledged: true,
-    });
-    assert.equal(result.emailDelivered, false);
-    assert.ok(result.recoveryPhrase, 'phrase still returned to caller');
-    assert.ok(result.pdfBytes, 'PDF still returned to caller');
+    const emailCall = fetchCalls.find(c => c.url.includes('/recovery/email'));
+    assert.equal(emailCall, undefined, 'must not POST /api/v1/recovery/email — endpoint is gone');
   });
 });
 
@@ -426,7 +400,6 @@ describe('TarnClient.recoverAccount — round trip', () => {
     const c1 = new TarnClient('https://api.tarn.dev', APP);
     const reg = await c1.register('orig@example.com', 'orig-password', {
       recoveryAcknowledged: true,
-      emailRecoveryKit: false,
     });
     const phrase = reg.recoveryPhrase;
     storedDataLookupKey = reg.dataLookupKey;
@@ -523,20 +496,19 @@ describe('TarnClient.recoverAccount — round trip', () => {
 describe('TarnClient.regenerateRecoveryKit', () => {
   afterEach(restoreFetch);
 
-  it('without emailRecoveryKit: returns PDF, makes no network call', async () => {
+  it('returns PDF for a valid phrase, makes no network call', async () => {
     mockFetch([]);
     const client = new TarnClient('https://api.tarn.dev', APP);
     const phrase = generateRecoveryPhrase();
-    const r = await client.regenerateRecoveryKit({ phrase, emailRecoveryKit: false });
+    const r = await client.regenerateRecoveryKit({ phrase });
     assert.ok(r.pdfBytes instanceof Uint8Array);
-    assert.equal(r.emailDelivered, false);
     assert.equal(fetchCalls.length, 0);
   });
 
   it('rejects an invalid phrase', async () => {
     const client = new TarnClient('https://api.tarn.dev', APP);
     await assert.rejects(
-      () => client.regenerateRecoveryKit({ phrase: 'bad phrase', emailRecoveryKit: false }),
+      () => client.regenerateRecoveryKit({ phrase: 'bad phrase' }),
       /expected 24|invalid/,
     );
   });
@@ -584,47 +556,3 @@ describe('renderRecoveryPDF', () => {
   });
 });
 
-// ============ sendRecoveryKitEmail ============
-
-describe('TarnClient.sendRecoveryKitEmail', () => {
-  afterEach(restoreFetch);
-
-  it('rejects without an active session', async () => {
-    mockFetch([]);
-    const client = new TarnClient('https://api.tarn.dev', APP);
-    const phrase = generateRecoveryPhrase();
-    const pdfBytes = renderRecoveryPDF({ phrase });
-    await assert.rejects(
-      () => client.sendRecoveryKitEmail({ recipientEmail: 'a@b.com', pdfBytes }),
-      /Not authenticated/,
-    );
-    assert.equal(fetchCalls.length, 0);
-  });
-
-  it('posts pdf_base64 + recipient_email when authenticated', async () => {
-    mockFetch([
-      // register
-      { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
-      { status: 200, body: JSON.stringify({ nonce: 'b'.repeat(64) }) },
-      { status: 200, body: JSON.stringify({ jwt: fakeJwt('reg') }) },
-      // sendRecoveryKitEmail call
-      { status: 200, body: JSON.stringify({ ok: true }) },
-    ]);
-    const client = new TarnClient('https://api.tarn.dev', APP);
-    const reg = await client.register('rec@example.com', 'password-2026', {
-      recoveryAcknowledged: true,
-      emailRecoveryKit: false,
-    });
-    await client.sendRecoveryKitEmail({
-      recipientEmail: 'a@b.com',
-      pdfBytes: reg.pdfBytes,
-      appName: 'Bookish',
-    });
-    const emailCall = fetchCalls.find(c => c.url.endsWith('/recovery/email'));
-    assert.ok(emailCall);
-    const body = JSON.parse(emailCall.body);
-    assert.equal(body.recipient_email, 'a@b.com');
-    assert.equal(body.app_name, 'Bookish');
-    assert.ok(body.pdf_base64.length > 0);
-  });
-});

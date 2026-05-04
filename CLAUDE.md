@@ -60,16 +60,9 @@ The generator requires Python with `reportlab` and `markdown-it-py` (`python -m 
   This tests the full lifecycle (health, register, app auth, set rules, login, write, read, Turbo gateway, status, delete) against the live API. Do not consider a deploy complete until this passes.
 - The bookish app private key (`TARN_APP_KEY_BOOKISH`) is in `api/.dev.vars` (local) and Cloudflare Worker secrets (production).
 
-### Worker secrets (issue #12 — recovery email forwarder)
+### Recovery-kit delivery is an app concern, not a Tarn concern
 
-The `POST /api/v1/recovery/email` endpoint forwards client-rendered recovery PDFs through Resend. Two Worker secrets must be set in production:
-
-```
-npx wrangler secret put EMAIL_FORWARDER_API_KEY  # Resend API key (re_...)
-npx wrangler secret put EMAIL_FORWARDER_FROM     # e.g. "Tarn <recovery@tarn.dev>"
-```
-
-If either is missing the endpoint returns 503 (apps can still let the user download the PDF locally — the `emailRecoveryKit: false` SDK path skips the network call entirely). The endpoint never persists the PDF; it only forwards.
+Tarn deliberately has no endpoint that handles a recovery PDF, recovery phrase, or any other plaintext recovery material — even ephemerally. The kit is rendered client-side (`renderRecoveryPDF` / `tarn.recovery.export`) and the bytes never leave the user's device on Tarn's account. Apps decide how to surface the kit to the user (download, print, app-operated email, etc.); the platform's job ends at producing the bytes. If you find yourself adding a route under `/api/v1/recovery/*` that takes phrase or PDF material as input, stop — that's a zero-knowledge boundary violation.
 
 ## D1 Database
 
