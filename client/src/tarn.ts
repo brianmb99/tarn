@@ -1764,7 +1764,7 @@ export class TarnClient {
           const match = (issuedRecord.invites || []).find((i: any) => i.token_id === cand.viaInviteToken);
           if (!match) continue;
           try {
-            await this.acceptConnectionRequest(cand.requestNonce, { label: match.display_name || null });
+            await this.acceptConnectionRequest(cand.requestNonce, { label: match.label || null });
             (autoAccepted || (autoAccepted = new Set())).add(cand.requestNonce);
           } catch (err: any) {
             console.warn(`[TarnClient] listIncomingRequests: auto-accept failed for ${cand.requestNonce}: ${err.message}`);
@@ -2079,7 +2079,7 @@ export class TarnClient {
    *
    * Default expiry is 7 days; server enforces a 30-day cap.
    *
-   * @param {{ display_name?: string, expiry_days?: number }} [opts]
+   * @param {{ label?: string, expiry_days?: number }} [opts]
    * @returns {Promise<{ token_id: string, invite_url: string, expires_at: number }>}
    */
   async createInviteToken(opts: any = {}): Promise<any> {
@@ -2090,9 +2090,13 @@ export class TarnClient {
     if (!this.#email) {
       throw new Error('createInviteToken(): client missing sender email — re-login');
     }
-    const displayName = opts.display_name == null ? '' : String(opts.display_name);
-    if (displayName.length > 64) {
-      throw new Error('createInviteToken(): display_name exceeds 64 chars');
+    // Local-only label: stored in the inviter's issued-invites record so
+    // listIssuedInvites + the auto-accept path can label the resulting
+    // connection. Never sent to the recipient — Tarn has no concept of a
+    // user-facing display name on the wire.
+    const label = opts.label == null ? '' : String(opts.label);
+    if (label.length > 64) {
+      throw new Error('createInviteToken(): label exceeds 64 chars');
     }
     const expiryDays = Number.isInteger(opts.expiry_days) ? opts.expiry_days : 7;
     if (expiryDays < 1 || expiryDays > 30) {
@@ -2117,7 +2121,6 @@ export class TarnClient {
     const plaintext = {
       inviter_share_pub: inviterSharePubBase64Url,
       inviter_signing_pub: inviterSigningPubBase64,
-      inviter_display_name: displayName,
       app_id: this.#appId,
       issued_at: now,
     };
@@ -2162,7 +2165,7 @@ export class TarnClient {
       const state = await this.#loadIssuedInvitesRecord();
       const updated = addIssuedInvite(state.record, {
         token_id: tokenId,
-        display_name: displayName,
+        label,
         issued_at: now,
         expires_at: expiresAt,
         redeemed_at: null,
@@ -2186,7 +2189,7 @@ export class TarnClient {
    *
    * @param {string} tokenId
    * @param {string} payloadKeyB64Url - base64url of the 32-byte AES key
-   * @returns {Promise<{ inviter_display_name: string, inviter_share_pub_fingerprint: string, app_id: string, issued_at: number, expires_at: number } | null>}
+   * @returns {Promise<{ inviter_share_pub_fingerprint: string, app_id: string, issued_at: number, expires_at: number } | null>}
    */
   async previewInviteToken(tokenId: string, payloadKeyB64Url: string): Promise<any> {
     if (typeof tokenId !== 'string' || tokenId.length === 0) {
@@ -2228,7 +2231,6 @@ export class TarnClient {
     const fingerprint = await fingerprintSharePub(inviterSharePub);
 
     return {
-      inviter_display_name: plaintext.inviter_display_name || '',
       inviter_share_pub_fingerprint: fingerprint,
       app_id,
       issued_at,
@@ -2363,7 +2365,7 @@ export class TarnClient {
    * List the current user's outstanding issued invites (Section 8). Cached
    * after the first call; refreshed by createInviteToken / revokeIssuedInvite.
    *
-   * @returns {Promise<Array<{ token_id: string, display_name: string, issued_at: number, expires_at: number, redeemed_at: number | null, redeemer_share_pub_fingerprint: string | null }>>}
+   * @returns {Promise<Array<{ token_id: string, label: string, issued_at: number, expires_at: number, redeemed_at: number | null, redeemer_share_pub_fingerprint: string | null }>>}
    */
   async listIssuedInvites() {
     await this.#requireAuth();

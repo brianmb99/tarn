@@ -70,8 +70,10 @@ await maybeGrantLocalRules(API_BASE, reg.dataLookupKey);
 console.log('[recipient] previewing invite (non-consuming)');
 const preview = await tarn.connections.previewInvite(tokenId, payloadKey);
 if (preview) {
-  console.log('  invited by:', preview.inviter_display_name || '(no display name)');
-  console.log('  expires_at:', new Date(preview.expires_at * 1000).toISOString());
+  // Tarn carries no inviter name on the wire — apps that want to show
+  // "X invited you" send the name through their own delivery channel.
+  console.log('  fingerprint:', preview.inviter_share_pub_fingerprint);
+  console.log('  expires_at: ', new Date(preview.expires_at * 1000).toISOString());
 } else {
   console.log('  preview returned null — token may be expired or already used');
 }

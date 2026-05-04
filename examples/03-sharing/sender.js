@@ -61,7 +61,7 @@ console.log('[sender] library:', (await tarn.notes.list()).map((n) => n.title));
 
 console.log('\n[sender] creating invite token');
 const invite = await tarn.connections.createInvite({
-  display_name: 'Sender',
+  label:        'Sender',   // local-only label for the to-be connection
   expiry_days:  1,
 });
 console.log('  token_id:   ', invite.token_id);

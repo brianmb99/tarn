@@ -92,8 +92,14 @@ export type InviteToken = {
 
 /** Options accepted by `tarn.connections.createInvite()`. */
 export type CreateInviteOpts = {
-  /** Up to 64 chars; shown to the redeemer on the preview screen. */
-  display_name?: string;
+  /**
+   * Optional local label for the connection-to-be (≤ 64 chars). Stored only
+   * in the inviter's encrypted issued-invites record; surfaced in
+   * `listIssuedInvites()` and used to seed `Connection.label` when the
+   * matching redemption auto-accepts. Never sent to the recipient — Tarn
+   * has no concept of a user-facing display name on the wire.
+   */
+  label?: string;
   /** 1–30; defaults to 7. */
   expiry_days?: number;
 };
@@ -102,9 +108,13 @@ export type CreateInviteOpts = {
  * Result of `tarn.connections.previewInvite(...)` — non-consuming peek at
  * an invite token. Returns null on any recoverable failure (expired, used,
  * not found, wrong payload key); never throws on those.
+ *
+ * Tarn does not carry a name for the inviter on the wire — the encrypted
+ * payload contains only their public keys. Apps that want to show "X
+ * invited you" UI should pass the inviter's name through their own
+ * delivery channel (e.g., the message accompanying the link).
  */
 export type InvitePreview = {
-  inviter_display_name: string;
   /**
    * Short hex digest of the inviter's share_pub. Stable identifier for the
    * inviter that doesn't expose their email — useful for "this is the same
@@ -125,7 +135,13 @@ export type InvitePreview = {
  */
 export type IssuedInvite = {
   token_id: string;
-  display_name: string;
+  /**
+   * Local-only label the inviter chose at invite-creation time. Used to
+   * render "Manage invites" UI ("Pending: Maya") and to seed
+   * `Connection.label` when the matching redemption auto-accepts. Never
+   * sent to the recipient.
+   */
+  label: string;
   issued_at: number;
   expires_at: number;
   /** Unix seconds at which the invite was redeemed; null if still pending. */

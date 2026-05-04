@@ -302,7 +302,6 @@ describe('AES-256-GCM payload round-trip', () => {
     const plaintext = {
       inviter_share_pub: bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
       inviter_signing_pub: 'spki-base64-stub',
-      inviter_display_name: 'Maya',
       app_id: 'test-app',
       issued_at: NOW,
     };
@@ -393,7 +392,7 @@ describe('SDK createInviteToken privacy invariant', () => {
       return new Response(JSON.stringify({ token_id: 'x', expires_at: 0 }), { status: 401 });
     };
     try {
-      try { await client.createInviteToken({ display_name: 'x' }); } catch {}
+      try { await client.createInviteToken({ label: 'x' }); } catch {}
     } finally {
       global.fetch = originalFetch;
     }

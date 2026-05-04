@@ -209,8 +209,8 @@ For consumer apps where the inviter doesn't know the recipient's email (or the r
 ```js
 // Inviter — generate a single-use, time-limited link.
 const { token_id, invite_url, expires_at } = await tarn.connections.createInvite({
-  display_name: 'Maya',
-  expiry_days:  7,    // default 7, server max 30
+  label:       'Maya',  // local-only: labels the connection that forms when this redeems
+  expiry_days: 7,       // default 7, server max 30
 });
 // invite_url is something like:
 //   https://app.example.com/invite/<token_id>#<base64url payload_key>
@@ -224,6 +224,8 @@ await tarn.connections.redeemInvite(tokenId, payloadKey);
 ```
 
 The URL fragment (`#`) is never transmitted to the API — the payload key stays on the recipient's device. Tarn stores opaque ciphertext keyed on `token_id` and never sees the inviter's identity.
+
+`label` is local: it's stored only in the inviter's encrypted `tarn-issued-invites-v1` record, surfaced in `listIssuedInvites()`, and used to seed `Connection.label` when the matching redemption auto-accepts. The recipient never sees it. If your app wants to show the recipient who's reaching out (e.g. "Maya invited you"), pass that name through your delivery channel — the message body of the email/SMS/QR-page that carries the invite URL.
 
 ---
 

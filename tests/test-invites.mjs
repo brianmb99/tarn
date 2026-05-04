@@ -86,7 +86,7 @@ await test('3. happy path: invite → preview → redeem → auto-accept (both c
   const inviterEmail = randomEmail();
   await registerWithRules(inviter, inviterEmail, 'pw-' + Date.now());
 
-  const created = await inviter.createInviteToken({ display_name: 'Maya', expiry_days: 7 });
+  const created = await inviter.createInviteToken({ label: 'Maya', expiry_days: 7 });
   assert(typeof created.token_id === 'string', 'token_id must be string');
   assert(created.token_id.length === 43, `token_id must be 43 chars, got ${created.token_id.length}`);
   assert(created.invite_url.includes(created.token_id), 'invite_url must include token_id');
@@ -107,10 +107,12 @@ await test('3. happy path: invite → preview → redeem → auto-accept (both c
   const previewBody = await previewRes.json();
   assert(previewBody.app_id === INVITE_APP_ID, 'preview app_id mismatch');
 
-  // Recipient client decrypts the preview via the SDK helper.
+  // Recipient client decrypts the preview via the SDK helper. The preview
+  // does NOT carry an inviter name — that's an app-layer concern handled at
+  // delivery time. Only the fingerprint + scope/timestamps round-trip.
   const recipientPreview = await recipient.previewInviteToken(created.token_id, fragment);
   assert(recipientPreview != null, 'previewInviteToken should return non-null on active invite');
-  assert(recipientPreview.inviter_display_name === 'Maya', 'display_name should round-trip');
+  assert(!('inviter_display_name' in recipientPreview), 'preview must not carry an inviter display name');
   assert(typeof recipientPreview.inviter_share_pub_fingerprint === 'string', 'fingerprint must be present');
   assert(/^[0-9a-f:]+$/.test(recipientPreview.inviter_share_pub_fingerprint), 'fingerprint must be hex+colons');
 
@@ -128,7 +130,7 @@ await test('3. happy path: invite → preview → redeem → auto-accept (both c
   // Both sides see each other in connections.
   const inviterConnections = await inviter.listConnections();
   assert(inviterConnections.length === 1, `inviter should have 1 connection, got ${inviterConnections.length}`);
-  assert(inviterConnections[0].label === 'Maya', `inviter label should seed from display_name, got ${inviterConnections[0].label}`);
+  assert(inviterConnections[0].label === 'Maya', `inviter label should seed from issued-invite label, got ${inviterConnections[0].label}`);
 
   await sleep(150);
   await recipient.listIncomingRequests();
@@ -145,7 +147,7 @@ await test('4. expired invite returns 410 on redeem', async () => {
   await resetState();
   const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
   await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
-  const invite = await inviter.createInviteToken({ display_name: 'X', expiry_days: 7 });
+  const invite = await inviter.createInviteToken({ label: 'X', expiry_days: 7 });
 
   // Backdate via direct DB mutation.
   await backdateInviteExpiresAt(invite.token_id, 1000);
@@ -168,7 +170,7 @@ await test('5. redeeming an already-used invite returns 409', async () => {
   await resetState();
   const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
   await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
-  const invite = await inviter.createInviteToken({ display_name: 'Y' });
+  const invite = await inviter.createInviteToken({ label: 'Y' });
   const fragment = invite.invite_url.split('#')[1];
 
   await resetState();
@@ -193,7 +195,7 @@ await test('6. two concurrent redeems: exactly one wins', async () => {
   await resetState();
   const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
   await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
-  const invite = await inviter.createInviteToken({ display_name: 'Race' });
+  const invite = await inviter.createInviteToken({ label: 'Race' });
   const fragment = invite.invite_url.split('#')[1];
 
   await resetState();
@@ -221,7 +223,7 @@ await test('7. inviter offline at redemption: connection still forms when they p
   await resetState();
   const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
   await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
-  const invite = await inviter.createInviteToken({ display_name: 'Offline' });
+  const invite = await inviter.createInviteToken({ label: 'Offline' });
   const fragment = invite.invite_url.split('#')[1];
 
   // Recipient redeems while inviter is "offline" (i.e., not calling listIncomingRequests).
@@ -239,7 +241,7 @@ await test('7. inviter offline at redemption: connection still forms when they p
   await inviter.listIncomingRequests();
   const after = await inviter.listConnections();
   assert(after.length === 1, `inviter should have 1 connection after polling, got ${after.length}`);
-  assert(after[0].label === 'Offline', `label should seed from display_name, got ${after[0].label}`);
+  assert(after[0].label === 'Offline', `label should seed from issued-invite label, got ${after[0].label}`);
 
   // And the request must NOT be in the surfaced list on subsequent polls.
   const second = await inviter.listIncomingRequests();
@@ -253,7 +255,7 @@ await test('8. recipient signs up AFTER createInviteToken returns the URL', asyn
   await resetState();
   const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
   await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
-  const invite = await inviter.createInviteToken({ display_name: 'Late' });
+  const invite = await inviter.createInviteToken({ label: 'Late' });
 
   // Time passes (no-op) — recipient just now signs up.
   await resetState();
@@ -271,7 +273,7 @@ await test('9. listIssuedInvites returns the entry; revokeIssuedInvite removes i
   await resetState();
   const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
   await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
-  const invite = await inviter.createInviteToken({ display_name: 'ToRevoke' });
+  const invite = await inviter.createInviteToken({ label: 'ToRevoke' });
 
   const issued = await inviter.listIssuedInvites();
   assert(issued.some(i => i.token_id === invite.token_id), 'createInviteToken should populate listIssuedInvites');
@@ -344,7 +346,7 @@ await test('11. createInviteToken does not include the payload_key in any HTTP b
     return originalFetch(url, init);
   };
   try {
-    const res = await inviter.createInviteToken({ display_name: 'Quiet' });
+    const res = await inviter.createInviteToken({ label: 'Quiet' });
     const fragment = res.invite_url.split('#')[1];
     // The fragment IS the payload_key (base64url). Assert it's in the URL but
     // not in any HTTP body that went over the wire.

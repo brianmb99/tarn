@@ -176,7 +176,6 @@ class StubUnderlying implements IUnderlyingClient {
     txid: string;
   }> = [];
   invitePreviewResult: {
-    inviter_display_name: string;
     inviter_share_pub_fingerprint: string;
     app_id: string;
     issued_at: number;
@@ -184,7 +183,7 @@ class StubUnderlying implements IUnderlyingClient {
   } | null = null;
   issuedInvites: Array<{
     token_id: string;
-    display_name: string;
+    label: string;
     issued_at: number;
     expires_at: number;
     redeemed_at: number | null;
@@ -707,7 +706,7 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
   });
 
   it('connections.createInvite returns the typed InviteToken shape', async () => {
-    const out = await tarn.connections.createInvite({ display_name: 'Alice', expiry_days: 3 });
+    const out = await tarn.connections.createInvite({ label: 'Alice', expiry_days: 3 });
     assert.equal(stub.createInviteTokenCalls, 1);
     assert.equal(out.token_id, 'stub-token-id');
     assert.equal(out.invite_url, 'tarn:invite/stub-token-id#stub-payload-key');
@@ -723,7 +722,6 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
 
   it('connections.previewInvite normalizes the underlying preview shape', async () => {
     stub.invitePreviewResult = {
-      inviter_display_name: 'Maya',
       inviter_share_pub_fingerprint: '0123abcd',
       app_id: 'bookish',
       issued_at: 1714000000,
@@ -731,7 +729,6 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     };
     const out = await tarn.connections.previewInvite('tok', 'key');
     assert.deepEqual(out, {
-      inviter_display_name: 'Maya',
       inviter_share_pub_fingerprint: '0123abcd',
       app_id: 'bookish',
       issued_at: 1714000000,
@@ -753,7 +750,7 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     stub.issuedInvites = [
       {
         token_id: 't1',
-        display_name: 'For Bob',
+        label: 'For Bob',
         issued_at: 1714000000,
         expires_at: 1714600000,
         redeemed_at: null,
@@ -761,7 +758,7 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
       },
       {
         token_id: 't2',
-        display_name: 'For Maya',
+        label: 'For Maya',
         issued_at: 1714100000,
         expires_at: 1714700000,
         redeemed_at: 1714200000,

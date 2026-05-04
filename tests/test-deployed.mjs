@@ -835,7 +835,7 @@ await test('Invite inviter + redeemer register', async () => {
 let deployedInvite;
 
 await test('createInviteToken returns a token + url + expiry', async () => {
-  deployedInvite = await inviteInviter.createInviteToken({ display_name: 'Pat', expiry_days: 1 });
+  deployedInvite = await inviteInviter.createInviteToken({ label: 'Pat', expiry_days: 1 });
   assert(typeof deployedInvite.token_id === 'string' && deployedInvite.token_id.length === 43,
     `bad token_id: ${deployedInvite.token_id}`);
   assert(deployedInvite.invite_url.includes('#'), 'invite_url should include the payload_key fragment');
@@ -846,7 +846,8 @@ await test('previewInviteToken returns the payload (unauthenticated path)', asyn
   const fragment = deployedInvite.invite_url.split('#')[1];
   const preview = await inviteRedeemer.previewInviteToken(deployedInvite.token_id, fragment);
   assert(preview != null, 'preview should not be null on an active invite');
-  assert(preview.inviter_display_name === 'Pat', `display_name mismatch: ${preview.inviter_display_name}`);
+  assert(!('inviter_display_name' in preview),
+    'preview must not carry an inviter display name (no name slot on the wire)');
   assert(typeof preview.inviter_share_pub_fingerprint === 'string',
     'fingerprint must be present on the preview');
 });
@@ -862,7 +863,7 @@ await test('redeemInviteToken forms a connection on the inviter side after auto-
     'auto-accept should consume the request from the surfaced list');
   const conns = await inviteInviter.listConnections();
   assert(conns.length === 1, `inviter should have 1 connection, got ${conns.length}`);
-  assert(conns[0].label === 'Pat', `label should seed from display_name, got ${conns[0].label}`);
+  assert(conns[0].label === 'Pat', `label should seed from issued-invite label, got ${conns[0].label}`);
 });
 
 await test('Cleanup invite-leg accounts', async () => {

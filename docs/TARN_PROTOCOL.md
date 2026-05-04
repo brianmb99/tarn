@@ -1097,7 +1097,6 @@ The inviter generates two independent 32-byte secrets client-side:
 plaintext = JSON({
   inviter_share_pub:    <base64url 32 bytes>,
   inviter_signing_pub:  <base64url SPKI>,
-  inviter_display_name: <string ≤ 64 chars>,
   app_id:               <string>,
   issued_at:            <unix seconds>
 })
@@ -1107,7 +1106,9 @@ url        = <apps.invite_url_template, with {token_id}> # base64url(payload_key
                                                           # see "App-side URL template" below
 ```
 
-The server stores `(token_id, payload, ...metadata)` and never learns the contents of `payload` — `inviter_share_pub`, `inviter_signing_pub`, and `inviter_display_name` are not visible to the API. This is the consistent zero-knowledge story across the rest of the protocol.
+The payload carries only the inviter's public-key material plus scope/timestamp metadata. There is no display-name slot on the wire — Tarn has no concept of a user-facing name in its identity model, so the protocol does not pretend to provide one. Apps that want to render "X invited you" UI pass that name through their own delivery channel (e.g., the message accompanying the invite link).
+
+The server stores `(token_id, payload, ...metadata)` and never learns the contents of `payload` — `inviter_share_pub` and `inviter_signing_pub` are not visible to the API. This is the consistent zero-knowledge story across the rest of the protocol.
 
 ### App-side URL template
 
@@ -1123,7 +1124,7 @@ Set at app onboarding. The SDK calls `GET /api/v1/apps/:app_id/invite-template` 
 
 The app's web handler at that URL is responsible for:
 - Reading `token_id` from the path and `payload_key` from `window.location.hash.slice(1)`.
-- Calling `tarn.previewInviteToken(token_id, payloadKey)` to populate any "Maya invited you" UI it wants.
+- Calling `tarn.previewInviteToken(token_id, payloadKey)` to confirm the invite is still valid (returns scope + fingerprint + timestamps; no inviter name — apps render "Maya invited you" UI from whatever the inviter put in the message accompanying the link).
 - Calling `tarn.redeemInviteToken(token_id, payloadKey)` once the recipient is authenticated (signing up first if needed).
 - Server-side rendering the page with `<meta property="og:title">` etc. for messenger-preview unfurls — the app can fetch the unauthenticated preview server-side to populate them.
 - Universal Links / App Links handling for native apps.
@@ -1190,7 +1191,7 @@ Errors:
   429 if per-IP preview rate exceeded
 ```
 
-The app_id and timestamps are unencrypted — they're already implied by the URL hosting the invite, and the recipient's app needs `app_id` to confirm scope before redeeming. Everything else (inviter_share_pub, signing_pub, display_name) is inside the encrypted payload.
+The app_id and timestamps are unencrypted — they're already implied by the URL hosting the invite, and the recipient's app needs `app_id` to confirm scope before redeeming. Everything else (inviter_share_pub, signing_pub) is inside the encrypted payload.
 
 #### `POST /api/v1/invite/redeem/:token_id` (authenticated, user-role)
 
@@ -1236,7 +1237,7 @@ Section 8 makes it a first-class primitive:
 - The label persists in the connections record (`tarn-connections-v1`) blob alongside other per-connection fields. No new server-side surface.
 - The label is local to the labeling user — the labeled party does not see what they were labeled.
 
-Used by invite redemption to seed the connection's label with the inviter's `display_name` from the decrypted payload, so apps get an out-of-the-box "this is Maya" without app-layer storage.
+Used by invite redemption to seed the new connection's label with the `label` the inviter recorded against the matching token in `tarn-issued-invites-v1` — the inviter answered "who am I sending this to?" at invite-creation time, and the auto-accept path applies that answer to the connection that forms. The recipient never sees the label; it's the inviter's local annotation.
 
 ### Auto-accept on the inviter side
 
@@ -1256,7 +1257,7 @@ plaintext  = JSON({
   version: 1,
   invites: [
     {
-      token_id, display_name, issued_at, expires_at,
+      token_id, label, issued_at, expires_at,
       redeemed_at, redeemer_share_pub_fingerprint
     },
     ...
@@ -1272,13 +1273,14 @@ DEK-encrypted. Synced across the inviter's devices via standard data-blob storag
 - **Malicious recipient redeems but refuses the handshake**. Token consumed; inviter must reissue. No worse than the email-flow case where a recipient declines.
 - **Server compromise**. Attacker can enumerate live tokens via the `invites` table but cannot decrypt payloads (the `payload_key` lives only in URL fragments held by recipients). Best they can do is mark tokens used (denial-of-service) or redirect connection-request handshakes (which fail signature verification on the inviter side because the attacker doesn't have the recipient's identity to sign as).
 - **Token enumeration**. 256-bit space is brute-force-infeasible regardless. The 100/hour/IP preview rate-limit is defense-in-depth.
-- **Inviter-identity exposure to API operators**. Operators see `(inviter_dlk, token_id, time, redeemer_fingerprint)` per row. They do **not** see `inviter_share_pub`, `inviter_signing_pub`, or `inviter_display_name` — those are inside the encrypted payload.
+- **Inviter-identity exposure to API operators**. Operators see `(inviter_dlk, token_id, time, redeemer_fingerprint)` per row. They do **not** see `inviter_share_pub` or `inviter_signing_pub` — those are inside the encrypted payload.
 
 ### SDK surface
 
 ```
 client.createInviteToken({
-  display_name?: string,        // shown to recipient at preview/redeem time, ≤ 64 chars
+  label?: string,               // local-only label for the connection-to-be, ≤ 64 chars
+                                //   stored in tarn-issued-invites-v1; never sent to the recipient
   expiry_days?: number,         // default 7, server max 30
 }): Promise<{
   token_id: string,
@@ -1287,7 +1289,6 @@ client.createInviteToken({
 }>
 
 client.previewInviteToken(token_id, payloadKey): Promise<{
-  inviter_display_name: string,
   inviter_share_pub_fingerprint: string,   // short hex for verification UI
   app_id: string,
   issued_at: number,

@@ -34,7 +34,6 @@ interface UnderlyingInviteToken {
 }
 
 interface UnderlyingInvitePreview {
-  inviter_display_name: string;
   inviter_share_pub_fingerprint: string;
   app_id: string;
   issued_at: number;
@@ -43,7 +42,7 @@ interface UnderlyingInvitePreview {
 
 interface UnderlyingIssuedInvite {
   token_id: string;
-  display_name: string;
+  label: string;
   issued_at: number;
   expires_at: number;
   redeemed_at: number | null;
@@ -192,7 +191,6 @@ export class ConnectionsNamespace {
     const raw = await this.#client.previewInviteToken(tokenId, payloadKey);
     if (!raw) return null;
     return {
-      inviter_display_name: raw.inviter_display_name,
       inviter_share_pub_fingerprint: raw.inviter_share_pub_fingerprint,
       app_id: raw.app_id,
       issued_at: raw.issued_at,
@@ -217,7 +215,7 @@ export class ConnectionsNamespace {
     const raw = await this.#client.listIssuedInvites();
     return raw.map((r) => ({
       token_id: r.token_id,
-      display_name: r.display_name,
+      label: r.label,
       issued_at: r.issued_at,
       expires_at: r.expires_at,
       redeemed_at: r.redeemed_at,
