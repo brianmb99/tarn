@@ -4638,19 +4638,27 @@ export class TarnClient {
           return res;
         }
 
-        // Drain body before retry so the underlying connection can be reused.
-        try { await res.body?.cancel(); } catch {}
-
         const retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
         // Don't honor Retry-After values longer than 60 seconds — the server
         // is telling us to back off for a budget window we can't realistically
         // wait for (recovery email rate limit, share-inbox fetch limit, etc.
-        // all return Retry-After: 3600). Surface the 429 to the caller instead
-        // so they can decide what to do, rather than blocking the test or
-        // the UX for an hour.
+        // all return Retry-After: 3600). Surface the 429 to the caller with
+        // its body intact so they can decide what to do, rather than blocking
+        // the test or the UX for an hour.
+        //
+        // (Body cancel must happen AFTER this early return — cancelling and
+        // then returning the Response leaves the caller holding a consumed
+        // body and `.text()` throws "Body has already been read". That bug
+        // surfaced as cascading smoke-test failures whenever cumulative rate
+        // limits on the share-inbox path drove the API into 429 territory.)
         if (retryAfterSec != null && retryAfterSec > 60) {
           return res;
         }
+
+        // Committed to a retry — drain the body so the underlying connection
+        // can be reused and undici can pool it cleanly.
+        try { await res.body?.cancel(); } catch {}
+
         const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : backoffMs(attempt);
         console.warn(`[TarnClient] ${res.status} on ${url} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
         await sleep(waitMs);

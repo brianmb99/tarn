@@ -1,6 +1,6 @@
 # 02 — CRUD on two collections
 
-Full create / read / update / delete on a `books` collection (with an enum field) plus a generic key/value `settings` collection. Demonstrates schema validation, partial-merge updates, and multiple collections in one schema.
+Full create / read / update / delete on a `notes` collection (with an enum field) plus a generic key/value `settings` collection. Demonstrates schema validation, partial-merge updates, and multiple collections in one schema.
 
 ## Setup
 
@@ -26,9 +26,9 @@ TARN_API=https://api.tarn.dev npm start
 
 ## What to look for
 
-- After `[books] create`, two records appear in `[books] list`.
-- `[books] update b1 (partial)` adds a `rating` and changes `status` without touching `title` or `author` — the SDK reads the current record and merges the patch.
-- `[books] schema validation` shows a synchronous error from passing an invalid enum value (`'half-finished'`). No network call is made — the schema rejects the write before encryption.
+- After `[notes] create`, two records appear in `[notes] list`.
+- `[notes] update n1 (partial)` adds a `priority` and changes `status` without touching `title` or `body` — the SDK reads the current record and merges the patch.
+- `[notes] schema validation` shows a synchronous error from passing an invalid enum value (`'in-progress'`). No network call is made — the schema rejects the write before encryption.
 - `[settings] update flags` shows that `value` can be any JSON-serializable object, not just a string.
 - The `settings` collection has no `share()` / `listShared()` method because `shareable` defaults to false. Try calling `tarn.settings.share(...)` and you'll get a `TarnCollectionError`.
 

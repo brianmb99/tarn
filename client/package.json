@@ -2,18 +2,18 @@
   "name": "tarn-client",
   "version": "0.3.0",
   "type": "module",
-  "main": "./dist/cjs/index.cjs",
+  "main": "./dist/esm/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
-      "import": "./dist/esm/index.js",
-      "default": "./dist/cjs/index.cjs"
+      "import": "./dist/esm/index.js"
     }
   },
   "files": [
-    "dist/",
+    "dist/esm/",
+    "dist/types/",
     "src/",
     "README.md"
   ],

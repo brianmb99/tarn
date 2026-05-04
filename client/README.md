@@ -14,16 +14,16 @@ Ships full TypeScript declarations. Works in browsers and Node.js 18+.
 import { TarnClient, defineSchema, TarnStorage } from 'tarn-client';
 
 const schema = defineSchema({
-  appId: 'bookish',
+  appId: 'your-app',
   version: 1,
   collections: {
-    books: {
-      primaryKey: 'bookId',
+    notes: {
+      primaryKey: 'noteId',
       fields: {
-        bookId: 'string',
-        title:  'string',
-        author: 'string?',
-        rating: 'integer?',
+        noteId:   'string',
+        title:    'string',
+        body:     'string?',
+        priority: 'integer?',
       },
       shareable: true,
     },
@@ -32,15 +32,15 @@ const schema = defineSchema({
 
 const tarn = await TarnClient.create({
   apiBase: 'http://localhost:8787',
-  appId:   'bookish',
+  appId:   'your-app',
   schema,
   storage: TarnStorage.memory(),
 });
 
 await tarn.register('me@example.com', 'p@ssw0rd', { recoveryAcknowledged: true });
 
-await tarn.books.create({ bookId: 'b1', title: 'Mountains' });
-console.log(await tarn.books.list());
+await tarn.notes.create({ noteId: 'n1', title: 'Hello, Tarn' });
+console.log(await tarn.notes.list());
 ```
 
 That's the whole shape. Everything below is detail.
@@ -55,19 +55,19 @@ A schema declares what collections exist, what fields each collection has, and w
 import { defineSchema } from 'tarn-client';
 
 export const schema = defineSchema({
-  appId:   'bookish',
+  appId:   'your-app',
   version: 1,
   collections: {
-    books: {
-      primaryKey: 'bookId',
+    notes: {
+      primaryKey: 'noteId',
       fields: {
-        bookId: 'string',
-        title:  'string',
-        author: 'string?',
-        rating: { type: 'integer', required: false },
-        readAt: 'date?',
-        notes:  'string?',
-        status: { type: 'string', enum: ['unread', 'reading', 'done'] },
+        noteId:    'string',
+        title:     'string',
+        body:      'string?',
+        priority:  { type: 'integer', required: false },
+        updatedAt: 'date?',
+        pinned:    'boolean?',
+        status:    { type: 'string', enum: ['draft', 'active', 'archived'] },
       },
       shareable: true,
     },
@@ -112,10 +112,10 @@ Three rules cover the common cases:
 
 ```js
 // One-shot migration: read all, transform, re-write under the new schema.
-const all = await tarn.books.list();
-for (const book of all) {
-  if (book.author == null) {
-    await tarn.books.update(book.bookId, { author: 'Unknown' });
+const all = await tarn.notes.list();
+for (const note of all) {
+  if (note.body == null) {
+    await tarn.notes.update(note.noteId, { body: '' });
   }
 }
 ```
@@ -132,19 +132,19 @@ Each `shareable: true` collection on the schema becomes a typed namespace on the
 
 ```js
 // Create. Validates against the schema. Returns the validated record.
-await tarn.books.create({ bookId: 'b1', title: 'Mountains', author: 'A' });
+await tarn.notes.create({ noteId: 'n1', title: 'Quarterly review', body: 'Pull metrics' });
 
 // Get one. Returns null if no record matches.
-const book = await tarn.books.get('b1');
+const note = await tarn.notes.get('n1');
 
 // List all live records.
-const all = await tarn.books.list();
+const all = await tarn.notes.list();
 
 // Partial update — SDK reads current, merges patch, writes a new entry.
-await tarn.books.update('b1', { rating: 5 });
+await tarn.notes.update('n1', { priority: 5 });
 
 // Tombstone.
-await tarn.books.delete('b1');
+await tarn.notes.delete('n1');
 ```
 
 Records are addressed by **primary key**, never by Arweave txid. The SDK maps primary keys onto the protocol's `Eid` tag so reads converge across devices.
@@ -157,17 +157,17 @@ Records are addressed by **primary key**, never by Arweave txid. The SDK maps pr
 const friends = await tarn.connections.list();
 
 // Share one record with one friend.
-await tarn.books.share(friends[0], 'b1');
+await tarn.notes.share(friends[0], 'n1');
 
 // Share with everyone (skips muted connections). Returns counts and per-conn failures.
-const result = await tarn.books.shareWithAll('b1');
+const result = await tarn.notes.shareWithAll('n1');
 // { ok: 3, failed: [{ connection, error }] }
 
 // Revoke from one friend.
-await tarn.books.unshare(friends[0], 'b1');
+await tarn.notes.unshare(friends[0], 'n1');
 
 // Read what a friend has shared with us under THIS collection.
-const theirs = await tarn.books.listShared(friends[0]);
+const theirs = await tarn.notes.listShared(friends[0]);
 ```
 
 Calling `share()` on a non-`shareable` collection throws — the schema is the gate.
@@ -183,7 +183,7 @@ Calling `share()` on a non-`shareable` collection throws — the schema is the g
 await tarn.connections.invite('alice@example.com');
 
 // Recipient lists incoming requests via the advanced surface, then accepts:
-await tarn.connections.accept(requestNonce, { label: 'Alice from book club' });
+await tarn.connections.accept(requestNonce, { label: 'Alice — work team' });
 
 // Listing.
 const conns = await tarn.connections.list();
@@ -396,16 +396,16 @@ Each example is a standalone npm package linking to this client via `file:../../
 The SDK is written in TypeScript and ships full `.d.ts` declarations. Schema-derived types flow through the client:
 
 ```ts
-const tarn = await TarnClient.create({ schema: bookishSchema, /* ... */ });
+const tarn = await TarnClient.create({ schema: mySchema, /* ... */ });
 
-await tarn.books.create({
-  bookId: 'b1',
+await tarn.notes.create({
+  noteId: 'n1',
   title:  'Foo',
   // titel: 'typo'    // ✗ TS error: unknown field
 });
 
-const book = await tarn.books.get('b1');
-//    ^? { bookId: string; title: string; author?: string; rating?: number; ... }
+const note = await tarn.notes.get('n1');
+//    ^? { noteId: string; title: string; body?: string; priority?: number; ... }
 ```
 
 Plain JavaScript works too — the inference simply doesn't run. The runtime validators still enforce the schema at write time.
@@ -425,7 +425,7 @@ Plain JavaScript works too — the inference simply doesn't run. The runtime val
 
 Tarn protects content end-to-end, but a few metadata properties remain visible:
 
-- **Connection-request inbox volume + timing** is observable to anyone who knows a user's `share_pub`. Bookish-class use is fine; sensitive contexts should consider `share_discoverable: false`.
+- **Connection-request inbox volume + timing** is observable to anyone who knows a user's `share_pub`. Casual social use is fine; sensitive contexts should consider `share_discoverable: false`.
 - **Account existence via discoverability lookup** — a `share_discoverable: true` account leaks "this email is a Tarn user" to anyone who runs the lookup.
 - **Once connected, share-log traffic is unlinkable** — per-pair tags are stealth-addressed; an Arweave observer cannot extract the connection graph from the protocol alone.
 

@@ -83,7 +83,7 @@ await tarn.connections.redeemInvite(tokenId, payloadKey);
 console.log('[recipient] waiting for the sender to auto-accept and share...');
 const start = Date.now();
 const TIMEOUT_MS = 5 * 60 * 1000;
-let books = [];
+let notes = [];
 let sender = null;
 
 while (Date.now() - start < TIMEOUT_MS) {
@@ -96,8 +96,8 @@ while (Date.now() - start < TIMEOUT_MS) {
   const conns = await tarn.connections.list();
   if (conns.length > 0) {
     sender = conns[0];
-    books = await tarn.books.listShared(sender);
-    if (books.length > 0) break;
+    notes = await tarn.notes.listShared(sender);
+    if (notes.length > 0) break;
   }
   await new Promise((r) => setTimeout(r, 2000));
 }
@@ -108,7 +108,7 @@ if (!sender) {
 }
 
 console.log('\n[recipient] sender:', sender.label ?? sender.email ?? '(no label)');
-console.log('[recipient] shared library:');
-for (const b of books) {
-  console.log(`  - ${b.title} (${b.author ?? 'unknown'})`);
+console.log('[recipient] shared notes:');
+for (const n of notes) {
+  console.log(`  - ${n.title}${n.body ? ' — ' + n.body : ''}`);
 }

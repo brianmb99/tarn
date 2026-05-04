@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 /**
- * Build the Tarn SDK: esbuild for ESM + CJS, tsc for .d.ts files.
+ * Build the Tarn SDK: esbuild for ESM, tsc for .d.ts files.
+ *
+ * ESM-only — Tarn ships exclusively as ESM. CJS was dropped because every
+ * supported runtime (Node 20+, modern browsers, Vite/Webpack/Rollup) handles
+ * ESM natively, and the `.js` ↔ `.cjs` extension juggling was non-trivial
+ * code on the build path that bought nothing.
+ *
  * Outputs:
- *   dist/esm/   — ESM with .js extensions (import specifiers stay as ./X.js)
- *   dist/cjs/   — CJS with .cjs extensions (require specifiers rewritten to ./X.cjs)
+ *   dist/esm/   — ESM with .js extensions, source maps
  *   dist/types/ — .d.ts declaration files
  */
 
 import { build } from 'esbuild';
-import { rm, readFile, writeFile } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
@@ -37,36 +42,6 @@ await build({
   outbase: srcDir,
   // .ts → .js (default for esbuild)
 });
-
-console.log('[build] esbuild CJS → dist/cjs/');
-await build({
-  entryPoints,
-  outdir: resolve(distDir, 'cjs'),
-  format: 'cjs',
-  platform: 'neutral',
-  target: 'es2022',
-  bundle: false,
-  sourcemap: true,
-  outbase: srcDir,
-  outExtension: { '.js': '.cjs' },
-});
-
-// CJS post-process: source uses `from './X.js'` ESM-style specifiers; esbuild
-// transpiles those to `require("./X.js")`. But we emit files as `.cjs`, so the
-// require targets don't exist. Rewrite ./X.js → ./X.cjs in every .cjs file.
-console.log('[build] post-processing CJS require() specifiers (.js → .cjs)');
-const cjsFiles = await glob('dist/cjs/**/*.cjs', { cwd: root, absolute: true });
-const requireRe = /require\("(\.\.?\/[^"]*?)\.js"\)/g;
-let rewritten = 0;
-for (const file of cjsFiles) {
-  const text = await readFile(file, 'utf8');
-  const fixed = text.replace(requireRe, 'require("$1.cjs")');
-  if (fixed !== text) {
-    await writeFile(file, fixed);
-    rewritten += 1;
-  }
-}
-console.log(`[build] rewrote require() specifiers in ${rewritten} CJS file(s)`);
 
 console.log('[build] tsc --emitDeclarationOnly → dist/types/');
 const tscResult = spawnSync('npx', ['tsc', '-p', 'tsconfig.build.json'], {

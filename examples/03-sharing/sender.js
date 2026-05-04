@@ -3,11 +3,11 @@
  *
  * Flow:
  *   1. Register a fresh Tarn account.
- *   2. Create a few books.
+ *   2. Create a few notes.
  *   3. Generate a single-use invite token + URL. Print it for the recipient.
  *   4. Poll `tarn.connections.listIncomingRequests()` until the recipient
  *      redeems and the connection auto-accepts.
- *   5. Share-with-all, so the new connection sees every book.
+ *   5. Share-with-all, so the new connection sees every note.
  *
  * The auto-accept happens inside `tarn.connections.listIncomingRequests()`:
  * it processes the inbox, and any inbound connection-request whose token
@@ -49,16 +49,16 @@ const reg = await tarn.register(email, password, {
 
 await maybeGrantLocalRules(API_BASE, reg.dataLookupKey);
 
-console.log('[sender] creating books');
-const titles = [
-  ['b1', 'The Snow Leopard',       'Peter Matthiessen'],
-  ['b2', 'Mountains of the Mind',  'Robert Macfarlane'],
-  ['b3', 'Annapurna',              'Maurice Herzog'],
+console.log('[sender] creating notes');
+const items = [
+  ['n1', 'Project kickoff agenda',   'Goals, owners, milestones, risks.'],
+  ['n2', 'Research follow-ups',      'Re-check the share-log seq mechanics under multi-device.'],
+  ['n3', 'Travel checklist',         'Passport, charger, adapter, offline maps.'],
 ];
-for (const [bookId, title, author] of titles) {
-  await tarn.books.create({ bookId, title, author });
+for (const [noteId, title, body] of items) {
+  await tarn.notes.create({ noteId, title, body });
 }
-console.log('[sender] library:', (await tarn.books.list()).map((b) => b.title));
+console.log('[sender] library:', (await tarn.notes.list()).map((n) => n.title));
 
 console.log('\n[sender] creating invite token');
 const invite = await tarn.connections.createInvite({
@@ -101,12 +101,12 @@ if (!connection) {
 }
 
 console.log('[sender] connected to', connection.label ?? connection.email ?? '(no label)');
-console.log('[sender] sharing all books with the new connection');
-const result = await tarn.books.shareWithAll('b1');
-console.log('  b1 shareWithAll:', result);
-const r2 = await tarn.books.shareWithAll('b2');
-console.log('  b2 shareWithAll:', r2);
-const r3 = await tarn.books.shareWithAll('b3');
-console.log('  b3 shareWithAll:', r3);
+console.log('[sender] sharing all notes with the new connection');
+const result = await tarn.notes.shareWithAll('n1');
+console.log('  n1 shareWithAll:', result);
+const r2 = await tarn.notes.shareWithAll('n2');
+console.log('  n2 shareWithAll:', r2);
+const r3 = await tarn.notes.shareWithAll('n3');
+console.log('  n3 shareWithAll:', r3);
 
 console.log('\n[sender] done. Recipient can now run listShared.');

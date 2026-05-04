@@ -4,12 +4,12 @@ export const schema = defineSchema({
   appId: 'bookish',
   version: 1,
   collections: {
-    books: {
-      primaryKey: 'bookId',
+    notes: {
+      primaryKey: 'noteId',
       fields: {
-        bookId: 'string',
+        noteId: 'string',
         title:  'string',
-        author: 'string?',
+        body:   'string?',
       },
       shareable: true,
     },

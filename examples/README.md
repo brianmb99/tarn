@@ -5,8 +5,8 @@ Four progressive examples for the [Tarn client SDK](../client/README.md). Each i
 | # | Path | What it demonstrates |
 |---|------|----------------------|
 | 1 | [`01-hello-world/`](./01-hello-world/) | The smallest possible Tarn app — register, create one record, list it. ~30 lines. |
-| 2 | [`02-crud/`](./02-crud/) | Full CRUD on two collections (`books` + `settings`). Shows partial-merge updates, schema validation, multiple collections in one schema. |
-| 3 | [`03-sharing/`](./03-sharing/) | Two clients form a connection via the invite-token flow, sender shares its library with all connections, recipient lists shared records. |
+| 2 | [`02-crud/`](./02-crud/) | Full CRUD on two collections (`notes` + `settings`). Shows partial-merge updates, schema validation, multiple collections in one schema. |
+| 3 | [`03-sharing/`](./03-sharing/) | Two clients form a connection via the invite-token flow, sender shares its notes with all connections, recipient lists shared records. |
 | 4 | [`04-recovery/`](./04-recovery/) | Register, capture the recovery phrase, simulate password loss, recover the account on a fresh client. |
 
 ## Setup (once)
@@ -33,4 +33,4 @@ Four progressive examples for the [Tarn client SDK](../client/README.md). Each i
 
 ## App registration
 
-Examples assume the `bookish` app is already registered in your local D1 (it is by default in the workspace's local wrangler dev setup, since Bookish is the reference app). If you want to run examples against a different app, follow the [App registration](../client/README.md#app-registration) section of the SDK README.
+Examples use `appId: 'bookish'` because that's the pre-registered app in the workspace's local wrangler-dev setup (Bookish is Tarn's reference consumer app). The collections, fields, and prose are deliberately product-agnostic; `bookish` is just a stable test-app token. If you want to run examples against a different app id, follow the [App registration](../client/README.md#app-registration) section of the SDK README.

@@ -33,48 +33,48 @@ const reg = await tarn.register(email, password, {
 
 await maybeGrantLocalRules(API_BASE, reg.dataLookupKey);
 
-// ============ books — full CRUD ============
+// ============ notes — full CRUD ============
 
-console.log('\n[books] create');
-await tarn.books.create({
-  bookId: 'b1',
-  title:  'The Snow Leopard',
-  author: 'Peter Matthiessen',
-  status: 'unread',
+console.log('\n[notes] create');
+await tarn.notes.create({
+  noteId: 'n1',
+  title:  'Quarterly review prep',
+  body:   'Pull metrics, draft talking points, share deck by Friday.',
+  status: 'draft',
 });
-await tarn.books.create({
-  bookId: 'b2',
-  title:  'Mountains of the Mind',
-  author: 'Robert Macfarlane',
-  status: 'reading',
+await tarn.notes.create({
+  noteId: 'n2',
+  title:  'Refactor the share-log cache',
+  body:   'Move per-pair derivations into a single LRU keyed on share_pub.',
+  status: 'active',
 });
 
-console.log('[books] list');
-console.log(await tarn.books.list());
+console.log('[notes] list');
+console.log(await tarn.notes.list());
 
-console.log('\n[books] get b1');
-console.log(await tarn.books.get('b1'));
+console.log('\n[notes] get n1');
+console.log(await tarn.notes.get('n1'));
 
 // Partial update — pass only what's changing.
-console.log('\n[books] update b1 (partial)');
-await tarn.books.update('b1', { rating: 5, status: 'done' });
-console.log(await tarn.books.get('b1'));
+console.log('\n[notes] update n1 (partial)');
+await tarn.notes.update('n1', { priority: 5, status: 'archived' });
+console.log(await tarn.notes.get('n1'));
 
 // Schema validation catches typos and bad enums synchronously.
-console.log('\n[books] schema validation');
+console.log('\n[notes] schema validation');
 try {
-  await tarn.books.create({
-    bookId: 'b3',
+  await tarn.notes.create({
+    noteId: 'n3',
     title:  'Bad Status',
-    status: 'half-finished',
+    status: 'in-progress',
   });
 } catch (err) {
   console.log('  caught:', err.message);
 }
 
-console.log('\n[books] delete b2');
-await tarn.books.delete('b2');
-console.log('  remaining:', (await tarn.books.list()).map((b) => b.bookId));
+console.log('\n[notes] delete n2');
+await tarn.notes.delete('n2');
+console.log('  remaining:', (await tarn.notes.list()).map((n) => n.noteId));
 
 // ============ settings — k/v with json values ============
 

@@ -17,16 +17,16 @@ The Tarn SDK is a TypeScript library that gives apps typed CRUD over encrypted, 
 import { TarnClient, defineSchema, TarnStorage } from 'tarn-client';
 
 const schema = defineSchema({
-  appId: 'bookish',
+  appId: 'your-app',
   version: 1,
   collections: {
-    books: {
-      primaryKey: 'bookId',
+    notes: {
+      primaryKey: 'noteId',
       fields: {
-        bookId: 'string',
-        title:  'string',
-        author: 'string?',
-        rating: 'integer?',
+        noteId:   'string',
+        title:    'string',
+        body:     'string?',
+        priority: 'integer?',
       },
       shareable: true,
     },
@@ -35,15 +35,15 @@ const schema = defineSchema({
 
 const tarn = await TarnClient.create({
   apiBase: 'https://api.tarn.dev',
-  appId:   'bookish',
+  appId:   'your-app',
   schema,
   storage: TarnStorage.localStorage(),
 });
 
 await tarn.login(email, password);
-await tarn.books.create({ bookId: 'b1', title: 'Mountains' });
-const all = await tarn.books.list();
-await tarn.books.share(connection, 'b1');
+await tarn.notes.create({ noteId: 'n1', title: 'Hello, Tarn' });
+const all = await tarn.notes.list();
+await tarn.notes.share(connection, 'n1');
 ```
 
 `tarn` carries six top-level namespaces, plus one typed namespace per collection in the schema:
@@ -71,19 +71,19 @@ This is the meat of the redesign — the layer that makes the schema-first surfa
 export function defineSchema<const S>(input: S): Schema<S extends SchemaInput ? S : never>
 ```
 
-The input is intentionally not constrained at the parameter level — constraining to `SchemaInput` would widen literal types like `'string'` to `string`, which would defeat downstream record-type derivation. Instead, the constraint moves into the return type, runtime validation enforces structural validity at module load, and the `<const>` capture preserves the literal shape so `tarn.books.create({ ... })` autocompletes from the schema and rejects unknown fields and type mismatches.
+The input is intentionally not constrained at the parameter level — constraining to `SchemaInput` would widen literal types like `'string'` to `string`, which would defeat downstream record-type derivation. Instead, the constraint moves into the return type, runtime validation enforces structural validity at module load, and the `<const>` capture preserves the literal shape so `tarn.notes.create({ ... })` autocompletes from the schema and rejects unknown fields and type mismatches.
 
 ```ts
-const tarn = await TarnClient.create({ schema: bookishSchema, /* ... */ });
+const tarn = await TarnClient.create({ schema: mySchema, /* ... */ });
 
-await tarn.books.create({
-  bookId: 'b1',
+await tarn.notes.create({
+  noteId: 'n1',
   title:  'Foo',
   // titel: 'typo'    // ✗ TS error: unknown field
 });
 
-const book = await tarn.books.get('b1');
-//    ^? { bookId: string; title: string; author?: string; rating?: number; ... }
+const note = await tarn.notes.get('n1');
+//    ^? { noteId: string; title: string; body?: string; priority?: number; ... }
 ```
 
 Plain JavaScript callers get the same runtime validation; only the autocomplete and the type-error surface are compile-time.
@@ -192,7 +192,7 @@ The cut between `client/` (lifecycle namespaces over an injected protocol client
 
 ## 5. Build pipeline
 
-`esbuild` for ESM + CJS, `tsc --emitDeclarationOnly` for `.d.ts`. Per-file output, no bundling — apps' bundlers tree-shake what they don't use:
+ESM-only. `esbuild` produces per-file ESM output, `tsc --emitDeclarationOnly` produces `.d.ts` files. No bundling — apps' bundlers tree-shake what they don't use:
 
 ```
 client/dist/
@@ -200,13 +200,13 @@ client/dist/
     schema/, collections/, sharing/, storage/, client/
     crypto.js, sharing.js, share-log.js, recovery.js, session-persistence.js, tarn.js
     index.js
-  cjs/        CJS with .cjs extensions; require() specifiers rewritten ./X.js → ./X.cjs
-    (mirror of esm/)
   types/      .d.ts declaration files
     (mirror of src/)
 ```
 
-The `package.json` `exports` map points to `dist/types/index.d.ts` for types, `dist/esm/index.js` for `import`, `dist/cjs/index.cjs` for `require`. Source ships in the package too (`files: ['dist/', 'src/', 'README.md']`) so consumers can step into TS source via source maps without unpacking the build.
+The `package.json` `exports` map points to `dist/types/index.d.ts` for types and `dist/esm/index.js` for `import`. Source ships in the package too (`files: ['dist/esm/', 'dist/types/', 'src/', 'README.md']`) so consumers can step into TS source via source maps without unpacking the build.
+
+CJS output was dropped during the single-envelope cleanup. Every supported runtime (Node 20+, modern browsers, Vite/Webpack/Rollup) handles ESM natively, and the `.js` ↔ `.cjs` extension juggling that ESM-source-emitted-as-CJS required (regex-rewriting `require("./X.js")` → `require("./X.cjs")` on every output file) was non-trivial code on the build path that bought nothing in practice.
 
 `prepublishOnly: typecheck && test && build` gates publishes — a broken typecheck or test, or a missing dist/ entry, blocks the publish before anything reaches npm.
 
@@ -230,7 +230,7 @@ Schemas are published to Arweave under `Type='app-schema', App=<app_id>, V=<vers
 
 That client is on the roadmap, not shipped. The protocol-level enabling work — schema publication endpoint, fixed `Type` tag, deterministic envelope formats — is done. Apps inherit the property by virtue of using the SDK; nothing app-side needs to change to make it true.
 
-This is the structural reason for the schema-first design. A wire-protocol-only client could never decode Bookish's books into the user-readable shape; the schema is what turns "decrypted opaque JSON" into "a record with named fields and types". Publishing it to the same permanent ledger as the data closes the recovery loop.
+This is the structural reason for the schema-first design. A wire-protocol-only client could never decode an app's records into their user-readable shape; the schema is what turns "decrypted opaque JSON" into "a record with named fields and types". Publishing it to the same permanent ledger as the data closes the recovery loop.
 
 ---
 
