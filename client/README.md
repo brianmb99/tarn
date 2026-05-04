@@ -240,10 +240,12 @@ const reg = await tarn.register('me@example.com', 'p@ssw0rd', {
 // reg.pdfBytes         — Uint8Array of the rendered PDF
 // Hand both to the user immediately. Do NOT persist either.
 
-// Re-render the kit later — generates a fresh phrase, rotates the recovery factor.
-const pdfBytes = await tarn.recovery.export({ format: 'pdf' });
+// Re-render the kit later for the same phrase. Pure client-side; no auth
+// required. The caller must supply the phrase — Tarn never persists it.
+const pdfBytes = await tarn.recovery.export({ format: 'pdf', phrase });
 // or: structured JSON for apps rendering their own format.
-const { phrase, appName, generatedAt } = await tarn.recovery.export({ format: 'json' });
+const json = await tarn.recovery.export({ format: 'json', phrase });
+// json: { phrase, appName, generatedAt }
 ```
 
 **Delivery is the app's job.** Tarn renders the kit entirely on the client and never sees the phrase or the PDF — there is no Tarn endpoint that handles plaintext recovery material, even ephemerally. Apps decide how to surface the bytes: a download is the recommended default (universally available, no third party); print and app-operated email are also fine. If the application wants to email the kit, it must operate the forwarder itself — Tarn will not host one, since routing recovery material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.

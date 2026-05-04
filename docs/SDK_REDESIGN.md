@@ -373,7 +373,10 @@ namespace tarn.account {
 }
 
 namespace tarn.recovery {
-  function export(opts: { format: 'pdf' | 'json' }): Promise<Blob | RecoveryData>;
+  // Caller supplies the phrase — Tarn never persists it. Re-export is pure
+  // client-side rendering; same (phrase, appName) always produces the same
+  // bytes. Phrase rotation is deliberately NOT exposed here.
+  function export(opts: { format: 'pdf' | 'json'; phrase: string; appName?: string }): Promise<Blob | RecoveryData>;
   // Delivery (download/print/app-operated email/etc.) is the app's job;
   // Tarn never handles plaintext kit material.
 }

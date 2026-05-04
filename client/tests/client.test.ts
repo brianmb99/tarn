@@ -116,10 +116,12 @@ class StubUnderlying implements IUnderlyingClient {
   }
 
   // ---- Recovery ----
-  async regenerateRecoveryKit(_opts?: Record<string, unknown>) {
+  lastRegenerateOpts: { phrase: string; appName?: string } | null = null;
+  async regenerateRecoveryKit(opts: { phrase: string; appName?: string }) {
     this.regenerateRecoveryKitCalls++;
+    this.lastRegenerateOpts = opts;
     return {
-      phrase: 'one two three four five six seven eight nine ten eleven twelve',
+      phrase: opts.phrase,
       pdfBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]), // %PDF
     };
   }
@@ -834,17 +836,20 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     assert.equal(stub.changeCredentialsCalls, 1);
   });
 
-  it('recovery.export({ format: pdf }) returns the PDF bytes', async () => {
-    const result = await tarn.recovery.export({ format: 'pdf' });
+  it('recovery.export({ format: pdf }) returns the PDF bytes and forwards the phrase', async () => {
+    const phrase = 'one two three four five six seven eight nine ten eleven twelve';
+    const result = await tarn.recovery.export({ format: 'pdf', phrase });
     assert.ok(result instanceof Uint8Array);
     assert.equal(stub.regenerateRecoveryKitCalls, 1);
+    assert.equal(stub.lastRegenerateOpts?.phrase, phrase, 'must pass phrase through to underlying');
   });
 
   it('recovery.export({ format: json }) returns the structured kit', async () => {
-    const result = await tarn.recovery.export({ format: 'json', appName: 'Bookish' });
+    const phrase = 'one two three four five six seven eight nine ten eleven twelve';
+    const result = await tarn.recovery.export({ format: 'json', phrase, appName: 'Bookish' });
     assert.ok(!(result instanceof Uint8Array));
     const json = result as { phrase: string; appName: string; generatedAt: string };
-    assert.ok(json.phrase.length > 0);
+    assert.equal(json.phrase, phrase);
     assert.equal(json.appName, 'Bookish');
     assert.ok(json.generatedAt);
   });

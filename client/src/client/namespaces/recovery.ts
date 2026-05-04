@@ -1,15 +1,17 @@
 /**
- * `tarn.recovery.*` — generate recovery kits.
+ * `tarn.recovery.*` — re-render the recovery kit for a phrase the user
+ * already holds.
  *
  * The kit format options:
- *   - 'pdf'  → PDF Blob with the default Tarn-branded layout (uses the
+ *   - 'pdf'  → PDF bytes with the default Tarn-branded layout (uses the
  *     existing `renderRecoveryPDF` from the recovery module).
  *   - 'json' → structured object with `phrase` and `appName` for apps
  *     that want to render their own format. Bytes only — no PDF library.
  *
  * Tarn never delivers the kit anywhere — apps are responsible for surfacing
  * the bytes to the user (download, print, or any other channel the app
- * decides is appropriate).
+ * decides is appropriate). The phrase is also never persisted by the SDK;
+ * the caller must pass it back in for every re-export.
  */
 
 export type RecoveryFormat = 'pdf' | 'json';
@@ -21,7 +23,10 @@ export type RecoveryJson = {
 };
 
 export interface IRecoveryClient {
-  regenerateRecoveryKit(opts?: Record<string, unknown>): Promise<{ phrase: string; pdfBytes: Uint8Array }>;
+  regenerateRecoveryKit(opts: {
+    phrase: string;
+    appName?: string;
+  }): Promise<{ phrase: string; pdfBytes: Uint8Array }>;
 }
 
 export class RecoveryNamespace {
@@ -34,19 +39,27 @@ export class RecoveryNamespace {
   }
 
   /**
-   * Generate a recovery kit. With `format: 'pdf'` returns the PDF as
-   * `Uint8Array` (Blob-equivalent — wrap in `new Blob([bytes], { type: 'application/pdf' })`
-   * if you need a Blob). With `format: 'json'` returns the structured data
-   * for apps that render their own kit.
+   * Re-render the recovery kit for a phrase the user already has. With
+   * `format: 'pdf'` returns the rendered PDF as `Uint8Array` (wrap in
+   * `new Blob([bytes], { type: 'application/pdf' })` if you need a Blob).
+   * With `format: 'json'` returns the structured kit data for apps that
+   * want to render their own format.
    *
-   * Idempotent at the protocol level — calling twice produces a fresh phrase
-   * each time and rotates the recovery factor on Arweave. The previously-
-   * generated phrase stops working after the next call (this is intentional
-   * — the user is replacing their recovery material).
+   * Pure client-side — no network call, no auth requirement. The phrase is
+   * validated against the BIP39 wordlist + checksum; an invalid phrase
+   * throws synchronously. The same (phrase, appName) tuple always produces
+   * an identical kit — re-export is idempotent and does NOT rotate any
+   * server-side state. (Phrase rotation is a separate, deliberately-absent
+   * operation — losing your phrase requires recoverAccount + a new
+   * registration-equivalent flow, not a casual re-export.)
    */
-  async export(opts: { format: RecoveryFormat; appName?: string }): Promise<Uint8Array | RecoveryJson> {
+  async export(opts: {
+    format: RecoveryFormat;
+    phrase: string;
+    appName?: string;
+  }): Promise<Uint8Array | RecoveryJson> {
     const appName = opts.appName ?? this.#appId;
-    const result = await this.#client.regenerateRecoveryKit({ appName });
+    const result = await this.#client.regenerateRecoveryKit({ phrase: opts.phrase, appName });
     if (opts.format === 'pdf') {
       return result.pdfBytes;
     }

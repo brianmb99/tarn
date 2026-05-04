@@ -411,11 +411,15 @@ export class TarnClient {
    * phrase is unchanged — Tarn does not store it, so the caller must provide
    * it. Pure client-side rendering — no network call, no auth requirement.
    *
+   * Returns the normalized form of the phrase alongside the rendered bytes
+   * so callers reflecting the kit back to a user (e.g. the `format: 'json'`
+   * path on the typed namespace) can surface a canonicalized version.
+   *
    * @param {{
    *   phrase: string,
    *   appName?: string,
    * }} opts
-   * @returns {Promise<{ pdfBytes: Uint8Array }>}
+   * @returns {Promise<{ phrase: string, pdfBytes: Uint8Array }>}
    */
   async regenerateRecoveryKit(opts: any = {}): Promise<any> {
     const { phrase, appName } = opts;
@@ -426,7 +430,7 @@ export class TarnClient {
     }
 
     const pdfBytes = renderRecoveryPDF({ phrase: validation.normalized, appName });
-    return { pdfBytes };
+    return { phrase: validation.normalized, pdfBytes };
   }
 
   /**

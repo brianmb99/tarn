@@ -496,13 +496,23 @@ describe('TarnClient.recoverAccount — round trip', () => {
 describe('TarnClient.regenerateRecoveryKit', () => {
   afterEach(restoreFetch);
 
-  it('returns PDF for a valid phrase, makes no network call', async () => {
+  it('returns the normalized phrase + PDF for a valid phrase, makes no network call', async () => {
     mockFetch([]);
     const client = new TarnClient('https://api.tarn.dev', APP);
     const phrase = generateRecoveryPhrase();
     const r = await client.regenerateRecoveryKit({ phrase });
     assert.ok(r.pdfBytes instanceof Uint8Array);
+    assert.equal(r.phrase, phrase, 'returns the normalized phrase for the JSON-export path');
     assert.equal(fetchCalls.length, 0);
+  });
+
+  it('normalizes whitespace + case in the returned phrase', async () => {
+    mockFetch([]);
+    const client = new TarnClient('https://api.tarn.dev', APP);
+    const phrase = generateRecoveryPhrase();
+    const messy = '  ' + phrase.toUpperCase().split(' ').join('   ') + '  ';
+    const r = await client.regenerateRecoveryKit({ phrase: messy });
+    assert.equal(r.phrase, phrase);
   });
 
   it('rejects an invalid phrase', async () => {
