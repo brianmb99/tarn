@@ -415,10 +415,10 @@ Plain JavaScript works too — the inference simply doesn't run. The runtime val
 ## Security model
 
 - **Client-side encryption.** All data is AES-256-GCM encrypted before leaving the client. The server never sees plaintext.
-- **Argon2id KDF.** Memory-hard (m=64 MiB, t=3, p=1) for password→master-key. Sub-keys derived via HKDF-Expand. Legacy PBKDF2 accounts continue to log in via a fallback path.
+- **Argon2id KDF.** Memory-hard (m=64 MiB, t=3, p=1) for password→master-key. Sub-keys derived via HKDF-Expand.
 - **ECDSA P-256 auth.** Challenge-response signing. No passwords transmitted; server stores only the public key.
 - **Per-content CEK + forward-secret DEK rotation.** Each blob is encrypted with its own random CEK, wrapped under a generation-indexed DEK chain. Credential changes append a fresh DEK so post-rotation writes are unreachable from old credentials.
-- **Multi-factor DEK chain (v4 envelope).** Each chain entry is wrapped twice — once under a password-derived KEK, once under a phrase-derived KEK. Either factor independently unwraps the chain.
+- **Multi-factor DEK chain.** Each chain entry is wrapped twice — once under a password-derived KEK, once under a phrase-derived KEK. Either factor independently unwraps the chain.
 - **Arweave permanence.** Data is stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.
 
 ### Publicly observable metadata

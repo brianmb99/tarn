@@ -237,9 +237,9 @@ await test('pre-#13 register (no share fields in body) succeeds and lookup retur
   const der = await crypto.subtle.exportKey('spki', keys.signingKeyPair.publicKey);
   const pubBase64 = btoa(String.fromCharCode(...new Uint8Array(der)));
 
-  // We need a wrapped_data_key — use the v1 single-key envelope (the
-  // simplest backward-compat path). The lookup is what we're testing, not
-  // login, so any opaque envelope shape works.
+  // We need a wrapped_data_key — use a bare base64 AES-KW ciphertext. The
+  // API stores it as opaque text and never parses it, so any byte string
+  // works for this test (which exercises the lookup endpoint, not login).
   const dummyDek = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const dekRaw = await crypto.subtle.exportKey('raw', dummyDek);
   const dekKw = await crypto.subtle.importKey('raw', dekRaw, 'AES-KW', true, ['wrapKey']);

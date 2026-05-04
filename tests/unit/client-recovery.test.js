@@ -3,7 +3,7 @@
 // Covers:
 //   - BIP39 phrase generation + validation
 //   - Recovery KEK derivation (Argon2id over phrase + per-account salt)
-//   - v4 envelope shape (multi-factor wrappings, recovery metadata block)
+//   - v1 envelope shape (multi-factor wrappings, recovery metadata block)
 //   - register() requires recoveryAcknowledged: true
 //   - register() emits v4 with both password and recovery_phrase wrappings
 //   - PDF rendering (basic structure, deterministic output for fixed inputs)
@@ -29,8 +29,8 @@ import {
   deriveRecoveryLookupKey,
   deriveRecoverySigningKeyPair,
   unwrapDataKeyChain,
-  wrapDataKeyChainEnvelopeV4,
-  buildV4Envelope,
+  wrapDataKeyChainEnvelope,
+  buildEnvelope,
   generateRandomDataKey,
   generateRecoverySalt,
   exportPublicKey,
@@ -191,12 +191,12 @@ describe('deriveRecoveryLookupKey + deriveRecoverySigningKeyPair', () => {
   });
 });
 
-// ============ V4 ENVELOPE ============
+// ============ V1 ENVELOPE (multi-factor) ============
 
-describe('v4 envelope wire format', () => {
-  it('parseWrappedDataKey accepts a v4 envelope and returns multi-factor chain', () => {
+describe('v1 envelope wire format', () => {
+  it('parseWrappedDataKey accepts a v1 envelope and returns multi-factor chain', () => {
     const wire = JSON.stringify({
-      v: 4,
+      v: 1,
       kdf: 'argon2id',
       kdf_params: { m_kib: 65536, t: 3, p: 1 },
       recovery: {
@@ -212,18 +212,19 @@ describe('v4 envelope wire format', () => {
       ],
     });
     const parsed = parseWrappedDataKey(wire);
-    assert.equal(parsed.envelopeVersion, 4);
+    assert.equal(parsed.envelopeVersion, 1);
     assert.equal(parsed.dekChain.length, 1);
     assert.equal(parsed.dekChain[0].wrappings.length, 2);
     assert.equal(parsed.recovery.salt.length, 16);
     assert.equal(parsed.wrappedBase64, 'PPPP'); // convenience: top-gen password wrapping
   });
 
-  it('parseWrappedDataKey rejects v4 with duplicate factor in same gen', () => {
+  it('parseWrappedDataKey rejects v1 with duplicate factor in same gen', () => {
     const wire = JSON.stringify({
-      v: 4,
+      v: 1,
       kdf: 'argon2id',
       kdf_params: { m_kib: 65536, t: 3, p: 1 },
+      recovery: { kdf: 'argon2id', kdf_params: { m_kib: 65536, t: 3, p: 1 }, salt: 'AAECAwQFBgcICQoLDA0ODw==' },
       dek_chain: [
         { gen: 1, wrappings: [
           { factor: 'password', wrapped: 'PPPP' },
@@ -234,19 +235,20 @@ describe('v4 envelope wire format', () => {
     assert.throws(() => parseWrappedDataKey(wire), /duplicate factor/);
   });
 
-  it('parseWrappedDataKey rejects v4 with missing wrappings', () => {
+  it('parseWrappedDataKey rejects v1 with missing wrappings', () => {
     const wire = JSON.stringify({
-      v: 4,
+      v: 1,
       kdf: 'argon2id',
       kdf_params: { m_kib: 65536, t: 3, p: 1 },
+      recovery: { kdf: 'argon2id', kdf_params: { m_kib: 65536, t: 3, p: 1 }, salt: 'AAECAwQFBgcICQoLDA0ODw==' },
       dek_chain: [{ gen: 1, wrappings: [] }],
     });
     assert.throws(() => parseWrappedDataKey(wire));
   });
 
-  it('parseWrappedDataKey rejects v4 with malformed recovery salt (wrong length)', () => {
+  it('parseWrappedDataKey rejects v1 with malformed recovery salt (wrong length)', () => {
     const wire = JSON.stringify({
-      v: 4,
+      v: 1,
       kdf: 'argon2id',
       kdf_params: { m_kib: 65536, t: 3, p: 1 },
       recovery: { kdf: 'argon2id', kdf_params: { m_kib: 65536, t: 3, p: 1 }, salt: 'AAA=' },
@@ -255,14 +257,14 @@ describe('v4 envelope wire format', () => {
     assert.throws(() => parseWrappedDataKey(wire), /salt must decode to 16 bytes/);
   });
 
-  it('round-trip: wrapDataKeyChainEnvelopeV4 → parseWrappedDataKey → unwrapDataKeyChain (both factors)', async () => {
+  it('round-trip: wrapDataKeyChainEnvelope → parseWrappedDataKey → unwrapDataKeyChain (both factors)', async () => {
     const dek = await generateRandomDataKey();
     const recoverySalt = generateRecoverySalt();
     const recoveryPhrase = generateRecoveryPhrase();
     const recKEK = await deriveRecoveryKey(recoveryPhrase, recoverySalt);
     const pwKEK = await generateRandomDataKey(); // stand-in for credential_encryption_key
 
-    const wire = await wrapDataKeyChainEnvelopeV4(
+    const wire = await wrapDataKeyChainEnvelope(
       [{ gen: 1, key: dek.gcmKey }],
       [
         { name: FACTOR_PASSWORD,        wrappingKey: pwKEK.kwKey },
@@ -272,7 +274,7 @@ describe('v4 envelope wire format', () => {
     );
 
     const parsed = parseWrappedDataKey(wire);
-    assert.equal(parsed.envelopeVersion, 4);
+    assert.equal(parsed.envelopeVersion, 1);
     assert.equal(parsed.dekChain[0].wrappings.length, 2);
     assert.deepEqual(parsed.recovery.salt, recoverySalt);
 
@@ -289,21 +291,21 @@ describe('v4 envelope wire format', () => {
     assert.deepEqual(pwDekBytes, recDekBytes);
   });
 
-  it('buildV4Envelope is byte-stable for the same input (idempotency)', () => {
+  it('buildEnvelope is byte-stable for the same input (idempotency)', () => {
     const chain = [{ gen: 1, wrappings: [
       { factor: 'password', wrapped: 'PPPP' },
       { factor: 'recovery_phrase', wrapped: 'RRRR' },
     ]}];
     const salt = new Uint8Array(16).fill(0x42);
-    const a = buildV4Envelope(chain, { salt });
-    const b = buildV4Envelope(chain, { salt });
+    const a = buildEnvelope(chain, { salt });
+    const b = buildEnvelope(chain, { salt });
     assert.equal(a, b);
   });
 });
 
 // ============ TarnClient.register — issue #12 enforcement ============
 
-describe('TarnClient.register — recovery acknowledgment + v4 envelope', () => {
+describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => {
   afterEach(restoreFetch);
 
   it('throws synchronously when recoveryAcknowledged is missing', async () => {
@@ -327,7 +329,7 @@ describe('TarnClient.register — recovery acknowledgment + v4 envelope', () => 
     assert.equal(fetchCalls.length, 0);
   });
 
-  it('emits a v4 envelope with both factors + returns phrase + PDF', async () => {
+  it('emits a v1 envelope with both factors + returns phrase + PDF', async () => {
     mockFetch([
       { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
       { status: 200, body: JSON.stringify({ nonce: 'b'.repeat(64) }) },
@@ -350,7 +352,7 @@ describe('TarnClient.register — recovery acknowledgment + v4 envelope', () => 
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
     const body = JSON.parse(registerCall.body);
     const env = JSON.parse(body.wrapped_data_key);
-    assert.equal(env.v, 4);
+    assert.equal(env.v, 1);
     assert.ok(env.recovery);
     assert.equal(env.dek_chain[0].wrappings.length, 2);
     const factors = env.dek_chain[0].wrappings.map(w => w.factor).sort();
@@ -407,7 +409,7 @@ describe('TarnClient.recoverAccount — round trip', () => {
   afterEach(restoreFetch);
 
   it('register → recoverAccount with same phrase → DEK chain preserved', async () => {
-    // Step 1: register an account, capture the v4 envelope server-side.
+    // Step 1: register an account, capture the v1 envelope server-side.
     let storedDataLookupKey, storedWrappedDataKey, storedRecoveryLookupKey;
 
     mockFetch([
@@ -473,7 +475,7 @@ describe('TarnClient.recoverAccount — round trip', () => {
     assert.equal(putBody.new_recovery_lookup_key, storedRecoveryLookupKey);
 
     const newEnv = JSON.parse(putBody.new_wrapped_data_key);
-    assert.equal(newEnv.v, 4);
+    assert.equal(newEnv.v, 1);
     assert.equal(newEnv.dek_chain.length, 1);
     const factors = newEnv.dek_chain[0].wrappings.map(w => w.factor).sort();
     assert.deepEqual(factors, ['password', 'recovery_phrase']);

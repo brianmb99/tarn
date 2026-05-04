@@ -98,7 +98,7 @@ type Brand<T, B extends string> = T & { readonly [__brand]: B };
 
 export type LookupKey       = Brand<string, 'LookupKey'>;        // hex, 32 bytes
 export type ShareKey        = Brand<string, 'ShareKey'>;         // base64url, 32 raw bytes
-export type WrappedDataKey  = Brand<string, 'WrappedDataKey'>;   // base64 AES-KW ciphertext or v3/v4 envelope JSON
+export type WrappedDataKey  = Brand<string, 'WrappedDataKey'>;   // v1 multi-factor envelope JSON
 export type Base64          = Brand<string, 'Base64'>;
 export type Base64Url       = Brand<string, 'Base64Url'>;
 export type Hex             = Brand<string, 'Hex'>;
@@ -126,7 +126,7 @@ Constructors live next to format validators (`asLookupKey`, `asBase64Url`, etc.)
 }
 ```
 
-`noUncheckedIndexedAccess` flags `array[i]` as `T | undefined` rather than `T`, which catches off-by-one and missing-key bugs at compile time. `exactOptionalPropertyTypes` distinguishes "absent property" from "property explicitly set to `undefined`" — important when an envelope JSON's missing-vs-null distinction is load-bearing (e.g., the v4 wrapped-data-key envelope's `recovery` block: absent means no recovery factor; present means one is enrolled). `noPropertyAccessFromIndexSignature` forces `obj[key]` rather than `obj.key` on dynamically-keyed maps, which keeps the type system honest about which accesses are checked literals and which are user-supplied strings.
+`noUncheckedIndexedAccess` flags `array[i]` as `T | undefined` rather than `T`, which catches off-by-one and missing-key bugs at compile time. `exactOptionalPropertyTypes` distinguishes "absent property" from "property explicitly set to `undefined`" — useful when wire-format objects (e.g., the wrapped-data-key envelope's optional fields, individual `Connection` fields) need their missing-vs-null distinction preserved on round-trip. `noPropertyAccessFromIndexSignature` forces `obj[key]` rather than `obj.key` on dynamically-keyed maps, which keeps the type system honest about which accesses are checked literals and which are user-supplied strings.
 
 ### No `@ts-nocheck`
 
@@ -217,7 +217,7 @@ The `package.json` `exports` map points to `dist/types/index.d.ts` for types, `d
 Four layers, each catching different things:
 
 - **96 TypeScript unit tests** in `client/tests/{schema,collection,client}.test.ts`. Schema validation (reserved-namespace enforcement, optional-vs-required, enum membership), collection wrapping (the partial-merge update path, primary-key-to-Eid mapping, `share()` only existing on `shareable: true` collections), namespace delegation (each lifecycle method calls through to the right underlying method) via a `MockTarnClient` that satisfies `IUnderlyingClient`. Pure logic; no network.
-- **418 JavaScript unit tests** in `tests/unit/*.test.js`. Crypto primitives (HKDF derivation, AES-KW wrap/unwrap byte stability, P-256 retry rule), per-content CEK handling, KDF dispatch (Argon2id default + PBKDF2 fallback), share-log read/write under simulated Arweave, session persistence round-trips, recovery factor unwrap, invite-token redemption. These run via `tsx` so the JS test files import the in-progress `.ts` source modules directly.
+- **400+ JavaScript unit tests** in `tests/unit/*.test.js`. Crypto primitives (HKDF derivation, AES-KW wrap/unwrap byte stability, P-256 retry rule, Argon2id determinism), per-content CEK handling, multi-factor wrapped-data-key envelope, share-log read/write under simulated Arweave, session persistence round-trips, recovery factor unwrap, invite-token redemption. These run via `tsx` so the JS test files import the in-progress `.ts` source modules directly.
 - **Integration tests** against `wrangler dev` in `tests/test-*.mjs`. Full HTTP round-trip: register → app auth → set rules → login → write → read → share → recover → delete. Catches contract drift between SDK and API.
 - **Four runnable examples** in `examples/`. Manually executed against a real API; catches end-to-end issues that mocks don't (real Arweave gateway responses, real Turbo upload latency, real CORS).
 - **GitHub Actions CI** on every push to `dev`/`main`: typecheck + TS unit tests + JS unit tests + build + `npm pack --dry-run`. Green CI is the required precondition for any merge.
@@ -226,7 +226,7 @@ Four layers, each catching different things:
 
 ## 7. The recovery property
 
-Schemas are published to Arweave under `Type='app-schema', App=<app_id>, V=<version>` via `tools/publish-schema.mjs`. Anyone with read access to Arweave (i.e., everyone, via a public gateway) can fetch the schema by app and version. Combined with the v4 wrapped-data-key envelope being recoverable from `Type='cred'` blobs and content blobs being recoverable from `Type='entry'` blobs, this means: a "Tarn recovery" client could be built that reads everything it needs straight from Arweave gateways via GraphQL, with no Tarn API in the loop, given only the user's email + password (or recovery phrase) and the app id.
+Schemas are published to Arweave under `Type='app-schema', App=<app_id>, V=<version>` via `tools/publish-schema.mjs`. Anyone with read access to Arweave (i.e., everyone, via a public gateway) can fetch the schema by app and version. Combined with the wrapped-data-key envelope being recoverable from `Type='cred'` blobs and content blobs being recoverable from `Type='entry'` blobs, this means: a "Tarn recovery" client could be built that reads everything it needs straight from Arweave gateways via GraphQL, with no Tarn API in the loop, given only the user's email + password (or recovery phrase) and the app id.
 
 That client is on the roadmap, not shipped. The protocol-level enabling work — schema publication endpoint, fixed `Type` tag, deterministic envelope formats — is done. Apps inherit the property by virtue of using the SDK; nothing app-side needs to change to make it true.
 

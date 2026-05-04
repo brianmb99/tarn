@@ -76,8 +76,8 @@ export class AdvancedEntries<C extends IAdvancedClient> {
 
   /**
    * Resolve the shareKey for an entry we wrote. Cache lookup with a
-   * fetch + AES-KW unwrap fallback. Null on legacy accounts or unrecoverable
-   * blobs.
+   * fetch + AES-KW unwrap fallback. Null only for unrecoverable blobs
+   * (unfetchable or malformed).
    */
   async getShareKey(txid: string): Promise<string | null> {
     return this.#client.getShareKey(txid);

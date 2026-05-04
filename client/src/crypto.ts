@@ -1,7 +1,6 @@
 // Tarn Client Crypto — key derivation, encryption, signing
 // WebCrypto for everything except the password→master_key KDF.
-// The KDF uses Argon2id (via hash-wasm) for new accounts; legacy accounts
-// continue to use PBKDF2-SHA256 for backward compatibility.
+// The KDF is Argon2id (via hash-wasm) — m=64 MiB, t=3, p=1.
 //
 // Key derivation uses HKDF-Expand (RFC 5869) with structured info strings.
 // Key wrapping uses AES-KW (RFC 3394).
@@ -63,29 +62,18 @@ function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
 
 // ============ CONSTANTS ============
 
-// KDF versions for the master_key derivation step.
-// v1 — PBKDF2-SHA256, 600k iterations (legacy, accounts created before Argon2id rollout).
-// v2 — Argon2id, m=64 MiB, t=3, p=1 (current default for new accounts).
-//
 // Argon2id parameters chosen to keep login latency near ~200ms on a recent
 // laptop, ~1–1.5s on a 3-year-old phone — well under the ~2s acceptance bar.
 // Memory-hard params neutralize GPU/ASIC parallelism on a leaked Arweave
 // credential blob, in line with the OWASP Argon2id recommendation.
-export const KDF_V1_PBKDF2 = 1 as const;
-export const KDF_V2_ARGON2ID = 2 as const;
-export const KDF_DEFAULT = KDF_V2_ARGON2ID;
-export type KdfVersion = typeof KDF_V1_PBKDF2 | typeof KDF_V2_ARGON2ID;
 
-// Wrapping factors (issue #12). Each entry in a v4 dek_chain is wrapped under
-// one or more factors; any factor's KEK independently unwraps the DEK.
+// Wrapping factors. Each entry in a dek_chain is wrapped under one or more
+// factors; any factor's KEK independently unwraps the DEK.
 //   PASSWORD        — derived from email+password via deriveCredentialEncryptionKey
 //   RECOVERY_PHRASE — derived from BIP39 phrase via deriveRecoveryKey
 export const FACTOR_PASSWORD = 'password' as const;
 export const FACTOR_RECOVERY_PHRASE = 'recovery_phrase' as const;
 export type Factor = typeof FACTOR_PASSWORD | typeof FACTOR_RECOVERY_PHRASE;
-
-const PBKDF2_ITERATIONS = 600000;
-const PBKDF2_HASH = 'SHA-256';
 
 const ARGON2ID_MEMORY_KIB = 64 * 1024; // 64 MiB
 const ARGON2ID_ITERATIONS = 3;
@@ -225,57 +213,35 @@ async function hkdfExpand(
 // ============ KEY DERIVATION ============
 
 /**
- * Derive master_key from email + password.
- * The master_key is app-independent — app isolation happens in sub-key derivation.
+ * Derive master_key from email + password via Argon2id.
  *
- * KDF dispatch:
- *   v2 (default) — Argon2id over UTF-8 password, salt = SHA-256(normalizedEmail)
- *   v1 (legacy)  — PBKDF2-SHA256 600k iters, same salt
- *
- * Both KDFs use SHA-256(normalizedEmail) as the salt so an account's salt is
- * stable across logins regardless of which KDF was originally used.
+ * The master_key is app-independent — app isolation happens in sub-key
+ * derivation. Salt = SHA-256(normalizedEmail) so an account's salt is
+ * deterministic from its identifier.
  */
 export async function deriveMasterKey(
   email: string,
   password: string,
-  kdfVersion: KdfVersion = KDF_DEFAULT,
 ): Promise<Uint8Array> {
   if (!email || !password) throw new Error('Email and password are required');
 
   const normalizedEmail = normalizeEmail(email);
   const encoder = new TextEncoder();
 
-  // Salt = SHA-256(normalizedEmail) — same for both KDFs.
   const salt = new Uint8Array(
     await crypto.subtle.digest('SHA-256', bs(encoder.encode(normalizedEmail))),
   );
 
-  if (kdfVersion === KDF_V2_ARGON2ID) {
-    const out = await argon2idHash({
-      password: encoder.encode(password),
-      salt,
-      parallelism: ARGON2ID_PARALLELISM,
-      iterations: ARGON2ID_ITERATIONS,
-      memorySize: ARGON2ID_MEMORY_KIB,
-      hashLength: KEY_LENGTH_BYTES,
-      outputType: 'binary',
-    });
-    return out instanceof Uint8Array ? out : new Uint8Array(out);
-  }
-
-  if (kdfVersion === KDF_V1_PBKDF2) {
-    const passwordKey = await crypto.subtle.importKey(
-      'raw', bs(encoder.encode(password)), 'PBKDF2', false, ['deriveBits'],
-    );
-    const masterKeyBits = await crypto.subtle.deriveBits(
-      { name: 'PBKDF2', salt: bs(salt), iterations: PBKDF2_ITERATIONS, hash: PBKDF2_HASH },
-      passwordKey,
-      KEY_LENGTH_BITS,
-    );
-    return new Uint8Array(masterKeyBits);
-  }
-
-  throw new Error(`Unknown KDF version: ${kdfVersion as number}`);
+  const out = await argon2idHash({
+    password: encoder.encode(password),
+    salt,
+    parallelism: ARGON2ID_PARALLELISM,
+    iterations: ARGON2ID_ITERATIONS,
+    memorySize: ARGON2ID_MEMORY_KIB,
+    hashLength: KEY_LENGTH_BYTES,
+    outputType: 'binary',
+  });
+  return out instanceof Uint8Array ? out : new Uint8Array(out);
 }
 
 /**
@@ -721,31 +687,29 @@ export async function unwrapDataKey(wrappedBase64: string, unwrappingKey: Crypto
   );
 }
 
-// ============ WRAPPED-DATA-KEY WIRE FORMAT (KDF-versioned envelope) ============
+// ============ WRAPPED-DATA-KEY WIRE FORMAT ============
 //
 // The `wrapped_data_key` field stored on the API/Arweave is opaque to the
-// server but carries a KDF version indicator so the client can verify which
-// KDF was used at registration. The API column is plain TEXT; the Arweave
-// credential mapping blob embeds the same string.
+// server but self-describes its KDF and version so the client can validate
+// what it pulled back. The API column is plain TEXT; the Arweave credential
+// mapping blob embeds the same string.
 //
-// v1 (legacy) — bare base64 of the AES-KW ciphertext. Implies PBKDF2 master_key.
-// v2 — JSON envelope with a single wrapped DEK: { v, kdf, kdf_params, wrapped }.
-//      DEK == credential_encryption_key (self-wrapping). Pre-issue-#11.
-// v3 — JSON envelope with a single-factor DEK chain (issue #11):
-//      { v: 3, kdf, kdf_params, dek_chain: [{gen, wrapped}, ...] }.
-// v4 (current default for new accounts) — multi-factor DEK chain (issue #12):
-//      { v: 4, kdf, kdf_params,
-//        recovery: { kdf, kdf_params, salt: <base64 16 bytes> } | absent,
+// v1 — multi-factor DEK chain:
+//      { v: 1, kdf: 'argon2id', kdf_params,
+//        recovery: { kdf, kdf_params, salt: <base64 16 bytes> },
 //        dek_chain: [{gen, wrappings: [{factor, wrapped}, ...]}, ...] }
 //
-// Detection: if the string parses as JSON, dispatch on `v`; otherwise legacy v1.
-// Read normalization: v1/v2/v3 are coerced to a single-factor v4-shaped chain
-// (factor = "password") so callers can branch on shape, not version.
+// Each chain entry's DEK is wrapped under one or more factors (password +
+// recovery_phrase); any factor's KEK independently unwraps it. Older
+// generations stay in the chain so blobs written under prior credentials
+// remain decryptable after a credential rotation. Every account carries
+// both factors — `recovery` is required, not optional.
 
-export type EnvelopeVersion = 1 | 2 | 3 | 4;
+export type EnvelopeVersion = 1;
+export const ENVELOPE_VERSION: EnvelopeVersion = 1;
 
 export type ChainWrapping = {
-  factor: string; // narrowed to Factor at the v4 layer; v1/v2/v3 use FACTOR_PASSWORD
+  factor: string; // narrowed to Factor by the wrap helpers
   wrappedBase64: string;
 };
 
@@ -755,47 +719,18 @@ export type DekChainEntry = {
 };
 
 export type ParsedWrappedDataKey = {
-  kdfVersion: KdfVersion;
   envelopeVersion: EnvelopeVersion;
   dekChain: DekChainEntry[];
   wrappedBase64: string;
-  kdfParams: Argon2idParams | null;
-  recovery: RecoveryMetadata | null;
+  kdfParams: Argon2idParams;
+  recovery: RecoveryMetadata;
 };
 
 /**
- * Wrap the data encryption key and pack into the wire format for the given KDF.
- * Produces the legacy single-key shape (envelope v1 for PBKDF2, envelope v2
- * for Argon2id). For new accounts after issue #11, prefer
- * {@link wrapDataKeyChainEnvelope} which produces a v3 chain envelope.
- */
-export async function wrapDataKeyEnvelope(
-  dataKey: CryptoKey,
-  wrappingKey: CryptoKey,
-  kdfVersion: KdfVersion,
-): Promise<WrappedDataKeyEnvelope> {
-  const wrappedBase64 = await wrapDataKey(dataKey, wrappingKey);
-
-  if (kdfVersion === KDF_V1_PBKDF2) {
-    return asEnvelope(wrappedBase64);
-  }
-
-  if (kdfVersion === KDF_V2_ARGON2ID) {
-    return asEnvelope(JSON.stringify({
-      v: 2,
-      kdf: 'argon2id',
-      kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
-      wrapped: wrappedBase64,
-    }));
-  }
-
-  throw new Error(`Unknown KDF version: ${kdfVersion as number}`);
-}
-
-/**
  * Generate a fresh random 32-byte DEK and import it as both an AES-GCM key
- * (for legacy/direct content encryption — and as a fallback when the chain
- * has only one entry) and an AES-KW key (for wrapping per-content CEKs).
+ * (used directly when no per-content CEK applies — historical reads and the
+ * recovery factor's wrapped DEK) and an AES-KW key (for wrapping per-content
+ * CEKs and chain entries).
  */
 export async function generateRandomDataKey(): Promise<DataKeyHandles> {
   const rawBytes = crypto.getRandomValues(new Uint8Array(KEY_LENGTH_BYTES));
@@ -807,29 +742,17 @@ export async function generateRandomDataKey(): Promise<DataKeyHandles> {
 }
 
 /**
- * Inspect a wire-format `wrapped_data_key` without unwrapping.
- *
- * Returns a normalized shape regardless of envelope version. v1/v2/v3 envelopes
- * are coerced into the v4-shaped multi-factor chain with a single `password`
- * wrapping per entry, so callers can branch on shape, not version.
+ * Inspect a wire-format `wrapped_data_key` without unwrapping. Validates that
+ * it is a v1 multi-factor envelope; throws on any other shape (legacy v1/v2/v3
+ * accounts no longer exist — those were one-account back-compat that we cut
+ * cleanly when there was still only one user).
  */
 export function parseWrappedDataKey(wireValue: string): ParsedWrappedDataKey {
   if (typeof wireValue !== 'string' || wireValue.length === 0) {
     throw new Error('wrapped_data_key must be a non-empty string');
   }
-
-  // v2+ envelopes are JSON objects starting with '{'. Bare base64 never starts
-  // with '{' (base64 alphabet is [A-Za-z0-9+/=]), so this prefix check is
-  // a safe, allocation-free dispatch before attempting JSON.parse.
   if (wireValue[0] !== '{') {
-    return {
-      kdfVersion: KDF_V1_PBKDF2,
-      envelopeVersion: 1,
-      dekChain: [{ gen: 1, wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: wireValue }] }],
-      wrappedBase64: wireValue,
-      kdfParams: null,
-      recovery: null,
-    };
+    throw new Error('wrapped_data_key must be a JSON envelope');
   }
 
   let parsed: Record<string, unknown>;
@@ -842,172 +765,104 @@ export function parseWrappedDataKey(wireValue: string): ParsedWrappedDataKey {
   if (!parsed || typeof parsed !== 'object') {
     throw new Error('wrapped_data_key envelope is missing required fields');
   }
-
-  if (parsed['v'] === 2 && parsed['kdf'] === 'argon2id') {
-    const wrapped = parsed['wrapped'];
-    if (typeof wrapped !== 'string') {
-      throw new Error('wrapped_data_key envelope is missing required fields');
-    }
-    return {
-      kdfVersion: KDF_V2_ARGON2ID,
-      envelopeVersion: 2,
-      dekChain: [{ gen: 1, wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: wrapped }] }],
-      wrappedBase64: wrapped,
-      kdfParams: (parsed['kdf_params'] as Argon2idParams | undefined) ?? null,
-      recovery: null,
-    };
+  if (parsed['v'] !== 1 || parsed['kdf'] !== 'argon2id') {
+    throw new Error(
+      `wrapped_data_key: unsupported envelope (expected v=1 kdf=argon2id, got v=${String(parsed['v'])} kdf=${String(parsed['kdf'])})`,
+    );
   }
 
-  if (parsed['v'] === 3 && parsed['kdf'] === 'argon2id') {
-    const dekChainRaw = parsed['dek_chain'];
-    if (!Array.isArray(dekChainRaw) || dekChainRaw.length === 0) {
-      throw new Error('v3 wrapped_data_key envelope must have a non-empty dek_chain');
+  const dekChainRaw = parsed['dek_chain'];
+  if (!Array.isArray(dekChainRaw) || dekChainRaw.length === 0) {
+    throw new Error('wrapped_data_key envelope must have a non-empty dek_chain');
+  }
+  const chain: DekChainEntry[] = dekChainRaw.map((entry: unknown, idx: number) => {
+    const e = entry as Record<string, unknown> | null;
+    if (
+      !e ||
+      typeof e !== 'object' ||
+      typeof e['gen'] !== 'number' ||
+      !Number.isInteger(e['gen']) ||
+      (e['gen'] as number) < 1 ||
+      !Array.isArray(e['wrappings']) ||
+      (e['wrappings'] as unknown[]).length === 0
+    ) {
+      throw new Error(`wrapped_data_key envelope dek_chain[${idx}] is malformed`);
     }
-    const chain: DekChainEntry[] = dekChainRaw.map((entry: unknown, idx: number) => {
-      const e = entry as Record<string, unknown> | null;
+    const wrappings: ChainWrapping[] = (e['wrappings'] as unknown[]).map((w: unknown, wIdx: number) => {
+      const wo = w as Record<string, unknown> | null;
       if (
-        !e ||
-        typeof e !== 'object' ||
-        typeof e['gen'] !== 'number' ||
-        !Number.isInteger(e['gen']) ||
-        (e['gen'] as number) < 1 ||
-        typeof e['wrapped'] !== 'string'
+        !wo ||
+        typeof wo !== 'object' ||
+        typeof wo['factor'] !== 'string' ||
+        (wo['factor'] as string).length === 0 ||
+        typeof wo['wrapped'] !== 'string'
       ) {
-        throw new Error(`v3 wrapped_data_key envelope dek_chain[${idx}] is malformed`);
+        throw new Error(`wrapped_data_key envelope dek_chain[${idx}].wrappings[${wIdx}] is malformed`);
       }
-      return {
-        gen: e['gen'] as number,
-        wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: e['wrapped'] as string }],
-      };
+      return { factor: wo['factor'] as string, wrappedBase64: wo['wrapped'] as string };
     });
-    const seen = new Set<number>();
-    for (const e of chain) {
-      if (seen.has(e.gen)) {
-        throw new Error(`v3 wrapped_data_key envelope has duplicate gen: ${e.gen}`);
+    const factorSeen = new Set<string>();
+    for (const w of wrappings) {
+      if (factorSeen.has(w.factor)) {
+        throw new Error(`wrapped_data_key envelope dek_chain[${idx}] has duplicate factor: ${w.factor}`);
       }
-      seen.add(e.gen);
+      factorSeen.add(w.factor);
     }
-    chain.sort((a, b) => a.gen - b.gen);
-    const top = chain[chain.length - 1]!;
-    return {
-      kdfVersion: KDF_V2_ARGON2ID,
-      envelopeVersion: 3,
-      dekChain: chain,
-      wrappedBase64: top.wrappings[0]!.wrappedBase64,
-      kdfParams: (parsed['kdf_params'] as Argon2idParams | undefined) ?? null,
-      recovery: null,
-    };
+    return { gen: e['gen'] as number, wrappings };
+  });
+  const seen = new Set<number>();
+  for (const e of chain) {
+    if (seen.has(e.gen)) {
+      throw new Error(`wrapped_data_key envelope has duplicate gen: ${e.gen}`);
+    }
+    seen.add(e.gen);
   }
+  chain.sort((a, b) => a.gen - b.gen);
 
-  if (parsed['v'] === 4 && parsed['kdf'] === 'argon2id') {
-    const dekChainRaw = parsed['dek_chain'];
-    if (!Array.isArray(dekChainRaw) || dekChainRaw.length === 0) {
-      throw new Error('v4 wrapped_data_key envelope must have a non-empty dek_chain');
-    }
-    const chain: DekChainEntry[] = dekChainRaw.map((entry: unknown, idx: number) => {
-      const e = entry as Record<string, unknown> | null;
-      if (
-        !e ||
-        typeof e !== 'object' ||
-        typeof e['gen'] !== 'number' ||
-        !Number.isInteger(e['gen']) ||
-        (e['gen'] as number) < 1 ||
-        !Array.isArray(e['wrappings']) ||
-        (e['wrappings'] as unknown[]).length === 0
-      ) {
-        throw new Error(`v4 wrapped_data_key envelope dek_chain[${idx}] is malformed`);
-      }
-      const wrappings: ChainWrapping[] = (e['wrappings'] as unknown[]).map((w: unknown, wIdx: number) => {
-        const wo = w as Record<string, unknown> | null;
-        if (
-          !wo ||
-          typeof wo !== 'object' ||
-          typeof wo['factor'] !== 'string' ||
-          (wo['factor'] as string).length === 0 ||
-          typeof wo['wrapped'] !== 'string'
-        ) {
-          throw new Error(`v4 wrapped_data_key envelope dek_chain[${idx}].wrappings[${wIdx}] is malformed`);
-        }
-        return { factor: wo['factor'] as string, wrappedBase64: wo['wrapped'] as string };
-      });
-      // No two wrappings in the same entry should share a factor name.
-      const factorSeen = new Set<string>();
-      for (const w of wrappings) {
-        if (factorSeen.has(w.factor)) {
-          throw new Error(`v4 wrapped_data_key envelope dek_chain[${idx}] has duplicate factor: ${w.factor}`);
-        }
-        factorSeen.add(w.factor);
-      }
-      return { gen: e['gen'] as number, wrappings };
-    });
-    const seen = new Set<number>();
-    for (const e of chain) {
-      if (seen.has(e.gen)) {
-        throw new Error(`v4 wrapped_data_key envelope has duplicate gen: ${e.gen}`);
-      }
-      seen.add(e.gen);
-    }
-    chain.sort((a, b) => a.gen - b.gen);
-
-    let recovery: RecoveryMetadata | null = null;
-    const recoveryRaw = parsed['recovery'];
-    if (recoveryRaw) {
-      const r = recoveryRaw as Record<string, unknown>;
-      if (
-        !r ||
-        typeof r !== 'object' ||
-        r['kdf'] !== 'argon2id' ||
-        !r['kdf_params'] ||
-        typeof r['salt'] !== 'string'
-      ) {
-        throw new Error('v4 wrapped_data_key envelope has malformed recovery block');
-      }
-      const saltBytes = base64ToBytesRaw(r['salt'] as string);
-      if (saltBytes.length !== RECOVERY_SALT_LEN) {
-        throw new Error(`v4 recovery.salt must decode to ${RECOVERY_SALT_LEN} bytes, got ${saltBytes.length}`);
-      }
-      recovery = {
-        kdf: 'argon2id',
-        kdfParams: r['kdf_params'] as Argon2idParams,
-        salt: saltBytes,
-      };
-    }
-
-    // Convenience field: highest-gen `password` wrapping (current write-side
-    // wrapping). If there is no password wrapping at the current gen (would be
-    // unusual — all current writers include one) fall back to the first
-    // wrapping at the current gen.
-    const top = chain[chain.length - 1]!;
-    const pw = top.wrappings.find(w => w.factor === FACTOR_PASSWORD);
-    const wrappedBase64 = (pw ?? top.wrappings[0]!).wrappedBase64;
-
-    return {
-      kdfVersion: KDF_V2_ARGON2ID,
-      envelopeVersion: 4,
-      dekChain: chain,
-      wrappedBase64,
-      kdfParams: (parsed['kdf_params'] as Argon2idParams | undefined) ?? null,
-      recovery,
-    };
+  // Recovery block is required (every account has both factors).
+  const recoveryRaw = parsed['recovery'];
+  if (!recoveryRaw || typeof recoveryRaw !== 'object') {
+    throw new Error('wrapped_data_key envelope is missing required recovery block');
   }
+  const r = recoveryRaw as Record<string, unknown>;
+  if (
+    r['kdf'] !== 'argon2id' ||
+    !r['kdf_params'] ||
+    typeof r['salt'] !== 'string'
+  ) {
+    throw new Error('wrapped_data_key envelope has malformed recovery block');
+  }
+  const saltBytes = base64ToBytesRaw(r['salt'] as string);
+  if (saltBytes.length !== RECOVERY_SALT_LEN) {
+    throw new Error(`recovery.salt must decode to ${RECOVERY_SALT_LEN} bytes, got ${saltBytes.length}`);
+  }
+  const recovery: RecoveryMetadata = {
+    kdf: 'argon2id',
+    kdfParams: r['kdf_params'] as Argon2idParams,
+    salt: saltBytes,
+  };
 
-  throw new Error(`Unsupported wrapped_data_key envelope version: v=${String(parsed['v'])} kdf=${String(parsed['kdf'])}`);
-}
+  // Convenience field: highest-gen `password` wrapping (current write-side
+  // wrapping). All current writers include both factors at every gen, so this
+  // is always present.
+  const top = chain[chain.length - 1]!;
+  const pw = top.wrappings.find(w => w.factor === FACTOR_PASSWORD);
+  if (!pw) {
+    throw new Error('wrapped_data_key envelope: current gen is missing the password wrapping');
+  }
+  const kdfParams = (parsed['kdf_params'] as Argon2idParams | undefined) ?? {
+    m_kib: ARGON2ID_MEMORY_KIB,
+    t: ARGON2ID_ITERATIONS,
+    p: ARGON2ID_PARALLELISM,
+  };
 
-/**
- * Unwrap the data encryption key from the wire format. For backward compat
- * with the v1/v2 single-key shape, returns the highest-gen DEK as `dataKey`.
- *
- * For v3 envelopes, prefer {@link unwrapDataKeyChain} which returns the full
- * generation map needed to read older blobs.
- */
-export async function unwrapDataKeyEnvelope(
-  wireValue: string,
-  unwrappingKey: CryptoKey,
-): Promise<{ dataKey: CryptoKey; kdfVersion: KdfVersion; kdfParams: Argon2idParams | null }> {
-  const parsed = parseWrappedDataKey(wireValue);
-  const dataKey = await unwrapDataKey(parsed.wrappedBase64, unwrappingKey);
-  return { dataKey, kdfVersion: parsed.kdfVersion, kdfParams: parsed.kdfParams };
+  return {
+    envelopeVersion: 1,
+    dekChain: chain,
+    wrappedBase64: pw.wrappedBase64,
+    kdfParams,
+    recovery,
+  };
 }
 
 /** Result of unwrapping every DEK in a chain via a chosen factor's KEK. */
@@ -1015,18 +870,15 @@ export type UnwrappedDekChain = {
   dekByGen: Map<number, DataKeyPair>;
   currentGen: number;
   envelopeVersion: EnvelopeVersion;
-  kdfVersion: KdfVersion;
-  kdfParams: Argon2idParams | null;
-  recovery: RecoveryMetadata | null;
+  kdfParams: Argon2idParams;
+  recovery: RecoveryMetadata;
 };
 
 /**
  * Unwrap every DEK in the chain via the named factor (defaults to
  * `FACTOR_PASSWORD`). Returns a Map keyed by generation plus the current
- * (highest) generation number. Always returns a Map even for legacy single-key
- * envelopes — they expose a synthetic password wrapping per entry.
- *
- * Each value is a pair of WebCrypto handles for the same 32-byte DEK:
+ * (highest) generation number. Each value is a pair of WebCrypto handles
+ * for the same 32-byte DEK:
  *   - `gcmKey`: AES-GCM, extractable
  *   - `kwKey`:  AES-KW, used to wrap/unwrap per-content CEKs
  */
@@ -1060,68 +912,29 @@ export async function unwrapDataKeyChain(
     dekByGen,
     currentGen,
     envelopeVersion: parsed.envelopeVersion,
-    kdfVersion: parsed.kdfVersion,
     kdfParams: parsed.kdfParams,
     recovery: parsed.recovery,
   };
 }
 
-/** Build a v3 envelope from a chain of (gen, raw_wrapped_base64) pairs. */
-export function buildV3Envelope(
-  chain: ReadonlyArray<{ gen: number; wrappedBase64: string }>,
-): WrappedDataKeyEnvelope {
-  if (!Array.isArray(chain) || chain.length === 0) {
-    throw new Error('chain must be a non-empty array');
-  }
-  const sorted = chain.slice().sort((a, b) => a.gen - b.gen);
-  return asEnvelope(JSON.stringify({
-    v: 3,
-    kdf: 'argon2id',
-    kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
-    dek_chain: sorted.map(e => ({ gen: e.gen, wrapped: e.wrappedBase64 })),
-  }));
-}
-
-/**
- * Wrap an array of DEK CryptoKeys (one per generation) under the given
- * wrapping key and pack into a v3 envelope.
- */
-export async function wrapDataKeyChainEnvelope(
-  chain: ReadonlyArray<{ gen: number; key: CryptoKey }>,
-  wrappingKey: CryptoKey,
-): Promise<WrappedDataKeyEnvelope> {
-  if (!Array.isArray(chain) || chain.length === 0) {
-    throw new Error('chain must be a non-empty array');
-  }
-  const wrapped: Array<{ gen: number; wrappedBase64: string }> = [];
-  for (const entry of chain) {
-    if (!entry || typeof entry.gen !== 'number' || !entry.key) {
-      throw new Error('chain entries must be {gen: number, key: CryptoKey}');
-    }
-    const wrappedBase64 = await wrapDataKey(entry.key, wrappingKey);
-    wrapped.push({ gen: entry.gen, wrappedBase64 });
-  }
-  return buildV3Envelope(wrapped);
-}
-
-// ============ v4 ENVELOPE — MULTI-FACTOR WRAPPING (issue #12) ============
+// ============ ENVELOPE BUILDERS ============
 
 /** Generate a fresh random salt for the recovery KDF (per-account, 16 bytes). */
 export function generateRecoverySalt(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(RECOVERY_SALT_LEN));
 }
 
-export type V4FactorInput = { name: string; wrappingKey: CryptoKey };
-export type V4ChainEntry = { gen: number; wrappings: ChainWrapping[] };
-export type V4Recovery = { salt: Uint8Array; kdfParams?: Argon2idParams } | null;
+export type FactorInput = { name: string; wrappingKey: CryptoKey };
+export type ChainEntry = { gen: number; wrappings: ChainWrapping[] };
+export type Recovery = { salt: Uint8Array; kdfParams?: Argon2idParams };
 
 /**
- * Build a v4 envelope from a chain whose entries each carry one or more
- * already-wrapped factors (raw base64 ciphertexts).
+ * Build a wrapped-data-key envelope from a chain whose entries each carry one
+ * or more already-wrapped factors (raw base64 ciphertexts).
  */
-export function buildV4Envelope(
-  chain: ReadonlyArray<V4ChainEntry>,
-  recovery: V4Recovery,
+export function buildEnvelope(
+  chain: ReadonlyArray<ChainEntry>,
+  recovery: Recovery,
 ): WrappedDataKeyEnvelope {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
@@ -1138,27 +951,16 @@ export function buildV4Envelope(
       throw new Error('chain entries must be {gen: number, wrappings: [{factor, wrappedBase64}, ...]}');
     }
   }
-  const sorted: V4ChainEntry[] = chain.slice().sort((a, b) => a.gen - b.gen);
-
-  // If any entry references a recovery_phrase wrapping, the envelope MUST
-  // carry the recovery metadata block.
-  const hasRecoveryWrap = sorted.some((e: V4ChainEntry) =>
-    e.wrappings.some((w: ChainWrapping) => w.factor === FACTOR_RECOVERY_PHRASE),
-  );
-  if (hasRecoveryWrap && !recovery) {
-    throw new Error('chain has recovery_phrase wrappings but no recovery metadata supplied');
+  if (!recovery || !(recovery.salt instanceof Uint8Array) || recovery.salt.length !== RECOVERY_SALT_LEN) {
+    throw new Error(`recovery.salt must be a Uint8Array of length ${RECOVERY_SALT_LEN}`);
   }
+  const sorted: ChainEntry[] = chain.slice().sort((a, b) => a.gen - b.gen);
 
-  const out: Record<string, unknown> = {
-    v: 4,
+  return asEnvelope(JSON.stringify({
+    v: ENVELOPE_VERSION,
     kdf: 'argon2id',
     kdf_params: { m_kib: ARGON2ID_MEMORY_KIB, t: ARGON2ID_ITERATIONS, p: ARGON2ID_PARALLELISM },
-  };
-  if (recovery) {
-    if (!(recovery.salt instanceof Uint8Array) || recovery.salt.length !== RECOVERY_SALT_LEN) {
-      throw new Error(`recovery.salt must be a Uint8Array of length ${RECOVERY_SALT_LEN}`);
-    }
-    out['recovery'] = {
+    recovery: {
       kdf: 'argon2id',
       kdf_params: recovery.kdfParams ?? {
         m_kib: ARGON2ID_MEMORY_KIB,
@@ -1166,23 +968,26 @@ export function buildV4Envelope(
         p: ARGON2ID_PARALLELISM,
       },
       salt: bytesToBase64Raw(recovery.salt),
-    };
-  }
-  out['dek_chain'] = sorted.map((e: V4ChainEntry) => ({
-    gen: e.gen,
-    wrappings: e.wrappings.map((w: ChainWrapping) => ({ factor: w.factor, wrapped: w.wrappedBase64 })),
+    },
+    dek_chain: sorted.map((e: ChainEntry) => ({
+      gen: e.gen,
+      wrappings: e.wrappings.map((w: ChainWrapping) => ({ factor: w.factor, wrapped: w.wrappedBase64 })),
+    })),
   }));
-  return asEnvelope(JSON.stringify(out));
 }
 
 /**
- * Wrap a chain of DEK CryptoKeys under one or more factors and pack into a v4
- * envelope. Each chain entry is wrapped independently under every factor.
+ * Wrap a chain of DEK CryptoKeys under each of the supplied factors and pack
+ * into a v1 envelope. Every chain entry is wrapped under every factor.
+ *
+ * `factors` must include both `FACTOR_PASSWORD` and `FACTOR_RECOVERY_PHRASE`
+ * (every account carries both); the writer can pass either one as the first
+ * factor — order doesn't affect the result.
  */
-export async function wrapDataKeyChainEnvelopeV4(
+export async function wrapDataKeyChainEnvelope(
   chain: ReadonlyArray<{ gen: number; key: CryptoKey }>,
-  factors: ReadonlyArray<V4FactorInput>,
-  recovery: V4Recovery,
+  factors: ReadonlyArray<FactorInput>,
+  recovery: Recovery,
 ): Promise<WrappedDataKeyEnvelope> {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
@@ -1195,19 +1000,13 @@ export async function wrapDataKeyChainEnvelopeV4(
       throw new Error('factors must be {name: string, wrappingKey: CryptoKey}');
     }
   }
-  // Forbid duplicate factor names — each entry's wrappings list must be unique
-  // by factor.
   const seenFactors = new Set<string>();
   for (const f of factors) {
     if (seenFactors.has(f.name)) throw new Error(`Duplicate factor name: ${f.name}`);
     seenFactors.add(f.name);
   }
-  const hasRecoveryFactor = factors.some(f => f.name === FACTOR_RECOVERY_PHRASE);
-  if (hasRecoveryFactor && !recovery) {
-    throw new Error('recovery metadata is required when factors include recovery_phrase');
-  }
 
-  const wrappedChain: V4ChainEntry[] = [];
+  const wrappedChain: ChainEntry[] = [];
   for (const entry of chain) {
     if (!entry || typeof entry.gen !== 'number' || !entry.key) {
       throw new Error('chain entries must be {gen: number, key: CryptoKey}');
@@ -1219,7 +1018,7 @@ export async function wrapDataKeyChainEnvelopeV4(
     }
     wrappedChain.push({ gen: entry.gen, wrappings });
   }
-  return buildV4Envelope(wrappedChain, recovery);
+  return buildEnvelope(wrappedChain, recovery);
 }
 
 // ============ CHALLENGE SIGNING ============
@@ -1241,32 +1040,30 @@ export type AllKeys = {
   credentialEncryptionKey: DataKeyHandles;
   signingKeyPair: SigningKeyPair;
   sharingKeyPair: SharingKeyPair;
-  kdfVersion: KdfVersion;
 };
 
 /**
  * Derive all keys from email + password + app in one call.
  *
- * Also derives the sharing keypair (issue #13) so callers that need to publish
- * a `share_pub` (register, changeCredentials) get it without an extra HKDF
- * call. The keypair is per-app — `share_pub` for the same email+password
- * differs across `app_id` values, just like the existing sub-keys.
+ * Derives the sharing keypair too so callers that need to publish a
+ * `share_pub` (register, changeCredentials) get it without an extra HKDF
+ * call. All keys are per-app — different `app_id` values produce
+ * completely independent identities for the same email+password.
  */
 export async function deriveAllKeys(
   email: string,
   password: string,
   appId: string,
-  kdfVersion: KdfVersion = KDF_DEFAULT,
 ): Promise<AllKeys> {
   if (!appId) throw new Error('appId is required');
-  const masterKey = await deriveMasterKey(email, password, kdfVersion);
+  const masterKey = await deriveMasterKey(email, password);
   const [credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair] = await Promise.all([
     deriveCredentialLookupKey(masterKey, appId),
     deriveCredentialEncryptionKey(masterKey, appId),
     deriveSigningKeyPair(masterKey, appId),
     deriveSharingKeyPair(masterKey, appId),
   ]);
-  return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair, kdfVersion };
+  return { masterKey, credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair };
 }
 
 // ============ ENCODING HELPERS ============

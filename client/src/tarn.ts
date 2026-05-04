@@ -19,10 +19,8 @@ import {
   exportPublicKey,
   encodeSharePub,
   decodeSharePub,
-  wrapDataKeyEnvelope,
   wrapDataKeyChainEnvelope,
-  wrapDataKeyChainEnvelopeV4,
-  buildV4Envelope,
+  buildEnvelope,
   unwrapDataKeyChain,
   signChallenge,
   encrypt,
@@ -40,9 +38,6 @@ import {
   base64UrlToBytes,
   bytesToBase64,
   bytesToBase64Url,
-  KDF_V1_PBKDF2,
-  KDF_V2_ARGON2ID,
-  KDF_DEFAULT,
   FACTOR_PASSWORD,
   FACTOR_RECOVERY_PHRASE,
 } from './crypto.js';
@@ -117,11 +112,8 @@ import {
   OP_ROTATE_IDENTITY,
 } from './share-log.js';
 
-// Local type aliases used throughout the class. Step 6d-i (auth flow) types
-// these precisely; entry CRUD / sharing / share-log internals use looser
-// types via the `any` aliases below and tighten in 6d-ii / 6d-iii.
+// Local type aliases used throughout the class.
 import type {
-  KdfVersion,
   Argon2idParams,
   DataKeyHandles,
   DataKeyPair,
@@ -132,7 +124,7 @@ import type { ReplayNonceCache } from './sharing.js';
 
 type Tag = { name: string; value: string };
 
-/** Internal v4 recovery-factor metadata cached on the live client. */
+/** Internal recovery-factor metadata cached on the live client. */
 type RecoveryFactorMeta = {
   salt: Uint8Array;
   kdfParams: Argon2idParams;
@@ -162,20 +154,14 @@ export class TarnClient {
   #credentialLookupKey: string | null = null;
   #credentialEncryptionKey: DataKeyHandles | null = null;
   #signingKeyPair: SigningKeyPair | null = null;
-  // KDF version this account was registered/logged in under. Set on register
-  // (always KDF_DEFAULT for new accounts) and login (whichever path succeeded).
-  // Used by changeCredentials() to preserve the original KDF — automatic
-  // upgrade from PBKDF2 to Argon2id is intentionally out of scope.
-  #kdfVersion: KdfVersion | null = null;
 
-  // DEK chain (issue #11). Always populated on a successful login/register,
-  // even for legacy single-key (v1/v2) envelopes — those become a one-entry
-  // chain at gen=1. Keys are {gcmKey, kwKey} pairs holding two WebCrypto
-  // handles for the same 32 raw bytes (AES-GCM for direct legacy decryption,
-  // AES-KW for wrapping per-content CEKs).
+  // DEK chain. Populated on every successful login/register/recoverAccount.
+  // Keys are {gcmKey, kwKey} pairs holding two WebCrypto handles for the same
+  // 32 raw bytes (AES-GCM for direct decryption, AES-KW for wrapping
+  // per-content CEKs). Old generations stay in the chain so blobs written
+  // under prior credentials remain decryptable after a credential rotation.
   #dekByGen: Map<number, DataKeyPair> | null = null;
   #currentGen: number | null = null;
-  #envelopeVersion: 1 | 2 | 3 | 4 | null = null;
 
   // Sharing handshake state (issue #14, Section 5a). Populated on every
   // register/login/changeCredentials/recoverAccount path so the connection
@@ -254,12 +240,12 @@ export class TarnClient {
   #shareKeyCache: Map<string, string> = new Map();
   #shareKeyCacheCap = 64;
 
-  // v4 recovery-factor state (issue #12). Holds enough information to preserve
-  // existing recovery wrappings across a credential change without requiring
-  // the user to re-enter the phrase: the per-account salt + KDF params (so a
-  // future write that DOES have the phrase can re-derive the same KEK), and
-  // a snapshot of the existing wrapped recovery bytes per gen (so we can
-  // re-emit them verbatim). Null for v1/v2/v3 accounts.
+  // Recovery-factor state. Holds enough information to preserve existing
+  // recovery wrappings across a credential change without requiring the user
+  // to re-enter the phrase: the per-account salt + KDF params (so a future
+  // write that DOES have the phrase can re-derive the same KEK), and a
+  // snapshot of the existing wrapped recovery bytes per gen (so we can
+  // re-emit them verbatim).
   #recoveryFactorMeta: RecoveryFactorMeta | null = null;
   #recoveryLookupKey: string | null = null;
 
@@ -333,8 +319,6 @@ export class TarnClient {
     // surfaced via listSessions on every device tied to this account.
     if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
-    const kdfVersion = KDF_DEFAULT; // New accounts always use Argon2id (v2).
-
     // Derive password-side keys + recovery-phrase-side keys + share-lookup
     // key in parallel — Argon2id calls dominate registration latency, so
     // overlap them. share_lookup_key is HKDF over SHA-256(email), independent
@@ -344,7 +328,7 @@ export class TarnClient {
     const recoverySalt = generateRecoverySalt();
 
     const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair, shareLookupKey] = await Promise.all([
-      deriveAllKeys(email, password, this.#appId, kdfVersion),
+      deriveAllKeys(email, password, this.#appId),
       deriveRecoveryKey(phrase, recoverySalt),
       deriveRecoveryLookupKey(phraseEntropy, this.#appId),
       deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
@@ -359,7 +343,7 @@ export class TarnClient {
 
     // Random DEK at generation 1. Wrap under both password + recovery factors.
     const dek = await generateRandomDataKey();
-    const wrappedDataKey = await wrapDataKeyChainEnvelopeV4(
+    const wrappedDataKey = await wrapDataKeyChainEnvelope(
       [{ gen: 1, key: dek.gcmKey }],
       [
         { name: FACTOR_PASSWORD,        wrappingKey: keys.credentialEncryptionKey.kwKey },
@@ -394,8 +378,6 @@ export class TarnClient {
     this.#dataLookupKey = res.json.data_lookup_key;
     this.#dekByGen = new Map([[1, { gcmKey: dek.gcmKey, kwKey: dek.kwKey }]]);
     this.#currentGen = 1;
-    this.#envelopeVersion = 4;
-    this.#kdfVersion = kdfVersion;
     this.#email = email;
     this.#sharingKeyPair = keys.sharingKeyPair;
     // Snapshot the recovery wrapping bytes for the freshly-registered chain
@@ -404,14 +386,16 @@ export class TarnClient {
     // exact wire bytes after wrap.
     {
       const re = parseWrappedDataKey(wrappedDataKey);
-      const wrappingsByGen = new Map();
+      const wrappingsByGen = new Map<number, string>();
       for (const entry of re.dekChain) {
         const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
         if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
       }
-      this.#recoveryFactorMeta = re.recovery
-        ? { salt: re.recovery.salt, kdfParams: re.recovery.kdfParams, wrappingsByGen }
-        : null;
+      this.#recoveryFactorMeta = {
+        salt: re.recovery.salt,
+        kdfParams: re.recovery.kdfParams,
+        wrappingsByGen,
+      };
     }
     this.#recoveryLookupKey = recoveryLookupKey;
 
@@ -577,9 +561,6 @@ export class TarnClient {
     // into unwrapDataKeyChain) because the salt + params live in the envelope
     // and the KEK derivation is the slow Argon2id step.
     const parsed = parseWrappedDataKey(wrapped_data_key);
-    if (parsed.envelopeVersion !== 4 || !parsed.recovery) {
-      throw new Error('recoverAccount(): account is not v4 (no recovery factor enrolled)');
-    }
     const recoveryKEK = await deriveRecoveryKey(
       validation.normalized,
       parsed.recovery.salt,
@@ -610,9 +591,8 @@ export class TarnClient {
     // share_lookup_key are also rederived under the new credentials so the
     // recovered account stays discoverable post-recovery (or non-discoverable,
     // if the caller passed `shareDiscoverable: false`).
-    const kdfVersion = KDF_DEFAULT;
     const [newKeys, newShareLookupKey] = await Promise.all([
-      deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion),
+      deriveAllKeys(newEmail, newPassword, this.#appId),
       deriveShareLookupKey(newEmail, this.#appId),
     ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
@@ -624,7 +604,7 @@ export class TarnClient {
     }
     chain.sort((a, b) => a.gen - b.gen);
 
-    const newWrappedDataKey = await wrapDataKeyChainEnvelopeV4(
+    const newWrappedDataKey = await wrapDataKeyChainEnvelope(
       chain,
       [
         { name: FACTOR_PASSWORD,        wrappingKey: newKeys.credentialEncryptionKey.kwKey },
@@ -734,8 +714,6 @@ export class TarnClient {
     this.#signingKeyPair = newKeys.signingKeyPair;
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
-    this.#envelopeVersion = 4;
-    this.#kdfVersion = kdfVersion;
     this.#email = newEmail;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
     // Pair-key cache is derived from share_priv; recovery rotates it.
@@ -780,32 +758,19 @@ export class TarnClient {
     // Section 7.5 (issue #20): one-shot device label, consumed by the next
     // /auth/verify call inside #verifyChallenge below.
     if (opts && opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
-    // KDF dispatch — chicken-and-egg problem: credential_lookup_key depends on
-    // master_key, which depends on the KDF, which we don't know until we find
-    // the account. Strategy: try the current default KDF (Argon2id v2) first;
-    // on 404, fall back to legacy PBKDF2 (v1). New accounts pay only the v2
-    // cost; legacy accounts pay v2 + v1 once per login (~2s worst case on a
-    // representative slow device, well under acceptance bar).
-    let keys = await deriveAllKeys(email, password, this.#appId, KDF_V2_ARGON2ID);
-    let challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+    // Single-KDF login: Argon2id is the only path. Legacy PBKDF2 accounts no
+    // longer exist (back-compat was cut cleanly when there was still only one
+    // user — see TARN_PROTOCOL.md §2).
+    const keys = await deriveAllKeys(email, password, this.#appId);
+    const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
       retry: true, // generates a fresh nonce per call — safe to retry
       body: { credential_lookup_key: keys.credentialLookupKey },
     });
 
     if (challengeRes.status === 404) {
-      // Fall back to legacy PBKDF2 path.
-      keys = await deriveAllKeys(email, password, this.#appId, KDF_V1_PBKDF2);
-      challengeRes = await this.#fetch('/api/v1/auth/challenge', {
-        method: 'POST',
-        retry: true,
-        body: { credential_lookup_key: keys.credentialLookupKey },
-      });
-      if (challengeRes.status === 404) {
-        throw new Error('Account not found');
-      }
+      throw new Error('Account not found');
     }
-
     if (challengeRes.status !== 200) {
       throw new Error(`Challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
     }
@@ -815,35 +780,24 @@ export class TarnClient {
     this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = challengeRes.json.data_lookup_key;
 
-    // Unwrap data encryption key chain — handles legacy bare-base64 (v1),
-    // single-key v2 envelopes, and v3 chain envelopes uniformly. The
-    // envelope's kdfVersion is a sanity check: an Argon2id-derived key
-    // wrapping a v1 envelope (or vice versa) would indicate either tampering
-    // or a server-side mix-up.
+    // Unwrap the DEK chain via the password factor.
     const unwrapped = await unwrapDataKeyChain(
       challengeRes.json.wrapped_data_key,
       keys.credentialEncryptionKey.kwKey,
     );
-    if (unwrapped.kdfVersion !== keys.kdfVersion) {
-      throw new Error(
-        `KDF mismatch: derived with v${keys.kdfVersion} but credential blob declares v${unwrapped.kdfVersion}`,
-      );
-    }
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
-    this.#envelopeVersion = unwrapped.envelopeVersion;
-    this.#kdfVersion = keys.kdfVersion;
     this.#email = email;
     this.#sharingKeyPair = keys.sharingKeyPair;
-    // Capture the recovery-factor metadata (v4 only) so a subsequent
-    // changeCredentials() can preserve existing recovery wrappings without
-    // requiring the user to re-enter the phrase. Login does NOT reveal the
-    // recovery_lookup_key (the server doesn't return it on the password-side
-    // challenge); recoveryLookupKey stays null until the next register or
-    // recoverAccount call repopulates it.
-    if (unwrapped.recovery) {
+    // Capture the recovery-factor metadata so a subsequent changeCredentials()
+    // can preserve existing recovery wrappings without requiring the user to
+    // re-enter the phrase. Login does NOT reveal the recovery_lookup_key (the
+    // server doesn't return it on the password-side challenge);
+    // recoveryLookupKey stays null until the next register or recoverAccount
+    // call repopulates it.
+    {
       const reparsed = parseWrappedDataKey(challengeRes.json.wrapped_data_key);
-      const wrappingsByGen = new Map();
+      const wrappingsByGen = new Map<number, string>();
       for (const entry of reparsed.dekChain) {
         const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
         if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
@@ -853,8 +807,6 @@ export class TarnClient {
         kdfParams: unwrapped.recovery.kdfParams,
         wrappingsByGen,
       };
-    } else {
-      this.#recoveryFactorMeta = null;
     }
     this.#recoveryLookupKey = null;
 
@@ -867,38 +819,32 @@ export class TarnClient {
   /**
    * Change credentials (email and/or password). Requires an active session.
    *
-   * Forward-secret DEK rotation (issue #11): on every credential change for
-   * an Argon2id account, mint a fresh random DEK at gen N+1 and append to
-   * the chain. Existing gens stay accessible (re-wrapped under the new
-   * credential_encryption_key) so prior data is still readable.
+   * Forward-secret DEK rotation: on every credential change, mint a fresh
+   * random DEK at gen N+1 and append to the chain. Existing gens stay
+   * accessible (re-wrapped under the new credential_encryption_key) so prior
+   * data is still readable.
    *
-   * Recovery factor handling (issue #12, v4 accounts):
+   * Recovery factor handling:
    * - Old gens' recovery wrappings are PRESERVED verbatim — we don't have the
    *   recovery KEK in this code path (user is logged in via password), so we
    *   can't re-wrap. AES-KW is deterministic anyway: re-wrapping the same DEK
    *   under the same recovery KEK would produce identical bytes, so preserving
    *   is byte-equivalent.
    * - The NEW gen (N+1) gets a recovery wrapping when the caller passes
-   *   `phrase`. **Required by default for v4 accounts** (issue #17 follow-up):
-   *   without it, the new gen has only a password wrapping, and recovery for
-   *   data written under that gen is not possible until the user runs
-   *   `regenerateRecoveryKit` or `recoverAccount` to repair the gap. Apps that
-   *   need to skip the prompt may pass `acceptRecoveryGap: true` to opt out;
-   *   this is intended only for non-interactive flows where the gap is
-   *   knowingly accepted.
+   *   `phrase`. Required by default: without it, the new gen has only a
+   *   password wrapping, and recovery for data written under that gen is not
+   *   possible until the user runs `regenerateRecoveryKit` or `recoverAccount`
+   *   to repair the gap. Apps with a non-interactive flow that knowingly
+   *   accepts the gap may pass `acceptRecoveryGap: true`.
    *
-   * For PBKDF2 (KDF v1) accounts the rotation upgrade is intentionally not
-   * applied — they stay on the legacy single-key envelope (issue #11 is
-   * scoped to Argon2id accounts; legacy KDF migration is a separate concern).
-   *
-   * Connection-side identity rotation (issue #17, sharing §13.5): after the
-   * credential blob is published, this method announces the new sharing +
-   * signing pubkeys to every connection by publishing a `rotate_identity` entry
-   * to each connection's OLD outbound log under OLD per-pair keys. Connections'
-   * clients pick up the rotation on their next read/sync, update the connection
-   * record, and switch to the new keys without user intervention. The known
-   * limitation about rotation under compromised OLD keys (sharing §13.5) is
-   * accepted for v1; out-of-band recovery is the documented response.
+   * Connection-side identity rotation (sharing §13.5): after the credential
+   * blob is published, this method announces the new sharing + signing pubkeys
+   * to every connection by publishing a `rotate_identity` entry to each
+   * connection's OLD outbound log under OLD per-pair keys. Connections' clients
+   * pick up the rotation on their next read/sync, update the connection record,
+   * and switch to the new keys without user intervention. The known limitation
+   * about rotation under compromised OLD keys (sharing §13.5) is accepted for
+   * v1; out-of-band recovery is the documented response.
    *
    * @param {string} newEmail
    * @param {string} newPassword
@@ -907,11 +853,10 @@ export class TarnClient {
    *   acceptRecoveryGap?: boolean,
    *   skipRotationAnnounce?: boolean,
    * }} [opts]
-   *   - `phrase`: BIP39 recovery phrase. Required for v4 accounts unless
-   *     `acceptRecoveryGap: true` is set. Extends the recovery wrapping to
-   *     gen N+1.
-   *   - `acceptRecoveryGap`: opt out of the v4 phrase requirement. The new
-   *     gen ships without a recovery wrapping.
+   *   - `phrase`: BIP39 recovery phrase. Required unless `acceptRecoveryGap:
+   *     true` is set. Extends the recovery wrapping to gen N+1.
+   *   - `acceptRecoveryGap`: opt out of the phrase requirement. The new gen
+   *     ships without a recovery wrapping.
    *   - `skipRotationAnnounce`: skip the §13.5 rotation announcement to
    *     connections. Used by tests + low-level flows that intentionally manage
    *     identity rotation themselves; production callers should leave it
@@ -920,152 +865,95 @@ export class TarnClient {
   async changeCredentials(newEmail: string, newPassword: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
 
-    // §17 follow-up: phrase is required by default for v4 accounts. Skipping
-    // it leaves the new gen without a recovery wrapping; if the user later
-    // forgets the password, data written under the new gen is lost. Apps
-    // that have a knowing reason to skip can pass `acceptRecoveryGap: true`.
-    if (this.#envelopeVersion === 4 && !opts.phrase && opts.acceptRecoveryGap !== true) {
+    // Phrase is required by default. Skipping it leaves the new gen without a
+    // recovery wrapping; if the user later forgets the password, data written
+    // under the new gen is lost.
+    if (!opts.phrase && opts.acceptRecoveryGap !== true) {
       throw new Error(
-        'changeCredentials(): v4 accounts must supply `phrase` (the recovery phrase) ' +
+        'changeCredentials(): must supply `phrase` (the recovery phrase) ' +
         'so the new generation gets a recovery wrapping. Pass `acceptRecoveryGap: true` ' +
         'to override (the new gen will be unrecoverable via phrase until repaired).',
       );
     }
 
-    // Preserve the original KDF — silent upgrade from PBKDF2 to Argon2id is
-    // out of scope for this issue (would be a separate migration concern).
-    const kdfVersion = this.#kdfVersion ?? KDF_DEFAULT;
     const [newKeys, newShareLookupKey] = await Promise.all([
-      deriveAllKeys(newEmail, newPassword, this.#appId, kdfVersion),
+      deriveAllKeys(newEmail, newPassword, this.#appId),
       deriveShareLookupKey(newEmail, this.#appId),
     ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-    // Sharing keypair (issue #13) rotates with master_key (depends on both
-    // email and password). The discoverability flag is preserved by the API
-    // when omitted; let `opts.shareDiscoverable` override it for callers that
-    // also want to flip it as part of the credential change.
+    // Sharing keypair rotates with master_key (depends on both email and
+    // password). The discoverability flag is preserved by the API when
+    // omitted; let `opts.shareDiscoverable` override it for callers that also
+    // want to flip it as part of the credential change.
     const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
 
-    let newWrappedDataKey;
-    let newDekByGen;
-    let newCurrentGen;
-    let newEnvelopeVersion: 1 | 2 | 3 | 4;
-    let newRecoveryFactorMeta = this.#recoveryFactorMeta;
-
-    if (kdfVersion === KDF_V1_PBKDF2) {
-      // Legacy PBKDF2 path — keep the existing single-key envelope shape.
-      // No forward-secret rotation for v1 accounts in this issue.
-      const existing = this.#dekByGen!.get(this.#currentGen!);
-      newWrappedDataKey = await wrapDataKeyEnvelope(
-        existing!.gcmKey,
-        newKeys.credentialEncryptionKey.kwKey,
-        KDF_V1_PBKDF2,
-      );
-      newDekByGen = this.#dekByGen;
-      newCurrentGen = this.#currentGen;
-      newEnvelopeVersion = 1;
-    } else if (this.#envelopeVersion === 4) {
-      // v4 path — multi-factor envelope. Re-wrap the entire chain under the
-      // new password KEK; preserve recovery wrappings verbatim (we don't have
-      // the recovery KEK without the phrase). New gen N+1 gets a password
-      // wrapping always, and a recovery wrapping iff the caller supplied the
-      // phrase (allowing recovery to remain complete after the change).
-      const nextGen = this.#currentGen! + 1;
-      const newDek = await generateRandomDataKey();
-
-      // Build chain of {gen, key} for password-side re-wrap.
-      const chain = [];
-      for (const [gen, pair] of this.#dekByGen!) {
-        chain.push({ gen, key: pair.gcmKey });
-      }
-      chain.push({ gen: nextGen, key: newDek.gcmKey });
-      chain.sort((a, b) => a.gen - b.gen);
-
-      // Re-wrap each chain entry under the new password KEK.
-      const reWrappedPassword = new Map();
-      for (const entry of chain) {
-        const wrappedBase64 = await this.#wrapDekRaw(entry.key, newKeys.credentialEncryptionKey.kwKey);
-        reWrappedPassword.set(entry.gen, wrappedBase64);
-      }
-
-      // Recovery wrappings: preserve existing per-gen bytes; optionally derive
-      // a fresh wrapping for the new gen if a phrase was supplied.
-      const recoveryWrappingsByGen = new Map();
-      if (this.#recoveryFactorMeta) {
-        for (const [gen, b64] of this.#recoveryFactorMeta.wrappingsByGen) {
-          recoveryWrappingsByGen.set(gen, b64);
-        }
-      }
-      if (opts.phrase && this.#recoveryFactorMeta) {
-        const validation = validateRecoveryPhrase(opts.phrase);
-        if (!validation.valid) {
-          throw new Error(`changeCredentials(): invalid phrase: ${validation.reason}`);
-        }
-        const recKEK = await deriveRecoveryKey(
-          validation.normalized,
-          this.#recoveryFactorMeta.salt,
-          this.#recoveryFactorMeta.kdfParams,
-        );
-        const wrappedNewGen = await this.#wrapDekRaw(newDek.gcmKey, recKEK.kwKey);
-        recoveryWrappingsByGen.set(nextGen, wrappedNewGen);
-      }
-
-      // Stitch the wire-format chain together.
-      const wireChain = chain.map(({ gen }) => {
-        const wrappings: Array<{ factor: any; wrappedBase64: any }> = [{ factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen) }];
-        if (recoveryWrappingsByGen.has(gen)) {
-          wrappings.push({
-            factor: FACTOR_RECOVERY_PHRASE,
-            wrappedBase64: recoveryWrappingsByGen.get(gen),
-          });
-        }
-        return { gen, wrappings };
-      });
-
-      // buildV4Envelope is in crypto.js; call via a thin wrapper to avoid the
-      // direct dependency on the build helper from this file.
-      newWrappedDataKey = this.#buildV4FromWireChain(
-        wireChain,
-        this.#recoveryFactorMeta
-          ? { salt: this.#recoveryFactorMeta.salt, kdfParams: this.#recoveryFactorMeta.kdfParams }
-          : null,
-      );
-
-      newDekByGen = new Map(this.#dekByGen!);
-      newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
-      newCurrentGen = nextGen;
-      newEnvelopeVersion = 4;
-      if (this.#recoveryFactorMeta) {
-        newRecoveryFactorMeta = {
-          salt: this.#recoveryFactorMeta.salt,
-          kdfParams: this.#recoveryFactorMeta.kdfParams,
-          wrappingsByGen: recoveryWrappingsByGen,
-        };
-      }
-    } else {
-      // v2/v3 Argon2id path — single-factor chain envelope (issue #11).
-      // v2 envelopes (single self-wrapped DEK, pre-issue-#11) are upgraded in
-      // place to v3 here: the existing DEK becomes gen 1, the fresh random
-      // DEK becomes gen 2.
-      const nextGen = this.#currentGen! + 1;
-      const newDek = await generateRandomDataKey();
-
-      const chain = [];
-      for (const [gen, pair] of this.#dekByGen!) {
-        chain.push({ gen, key: pair.gcmKey });
-      }
-      chain.push({ gen: nextGen, key: newDek.gcmKey });
-
-      newWrappedDataKey = await wrapDataKeyChainEnvelope(
-        chain,
-        newKeys.credentialEncryptionKey.kwKey,
-      );
-
-      newDekByGen = new Map(this.#dekByGen!);
-      newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
-      newCurrentGen = nextGen;
-      newEnvelopeVersion = 3;
+    if (!this.#recoveryFactorMeta) {
+      // Should never happen — every account has a recovery factor at register.
+      throw new Error('changeCredentials(): missing recovery-factor metadata (corrupt session?)');
     }
+
+    // Multi-factor re-wrap. Build the new chain (existing gens + a fresh
+    // gen N+1), re-wrap every gen under the new password KEK, preserve the
+    // existing recovery wrappings byte-for-byte, and (when `phrase` was
+    // supplied) extend the recovery wrapping to gen N+1.
+    const nextGen = this.#currentGen! + 1;
+    const newDek = await generateRandomDataKey();
+
+    const chain: Array<{ gen: number; key: CryptoKey }> = [];
+    for (const [gen, pair] of this.#dekByGen!) {
+      chain.push({ gen, key: pair.gcmKey });
+    }
+    chain.push({ gen: nextGen, key: newDek.gcmKey });
+    chain.sort((a, b) => a.gen - b.gen);
+
+    const reWrappedPassword = new Map<number, string>();
+    for (const entry of chain) {
+      const wrappedBase64 = await this.#wrapDekRaw(entry.key, newKeys.credentialEncryptionKey.kwKey);
+      reWrappedPassword.set(entry.gen, wrappedBase64);
+    }
+
+    const recoveryWrappingsByGen = new Map<number, string>();
+    for (const [gen, b64] of this.#recoveryFactorMeta.wrappingsByGen) {
+      recoveryWrappingsByGen.set(gen, b64);
+    }
+    if (opts.phrase) {
+      const validation = validateRecoveryPhrase(opts.phrase);
+      if (!validation.valid) {
+        throw new Error(`changeCredentials(): invalid phrase: ${validation.reason}`);
+      }
+      const recKEK = await deriveRecoveryKey(
+        validation.normalized,
+        this.#recoveryFactorMeta.salt,
+        this.#recoveryFactorMeta.kdfParams,
+      );
+      const wrappedNewGen = await this.#wrapDekRaw(newDek.gcmKey, recKEK.kwKey);
+      recoveryWrappingsByGen.set(nextGen, wrappedNewGen);
+    }
+
+    const wireChain = chain.map(({ gen }) => {
+      const wrappings: Array<{ factor: string; wrappedBase64: string }> = [
+        { factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen)! },
+      ];
+      const recWrap = recoveryWrappingsByGen.get(gen);
+      if (recWrap !== undefined) {
+        wrappings.push({ factor: FACTOR_RECOVERY_PHRASE, wrappedBase64: recWrap });
+      }
+      return { gen, wrappings };
+    });
+
+    const newWrappedDataKey: string = buildEnvelope(
+      wireChain,
+      { salt: this.#recoveryFactorMeta.salt, kdfParams: this.#recoveryFactorMeta.kdfParams },
+    );
+
+    const newDekByGen = new Map(this.#dekByGen!);
+    newDekByGen.set(nextGen, { gcmKey: newDek.gcmKey, kwKey: newDek.kwKey });
+    const newCurrentGen = nextGen;
+    const newRecoveryFactorMeta: RecoveryFactorMeta = {
+      salt: this.#recoveryFactorMeta.salt,
+      kdfParams: this.#recoveryFactorMeta.kdfParams,
+      wrappingsByGen: recoveryWrappingsByGen,
+    };
 
     // Capture OLD key material BEFORE the PUT swaps things over. The
     // rotation-announce flow (§13.5) needs OLD share_priv + OLD signing_priv
@@ -1159,7 +1047,6 @@ export class TarnClient {
     this.#signingKeyPair = newKeys.signingKeyPair;
     this.#dekByGen = newDekByGen;
     this.#currentGen = newCurrentGen;
-    this.#envelopeVersion = newEnvelopeVersion;
     this.#recoveryFactorMeta = newRecoveryFactorMeta;
     this.#email = newEmail;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
@@ -1199,22 +1086,13 @@ export class TarnClient {
 
   /**
    * Wrap a single DEK CryptoKey under an AES-KW wrapping key, returning the
-   * raw base64 ciphertext. Thin convenience used by the v4 changeCredentials
-   * path so we can build wrappings imperatively without the higher-level
-   * envelope helpers.
+   * raw base64 ciphertext. Thin convenience used by the changeCredentials
+   * re-wrap loop so we can build wrappings imperatively without the
+   * higher-level envelope helpers.
    */
   async #wrapDekRaw(dekGcmKey: CryptoKey, wrappingKey: CryptoKey): Promise<string> {
     const wrapped = await crypto.subtle.wrapKey('raw', dekGcmKey, wrappingKey, 'AES-KW');
     return bytesToBase64(new Uint8Array(wrapped));
-  }
-
-  /**
-   * Build a v4 envelope JSON string from a wire-shaped chain (each entry
-   * already carrying base64-wrapped factor bytes). Defers to crypto.js's
-   * buildV4Envelope to keep the JSON shape in one place.
-   */
-  #buildV4FromWireChain(wireChain: any, recovery: any): string {
-    return buildV4Envelope(wireChain, recovery);
   }
 
   /**
@@ -1239,11 +1117,9 @@ export class TarnClient {
     this.#dataLookupKey = null;
     this.#dekByGen = null;
     this.#currentGen = null;
-    this.#envelopeVersion = null;
     this.#credentialLookupKey = null;
     this.#credentialEncryptionKey = null;
     this.#signingKeyPair = null;
-    this.#kdfVersion = null;
     this.#recoveryFactorMeta = null;
     this.#recoveryLookupKey = null;
     this.#email = null;
@@ -1296,8 +1172,6 @@ export class TarnClient {
       throw new Error(`Create failed: ${json?.error || res.status}`);
     }
 
-    // shareKey is null on legacy v1/v2 accounts (no per-content CEK). Sharing
-    // primitives reject null shareKeys; non-sharing flows ignore the field.
     this.#cacheShareKey(json.id, shareKey);
     return { txid: json.id, shareKey };
   }
@@ -1566,8 +1440,8 @@ export class TarnClient {
    * Resolve a shareKey for an entry we wrote. Looks up the in-memory cache
    * first (populated by createEntry / updateEntry / batchCreate); falls
    * back to fetching the blob from Tarn and AES-KW-unwrapping the in-blob
-   * slot using the writer's DEK. Returns null on legacy v1/v2 accounts
-   * (no per-content CEK) or if the blob is not in the Tarn-owned format.
+   * CEK slot using the writer's DEK. Returns null only if the blob is
+   * unfetchable or malformed.
    *
    * @param {string} txid
    * @returns {Promise<string | null>} base64url shareKey or null
@@ -1583,10 +1457,7 @@ export class TarnClient {
     return await this.#recoverShareKey(txid);
   }
 
-  /**
-   * Internal: cache a freshly-issued shareKey for a write. No-op if the
-   * value is null (legacy account). Evicts the oldest entry on overflow.
-   */
+  /** Internal: cache a freshly-issued shareKey for a write. */
   #cacheShareKey(txid: string, shareKey: string | null): void {
     if (!txid || shareKey == null) return;
     if (this.#shareKeyCache.has(txid)) {
@@ -1604,8 +1475,7 @@ export class TarnClient {
   /**
    * Internal cold-path: fetch the blob and unwrap its CEK slot using the
    * writer's DEK. Used by getShareKey() on cache miss. Returns null if
-   * the blob is unfetchable, malformed, or this account uses the legacy
-   * envelope (no per-content CEK).
+   * the blob is unfetchable or malformed.
    */
   async #recoverShareKey(txid: string): Promise<string | null> {
     const dek = this.#dekByGen!.get(this.#currentGen!);
@@ -1720,7 +1590,7 @@ export class TarnClient {
   async sendConnectionRequest(recipientEmail: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('sendConnectionRequest(): no sharing keypair — login as a v4 account first');
+      throw new Error('sendConnectionRequest(): no sharing keypair — login first');
     }
     if (!this.#email) {
       throw new Error('sendConnectionRequest(): client missing sender email — re-login');
@@ -1821,7 +1691,7 @@ export class TarnClient {
   async listIncomingRequests(opts: any = {}): Promise<any> {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('listIncomingRequests(): no sharing keypair — login as a v4 account first');
+      throw new Error('listIncomingRequests(): no sharing keypair — login first');
     }
     const windows = Number.isInteger(opts.windows) && opts.windows > 0
       ? opts.windows
@@ -2002,7 +1872,7 @@ export class TarnClient {
   async acceptConnectionRequest(requestNonce: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('acceptConnectionRequest(): no sharing keypair — login as a v4 account first');
+      throw new Error('acceptConnectionRequest(): no sharing keypair — login first');
     }
     if (typeof requestNonce !== 'string' || requestNonce.length === 0) {
       throw new Error('requestNonce is required');
@@ -2279,7 +2149,7 @@ export class TarnClient {
   async createInviteToken(opts: any = {}): Promise<any> {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('createInviteToken(): no sharing keypair — login as a v4 account first');
+      throw new Error('createInviteToken(): no sharing keypair — login first');
     }
     if (!this.#email) {
       throw new Error('createInviteToken(): client missing sender email — re-login');
@@ -2447,7 +2317,7 @@ export class TarnClient {
   async redeemInviteToken(tokenId: string, payloadKeyB64Url: string): Promise<any> {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
-      throw new Error('redeemInviteToken(): no sharing keypair — login as a v4 account first');
+      throw new Error('redeemInviteToken(): no sharing keypair — login first');
     }
     if (!this.#email) {
       throw new Error('redeemInviteToken(): client missing sender email — re-login');
@@ -2614,7 +2484,7 @@ export class TarnClient {
    */
   async #getPairKeysFor(connectionSharePubBase64Url: string): Promise<any> {
     if (!this.#sharingKeyPair) {
-      throw new Error('share log: no sharing keypair — login as a v4 account first');
+      throw new Error('share log: no sharing keypair — login first');
     }
     if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
       throw new Error('share log: connectionSharePubBase64Url must be a non-empty string');
@@ -4198,10 +4068,11 @@ export class TarnClient {
     }
 
     const payload = {
-      // Schema v2 (Section 7.5, issue #20) adds the `sid` field. v1 blobs are
-      // still accepted by resumeSession — sid restores as null and the SDK
-      // mints a fresh one on the next /auth/verify call.
-      v: 2,
+      // Schema v3 — drops the legacy kdfVersion / envelopeVersion fields that
+      // disappeared with the single-envelope cleanup. v1/v2 blobs from prior
+      // versions of the SDK no longer resume; they fail cleanly to null and
+      // the user re-authenticates.
+      v: 3,
       createdAt: now,
       expiresAt,
       apiBase: this.#apiBase,
@@ -4209,8 +4080,6 @@ export class TarnClient {
       email: this.#email,
       dataLookupKey: this.#dataLookupKey,
       credentialLookupKey: this.#credentialLookupKey,
-      kdfVersion: this.#kdfVersion,
-      envelopeVersion: this.#envelopeVersion,
       currentGen: this.#currentGen,
       dekByGen,
       signingPrivateKey: bytesToBase64(new Uint8Array(pkcs8)),
@@ -4272,8 +4141,11 @@ export class TarnClient {
         return null;
       }
       if (!payload || typeof payload !== 'object') return null;
-      // v1 (Section 7) and v2 (Section 7.5 — adds optional `sid`) both accepted.
-      if (payload.v !== 1 && payload.v !== 2) return null;
+      // Schema v3 only: v1/v2 blobs predate the single-envelope cleanup and
+      // carry kdfVersion/envelopeVersion fields the live client no longer
+      // tracks. Forcing v3 means stale blobs fail cleanly to null and the
+      // user re-authenticates — no partial-state hazards.
+      if (payload.v !== 3) return null;
 
       // Origin-binding check: a blob serialized for app A on api B must not
       // resume into app A' or api B'. The wrapping key is already origin-
@@ -4284,7 +4156,7 @@ export class TarnClient {
 
       const required = [
         'createdAt', 'expiresAt', 'email', 'dataLookupKey', 'credentialLookupKey',
-        'kdfVersion', 'envelopeVersion', 'currentGen', 'dekByGen',
+        'currentGen', 'dekByGen',
         'signingPrivateKey', 'signingPublicKey', 'sharingPrivateKey', 'sharingPublicKey',
       ];
       for (const k of required) {
@@ -4346,16 +4218,12 @@ export class TarnClient {
       // one that just logged in. credentialEncryptionKey is intentionally
       // not persisted (no code path reads it post-login).
       client.#jwt = payload.jwt || null;
-      // v2 carries the sessions sid (Section 7.5). v1 has no field — leave
-      // sid null and the SDK will mint a fresh one on the next verify.
-      client.#sid = (payload.v === 2 && typeof payload.sid === 'string') ? payload.sid : null;
+      client.#sid = typeof payload.sid === 'string' ? payload.sid : null;
       client.#dataLookupKey = payload.dataLookupKey;
       client.#credentialLookupKey = payload.credentialLookupKey;
       client.#signingKeyPair = { privateKey: signingPrivateKey, publicKey: signingPublicKey };
       client.#dekByGen = dekByGen;
       client.#currentGen = payload.currentGen;
-      client.#envelopeVersion = payload.envelopeVersion;
-      client.#kdfVersion = payload.kdfVersion;
       client.#email = payload.email;
       client.#sharingKeyPair = {
         privateKey: base64ToBytes(payload.sharingPrivateKey),
@@ -4550,82 +4418,55 @@ export class TarnClient {
   // ============ PRIVATE ============
 
   /**
-   * Encrypt a payload for an outgoing write (issue #11).
+   * Encrypt a payload for an outgoing write.
    *
-   * Per-content CEK pattern when the account has a v3 envelope: produces a
-   * blob prefixed with the TARN magic, with a fresh CEK wrapped under the
-   * current generation's DEK. The generation indicator travels alongside as
-   * the Arweave `Gen` tag — keeping the blob byte-layout from the design doc
-   * unchanged so a future recipient (Section 5) can skip bytes 5..44 without
-   * parsing tags.
+   * Per-content CEK: produces a blob prefixed with the TARN magic, with a
+   * fresh CEK wrapped under the current generation's DEK. The generation
+   * indicator travels alongside as the Arweave `Gen` tag — keeping the blob
+   * byte-layout stable so a recipient can skip bytes 5..44 without parsing
+   * tags.
    *
-   * For legacy single-key envelopes (v1/v2) the write stays in legacy format:
-   * direct AES-GCM with the gen-1 DEK and `Enc: aes-256-gcm` tag, no `Gen`
-   * tag, no magic prefix. v2 accounts upgrade to v3 on next changeCredentials.
+   * The encryption call surfaces the raw CEK so the caller can publish it
+   * through the share-log (see createEntry / updateEntry / shareEntry).
    *
    * @param {Object} plaintext - JSON-serializable payload
-   * @returns {Promise<{ encrypted: Uint8Array, tags: Array<{name:string, value:string}>, shareKey: string|null }>}
+   * @returns {Promise<{ encrypted: Uint8Array, tags: Array<{name:string, value:string}>, shareKey: string }>}
    */
-  async #encryptForWrite(plaintext: any): Promise<{ encrypted: Uint8Array; tags: Tag[]; shareKey: string | null }> {
+  async #encryptForWrite(plaintext: any): Promise<{ encrypted: Uint8Array; tags: Tag[]; shareKey: string }> {
     const dek = this.#dekByGen!.get(this.#currentGen!);
     if (!dek) {
       throw new Error(`Internal: no DEK for gen ${this.#currentGen}`);
     }
-
-    // v3 and v4 use the per-content CEK format with the same `Enc: tarn-cek-1`
-    // tag and `Gen: N` indicator. The two versions differ only in the credential
-    // envelope's wrapping shape — the on-the-wire blob layout is identical.
-    // The encryption call surfaces the raw CEK so the caller can publish it
-    // through the share-log (see createEntry / updateEntry / shareEntry).
-    if (this.#envelopeVersion === 3 || this.#envelopeVersion === 4) {
-      const { blob, shareKey } = await encryptWithCEK(dek.kwKey, plaintext);
-      return {
-        encrypted: blob,
-        tags: [
-          { name: 'Enc', value: 'tarn-cek-1' },
-          { name: 'Gen', value: String(this.#currentGen) },
-        ],
-        shareKey,
-      };
-    }
-
-    // Legacy v1/v2 envelope path — direct AES-GCM with the (only) DEK.
-    // No per-content key here; sharing is not supported on legacy accounts.
-    const encrypted = await encrypt(dek.gcmKey, plaintext);
+    const { blob, shareKey } = await encryptWithCEK(dek.kwKey, plaintext);
     return {
-      encrypted,
-      tags: [{ name: 'Enc', value: 'aes-256-gcm' }],
-      shareKey: null,
+      encrypted: blob,
+      tags: [
+        { name: 'Enc', value: 'tarn-cek-1' },
+        { name: 'Gen', value: String(this.#currentGen) },
+      ],
+      shareKey,
     };
   }
 
   /**
-   * Decrypt a blob from a read. Dispatches on the 5-byte TARN magic prefix
-   * (issue #11): new-format blobs use the per-content CEK path with the
-   * generation indicated by the `Gen` tag; legacy blobs use direct AES-GCM
-   * with the gen-1 DEK.
+   * Decrypt a blob from a read. Every blob is the v1 per-content CEK shape:
+   * 5-byte TARN magic prefix, 40-byte wrapped CEK slot, IV + AES-GCM
+   * ciphertext. The generation that wrote it is declared in the `Gen` tag.
    *
    * @param {Uint8Array} blobBytes
    * @param {Array<{name: string, value: string}>} tags
    * @returns {Promise<Object>}
    */
   async #decryptBlob(blobBytes: Uint8Array, tags: Tag[]): Promise<any> {
-    if (hasTarnBlobMagic(blobBytes)) {
-      const gen = readGenTag(tags) ?? 1;
-      const dek = this.#dekByGen!.get(gen);
-      if (!dek) {
-        throw new Error(`No DEK for blob generation ${gen} — chain has gens [${[...this.#dekByGen!.keys()].join(', ')}]`);
-      }
-      return await decryptWithCEK(dek.kwKey, blobBytes);
+    if (!hasTarnBlobMagic(blobBytes)) {
+      throw new Error('Blob is missing the TARN magic prefix (legacy or corrupt)');
     }
-
-    // Legacy blob — decrypt directly with the gen-1 DEK. For v3 accounts that
-    // were upgraded from v2, gen 1 holds the original (pre-issue-#11) DEK.
-    const legacy = this.#dekByGen!.get(1);
-    if (!legacy) {
-      throw new Error('No gen-1 DEK available for legacy blob decryption');
+    const gen = readGenTag(tags) ?? 1;
+    const dek = this.#dekByGen!.get(gen);
+    if (!dek) {
+      throw new Error(`No DEK for blob generation ${gen} — chain has gens [${[...this.#dekByGen!.keys()].join(', ')}]`);
     }
-    return await decrypt(legacy.gcmKey, blobBytes);
+    return await decryptWithCEK(dek.kwKey, blobBytes);
   }
 
   /**

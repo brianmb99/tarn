@@ -146,7 +146,7 @@ export class Collection<TRecord extends Record<string, unknown>> {
     if (!shareKey) {
       throw new TarnCollectionError(
         `Collection '${this.#name}': no shareKey available for record '${primaryKey}' ` +
-        `(legacy account or unrecoverable blob)`,
+        `(blob unfetchable or malformed)`,
       );
     }
     await this.#client.shareContent(connection, this.#contentIdFor(primaryKey), entry.txid, shareKey);
@@ -166,7 +166,7 @@ export class Collection<TRecord extends Record<string, unknown>> {
     if (!shareKey) {
       throw new TarnCollectionError(
         `Collection '${this.#name}': no shareKey available for record '${primaryKey}' ` +
-        `(legacy account or unrecoverable blob)`,
+        `(blob unfetchable or malformed)`,
       );
     }
     const contentId = this.#contentIdFor(primaryKey);

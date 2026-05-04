@@ -14,7 +14,6 @@ import {
   deriveAllKeys,
   unwrapDataKeyChain,
   parseWrappedDataKey,
-  KDF_V2_ARGON2ID,
 } from '../../client/src/crypto.js';
 
 const APP = 'bookish';
@@ -85,7 +84,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
     const registerBody = JSON.parse(registerCall.body);
     const registeredEnvelope = JSON.parse(registerBody.wrapped_data_key);
-    assert.equal(registeredEnvelope.v, 4);
+    assert.equal(registeredEnvelope.v, 1);
     assert.equal(registeredEnvelope.dek_chain.length, 1);
     assert.equal(registeredEnvelope.dek_chain[0].gen, 1);
     const gen1PasswordWrapAtRegister =
@@ -99,9 +98,9 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     assert.ok(putCall, 'changeCredentials should send PUT /api/v1/auth');
     const putBody = JSON.parse(putCall.body);
 
-    // New envelope is v4 with TWO entries — gen 1 (re-wrapped) + gen 2 (fresh).
+    // New envelope is v1 with TWO entries — gen 1 (re-wrapped) + gen 2 (fresh).
     const newEnvelope = JSON.parse(putBody.new_wrapped_data_key);
-    assert.equal(newEnvelope.v, 4);
+    assert.equal(newEnvelope.v, 1);
     assert.equal(newEnvelope.kdf, 'argon2id');
     assert.equal(newEnvelope.dek_chain.length, 2);
     assert.deepEqual(newEnvelope.dek_chain.map(e => e.gen), [1, 2]);
@@ -129,7 +128,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     assert.equal(gen2Wrappings[0].factor, 'password');
 
     // The new envelope MUST be unwrappable with the NEW credential_encryption_key.
-    const newKeys = await deriveAllKeys(NEW_EMAIL, NEW_PASSWORD, APP, KDF_V2_ARGON2ID);
+    const newKeys = await deriveAllKeys(NEW_EMAIL, NEW_PASSWORD, APP);
     const unwrapped = await unwrapDataKeyChain(
       putBody.new_wrapped_data_key,
       newKeys.credentialEncryptionKey.kwKey,
@@ -162,7 +161,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     // Capture the gen 1 DEK as wrapped under the OLD credential_encryption_key.
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
     const oldEnvelope = JSON.parse(JSON.parse(registerCall.body).wrapped_data_key);
-    const oldKeys = await deriveAllKeys(OLD_EMAIL, OLD_PASSWORD, APP, KDF_V2_ARGON2ID);
+    const oldKeys = await deriveAllKeys(OLD_EMAIL, OLD_PASSWORD, APP);
     const oldUnwrapped = await unwrapDataKeyChain(
       JSON.stringify(oldEnvelope),
       oldKeys.credentialEncryptionKey.kwKey,
@@ -182,7 +181,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     // Now grab the new envelope, unwrap with NEW credentials, recover gen 1.
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');
     const newWdk = JSON.parse(putCall.body).new_wrapped_data_key;
-    const newKeys = await deriveAllKeys(NEW_EMAIL, NEW_PASSWORD, APP, KDF_V2_ARGON2ID);
+    const newKeys = await deriveAllKeys(NEW_EMAIL, NEW_PASSWORD, APP);
     const newUnwrapped = await unwrapDataKeyChain(newWdk, newKeys.credentialEncryptionKey.kwKey);
     const gen1KeyNew = newUnwrapped.dekByGen.get(1).gcmKey;
 
@@ -218,11 +217,11 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
 
     // The final envelope is the most recent PUT body.
     const finalEnvelope = JSON.parse(JSON.parse(putCalls[2].body).new_wrapped_data_key);
-    assert.equal(finalEnvelope.v, 4);
+    assert.equal(finalEnvelope.v, 1);
     assert.deepEqual(finalEnvelope.dek_chain.map(e => e.gen), [1, 2, 3, 4]);
 
     // Final envelope unwraps with the final credentials and exposes 4 DEKs.
-    const finalKeys = await deriveAllKeys('e3@x.com', 'p3', APP, KDF_V2_ARGON2ID);
+    const finalKeys = await deriveAllKeys('e3@x.com', 'p3', APP);
     const finalUnwrapped = await unwrapDataKeyChain(
       JSON.stringify(finalEnvelope),
       finalKeys.credentialEncryptionKey.kwKey,
@@ -248,8 +247,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
     const putCall = fetchCalls.find(c => c.url.endsWith('/auth') && c.method === 'PUT');
     const newWdk = JSON.parse(putCall.body).new_wrapped_data_key;
     const parsed = parseWrappedDataKey(newWdk);
-    assert.equal(parsed.envelopeVersion, 4);
-    assert.equal(parsed.kdfVersion, KDF_V2_ARGON2ID);
+    assert.equal(parsed.envelopeVersion, 1);
     assert.equal(parsed.dekChain.length, 2);
   });
 });

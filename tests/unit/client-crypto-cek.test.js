@@ -1,17 +1,19 @@
-// Unit tests for issue #11 — per-content CEK pattern, random DEK at
-// registration, and forward-secret DEK chain rotation.
+// Unit tests for the per-content CEK pattern, random DEK at registration,
+// forward-secret DEK chain rotation, and the v1 multi-factor envelope.
 // Run: node --test tests/unit/client-crypto-cek.test.js
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   deriveAllKeys,
+  deriveRecoveryKey,
   generateRandomDataKey,
+  generateRecoverySalt,
   wrapDataKey,
   wrapDataKeyChainEnvelope,
   unwrapDataKeyChain,
   parseWrappedDataKey,
-  buildV3Envelope,
+  buildEnvelope,
   encryptWithCEK,
   decryptWithCEK,
   decryptBlobWithSharedCEK,
@@ -19,12 +21,31 @@ import {
   encrypt,
   TARN_BLOB_MAGIC,
   bytesToBase64Url,
-  KDF_V2_ARGON2ID,
+  FACTOR_PASSWORD,
+  FACTOR_RECOVERY_PHRASE,
 } from '../../client/src/crypto.js';
 
 const TEST_EMAIL = 'cek-test@example.com';
 const TEST_PASSWORD = 'correct-horse-battery-staple-2026';
 const TEST_APP = 'bookish';
+const TEST_PHRASE =
+  'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+// Helpers — every test that builds an envelope needs both factors + a salt.
+
+async function makeFactors() {
+  const keys = await deriveAllKeys(TEST_EMAIL, TEST_PASSWORD, TEST_APP);
+  const salt = generateRecoverySalt();
+  const recoveryKEK = await deriveRecoveryKey(TEST_PHRASE, salt);
+  return { keys, salt, recoveryKEK };
+}
+
+function bothFactors(passwordKwKey, recoveryKwKey) {
+  return [
+    { name: FACTOR_PASSWORD,        wrappingKey: passwordKwKey },
+    { name: FACTOR_RECOVERY_PHRASE, wrappingKey: recoveryKwKey },
+  ];
+}
 
 // ============ Magic prefix ============
 
@@ -39,9 +60,9 @@ describe('TARN_BLOB_MAGIC', () => {
     assert.equal(hasTarnBlobMagic(newBlob), true);
   });
 
-  it('hasTarnBlobMagic rejects legacy blobs (random IV start)', () => {
-    const legacy = new Uint8Array(13).fill(0xab);
-    assert.equal(hasTarnBlobMagic(legacy), false);
+  it('hasTarnBlobMagic rejects non-magic blobs', () => {
+    const random = new Uint8Array(13).fill(0xab);
+    assert.equal(hasTarnBlobMagic(random), false);
   });
 
   it('hasTarnBlobMagic rejects too-short input', () => {
@@ -74,117 +95,134 @@ describe('generateRandomDataKey', () => {
   });
 });
 
-// ============ v3 envelope (DEK chain) ============
+// ============ v1 envelope (multi-factor DEK chain) ============
 
-describe('v3 envelope', () => {
-  it('buildV3Envelope produces well-formed JSON with sorted gens', () => {
-    const wire = buildV3Envelope([
-      { gen: 2, wrappedBase64: 'BBBB' },
-      { gen: 1, wrappedBase64: 'AAAA' },
-    ]);
+describe('v1 envelope', () => {
+  it('buildEnvelope produces well-formed JSON with sorted gens and required recovery block', async () => {
+    const { salt } = await makeFactors();
+    const wire = buildEnvelope(
+      [
+        { gen: 2, wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: 'BBBB' }] },
+        { gen: 1, wrappings: [{ factor: FACTOR_PASSWORD, wrappedBase64: 'AAAA' }] },
+      ],
+      { salt },
+    );
     const parsed = JSON.parse(wire);
-    assert.equal(parsed.v, 3);
+    assert.equal(parsed.v, 1);
     assert.equal(parsed.kdf, 'argon2id');
     assert.deepEqual(parsed.kdf_params, { m_kib: 65536, t: 3, p: 1 });
-    assert.deepEqual(parsed.dek_chain, [
-      { gen: 1, wrapped: 'AAAA' },
-      { gen: 2, wrapped: 'BBBB' },
-    ]);
+    assert.equal(parsed.dek_chain.length, 2);
+    assert.equal(parsed.dek_chain[0].gen, 1);
+    assert.equal(parsed.dek_chain[1].gen, 2);
+    assert.ok(parsed.recovery, 'recovery block must be present');
+    assert.equal(parsed.recovery.kdf, 'argon2id');
   });
 
-  it('parseWrappedDataKey accepts v3 envelopes', () => {
+  it('parseWrappedDataKey accepts a v1 envelope and surfaces the password wrapping', () => {
     const wire = JSON.stringify({
-      v: 3,
+      v: 1,
       kdf: 'argon2id',
       kdf_params: { m_kib: 65536, t: 3, p: 1 },
+      recovery: {
+        kdf: 'argon2id',
+        kdf_params: { m_kib: 65536, t: 3, p: 1 },
+        salt: 'AAAAAAAAAAAAAAAAAAAAAA==',
+      },
       dek_chain: [
-        { gen: 1, wrapped: 'AAAA' },
-        { gen: 2, wrapped: 'BBBB' },
+        { gen: 1, wrappings: [{ factor: 'password', wrapped: 'AAAA' }, { factor: 'recovery_phrase', wrapped: 'AAAA-rec' }] },
+        { gen: 2, wrappings: [{ factor: 'password', wrapped: 'BBBB' }, { factor: 'recovery_phrase', wrapped: 'BBBB-rec' }] },
       ],
     });
     const parsed = parseWrappedDataKey(wire);
-    assert.equal(parsed.kdfVersion, KDF_V2_ARGON2ID);
-    assert.equal(parsed.envelopeVersion, 3);
+    assert.equal(parsed.envelopeVersion, 1);
     assert.equal(parsed.dekChain.length, 2);
-    // v3 envelopes are normalized to the v4-shaped multi-factor chain with a
-    // single synthetic `password` wrapping per entry (issue #12).
-    assert.deepEqual(parsed.dekChain[0], {
-      gen: 1, wrappings: [{ factor: 'password', wrappedBase64: 'AAAA' }],
-    });
-    assert.deepEqual(parsed.dekChain[1], {
-      gen: 2, wrappings: [{ factor: 'password', wrappedBase64: 'BBBB' }],
-    });
+    assert.equal(parsed.dekChain[0].wrappings.length, 2);
     // wrappedBase64 returns the highest-gen entry's password wrapping as a convenience
     assert.equal(parsed.wrappedBase64, 'BBBB');
+    assert.ok(parsed.recovery, 'parsed.recovery is required');
   });
 
-  it('parseWrappedDataKey normalizes v1 (bare base64) to a one-entry chain', () => {
-    const parsed = parseWrappedDataKey('aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8gd29ybGRsbA==');
-    assert.equal(parsed.envelopeVersion, 1);
-    assert.equal(parsed.dekChain.length, 1);
-    assert.equal(parsed.dekChain[0].gen, 1);
+  it('parseWrappedDataKey rejects bare base64 (legacy v1 single-key)', () => {
+    assert.throws(
+      () => parseWrappedDataKey('aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8gd29ybGRsbA=='),
+      /must be a JSON envelope/,
+    );
   });
 
-  it('parseWrappedDataKey normalizes v2 to a one-entry chain', () => {
+  it('parseWrappedDataKey rejects pre-cleanup envelopes (v=2/v=3/v=4)', () => {
+    for (const v of [2, 3, 4]) {
+      const wire = JSON.stringify({ v, kdf: 'argon2id', dek_chain: [] });
+      assert.throws(() => parseWrappedDataKey(wire), /unsupported envelope/);
+    }
+  });
+
+  it('parseWrappedDataKey rejects an envelope missing the recovery block', () => {
     const wire = JSON.stringify({
-      v: 2, kdf: 'argon2id',
+      v: 1,
+      kdf: 'argon2id',
       kdf_params: { m_kib: 65536, t: 3, p: 1 },
-      wrapped: 'CCCC',
+      dek_chain: [{ gen: 1, wrappings: [{ factor: 'password', wrapped: 'AAAA' }] }],
     });
-    const parsed = parseWrappedDataKey(wire);
-    assert.equal(parsed.envelopeVersion, 2);
-    assert.equal(parsed.dekChain.length, 1);
-    assert.deepEqual(parsed.dekChain[0], {
-      gen: 1, wrappings: [{ factor: 'password', wrappedBase64: 'CCCC' }],
-    });
+    assert.throws(() => parseWrappedDataKey(wire), /missing required recovery block/);
   });
 
-  it('parseWrappedDataKey rejects v3 with empty chain', () => {
-    const wire = JSON.stringify({ v: 3, kdf: 'argon2id', dek_chain: [] });
+  it('parseWrappedDataKey rejects an envelope with no password wrapping at the current gen', () => {
+    const wire = JSON.stringify({
+      v: 1,
+      kdf: 'argon2id',
+      kdf_params: { m_kib: 65536, t: 3, p: 1 },
+      recovery: {
+        kdf: 'argon2id',
+        kdf_params: { m_kib: 65536, t: 3, p: 1 },
+        salt: 'AAAAAAAAAAAAAAAAAAAAAA==',
+      },
+      dek_chain: [{ gen: 1, wrappings: [{ factor: 'recovery_phrase', wrapped: 'X' }] }],
+    });
+    assert.throws(() => parseWrappedDataKey(wire), /missing the password wrapping/);
+  });
+
+  it('parseWrappedDataKey rejects an empty chain', () => {
+    const wire = JSON.stringify({
+      v: 1, kdf: 'argon2id',
+      recovery: { kdf: 'argon2id', kdf_params: { m_kib: 65536, t: 3, p: 1 }, salt: 'AAAAAAAAAAAAAAAAAAAAAA==' },
+      dek_chain: [],
+    });
     assert.throws(() => parseWrappedDataKey(wire), /non-empty dek_chain/);
   });
 
-  it('parseWrappedDataKey rejects v3 with duplicate gens', () => {
+  it('parseWrappedDataKey rejects duplicate gens', () => {
     const wire = JSON.stringify({
-      v: 3, kdf: 'argon2id',
+      v: 1, kdf: 'argon2id',
+      recovery: { kdf: 'argon2id', kdf_params: { m_kib: 65536, t: 3, p: 1 }, salt: 'AAAAAAAAAAAAAAAAAAAAAA==' },
       dek_chain: [
-        { gen: 1, wrapped: 'AAAA' },
-        { gen: 1, wrapped: 'BBBB' },
+        { gen: 1, wrappings: [{ factor: 'password', wrapped: 'A' }] },
+        { gen: 1, wrappings: [{ factor: 'password', wrapped: 'B' }] },
       ],
     });
     assert.throws(() => parseWrappedDataKey(wire), /duplicate gen/);
-  });
-
-  it('parseWrappedDataKey rejects v3 with malformed entries', () => {
-    const cases = [
-      JSON.stringify({ v: 3, kdf: 'argon2id', dek_chain: [{ gen: 0, wrapped: 'A' }] }),
-      JSON.stringify({ v: 3, kdf: 'argon2id', dek_chain: [{ gen: 'one', wrapped: 'A' }] }),
-      JSON.stringify({ v: 3, kdf: 'argon2id', dek_chain: [{ gen: 1 }] }),
-    ];
-    for (const wire of cases) {
-      assert.throws(() => parseWrappedDataKey(wire), /malformed/);
-    }
   });
 });
 
 // ============ wrapDataKeyChainEnvelope round-trip ============
 
 describe('wrapDataKeyChainEnvelope <-> unwrapDataKeyChain', () => {
-  it('round-trips a single-gen chain', async () => {
-    const k = await deriveAllKeys(TEST_EMAIL, TEST_PASSWORD, TEST_APP, KDF_V2_ARGON2ID);
+  it('round-trips a single-gen chain via the password factor', async () => {
+    const { keys, salt, recoveryKEK } = await makeFactors();
     const dek = await generateRandomDataKey();
 
     const wire = await wrapDataKeyChainEnvelope(
       [{ gen: 1, key: dek.gcmKey }],
-      k.credentialEncryptionKey.kwKey,
+      bothFactors(keys.credentialEncryptionKey.kwKey, recoveryKEK.kwKey),
+      { salt },
     );
 
     const parsed = JSON.parse(wire);
-    assert.equal(parsed.v, 3);
+    assert.equal(parsed.v, 1);
     assert.equal(parsed.dek_chain.length, 1);
+    assert.equal(parsed.dek_chain[0].wrappings.length, 2, 'both factors present');
 
-    const unwrapped = await unwrapDataKeyChain(wire, k.credentialEncryptionKey.kwKey);
-    assert.equal(unwrapped.envelopeVersion, 3);
+    const unwrapped = await unwrapDataKeyChain(wire, keys.credentialEncryptionKey.kwKey);
+    assert.equal(unwrapped.envelopeVersion, 1);
     assert.equal(unwrapped.currentGen, 1);
     assert.equal(unwrapped.dekByGen.size, 1);
     assert.ok(unwrapped.dekByGen.get(1).gcmKey instanceof CryptoKey);
@@ -192,7 +230,7 @@ describe('wrapDataKeyChainEnvelope <-> unwrapDataKeyChain', () => {
   });
 
   it('round-trips a multi-gen chain (forward-secret rotation simulation)', async () => {
-    const k = await deriveAllKeys(TEST_EMAIL, TEST_PASSWORD, TEST_APP, KDF_V2_ARGON2ID);
+    const { keys, salt, recoveryKEK } = await makeFactors();
     const dek1 = await generateRandomDataKey();
     const dek2 = await generateRandomDataKey();
     const dek3 = await generateRandomDataKey();
@@ -203,10 +241,11 @@ describe('wrapDataKeyChainEnvelope <-> unwrapDataKeyChain', () => {
         { gen: 2, key: dek2.gcmKey },
         { gen: 3, key: dek3.gcmKey },
       ],
-      k.credentialEncryptionKey.kwKey,
+      bothFactors(keys.credentialEncryptionKey.kwKey, recoveryKEK.kwKey),
+      { salt },
     );
 
-    const unwrapped = await unwrapDataKeyChain(wire, k.credentialEncryptionKey.kwKey);
+    const unwrapped = await unwrapDataKeyChain(wire, keys.credentialEncryptionKey.kwKey);
     assert.equal(unwrapped.currentGen, 3);
     assert.equal(unwrapped.dekByGen.size, 3);
 
@@ -222,35 +261,57 @@ describe('wrapDataKeyChainEnvelope <-> unwrapDataKeyChain', () => {
     }
   });
 
-  it('rejects empty chain', async () => {
-    const k = await deriveAllKeys(TEST_EMAIL, TEST_PASSWORD, TEST_APP, KDF_V2_ARGON2ID);
-    await assert.rejects(
-      () => wrapDataKeyChainEnvelope([], k.credentialEncryptionKey.kwKey),
-      /non-empty/,
-    );
-  });
-
-  it('a fresh random DEK is NOT equal to the credential_encryption_key (no self-wrapping)', async () => {
-    // The pre-issue-#11 quirk was DEK := credential_encryption_key. With a
-    // random DEK, the two key bytes diverge — verify this by encrypting with
-    // the wrapping key and confirming the unwrapped DEK can't decrypt it.
-    const k = await deriveAllKeys(TEST_EMAIL, TEST_PASSWORD, TEST_APP, KDF_V2_ARGON2ID);
+  it('round-trips via the recovery factor (parallel access path)', async () => {
+    const { keys, salt, recoveryKEK } = await makeFactors();
     const dek = await generateRandomDataKey();
 
     const wire = await wrapDataKeyChainEnvelope(
       [{ gen: 1, key: dek.gcmKey }],
-      k.credentialEncryptionKey.kwKey,
+      bothFactors(keys.credentialEncryptionKey.kwKey, recoveryKEK.kwKey),
+      { salt },
     );
-    const unwrapped = await unwrapDataKeyChain(wire, k.credentialEncryptionKey.kwKey);
-    const recovered = unwrapped.dekByGen.get(1).gcmKey;
+
+    // Same envelope, different factor. Must produce the same DEK bytes.
+    const unwrappedByPwd = await unwrapDataKeyChain(wire, keys.credentialEncryptionKey.kwKey, FACTOR_PASSWORD);
+    const unwrappedByRec = await unwrapDataKeyChain(wire, recoveryKEK.kwKey, FACTOR_RECOVERY_PHRASE);
 
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ct = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv },
-      k.credentialEncryptionKey.gcmKey,
+      unwrappedByPwd.dekByGen.get(1).gcmKey,
+      new TextEncoder().encode('shared-payload'),
+    );
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, unwrappedByRec.dekByGen.get(1).gcmKey, ct);
+    assert.equal(new TextDecoder().decode(pt), 'shared-payload');
+  });
+
+  it('rejects empty chain', async () => {
+    const { keys, salt, recoveryKEK } = await makeFactors();
+    await assert.rejects(
+      () => wrapDataKeyChainEnvelope([], bothFactors(keys.credentialEncryptionKey.kwKey, recoveryKEK.kwKey), { salt }),
+      /non-empty/,
+    );
+  });
+
+  it('a fresh random DEK is NOT equal to the credential_encryption_key', async () => {
+    const { keys, salt, recoveryKEK } = await makeFactors();
+    const dek = await generateRandomDataKey();
+    const wire = await wrapDataKeyChainEnvelope(
+      [{ gen: 1, key: dek.gcmKey }],
+      bothFactors(keys.credentialEncryptionKey.kwKey, recoveryKEK.kwKey),
+      { salt },
+    );
+    const unwrapped = await unwrapDataKeyChain(wire, keys.credentialEncryptionKey.kwKey);
+    const recovered = unwrapped.dekByGen.get(1).gcmKey;
+
+    // Encrypt under the credential_encryption_key; the recovered DEK must NOT
+    // be able to decrypt — that would prove self-wrapping.
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      keys.credentialEncryptionKey.gcmKey,
       new TextEncoder().encode('encrypted-with-credential-encryption-key'),
     );
-    // Decryption with the random DEK should FAIL — different keys.
     await assert.rejects(
       () => crypto.subtle.decrypt({ name: 'AES-GCM', iv }, recovered, ct),
     );
@@ -301,8 +362,8 @@ describe('encryptWithCEK <-> decryptWithCEK', () => {
 
   it('decryptWithCEK rejects a blob without the magic prefix', async () => {
     const dek = await generateRandomDataKey();
-    const legacy = await encrypt(dek.gcmKey, { x: 1 }); // legacy format, no magic
-    await assert.rejects(() => decryptWithCEK(dek.kwKey, legacy), /magic prefix/);
+    const noMagic = await encrypt(dek.gcmKey, { x: 1 }); // direct AES-GCM, no magic
+    await assert.rejects(() => decryptWithCEK(dek.kwKey, noMagic), /magic prefix/);
   });
 
   it('decryptWithCEK rejects a too-short blob', async () => {
@@ -349,9 +410,9 @@ describe('decryptBlobWithSharedCEK', () => {
 
   it('rejects a blob without the magic prefix', async () => {
     const fakeShareKey = bytesToBase64Url(new Uint8Array(32));
-    const legacy = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]); // no magic
+    const noMagic = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]); // no magic
     await assert.rejects(
-      () => decryptBlobWithSharedCEK(legacy, fakeShareKey),
+      () => decryptBlobWithSharedCEK(noMagic, fakeShareKey),
       /magic prefix/,
     );
   });

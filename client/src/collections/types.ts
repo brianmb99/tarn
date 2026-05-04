@@ -33,8 +33,7 @@ export type DecryptedEntry = {
  *
  * Writes return the freshly-issued `shareKey` alongside the `txid` so
  * sharing-path callers can publish through the share-log without an extra
- * blob fetch + AES-KW unwrap. `shareKey` is null on legacy v1/v2 accounts
- * (no per-content CEK); sharing primitives reject null shareKeys.
+ * blob fetch + AES-KW unwrap.
  */
 export interface ITarnClient {
   isLoggedIn(): boolean;
