@@ -130,7 +130,7 @@ The API stores `wrapped_data_key` as opaque text. The string is a self-describin
 ```
 
 - Each `dek_chain` entry's `wrappings` array carries the same DEK wrapped under each factor's KEK. AES-KW is deterministic, so the same (DEK, KEK) pair always produces the same ciphertext bytes — preserving register-retry idempotency.
-- When `changeCredentials` runs without the account key (caller passed `acceptRecoveryGap: true`): old gens preserve their existing recovery wrappings verbatim (re-wrapping under the same KEK is byte-identical anyway), and the new gen N+1 has only a `password` wrapping. The gap is closed by `recoverAccount` or, when shipped, the planned `rotateAccountKey` primitive (Phase 4 of the recovery roadmap; not yet implemented), which re-wrap every gen under the recovery factor. By default the SDK requires `phrase` and refuses the rotation if it would create a gap.
+- When `changeCredentials` runs without the account key (caller passed `acceptRecoveryGap: true`): old gens preserve their existing recovery wrappings verbatim (re-wrapping under the same KEK is byte-identical anyway), and the new gen N+1 has only a `password` wrapping. The gap is closed by `recoverAccount` or by `rotateAccountKey` (Phase 4 — `POST /api/v1/account/rotate-account-key`, exposed as `tarn.accountKey.rotate()`), both of which re-wrap every gen under the recovery factor. By default the SDK requires `phrase` and refuses the rotation if it would create a gap.
 - The current generation (used for new writes) is the entry with the highest `gen`. Old gens stay in the chain so older content blobs remain decryptable.
 
 The envelope is byte-stable for the same `(username, password, app, recovery_phrase, recovery_salt)` inputs (AES-KW is deterministic; `JSON.stringify` is insertion-ordered; chain entries are written in generation order). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
@@ -182,7 +182,7 @@ Two distinct storage modes exist for the account key. The wire protocol supports
 
 **Apps choose by sending or not sending `wrapped_account_key` at registration.** The wire format is identical otherwise.
 
-**Users can switch later.** Toggle endpoints (`PUT /api/v1/account/account-key` to enable, `DELETE /api/v1/account/account-key` to disable) will be added in Phase 4 of the recovery roadmap. They are not yet implemented; the field is mentioned here so apps know the storage choice is not permanent.
+**Users can switch later.** Toggle endpoints `PUT /api/v1/account/account-key` (enable, Model A → B) and `DELETE /api/v1/account/account-key` (disable, Model B → A) are documented below — both require the same JWT + step-up token posture as the fetch endpoint. Either toggle republishes the credential blob to Arweave so the rebuild path stays in sync. The SDK exposes them as `tarn.accountKey.enableKeyStorage()` and `tarn.accountKey.disableKeyStorage()`.
 
 **Future passkey support is independent of this choice.** Phase 6 of the roadmap adds WebAuthn-PRF as a third auth factor in the envelope (alongside `password` and `recovery_phrase`). Whether or not an account uses Model A or Model B, it can independently opt in to passkey factors.
 
@@ -257,7 +257,76 @@ Response on Model A account (no wrap stored): `404` with body `{"error": "no_acc
 
 **Wrap-pinning check (client-side).** After decrypting the wrap, the SDK derives `recovery_lookup_key` from the resulting account-key entropy via the same HMAC chain used elsewhere (`HMAC-SHA256(entropy, "tarn-v1:recovery-lookup:<app_id>:1")` truncated to 32 bytes). It compares this to the `recovery_lookup_key` returned in the fetch response. Mismatch → SDK throws a typed `AccountKeyPinningError` and refuses to return the phrase. The pin check defends against the server returning a wrap that decrypts to a *different* (also valid) 24-word phrase — possible under a colluding storage backend or a wrap mis-binding bug.
 
-**Audit log.** Every successful fetch writes a row to `account_key_fetch_log` (`data_lookup_key`, `fetched_at`, hashed `ip_hash`, truncated `user_agent`). Inserted via `ctx.waitUntil` so a D1 hiccup does not block the response. This enables future "account key was last viewed at X" UX in app settings.
+**Audit log.** Every successful fetch writes a row to `account_key_fetch_log` (`data_lookup_key`, `fetched_at`, hashed `ip_hash`, truncated `user_agent`, `op = 'fetch'`). Inserted via `ctx.waitUntil` so a D1 hiccup does not block the response. This enables future "account key was last viewed at X" UX in app settings. Phase 4 reuses the same table to record `op = 'enable' | 'disable' | 'rotate'` rows for the toggle and rotation endpoints below — same columns, same semantics, just a discriminator on `op`. The historical name `account_key_fetch_log` is preserved for tool compatibility.
+
+#### Account-key storage toggle (Phase 4)
+
+**Enable storage (Model A → Model B): `PUT /api/v1/account/account-key`**
+
+Stores a fresh wrap on the `accounts` row and republishes the credential blob to Arweave. Auth: BOTH a session JWT AND a fresh step-up token (same posture as the fetch — the user just re-entered their password to derive the gen-1 DEK that produced the wrap; the step-up proves they did).
+
+Request body:
+
+```json
+{ "wrapped_account_key": "<base64 ciphertext, 100..1024 chars>" }
+```
+
+Response: `200 OK` with `{ "stored": true }`. The same validation rules as the registration `wrapped_account_key` field apply (length bounds, base64 / base64url charset). If the column is already populated this is treated as an OVERWRITE — the SDK's `enableKeyStorage` does a client-side wrap-pinning check before sending, so calling this twice with valid input is byte-equivalent to calling it once. Audit row: `op = 'enable'`.
+
+Errors: `400` for missing/invalid wrap, `401` for missing/invalid JWT or step-up token, `403` for app-role JWTs.
+
+**Disable storage (Model B → Model A): `DELETE /api/v1/account/account-key`**
+
+Sets `accounts.wrapped_account_key = NULL` and republishes the credential blob to Arweave. Same auth posture (JWT + step-up).
+
+Response on a Model B account: `200 OK` with `{ "stored": false }`. Response on an already-Model-A account: `200 OK` with `{ "stored": false, "already_disabled": true }` — idempotent by design. UI code can treat both responses identically; the `already_disabled` flag is purely informational. Audit row: `op = 'disable'` (only on the actual write path, not the no-op).
+
+Errors: `401` for missing/invalid JWT or step-up token, `403` for app-role JWTs.
+
+#### Account-key rotation (Phase 4): `POST /api/v1/account/rotate-account-key`
+
+Atomically swaps the recovery factor on an account. The client has generated a fresh account key, derived all dependent values, re-wrapped every gen of the DEK chain under {existing password KEK (unchanged — the password did not rotate), NEW recovery KEK}, and submits the bundle here.
+
+**Auth: JWT only — no step-up.** The friction is client-side: the user must have generated and confirmed a new phrase before this endpoint is reachable. Adding a step-up gate here would just push it onto the toggle endpoints' auth machinery for no additional security gain — the rotation itself proves possession of the password (the new envelope decrypts only under the password KEK derived from the same password the JWT proves possession of).
+
+Request body:
+
+```json
+{
+  "new_envelope":             "<full updated wrapped_data_key envelope (string)>",
+  "new_recovery_lookup_key":  "<64-char hex>",
+  "new_recovery_public_key":  "<base64 SPKI P-256>",
+  "new_wrapped_account_key":  "<base64 ciphertext or null>"
+}
+```
+
+`new_wrapped_account_key` reflects the current Model A/B state at rotation time:
+- Model B → include the wrap (computed under DEK_gen1 + the v1 AAD against the new account-key plaintext). Rotation does NOT flip the model.
+- Model A → set to `null` (or omit). The wrap stays NULL.
+
+The SDK helper `tarn.accountKey.rotate()` reads `isStored()` to make this choice automatically.
+
+**Atomicity.** The four fields (`wrapped_data_key`, `recovery_lookup_key`, `recovery_public_key`, `wrapped_account_key`) update in a single D1 statement. There is no partial-state window. After D1 commits, the credential blob is republished to Arweave (best-effort, in `waitUntil`).
+
+**Recovery-salt rotation.** The protocol does NOT mandate that the salt change across rotation, but the SDK's `tarn.accountKey.rotate()` generates a fresh salt as part of the new envelope. Reasoning: rotation is an explicit "evict the recovery factor" operation, and refreshing the salt completes the eviction (a security-scoped attacker who recorded the old salt + ciphertext gains nothing against the new state). Old data wrapped under the old salt + old KEK remains on Arweave forever (immutable history) but is unwrappable without the now-defunct old phrase. Apps that drive the wire protocol directly may keep the old salt if they wish; the API stores whatever the client sends.
+
+Response: `200 OK` with `{ "rotated": true }`. Audit row: `op = 'rotate'`.
+
+Errors:
+- `400` for invalid envelope / lookup key / public key / wrap shape.
+- `400` if `new_recovery_lookup_key === credential_lookup_key` (the two identifier spaces must stay disjoint, mirroring the register / changeCredentials invariant).
+- `409` if `new_recovery_lookup_key` collides with another account's recovery lookup key (astronomically unlikely with 256-bit HMAC output, but propagated cleanly so the SDK can surface a retry).
+- `401` for missing/invalid JWT, `403` for app-role JWTs.
+
+**Effect on `recoverAccount`.** Post-rotation, the OLD account key no longer authenticates `recoverAccount` (the OLD `recovery_lookup_key` no longer maps to any account row, so `/auth/challenge` returns 404). The NEW key works as expected. Pre-rotation data remains decryptable under either the password OR the new recovery factor (the DEK chain itself is unchanged; only the wrappings rotated).
+
+#### Optional rotation in `recoverAccount`: `{ rotatePhrase: true }`
+
+`recoverAccount` accepts an optional `rotatePhrase: boolean` parameter (default `false`). When `true`, the SDK runs `rotateAccountKey` inline after the recovery completes successfully and surfaces the new account key in the result object as `accountKey`. This is the "I think someone may have my recovery phrase too" escalation path during a forgot-password flow — the user gets fresh credentials AND a fresh account key in one round trip, with no separate UI step.
+
+When `false` (default), `recoverAccount` behaves exactly as documented in §7a: the phrase stays the same after recovery; the result has no `accountKey` field. Existing apps see no behavior change.
+
+The implementation reuses the rotation primitive directly — no new endpoint. If the inline rotation fails after a successful recovery, `recoverAccount` throws a partial-success error pointing at `tarn.accountKey.rotate()` for retry; the user is logged in under the new credentials and the OLD account key still works.
 
 ### Data lookup key
 
@@ -666,6 +735,8 @@ CLIENT -> API:
 data_lookup_key unchanged. All pre-recovery data is decryptable under the new credentials.
 ```
 
+**Optional `{ rotatePhrase: true }`.** Pass this on the SDK `recoverAccount` call to bundle a phrase rotation into the same flow — useful when the user is recovering specifically because they suspect the phrase itself has been compromised. After step 13 above, the SDK runs `rotateAccountKey` inline and surfaces the new phrase in the result as `accountKey`. The OLD phrase no longer authenticates `recoverAccount` post-call. Default `false` preserves the existing semantics: recovery rotates credentials, the phrase stays the same. See the `rotateAccountKey` section for details.
+
 ### 8. D1 Recovery
 
 All tables fully rebuildable from Arweave. Entries self-heal on cache miss. Accounts rebuilt from `Type=cred` blobs. Apps rebuilt from `Type=app-reg` blobs.
@@ -724,6 +795,34 @@ DELETE /api/v1/auth
   Auth: JWT
   Returns: 200 OK
   Errors: 401
+
+POST /api/v1/auth/step-up
+  Body: { credential_lookup_key, nonce, signature, scope: "account_key_fetch" }
+  Auth: signature (verified against the row's stored public_key, same as /auth/verify)
+  Returns: { step_up_token, expires_at, scope }
+  Errors: 400 (unknown scope), 401 (bad signature / expired nonce)
+
+GET /api/v1/account/account-key
+  Auth: JWT + X-Step-Up-Token (single-use, account_key_fetch scope)
+  Returns: { wrapped_account_key, recovery_salt, kdf_params, recovery_lookup_key }
+  Errors: 401 (missing/invalid auth), 404 with body {error:"no_account_key_stored"} (Model A)
+
+PUT /api/v1/account/account-key
+  Body: { wrapped_account_key }
+  Auth: JWT + X-Step-Up-Token (account_key_fetch scope)
+  Returns: { stored: true }
+  Errors: 400 (invalid wrap), 401 (missing/invalid auth), 403 (app role)
+
+DELETE /api/v1/account/account-key
+  Auth: JWT + X-Step-Up-Token (account_key_fetch scope)
+  Returns: { stored: false }  OR  { stored: false, already_disabled: true } (idempotent on Model A)
+  Errors: 401 (missing/invalid auth), 403 (app role)
+
+POST /api/v1/account/rotate-account-key
+  Body: { new_envelope, new_recovery_lookup_key, new_recovery_public_key, new_wrapped_account_key }
+  Auth: JWT
+  Returns: { rotated: true }
+  Errors: 400 (invalid bundle), 409 (recovery_lookup_key collision), 401, 403
 ```
 
 #### Recovery-kit delivery and rendering are not Tarn responsibilities

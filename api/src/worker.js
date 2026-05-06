@@ -15,7 +15,12 @@ import {
   handleDeleteAccount,
   handleStepUp,
 } from './routes/auth.js';
-import { handleGetAccountKey } from './routes/account.js';
+import {
+  handleGetAccountKey,
+  handlePutAccountKey,
+  handleDeleteAccountKey,
+  handleRotateAccountKey,
+} from './routes/account.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules, handleSetInviteTemplate, handleSetSchema } from './routes/apps.js';
@@ -103,6 +108,20 @@ export default {
       // step-up token (X-Step-Up-Token header).
       if (path === '/api/v1/account/account-key' && method === 'GET') {
         return await handleGetAccountKey(request, env, ctx, cors);
+      }
+      // Phase 4: toggle Model A ↔ Model B. Same auth posture as fetch
+      // (JWT + X-Step-Up-Token) for both PUT and DELETE.
+      if (path === '/api/v1/account/account-key' && method === 'PUT') {
+        return await handlePutAccountKey(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/account/account-key' && method === 'DELETE') {
+        return await handleDeleteAccountKey(request, env, ctx, cors);
+      }
+      // Phase 4: rotate the account key. JWT only — the friction is on
+      // the client side (user must have generated and confirmed a new
+      // phrase before this is reachable).
+      if (path === '/api/v1/account/rotate-account-key' && method === 'POST') {
+        return await handleRotateAccountKey(request, env, ctx, cors);
       }
 
       // Auth — credential management (authenticated)

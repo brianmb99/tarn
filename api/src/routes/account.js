@@ -1,25 +1,30 @@
-// Account-key Model B retrieval (Phase 3, RECOVERY_PLAN.md).
+// Account-key Model B retrieval + Phase 4 toggle / rotation endpoints.
 //
-// GET /api/v1/account/account-key
+// GET    /api/v1/account/account-key            — Phase 3, fetch (Model B)
+// PUT    /api/v1/account/account-key            — Phase 4, enable storage (Model A → B)
+// DELETE /api/v1/account/account-key            — Phase 4, disable storage (Model B → A)
+// POST   /api/v1/account/rotate-account-key     — Phase 4, rotate the account key
 //
-// Returns the wrapped account-key ciphertext + everything the client needs
-// to derive the recovery_lookup_key for the wrap-pinning check on the
-// decrypted plaintext. The wrap is opaque to the server; decryption is
-// strictly client-side.
+// Common shape:
+//   - GET  / PUT / DELETE require BOTH a session JWT (Authorization: Bearer)
+//     AND a single-use step-up token (X-Step-Up-Token header). Either missing → 401.
+//   - POST rotate-account-key requires the JWT only. The friction is
+//     client-side (the user must have generated and confirmed a new phrase);
+//     the SDK orchestrates the full re-wrap and submits atomically.
 //
-// Auth: BOTH a session JWT (Authorization: Bearer …) AND a single-use
-// step-up token (X-Step-Up-Token header). Either missing → 401. The session
-// proves the caller is logged in to *some* account; the step-up token
-// proves a fresh password re-entry on this device. Both bind to the same
-// data_lookup_key — we explicitly cross-check.
-//
-// Audit: every successful fetch writes a row to `account_key_fetch_log`
-// (data_lookup_key, fetched_at, ip_hash, user_agent) so the SDK / app
-// surface can later render "your account key was last viewed at X".
+// All write endpoints publish a fresh credential blob to Arweave after the
+// D1 commit (best-effort in waitUntil) so the "Tarn infra is rebuildable
+// from Arweave" property holds. Audit-log rows are written to
+// `account_key_fetch_log` (despite the historical name, it now carries
+// `op IN ('fetch','enable','disable','rotate')` after migration 0017).
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH } from './auth.js';
+import { importPublicKey, isValidHex64 } from '../crypto.js';
+import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
+import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
+import { PROTOCOL_VERSION } from '../constants.js';
 
 async function hashIp(ip) {
   if (!ip) return null;
@@ -30,6 +35,103 @@ async function hashIp(ip) {
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }
+
+/**
+ * Best-effort audit-log write. Mirrors the Phase 3 fetch path: any D1
+ * hiccup must NOT fail the user-visible operation, so this runs in
+ * waitUntil and swallows errors with a console warning.
+ */
+function writeAudit(ctx, env, request, dataLookupKey, op) {
+  ctx.waitUntil((async () => {
+    try {
+      const ip = request.headers.get('CF-Connecting-IP') || null;
+      const ipHash = await hashIp(ip);
+      const userAgent = (request.headers.get('User-Agent') || '').slice(0, 256) || null;
+      await env.DB.prepare(
+        'INSERT INTO account_key_fetch_log (data_lookup_key, fetched_at, ip_hash, user_agent, op) VALUES (?1, ?2, ?3, ?4, ?5)'
+      ).bind(dataLookupKey, Date.now(), ipHash, userAgent, op).run();
+    } catch (err) {
+      console.warn(`[tarn-api] account_key_fetch_log insert failed (op=${op}):`, err.message);
+    }
+  })());
+}
+
+/**
+ * Validate a wrapped_account_key field with the same rules as the
+ * registration path (Phase 3): base64 string, 100..1024 chars. Used by
+ * both the PUT toggle and the rotate endpoint.
+ *
+ * Returns null when valid, or an error string when not.
+ */
+function validateWrappedAccountKey(wrap) {
+  if (typeof wrap !== 'string') {
+    return 'wrapped_account_key must be a string';
+  }
+  if (wrap.length < 100 || wrap.length > 1024) {
+    return 'Invalid wrapped_account_key: implausible length';
+  }
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(wrap)) {
+    return 'Invalid wrapped_account_key: must be base64 / base64url';
+  }
+  return null;
+}
+
+/**
+ * Republish the credential mapping blob to Arweave with the current
+ * accounts row state. Phase 4 endpoints call this after every successful
+ * D1 commit so the Arweave-side rebuild path stays in sync. Best-effort
+ * (waitUntil); a Turbo failure does not roll back D1.
+ *
+ * The shape of the blob mirrors persistCredentialBlob in routes/auth.js
+ * but without the optional sharing-fields plumbing (sharing fields are
+ * read straight from the row).
+ */
+function persistCredentialBlobFromRow(ctx, env, row) {
+  const blob = {
+    data_lookup_key: row.data_lookup_key,
+    wrapped_data_key: row.wrapped_data_key,
+    public_key: row.public_key,
+    app: row.app,
+  };
+  if (row.recovery_lookup_key) blob.recovery_lookup_key = row.recovery_lookup_key;
+  if (row.recovery_public_key) blob.recovery_public_key = row.recovery_public_key;
+  if (row.share_pub) blob.share_pub = row.share_pub;
+  if (row.share_pub) blob.share_discoverable = row.share_discoverable === 1;
+  if (row.share_lookup_key) blob.share_lookup_key = row.share_lookup_key;
+  if (row.wrapped_account_key) blob.wrapped_account_key = row.wrapped_account_key;
+
+  const tags = [
+    { name: 'App', value: 'tarn' },
+    { name: 'Type', value: 'cred' },
+    { name: 'Lk', value: row.credential_lookup_key },
+    { name: 'V', value: PROTOCOL_VERSION },
+  ];
+
+  ctx.waitUntil((async () => {
+    try {
+      const signingKey = env.APP_SIGNING_KEY;
+      if (!signingKey) {
+        console.warn('[tarn-api] APP_SIGNING_KEY not set — skipping Arweave republish');
+        return;
+      }
+      const blobBytes = new TextEncoder().encode(JSON.stringify(blob));
+      const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
+      await upsertWriteThrough(env.DB, txid, tags);
+      await markLookupBootstrapped(env.DB, row.credential_lookup_key, 'tarn', 'cred');
+      console.log(`[tarn-api] Account-key republish cached: ${txid}`);
+      const turbo = await uploadSignedDataItem(signedDataItem);
+      if (turbo.ok) {
+        console.log(`[tarn-api] Account-key republish uploaded to Turbo: ${txid}`);
+      } else {
+        console.warn(`[tarn-api] Account-key republish Turbo upload failed: ${turbo.status} ${turbo.body}`);
+      }
+    } catch (err) {
+      console.error('[tarn-api] Account-key republish error:', err.message);
+    }
+  })());
+}
+
+// ============ GET /api/v1/account/account-key (Phase 3) ============
 
 export async function handleGetAccountKey(request, env, ctx, cors) {
   const auth = await requireAuth(request, env, ctx);
@@ -46,9 +148,6 @@ export async function handleGetAccountKey(request, env, ctx, cors) {
   if (!consumed) {
     return errorResponse('Invalid or expired step-up token', 401, cors);
   }
-  // The step-up token must belong to the same account as the JWT — defense
-  // in depth against a JWT/token cross-binding mismatch (e.g., one user's
-  // JWT paired with another user's leaked step-up token).
   if (consumed.data_lookup_key !== auth.data_lookup_key) {
     return errorResponse('Step-up token does not match session', 401, cors);
   }
@@ -62,31 +161,11 @@ export async function handleGetAccountKey(request, env, ctx, cors) {
     return errorResponse('Account not found', 404, cors);
   }
   if (row.wrapped_account_key == null) {
-    // Model A account — no backup stored. The SDK uses this 404 to render
-    // the "no backup stored" Settings affordance instead of "view your key".
     return jsonResponse({ error: 'no_account_key_stored' }, 404, cors);
   }
 
-  // Audit log. Best-effort — a D1 hiccup must not block the user from seeing
-  // their own account key.
-  ctx.waitUntil((async () => {
-    try {
-      const ip = request.headers.get('CF-Connecting-IP') || null;
-      const ipHash = await hashIp(ip);
-      const userAgent = (request.headers.get('User-Agent') || '').slice(0, 256) || null;
-      await env.DB.prepare(
-        'INSERT INTO account_key_fetch_log (data_lookup_key, fetched_at, ip_hash, user_agent) VALUES (?1, ?2, ?3, ?4)'
-      ).bind(auth.data_lookup_key, Date.now(), ipHash, userAgent).run();
-    } catch (err) {
-      console.warn('[tarn-api] account_key_fetch_log insert failed:', err.message);
-    }
-  })());
+  writeAudit(ctx, env, request, auth.data_lookup_key, 'fetch');
 
-  // Return everything the client needs to derive recovery_KEK for the
-  // wrap-pinning check after decryption. recovery_salt + kdf_params live
-  // inside the wrapped_data_key envelope's `recovery` block — return them
-  // top-level here so the client doesn't have to re-parse the envelope just
-  // to read them.
   let recoverySalt = null;
   let kdfParams = null;
   try {
@@ -96,8 +175,7 @@ export async function handleGetAccountKey(request, env, ctx, cors) {
       kdfParams = env_.recovery.kdf_params ?? null;
     }
   } catch {
-    // Envelope shape isn't required for the wrap fetch; the client can
-    // re-parse from the next /auth/verify if needed.
+    // Envelope shape isn't required for the wrap fetch.
   }
 
   return jsonResponse({
@@ -106,4 +184,262 @@ export async function handleGetAccountKey(request, env, ctx, cors) {
     kdf_params: kdfParams,
     recovery_lookup_key: row.recovery_lookup_key ?? null,
   }, 200, cors);
+}
+
+// ============ PUT /api/v1/account/account-key (Phase 4 — enable storage) ============
+//
+// Toggle Model A → Model B. The caller must include a fresh step-up token
+// (proves the user just re-entered their password — which they need anyway
+// to derive the gen-1 DEK that produced the wrap). The wrap is opaque
+// ciphertext stored verbatim; decryption is impossible server-side.
+//
+// If `wrapped_account_key` is already set, this is treated as an overwrite
+// (the user re-entered the phrase and computed a fresh wrap). Documented in
+// TARN_PROTOCOL.md so apps know calling PUT twice is not an error.
+
+export async function handlePutAccountKey(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
+  if (!auth) return errorResponse('Unauthorized', 401, cors);
+  if (auth.role !== 'user') {
+    return errorResponse('Only user accounts can enable account-key storage', 403, cors);
+  }
+
+  const stepUpToken = request.headers.get('X-Step-Up-Token');
+  if (!stepUpToken) {
+    return errorResponse('Step-up token required', 401, cors);
+  }
+  const consumed = await consumeStepUpToken(env, stepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH);
+  if (!consumed) {
+    return errorResponse('Invalid or expired step-up token', 401, cors);
+  }
+  if (consumed.data_lookup_key !== auth.data_lookup_key) {
+    return errorResponse('Step-up token does not match session', 401, cors);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, cors);
+  }
+  const { wrapped_account_key } = body || {};
+  if (wrapped_account_key == null) {
+    return errorResponse('wrapped_account_key is required', 400, cors);
+  }
+  const wrapErr = validateWrappedAccountKey(wrapped_account_key);
+  if (wrapErr) return errorResponse(wrapErr, 400, cors);
+
+  // Update + read back in one shot so we have the full row for the
+  // Arweave republish below.
+  const update = await env.DB.prepare(
+    `UPDATE accounts
+        SET wrapped_account_key = ?2
+      WHERE data_lookup_key = ?1
+      RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
+                recovery_lookup_key, recovery_public_key,
+                share_pub, share_discoverable, share_lookup_key,
+                wrapped_account_key, data_lookup_key`
+  ).bind(auth.data_lookup_key, wrapped_account_key).first();
+  if (!update) {
+    return errorResponse('Account not found', 404, cors);
+  }
+
+  writeAudit(ctx, env, request, auth.data_lookup_key, 'enable');
+  persistCredentialBlobFromRow(ctx, env, update);
+
+  return jsonResponse({ stored: true }, 200, cors);
+}
+
+// ============ DELETE /api/v1/account/account-key (Phase 4 — disable storage) ============
+//
+// Toggle Model B → Model A. Same auth posture as PUT (JWT + step-up).
+// Idempotent: deleting the wrap on an already-Model-A account returns
+// 200 OK with `{ stored: false, already_disabled: true }` rather than 404
+// — the caller's intent ("ensure no wrap is stored") is satisfied either
+// way and an error would force every UI to special-case it.
+
+export async function handleDeleteAccountKey(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
+  if (!auth) return errorResponse('Unauthorized', 401, cors);
+  if (auth.role !== 'user') {
+    return errorResponse('Only user accounts can disable account-key storage', 403, cors);
+  }
+
+  const stepUpToken = request.headers.get('X-Step-Up-Token');
+  if (!stepUpToken) {
+    return errorResponse('Step-up token required', 401, cors);
+  }
+  const consumed = await consumeStepUpToken(env, stepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH);
+  if (!consumed) {
+    return errorResponse('Invalid or expired step-up token', 401, cors);
+  }
+  if (consumed.data_lookup_key !== auth.data_lookup_key) {
+    return errorResponse('Step-up token does not match session', 401, cors);
+  }
+
+  // Read-then-update so we can short-circuit the idempotent path without a
+  // pointless write + Arweave republish.
+  const existing = await env.DB.prepare(
+    `SELECT wrapped_account_key
+       FROM accounts
+      WHERE data_lookup_key = ?1`
+  ).bind(auth.data_lookup_key).first();
+  if (!existing) {
+    return errorResponse('Account not found', 404, cors);
+  }
+  if (existing.wrapped_account_key == null) {
+    // Already in Model A — no-op success.
+    return jsonResponse({ stored: false, already_disabled: true }, 200, cors);
+  }
+
+  const update = await env.DB.prepare(
+    `UPDATE accounts
+        SET wrapped_account_key = NULL
+      WHERE data_lookup_key = ?1
+      RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
+                recovery_lookup_key, recovery_public_key,
+                share_pub, share_discoverable, share_lookup_key,
+                wrapped_account_key, data_lookup_key`
+  ).bind(auth.data_lookup_key).first();
+  if (!update) {
+    // Account vanished between the read and the write (delete-account race).
+    return errorResponse('Account not found', 404, cors);
+  }
+
+  writeAudit(ctx, env, request, auth.data_lookup_key, 'disable');
+  persistCredentialBlobFromRow(ctx, env, update);
+
+  return jsonResponse({ stored: false }, 200, cors);
+}
+
+// ============ POST /api/v1/account/rotate-account-key (Phase 4) ============
+//
+// Atomically swap the recovery factor on an account. The caller has
+// generated a fresh account key client-side, derived all the dependent
+// values (recovery_lookup_key, recovery_public_key, recovery_KEK), and
+// re-wrapped every gen of the DEK chain. We just commit the bundle.
+//
+// Auth posture: JWT only — no step-up. The friction here is client-side
+// (the user must have generated and confirmed a new phrase before this is
+// reachable). Matching the plan's reasoning at RECOVERY_PLAN.md §4.4.
+//
+// Atomicity: D1 batch updates wrapped_data_key, recovery_lookup_key,
+// recovery_public_key, and wrapped_account_key together. Either all four
+// land or none do.
+//
+// Conflict handling: 409 if the new recovery_lookup_key collides with
+// another account (mirrors the changeCredentials path).
+
+export async function handleRotateAccountKey(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
+  if (!auth) return errorResponse('Unauthorized', 401, cors);
+  if (auth.role !== 'user') {
+    return errorResponse('Only user accounts can rotate the account key', 403, cors);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, cors);
+  }
+
+  const {
+    new_envelope,
+    new_recovery_lookup_key,
+    new_recovery_public_key,
+    new_wrapped_account_key,
+  } = body || {};
+
+  if (!new_envelope || typeof new_envelope !== 'string' || new_envelope.length === 0) {
+    return errorResponse('new_envelope is required', 400, cors);
+  }
+  if (!isValidHex64(new_recovery_lookup_key)) {
+    return errorResponse('Invalid new_recovery_lookup_key: must be 64-char lowercase hex', 400, cors);
+  }
+  try {
+    await importPublicKey(new_recovery_public_key);
+  } catch {
+    return errorResponse('Invalid new_recovery_public_key: must be base64-encoded SPKI P-256 public key', 400, cors);
+  }
+  // new_wrapped_account_key is OPTIONAL: present iff the account is in
+  // Model B at rotation time. Null / omitted explicitly leaves the wrap
+  // null in D1 (Model A stays Model A).
+  if (new_wrapped_account_key != null) {
+    const wrapErr = validateWrappedAccountKey(new_wrapped_account_key);
+    if (wrapErr) return errorResponse(wrapErr, 400, cors);
+  }
+
+  // Read the current row so we can detect "no actual change" + collision
+  // with an OTHER account (vs. our own current value, which is a no-op).
+  const current = await env.DB.prepare(
+    `SELECT credential_lookup_key, public_key, wrapped_data_key, app,
+            recovery_lookup_key, recovery_public_key,
+            share_pub, share_discoverable, share_lookup_key,
+            wrapped_account_key, data_lookup_key
+       FROM accounts
+      WHERE data_lookup_key = ?1`
+  ).bind(auth.data_lookup_key).first();
+  if (!current) {
+    return errorResponse('Account not found', 404, cors);
+  }
+  // The caller MUST NOT submit credential_lookup_key as the new recovery
+  // lookup (mirrors the register / changeCredentials invariant — the two
+  // identifier spaces must stay disjoint per account).
+  if (new_recovery_lookup_key === current.credential_lookup_key) {
+    return errorResponse('new_recovery_lookup_key must differ from credential_lookup_key', 400, cors);
+  }
+
+  // Up-front uniqueness check: the new recovery_lookup_key must not be
+  // taken by any OTHER account. (Same value as our own current is fine —
+  // it's a no-op rotation, and the UNIQUE constraint on the column allows
+  // it because we're rewriting our own row.)
+  if (new_recovery_lookup_key !== current.recovery_lookup_key) {
+    const conflict = await env.DB.prepare(
+      'SELECT 1 FROM accounts WHERE recovery_lookup_key = ?1'
+    ).bind(new_recovery_lookup_key).first();
+    if (conflict) {
+      return errorResponse('new_recovery_lookup_key already in use', 409, cors);
+    }
+  }
+
+  // D1 batch — single statement update against one row is already atomic;
+  // the explicit batch here is to keep the call structurally consistent
+  // with multi-row operations elsewhere (e.g. credential change). All four
+  // fields land in one statement, so there is no partial-state window.
+  let update;
+  try {
+    update = await env.DB.prepare(
+      `UPDATE accounts
+          SET wrapped_data_key       = ?2,
+              recovery_lookup_key    = ?3,
+              recovery_public_key    = ?4,
+              wrapped_account_key    = ?5
+        WHERE data_lookup_key = ?1
+        RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
+                  recovery_lookup_key, recovery_public_key,
+                  share_pub, share_discoverable, share_lookup_key,
+                  wrapped_account_key, data_lookup_key`
+    ).bind(
+      auth.data_lookup_key,
+      new_envelope,
+      new_recovery_lookup_key,
+      new_recovery_public_key,
+      new_wrapped_account_key ?? null,
+    ).first();
+  } catch (err) {
+    // UNIQUE constraint on recovery_lookup_key — another account raced us.
+    if (/UNIQUE/i.test(err.message || '')) {
+      return errorResponse('new_recovery_lookup_key already in use', 409, cors);
+    }
+    throw err;
+  }
+  if (!update) {
+    return errorResponse('Account not found', 404, cors);
+  }
+
+  writeAudit(ctx, env, request, auth.data_lookup_key, 'rotate');
+  persistCredentialBlobFromRow(ctx, env, update);
+
+  return jsonResponse({ rotated: true }, 200, cors);
 }

@@ -674,6 +674,25 @@ export class TarnClient {
     this.#currentGen = unwrapped.currentGen;
     this.#username = newUsername;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
+    // Repopulate recovery-factor metadata so a subsequent
+    // changeCredentials / rotateAccountKey on this client preserves the
+    // existing recovery wrappings (or rotates them) without needing the
+    // user to re-enter the phrase. The salt/params come from the parsed
+    // envelope; the wrappings come from the chain we just re-wrapped.
+    {
+      const reparsed = parseWrappedDataKey(newWrappedDataKey);
+      const wrappingsByGen = new Map<number, string>();
+      for (const entry of reparsed.dekChain) {
+        const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
+        if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
+      }
+      this.#recoveryFactorMeta = {
+        salt: reparsed.recovery.salt,
+        kdfParams: reparsed.recovery.kdfParams,
+        wrappingsByGen,
+      };
+    }
+    this.#recoveryLookupKey = recoveryLookupKey;
     // Pair-key cache is derived from share_priv; recovery rotates it.
     this.#pairKeyCache.clear();
     this.#shareLogCounters.clear();
@@ -702,7 +721,35 @@ export class TarnClient {
       }
     }
 
-    return { dataLookupKey: this.#dataLookupKey, rotationAnnouncements };
+    // Phase 4 — optional account-key rotation piggybacked on recovery.
+    // The user is performing a forgot-password flow but ALSO suspects
+    // their account key has been compromised — flipping `rotatePhrase`
+    // on the same call evicts the old key in one round trip rather than
+    // requiring a separate post-recovery `rotateAccountKey` call.
+    //
+    // Reuses rotateAccountKey directly: same wire-format, same atomicity
+    // guarantee. Returns the freshly-generated key in the result so the
+    // app can show it to the user (single-use, surfaced once).
+    let newAccountKey: string | undefined;
+    if (opts?.rotatePhrase === true) {
+      try {
+        const rotated = await this.rotateAccountKey({ password: newPassword });
+        newAccountKey = rotated.accountKey;
+      } catch (err: any) {
+        // The recovery itself succeeded; surface the rotation failure as
+        // a partial-success error. The user is logged in under the new
+        // credentials but the OLD account key still works. They can call
+        // tarn.accountKey.rotate() manually to retry.
+        throw new Error(
+          `recoverAccount({ rotatePhrase: true }): recovery succeeded but rotation failed: ${err?.message || err}. ` +
+          `Call tarn.accountKey.rotate() to retry.`,
+        );
+      }
+    }
+
+    const result: any = { dataLookupKey: this.#dataLookupKey, rotationAnnouncements };
+    if (newAccountKey !== undefined) result.accountKey = newAccountKey;
+    return result;
   }
 
   /**
@@ -1183,6 +1230,337 @@ export class TarnClient {
     }
 
     return { accountKey: phrase };
+  }
+
+  /**
+   * Phase 4 (RECOVERY_PLAN.md) — internal helper. Run the step-up
+   * challenge/sign/exchange dance and return the resulting opaque token.
+   * Throws on any failure; the token is single-use and 60s-TTL.
+   *
+   * Used by enableKeyStorage / disableKeyStorage (PUT/DELETE on
+   * /account/account-key both require step-up). viewAccountKey runs the
+   * same flow inline today; we don't extract its copy to avoid churning
+   * the Phase 3 path mid-Phase-4.
+   */
+  async #performStepUp(password: string, scope: string): Promise<string> {
+    if (!this.#username) {
+      throw new Error('#performStepUp: username unknown — log in first');
+    }
+    const reKeys = await deriveAllKeys(this.#username, password, this.#appId);
+    const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+      method: 'POST',
+      retry: true,
+      body: { credential_lookup_key: reKeys.credentialLookupKey },
+    });
+    if (challengeRes.status !== 200) {
+      throw new Error(`step-up challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
+    }
+    const signature = await signChallenge(reKeys.signingKeyPair.privateKey, challengeRes.json.nonce);
+    const stepUpRes = await this.#fetch('/api/v1/auth/step-up', {
+      method: 'POST',
+      body: {
+        credential_lookup_key: reKeys.credentialLookupKey,
+        nonce: challengeRes.json.nonce,
+        signature,
+        scope,
+      },
+    });
+    if (stepUpRes.status === 401) {
+      throw new Error('step-up auth failed (wrong password?)');
+    }
+    if (stepUpRes.status !== 200) {
+      throw new Error(`step-up failed: ${stepUpRes.json?.error || stepUpRes.status}`);
+    }
+    const token = stepUpRes.json.step_up_token;
+    if (!token) {
+      throw new Error('step-up succeeded but no token returned');
+    }
+    return token;
+  }
+
+  /**
+   * Phase 4 — enable Model B storage (Model A → Model B).
+   *
+   * The caller passes the freshly-entered password (drives the step-up
+   * proof + DEK derivation) AND the user's existing account key (the SDK
+   * does not retain it post-registration; the app prompts the user to
+   * type their saved key, validates it via `validateAccountKey`, and
+   * passes it here).
+   *
+   * Flow:
+   *   1. Validate the supplied account key (BIP39 checksum).
+   *   2. Re-derive credential keys + DEK from the password (step-up dance).
+   *   3. Wrap the account key under DEK_gen1 with the v1 AAD.
+   *   4. Wrap-pinning client-side: derive `recovery_lookup_key` from the
+   *      supplied key and confirm it matches the value cached on the
+   *      client (recovered via parseWrappedDataKey on prior login). This
+   *      catches "user typed a valid-but-wrong 24-word phrase" before we
+   *      poison the server with a wrap that decrypts to the wrong key.
+   *   5. PUT /account/account-key with JWT + step-up token.
+   *   6. Update the cached `account_key_stored` indicator.
+   *
+   * @returns `{ stored: true }` on success.
+   * @throws Error on invalid phrase, wrong password (step-up fails), or
+   *   pin-check mismatch (the server-known recovery_lookup_key does not
+   *   match what derives from the supplied phrase).
+   */
+  async enableKeyStorage(opts: { password: string; accountKey: string }): Promise<{ stored: true }> {
+    await this.#requireAuth();
+    if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
+      throw new Error('enableKeyStorage(): password is required');
+    }
+    if (!opts.accountKey || typeof opts.accountKey !== 'string') {
+      throw new Error('enableKeyStorage(): accountKey is required');
+    }
+    const validation = validateAccountKey(opts.accountKey);
+    if (!validation.valid) {
+      throw new Error(`enableKeyStorage(): invalid account key: ${validation.reason}`);
+    }
+    if (!this.#username) {
+      throw new Error('enableKeyStorage(): username unknown — log in first');
+    }
+    if (!this.#dekByGen || !this.#dekByGen.has(1)) {
+      throw new Error('enableKeyStorage(): DEK_gen1 not available (corrupt session?)');
+    }
+
+    // Pre-flight pin: derive recovery_lookup_key from the supplied phrase
+    // and compare to what the client knows. We learn the cached value at
+    // register-time (#recoveryLookupKey, set in register/recoverAccount).
+    // Login does NOT expose it (the password-side challenge response does
+    // not reveal it), so on a login-only session we skip the check rather
+    // than fail. The server still has the value and the user can recover
+    // their way out of any bad wrap via the existing recoverAccount flow.
+    const phraseEntropy = accountKeyToEntropy(validation.normalized);
+    const derivedLookup = await deriveRecoveryLookupKey(phraseEntropy, this.#appId);
+    if (this.#recoveryLookupKey && derivedLookup !== this.#recoveryLookupKey) {
+      throw new AccountKeyPinningError(
+        'enableKeyStorage(): supplied account key does not match the account on file. ' +
+        'Did you type the right phrase? Refusing to store an unrelated key.',
+      );
+    }
+
+    // Step-up first — fails fast on wrong password before we compute the wrap.
+    const stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
+
+    // Compute the wrap under DEK_gen1 with the v1 AAD. The wrap is
+    // deterministic w.r.t. (DEK, plaintext, IV); the IV is random, so the
+    // ciphertext bytes change per call even for the same phrase — fine,
+    // the server stores whatever we send.
+    const dekGen1 = this.#dekByGen.get(1)!;
+    const wrappedAccountKey = await wrapAccountKey(dekGen1.gcmKey, validation.normalized);
+
+    const res = await this.#fetchRaw('/api/v1/account/account-key', {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${this.#jwt}`,
+        'X-Step-Up-Token': stepUpToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ wrapped_account_key: wrappedAccountKey }),
+    });
+    const text = await res.text();
+    let json: any = null;
+    try { json = JSON.parse(text); } catch {}
+    if (res.status !== 200) {
+      throw new Error(`enableKeyStorage(): PUT failed: ${json?.error || res.status}`);
+    }
+    if (json?.stored !== true) {
+      throw new Error(`enableKeyStorage(): unexpected response shape: ${text}`);
+    }
+    this.#accountKeyStored = true;
+    return { stored: true };
+  }
+
+  /**
+   * Phase 4 — disable Model B storage (Model B → Model A).
+   *
+   * The caller passes only their freshly-entered password (drives the
+   * step-up proof). No phrase needed; the server simply nulls the wrap
+   * column and republishes the credential blob to Arweave.
+   *
+   * Idempotent: calling on an account that is already in Model A returns
+   * `{ stored: false, alreadyDisabled: true }` (the API returns 200 with
+   * `already_disabled: true`).
+   *
+   * @returns `{ stored: false }` on success.
+   * @throws Error on wrong password (step-up fails) or 4xx/5xx response.
+   */
+  async disableKeyStorage(opts: { password: string }): Promise<{ stored: false; alreadyDisabled?: boolean }> {
+    await this.#requireAuth();
+    if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
+      throw new Error('disableKeyStorage(): password is required');
+    }
+    const stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
+
+    const res = await this.#fetchRaw('/api/v1/account/account-key', {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${this.#jwt}`,
+        'X-Step-Up-Token': stepUpToken,
+        'Content-Type': 'application/json',
+      },
+    });
+    const text = await res.text();
+    let json: any = null;
+    try { json = JSON.parse(text); } catch {}
+    if (res.status !== 200) {
+      throw new Error(`disableKeyStorage(): DELETE failed: ${json?.error || res.status}`);
+    }
+    if (json?.stored !== false) {
+      throw new Error(`disableKeyStorage(): unexpected response shape: ${text}`);
+    }
+    this.#accountKeyStored = false;
+    if (json.already_disabled) {
+      return { stored: false, alreadyDisabled: true };
+    }
+    return { stored: false };
+  }
+
+  /**
+   * Phase 4 — rotate the account key. The user has indicated they want
+   * to evict the current account key (suspected leak, routine hygiene,
+   * etc.). The SDK generates a fresh one, derives all dependent values,
+   * re-wraps every gen of the DEK chain under {existing password KEK,
+   * NEW recovery KEK}, and submits the bundle atomically.
+   *
+   * Salt rotation: the recovery salt is regenerated as part of this flow.
+   * The salt is per-account random; rotating it as part of an explicit
+   * "evict the recovery factor" operation is the cleanest reset (a
+   * security-scoped attacker who recorded the OLD salt + ciphertext gains
+   * nothing against the new state). Previous data wrapped under the OLD
+   * salt + OLD KEK remains on Arweave forever (immutable history) but is
+   * unwrappable without the OLD phrase, which is now defunct.
+   *
+   * The caller must have a live session and supply the current password
+   * (needed to verify we still hold the existing DEK chain via the local
+   * #dekByGen — no server round-trip for the password proof, since
+   * rotation is JWT-only at the API).
+   *
+   * Flow:
+   *   1. Generate a new account key.
+   *   2. Generate a NEW recovery salt; derive new recovery_KEK,
+   *      recovery_lookup_key, recovery_signing_key, recovery_public_key.
+   *   3. Re-wrap every gen of the DEK chain under {existing password
+   *      KEKs (unchanged — the password did not rotate), NEW recovery
+   *      KEK}.
+   *   4. If Model B (isStored() === true): compute new wrapped_account_key
+   *      under DEK_gen1.
+   *   5. POST /account/rotate-account-key with the bundle.
+   *   6. Update the cached recovery-factor metadata + #recoveryLookupKey.
+   *   7. Return the new account key string. The SDK does NOT retain it.
+   *
+   * @returns `{ accountKey: string }` on success — the new phrase. The
+   *   app surfaces it to the user (downloadable kit, printable page, etc.)
+   *   and drops the in-memory copy promptly.
+   * @throws Error on wrong password (re-derived password KEK can't unwrap
+   *   the existing chain), 409 on lookup-key conflict, or 4xx/5xx response.
+   */
+  async rotateAccountKey(opts: { password: string }): Promise<{ accountKey: string }> {
+    await this.#requireAuth();
+    if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
+      throw new Error('rotateAccountKey(): password is required');
+    }
+    if (!this.#username) {
+      throw new Error('rotateAccountKey(): username unknown — log in first');
+    }
+    if (!this.#dekByGen || this.#dekByGen.size === 0) {
+      throw new Error('rotateAccountKey(): DEK chain unavailable (corrupt session?)');
+    }
+
+    // Re-derive password keys from the current password. We use this both
+    // as a wrong-password tripwire (the credential_lookup_key must match
+    // what we already have) and as the source of the password KEK for
+    // re-wrapping the chain.
+    const reKeys = await deriveAllKeys(this.#username, opts.password, this.#appId);
+    if (this.#credentialLookupKey && reKeys.credentialLookupKey !== this.#credentialLookupKey) {
+      throw new Error('rotateAccountKey(): wrong password — credential mismatch');
+    }
+
+    // 1. Generate a new account key + 2. derive new recovery state
+    //    (new salt + KEK + lookup + signing).
+    const newPhrase = generateAccountKey();
+    const newPhraseEntropy = accountKeyToEntropy(newPhrase);
+    const newRecoverySalt = generateRecoverySalt();
+    const [newRecoveryKEK, newRecoveryLookupKey, newRecoverySigningKeyPair] = await Promise.all([
+      deriveRecoveryKey(newPhrase, newRecoverySalt),
+      deriveRecoveryLookupKey(newPhraseEntropy, this.#appId),
+      deriveRecoverySigningKeyPair(newPhraseEntropy, this.#appId),
+    ]);
+    const newRecoveryPublicKey = await exportPublicKey(newRecoverySigningKeyPair.publicKey);
+
+    // 3. Re-wrap every gen under {existing password KEK, NEW recovery KEK}.
+    //    Build the chain in gen order and wrap each entry under both
+    //    factors; new salt goes into the envelope's recovery section.
+    const chain: Array<{ gen: number; key: CryptoKey }> = [];
+    for (const [gen, pair] of this.#dekByGen!) {
+      chain.push({ gen, key: pair.gcmKey });
+    }
+    chain.sort((a, b) => a.gen - b.gen);
+
+    const newWrappedDataKey = await wrapDataKeyChainEnvelope(
+      chain,
+      [
+        { name: FACTOR_PASSWORD,        wrappingKey: reKeys.credentialEncryptionKey.kwKey },
+        { name: FACTOR_RECOVERY_PHRASE, wrappingKey: newRecoveryKEK.kwKey },
+      ],
+      { salt: newRecoverySalt },
+    );
+
+    // 4. New wrap_account_key only if Model B. We treat #accountKeyStored
+    //    as the source of truth here; if it's null (resumed session that
+    //    never re-verified), we play it safe and skip the wrap. The user
+    //    can re-enable storage explicitly via enableKeyStorage afterwards.
+    let newWrappedAccountKey: string | null = null;
+    if (this.#accountKeyStored === true) {
+      const dekGen1 = this.#dekByGen!.get(1);
+      if (!dekGen1) {
+        throw new Error('rotateAccountKey(): DEK_gen1 missing — cannot compute wrap (chain corruption?)');
+      }
+      newWrappedAccountKey = await wrapAccountKey(dekGen1.gcmKey, newPhrase);
+    }
+
+    // 5. Submit. The API performs an atomic UPDATE across all four fields.
+    const res = await this.#fetch('/api/v1/account/rotate-account-key', {
+      method: 'POST',
+      auth: true,
+      body: {
+        new_envelope: newWrappedDataKey,
+        new_recovery_lookup_key: newRecoveryLookupKey,
+        new_recovery_public_key: newRecoveryPublicKey,
+        new_wrapped_account_key: newWrappedAccountKey,
+      },
+    });
+    if (res.status === 409) {
+      // Salt + entropy collision yielding the same recovery_lookup_key as
+      // another account is astronomically unlikely (HMAC over 32 random
+      // bytes → 256-bit space), but propagate the conflict cleanly so the
+      // app can prompt a retry.
+      throw new Error(`rotateAccountKey(): conflict: ${res.json?.error || 'recovery_lookup_key in use'}`);
+    }
+    if (res.status !== 200) {
+      throw new Error(`rotateAccountKey(): rotation failed: ${res.json?.error || res.status}`);
+    }
+
+    // 6. Update cached recovery-factor metadata so a subsequent
+    //    changeCredentials() preserves the NEW wrappings (not the old).
+    {
+      const reparsed = parseWrappedDataKey(newWrappedDataKey);
+      const wrappingsByGen = new Map<number, string>();
+      for (const entry of reparsed.dekChain) {
+        const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
+        if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
+      }
+      this.#recoveryFactorMeta = {
+        salt: reparsed.recovery.salt,
+        kdfParams: reparsed.recovery.kdfParams,
+        wrappingsByGen,
+      };
+    }
+    this.#recoveryLookupKey = newRecoveryLookupKey;
+    // accountKeyStored is unchanged (rotation does not flip the model).
+
+    // 7. Return the new phrase. SDK does NOT cache it.
+    return { accountKey: newPhrase };
   }
 
   /**

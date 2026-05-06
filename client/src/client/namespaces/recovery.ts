@@ -2,20 +2,21 @@
  * `tarn.accountKey.*` — account-key lifecycle namespace.
  *
  * Phase 3 (RECOVERY_PLAN.md): `view()` retrieves the stored account key
- * for Model B accounts via a step-up gated flow.
- *
- * Future phases land here:
- *   - Phase 4: `rotate()` (account-key rotation)
- *   - Phase 4: `enableKeyStorage()` / `disableKeyStorage()` (Model A/B toggle)
+ *   for Model B accounts via a step-up gated flow.
+ * Phase 4: `enableKeyStorage()` / `disableKeyStorage()` toggle Model A↔B,
+ *   and `rotate()` rotates the account key entirely.
  *
  * The SDK does not render recovery kits — apps render their own from the
  * account-key string returned by `register()` / `recoverAccount()` /
- * `view()`. The namespace's job is orchestration; it never persists the
- * decrypted account key.
+ * `view()` / `rotate()`. The namespace's job is orchestration; it never
+ * persists the decrypted account key.
  */
 
 export interface IAccountKeyClient {
   viewAccountKey(opts: { password: string }): Promise<{ accountKey: string }>;
+  enableKeyStorage(opts: { password: string; accountKey: string }): Promise<{ stored: true }>;
+  disableKeyStorage(opts: { password: string }): Promise<{ stored: false; alreadyDisabled?: boolean }>;
+  rotateAccountKey(opts: { password: string }): Promise<{ accountKey: string }>;
   isAccountKeyStored(): boolean | null;
 }
 
@@ -41,8 +42,8 @@ export class AccountKeyNamespace {
    *
    * Throws an Error with `no_account_key_stored` in the message for
    * accounts in Model A (no backup stored). Render the appropriate
-   * "no backup" Settings affordance and offer the toggle (Phase 4) to
-   * enable storage.
+   * "no backup" Settings affordance and offer the toggle (`enableKeyStorage`)
+   * to enable storage.
    *
    * The returned `accountKey` is a 24-word string. The SDK does not
    * cache or retain it — surface it to the user and drop the in-memory
@@ -50,6 +51,76 @@ export class AccountKeyNamespace {
    */
   async view(opts: { password: string }): Promise<{ accountKey: string }> {
     return this.#client.viewAccountKey(opts);
+  }
+
+  /**
+   * Enable Model B storage (Model A → Model B).
+   *
+   * Caller passes the freshly-entered password (powers the step-up proof
+   * + DEK derivation) AND the user's existing account key (the SDK does
+   * not retain it post-registration). Apps prompt the user to type their
+   * saved phrase, validate it via `validateAccountKey`, then call this.
+   *
+   * Failure modes:
+   *   - Invalid phrase (BIP39 checksum) → Error
+   *   - Wrong password → Error (step-up auth fails)
+   *   - Pin-check mismatch (the supplied phrase derives a different
+   *     `recovery_lookup_key` than the one on file for this account) →
+   *     `AccountKeyPinningError`. Indicates the user typed a valid 24-word
+   *     phrase that doesn't actually belong to this account.
+   *
+   * Idempotent on the wire: if storage was already enabled, the new wrap
+   * overwrites the old (the caller proved possession of the phrase via
+   * the pin check). Documented behavior.
+   */
+  async enableKeyStorage(opts: { password: string; accountKey: string }): Promise<{ stored: true }> {
+    return this.#client.enableKeyStorage(opts);
+  }
+
+  /**
+   * Disable Model B storage (Model B → Model A).
+   *
+   * Caller passes only the freshly-entered password (powers step-up).
+   * The wrap is removed from D1 + Arweave; subsequent `view()` calls
+   * fail with `no_account_key_stored`.
+   *
+   * Idempotent: on an already-Model-A account the call returns
+   * `{ stored: false, alreadyDisabled: true }` instead of erroring. UI
+   * code can treat both responses identically.
+   *
+   * Failure modes: wrong password (step-up fails) → Error.
+   */
+  async disableKeyStorage(opts: { password: string }): Promise<{ stored: false; alreadyDisabled?: boolean }> {
+    return this.#client.disableKeyStorage(opts);
+  }
+
+  /**
+   * Rotate the account key — generate a new one, re-wrap the entire DEK
+   * chain under {existing password KEK, new recovery KEK}, and atomically
+   * publish the bundle. The OLD account key is no longer usable for
+   * `recoverAccount` after this call returns.
+   *
+   * Use this when the user suspects their existing account key has been
+   * compromised, or as a routine hygiene step. The rotation does NOT
+   * change the user's password or username — only the account-key half
+   * of the recovery factor.
+   *
+   * Returns the new account key string so the app can present it to the
+   * user (downloadable kit, printable page, etc.). The SDK does not
+   * retain it.
+   *
+   * Failure modes:
+   *   - Wrong password → Error (credential mismatch tripwire)
+   *   - 409 conflict on lookup-key collision (astronomically unlikely;
+   *     retry yields a different key) → Error
+   *   - Network failure → Error; D1 is atomic so partial state cannot
+   *     occur. Safe to retry.
+   *
+   * If the account is in Model B, the new account key is also stored
+   * (re-wrapped under DEK_gen1). If Model A, the wrap stays absent.
+   */
+  async rotate(opts: { password: string }): Promise<{ accountKey: string }> {
+    return this.#client.rotateAccountKey(opts);
   }
 
   /**

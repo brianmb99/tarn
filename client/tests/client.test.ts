@@ -114,13 +114,31 @@ class StubUnderlying implements IUnderlyingClient {
     return { ok: true };
   }
 
-  // ---- Account-key (Phase 3) ----
+  // ---- Account-key (Phase 3 + Phase 4) ----
   viewAccountKeyCalls = 0;
   viewAccountKeyResult: { accountKey: string } = { accountKey: 'stub-phrase' };
   accountKeyStored: boolean | null = null;
+  enableKeyStorageCalls = 0;
+  disableKeyStorageCalls = 0;
+  rotateAccountKeyCalls = 0;
+  rotateAccountKeyResult: { accountKey: string } = { accountKey: 'rotated-stub-phrase' };
   async viewAccountKey(_opts: { password: string }) {
     this.viewAccountKeyCalls++;
     return this.viewAccountKeyResult;
+  }
+  async enableKeyStorage(_opts: { password: string; accountKey: string }) {
+    this.enableKeyStorageCalls++;
+    this.accountKeyStored = true;
+    return { stored: true as const };
+  }
+  async disableKeyStorage(_opts: { password: string }) {
+    this.disableKeyStorageCalls++;
+    this.accountKeyStored = false;
+    return { stored: false as const };
+  }
+  async rotateAccountKey(_opts: { password: string }) {
+    this.rotateAccountKeyCalls++;
+    return this.rotateAccountKeyResult;
   }
   isAccountKeyStored(): boolean | null {
     return this.accountKeyStored;

@@ -290,6 +290,60 @@ Failure modes:
 - **Pinning mismatch** — the SDK throws `AccountKeyPinningError`. Treat as a security warning and avoid surfacing the (would-be) phrase.
 - **Network / decryption failure** — propagated as a regular `Error`.
 
+### Toggling storage at runtime
+
+Users can switch their storage posture at any time after registration. Both methods drive a step-up auth dance internally — the caller passes the freshly-entered password.
+
+```js
+// Model A → Model B. Caller must also supply the user's existing
+// account key (the SDK does not retain it past register / view / rotate).
+// Apps prompt the user to type it, validate via validateAccountKey(),
+// then pass it here.
+await tarn.accountKey.enableKeyStorage({
+  password:   'freshly-re-entered-password',
+  accountKey: '24 words ...',
+});
+
+// Model B → Model A. Just the password — no phrase needed.
+await tarn.accountKey.disableKeyStorage({ password: 'freshly-re-entered-password' });
+```
+
+`enableKeyStorage` runs a wrap-pinning check before submitting: it derives `recovery_lookup_key` from the supplied phrase and compares to the value cached on the client. If the user types a valid 24-word phrase that doesn't actually belong to this account, the SDK throws `AccountKeyPinningError` BEFORE any server round trip. The pin check requires the SDK to have learned `recovery_lookup_key` (set at register / recoverAccount); on a login-only session the value isn't available and the pin check is skipped — the server is the only line of defense in that case, which is fine.
+
+`disableKeyStorage` is idempotent: calling it on an already-Model-A account returns `{ stored: false, alreadyDisabled: true }` instead of throwing. UI code can treat both responses identically.
+
+Failure modes for both:
+
+- **Wrong password** — step-up fails. Error message contains `"step-up auth failed"`.
+- **Pin-check failure** (`enableKeyStorage` only) — `AccountKeyPinningError`.
+- **Network / D1 failure** — propagated as a regular `Error`.
+
+### Rotating the account key
+
+When the user suspects their existing account key has been compromised (or wants to evict it as a routine hygiene step), `rotate()` generates a fresh one, re-wraps the entire DEK chain under the new recovery factor, and atomically publishes the bundle. The OLD account key stops working for `recoverAccount` immediately after this returns.
+
+```js
+const { accountKey: newPhrase } = await tarn.accountKey.rotate({
+  password: 'current-password',
+});
+// Surface newPhrase to the user briefly (downloadable kit, printable
+// page, etc.). The SDK does not retain it.
+```
+
+Notes:
+
+- The user's password and username are NOT changed by rotation — only the account-key half of the recovery factor.
+- The recovery salt is regenerated as part of the new envelope (clean reset of the recovery state).
+- If the account is in Model B, the new account key is also stored (re-wrapped under the existing gen-1 DEK). Model A stays Model A.
+- Pre-rotation data remains decryptable — the DEK chain itself is unchanged; only the wrappings rotated.
+- Apps can also pass `rotatePhrase: true` to `tarn.recoverAccount()` to bundle a rotation into a forgot-password flow (see below).
+
+Failure modes:
+
+- **Wrong password** — local credential mismatch tripwire. Error message contains `"wrong password"`.
+- **Conflict** — `409` from the API if the new `recovery_lookup_key` collides with another account (astronomically unlikely; retry yields a fresh key). Error message contains `"conflict"`.
+- **Network / D1 failure** — propagated as a regular `Error`. The D1 update is atomic, so partial state cannot occur; safe to retry.
+
 ### Account recovery (when the password is lost)
 
 Account recovery itself goes through the top-level `tarn.recoverAccount()` (auth lifecycle):
@@ -302,6 +356,21 @@ await tarn.recoverAccount({
 });
 // New credentials re-wrap the existing data keys; all pre-recovery data is decryptable.
 ```
+
+**Optional `{ rotatePhrase: true }`.** Pass this to bundle an account-key rotation into the recovery flow — useful when the user is recovering BECAUSE they suspect the phrase itself has been compromised (e.g. "I think someone has my recovery sheet"):
+
+```js
+const result = await tarn.recoverAccount({
+  phrase:       '24 words ...',
+  newUsername:  'me@example.com',
+  newPassword:  'fresh-password',
+  rotatePhrase: true,
+});
+// result.accountKey contains the NEW phrase; surface it to the user
+// once and let them save it. The OLD phrase no longer authenticates.
+```
+
+When `rotatePhrase` is omitted (default `false`), recovery preserves the existing phrase — exactly as documented in the protocol. The result has no `accountKey` field. If the inline rotation fails after a successful recovery, the SDK throws a partial-success error pointing at `tarn.accountKey.rotate()` for retry.
 
 ### Authentication and the username field
 
