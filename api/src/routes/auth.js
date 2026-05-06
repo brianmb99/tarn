@@ -30,18 +30,23 @@ function buildCredentialBlob(
   dataLookupKey, wrappedDataKey, publicKey, app,
   recoveryLookupKey, recoveryPublicKey,
   sharePub, shareDiscoverable, shareLookupKey,
+  wrappedAccountKey,
 ) {
   // Optional recovery fields (issue #12) are written when present so that a
   // pure-Arweave rebuild can repopulate the new D1 columns. Pre-v4 (recovery-
   // less) blobs omit them; the rebuild path treats absent fields as NULL.
   // Sharing fields (issue #13) follow the same opt-in pattern: pre-#13 blobs
   // omit them and the rebuild path treats absent share_pub as null.
+  // wrapped_account_key (Phase 3, RECOVERY_PLAN.md) is the AES-GCM-under-DEK
+  // ciphertext of the user's account key, opaque to Tarn. Present only for
+  // Model B accounts; absent for Model A.
   const blob = { data_lookup_key: dataLookupKey, wrapped_data_key: wrappedDataKey, public_key: publicKey, app };
   if (recoveryLookupKey) blob.recovery_lookup_key = recoveryLookupKey;
   if (recoveryPublicKey) blob.recovery_public_key = recoveryPublicKey;
   if (sharePub) blob.share_pub = sharePub;
   if (sharePub) blob.share_discoverable = !!shareDiscoverable;
   if (shareLookupKey) blob.share_lookup_key = shareLookupKey;
+  if (wrappedAccountKey) blob.wrapped_account_key = wrappedAccountKey;
   return JSON.stringify(blob);
 }
 
@@ -62,11 +67,13 @@ function persistCredentialBlob(
   ctx, env, credentialLookupKey, dataLookupKey, wrappedDataKey, publicKey, app,
   recoveryLookupKey, recoveryPublicKey,
   sharePub, shareDiscoverable, shareLookupKey,
+  wrappedAccountKey,
 ) {
   const blobBody = buildCredentialBlob(
     dataLookupKey, wrappedDataKey, publicKey, app,
     recoveryLookupKey, recoveryPublicKey,
     sharePub, shareDiscoverable, shareLookupKey,
+    wrappedAccountKey,
   );
   const tags = buildCredentialTags(credentialLookupKey);
 
@@ -129,6 +136,7 @@ export async function handleRegister(request, env, ctx, cors) {
     credential_lookup_key, public_key, wrapped_data_key, app,
     recovery_lookup_key, recovery_public_key,
     share_pub, share_discoverable, share_lookup_key,
+    wrapped_account_key,
   } = body;
 
   // Validate app — must be a registered app
@@ -179,9 +187,32 @@ export async function handleRegister(request, env, ctx, cors) {
     }
   }
 
+  // Optional wrapped_account_key (Phase 3 — Model B). When present, the
+  // account is registered in Model B; the wrap is opaque ciphertext stored
+  // verbatim in D1 + the Arweave credential blob. The server validates only
+  // that the field is a base64 string of plausible length — anything inside
+  // is the SDK's concern (decryption happens client-side after step-up).
+  //
+  // Length bound: the SDK wraps the 24-word account-key UTF-8 (up to ~215
+  // bytes) under AES-GCM. With IV + tag + base64 encoding the ciphertext
+  // lands in the ~200–400 char range. We accept 100..1024 chars as a
+  // generous bound that survives any reasonable encoding choice (raw
+  // iv||ct||tag, JSON-wrapped, etc.) without being unbounded.
+  if (wrapped_account_key != null) {
+    if (typeof wrapped_account_key !== 'string') {
+      return errorResponse('wrapped_account_key must be a string', 400, cors);
+    }
+    if (wrapped_account_key.length < 100 || wrapped_account_key.length > 1024) {
+      return errorResponse('Invalid wrapped_account_key: implausible length', 400, cors);
+    }
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(wrapped_account_key)) {
+      return errorResponse('Invalid wrapped_account_key: must be base64 / base64url', 400, cors);
+    }
+  }
+
   // Optional sharing fields (issue #13). All three are required together —
   // share_pub (43-char base64url X25519 pubkey), share_lookup_key (64-char
-  // hex, derivable from email alone), share_discoverable (bool, default true).
+  // hex, derivable from username alone), share_discoverable (bool, default true).
   // Pre-#13 clients omit them entirely; the rebuild path treats absent fields
   // as null in D1 (no share keypair published).
   const shareFieldsCount =
@@ -213,7 +244,7 @@ export async function handleRegister(request, env, ctx, cors) {
   // etc). Without idempotency, the user is permanently stuck — the account exists
   // but every retry returns 409. See issue #6.
   const existing = await env.DB.prepare(
-    'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key FROM accounts WHERE credential_lookup_key = ?1'
+    'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key, wrapped_account_key FROM accounts WHERE credential_lookup_key = ?1'
   ).bind(credential_lookup_key).first();
   if (existing) {
     const sameCreds =
@@ -224,7 +255,8 @@ export async function handleRegister(request, env, ctx, cors) {
       (existing.recovery_public_key ?? null) === (recovery_public_key ?? null) &&
       (existing.share_pub ?? null) === (share_pub ?? null) &&
       (existing.share_discoverable ?? null) === (shareDiscoverableInt ?? null) &&
-      (existing.share_lookup_key ?? null) === (share_lookup_key ?? null);
+      (existing.share_lookup_key ?? null) === (share_lookup_key ?? null) &&
+      (existing.wrapped_account_key ?? null) === (wrapped_account_key ?? null);
     if (sameCreds) {
       // Same payload — treat as idempotent success. The client can proceed as if
       // the original register succeeded (which it did, at the D1 layer).
@@ -249,8 +281,8 @@ export async function handleRegister(request, env, ctx, cors) {
   }
 
   // Same up-front check for share_lookup_key. The collision means a different
-  // account in the same app has already registered with this email — the
-  // client should surface that as "email already in use" to the user.
+  // account in the same app has already registered with this username — the
+  // client should surface that as "username already in use" to the user.
   if (share_lookup_key) {
     const shareConflict = await env.DB.prepare(
       'SELECT 1 FROM accounts WHERE share_lookup_key = ?1'
@@ -282,20 +314,21 @@ export async function handleRegister(request, env, ctx, cors) {
   // so concurrent retries also converge to the same success response.
   try {
     await env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)'
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key, wrapped_account_key) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12)'
     ).bind(
       credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, Date.now(),
       recovery_lookup_key ?? null, recovery_public_key ?? null,
       share_pub ?? null,
       shareDiscoverableInt ?? 1,
       share_lookup_key ?? null,
+      wrapped_account_key ?? null,
     ).run();
   } catch (err) {
     // UNIQUE constraint on credential_lookup_key, recovery_lookup_key, or
     // share_lookup_key — concurrent retry won the race (or unique collision).
     if (/UNIQUE/i.test(err.message || '')) {
       const raced = await env.DB.prepare(
-        'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key FROM accounts WHERE credential_lookup_key = ?1'
+        'SELECT data_lookup_key, public_key, wrapped_data_key, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key, wrapped_account_key FROM accounts WHERE credential_lookup_key = ?1'
       ).bind(credential_lookup_key).first();
       if (raced &&
           raced.public_key === public_key &&
@@ -305,7 +338,8 @@ export async function handleRegister(request, env, ctx, cors) {
           (raced.recovery_public_key ?? null) === (recovery_public_key ?? null) &&
           (raced.share_pub ?? null) === (share_pub ?? null) &&
           (raced.share_discoverable ?? null) === (shareDiscoverableInt ?? null) &&
-          (raced.share_lookup_key ?? null) === (share_lookup_key ?? null)) {
+          (raced.share_lookup_key ?? null) === (share_lookup_key ?? null) &&
+          (raced.wrapped_account_key ?? null) === (wrapped_account_key ?? null)) {
         return jsonResponse({ data_lookup_key: raced.data_lookup_key }, 201, cors);
       }
       // Distinguish the unique-constraint paths so the client gets a useful
@@ -337,6 +371,7 @@ export async function handleRegister(request, env, ctx, cors) {
     credential_lookup_key, data_lookup_key, wrapped_data_key, public_key, app,
     recovery_lookup_key, recovery_public_key,
     share_pub ?? null, shareDiscoverableInt === 0 ? false : true, share_lookup_key ?? null,
+    wrapped_account_key ?? null,
   );
 
   return jsonResponse({ data_lookup_key }, 201, cors);
@@ -452,9 +487,15 @@ export async function handleVerify(request, env, cors) {
   let publicKeyBase64;
   let jwtPayload;
 
+  // Side-channel result: whether this account stores a wrap of its account
+  // key (Phase 3, Model B). Surfaced on the /auth/verify response so the
+  // app can render the appropriate Settings UI without an extra round trip.
+  // Set when we look up the account row below; null for app-role JWTs.
+  let accountKeyStored = null;
+
   if (recovery_lookup_key) {
     const recoveryAccount = await env.DB.prepare(
-      'SELECT data_lookup_key, recovery_public_key, app FROM accounts WHERE recovery_lookup_key = ?1'
+      'SELECT data_lookup_key, recovery_public_key, app, wrapped_account_key FROM accounts WHERE recovery_lookup_key = ?1'
     ).bind(recovery_lookup_key).first();
     if (recoveryAccount && recoveryAccount.recovery_public_key) {
       publicKeyBase64 = recoveryAccount.recovery_public_key;
@@ -464,15 +505,17 @@ export async function handleVerify(request, env, cors) {
         app: recoveryAccount.app,
         via_recovery: true,
       };
+      accountKeyStored = recoveryAccount.wrapped_account_key != null;
     }
   } else {
     const account = await env.DB.prepare(
-      'SELECT data_lookup_key, public_key, app FROM accounts WHERE credential_lookup_key = ?1'
+      'SELECT data_lookup_key, public_key, app, wrapped_account_key FROM accounts WHERE credential_lookup_key = ?1'
     ).bind(credential_lookup_key).first();
 
     if (account) {
       publicKeyBase64 = account.public_key;
       jwtPayload = { sub: account.data_lookup_key, role: 'user', app: account.app };
+      accountKeyStored = account.wrapped_account_key != null;
     } else {
       const app = await env.DB.prepare(
         'SELECT app_id, public_key FROM apps WHERE app_id = ?1'
@@ -522,7 +565,14 @@ export async function handleVerify(request, env, cors) {
 
   // Issue JWT
   const jwt = await signJWT(jwtPayload, env.JWT_SECRET);
-  return jsonResponse({ jwt, expiresIn: 900 }, 200, cors);
+  const responseBody = { jwt, expiresIn: 900 };
+  // For user-role logins, include the Model B indicator so the app can
+  // render Settings UI without an extra round trip. App-role auth has no
+  // account_key concept — omit the field for them.
+  if (accountKeyStored !== null) {
+    responseBody.account_key_stored = accountKeyStored;
+  }
+  return jsonResponse(responseBody, 200, cors);
 }
 
 // ============ PUT /api/v1/auth — Credential Change ============
@@ -589,8 +639,8 @@ export async function handleCredentialChange(request, env, ctx, cors) {
 
   // Optional new sharing fields (issue #13). share_pub + share_lookup_key
   // travel together; share_discoverable is independent (can flip without
-  // republishing the keypair). Email change rotates share_lookup_key (it's
-  // email-derived); password change rotates share_pub (it's master_key-
+  // republishing the keypair). Username change rotates share_lookup_key (it's
+  // username-derived); password change rotates share_pub (it's master_key-
   // derived). The client typically supplies all three on every credential
   // change, but the API treats omission as "preserve existing" so a future
   // discoverability-only update can hit the same endpoint with just the flag.
@@ -622,8 +672,12 @@ export async function handleCredentialChange(request, env, ctx, cors) {
 
   // Read current account (need rules_json, app, and existing recovery + share
   // fields to preserve them when the caller doesn't supply replacements).
+  // wrapped_account_key (Phase 3, Model B) is preserved verbatim across a
+  // credential change — the gen-1 DEK survives forward-secret rotation, so
+  // the existing wrap remains decryptable; toggling Model A/B is a Phase 4
+  // concern with its own dedicated endpoints.
   const current = await env.DB.prepare(
-    'SELECT credential_lookup_key, rules_json, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT credential_lookup_key, rules_json, app, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key, wrapped_account_key FROM accounts WHERE data_lookup_key = ?1'
   ).bind(auth.data_lookup_key).first();
   if (!current) {
     return errorResponse('Account not found', 404, cors);
@@ -657,7 +711,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     }
   }
 
-  // Same uniqueness check for share_lookup_key on email change.
+  // Same uniqueness check for share_lookup_key on username change.
   if (
     new_share_lookup_key != null &&
     new_share_lookup_key !== current.share_lookup_key
@@ -679,7 +733,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM accounts WHERE credential_lookup_key = ?1').bind(current.credential_lookup_key),
     env.DB.prepare(
-      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)'
+      'INSERT INTO accounts (credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, created_at, recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key, wrapped_account_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)'
     ).bind(
       new_credential_lookup_key,
       new_public_key,
@@ -693,6 +747,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
       finalSharePub,
       finalShareDiscoverable,
       finalShareLookupKey,
+      current.wrapped_account_key ?? null,
     ),
   ]);
 
@@ -702,6 +757,7 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     new_credential_lookup_key, auth.data_lookup_key, new_wrapped_data_key, new_public_key, current.app,
     finalRecoveryLookupKey, finalRecoveryPublicKey,
     finalSharePub, finalShareDiscoverable === 1, finalShareLookupKey,
+    current.wrapped_account_key ?? null,
   );
 
   // Section 7.5: rotating credentials revokes every OTHER prior session. The
@@ -784,3 +840,134 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
 
   return jsonResponse({ ok: true, deleted: true }, 200, cors);
 }
+
+// ============ POST /api/v1/auth/step-up ============
+//
+// Phase 3 (RECOVERY_PLAN.md). Issues a short-lived, single-use token that
+// authorizes a privileged operation on the caller's account (currently:
+// fetching the wrapped account-key for Model B retrieval). Same auth dance
+// as /auth/verify — the client gets a fresh challenge from /auth/challenge,
+// signs it with the credential_signing_key derived from a freshly re-entered
+// password, and posts (credential_lookup_key, nonce, signature, scope) here.
+//
+// Token mechanism: opaque random 32-byte hex strings, stored in the
+// `step_up_tokens` D1 table with a 60-second TTL and an `consumed_at`
+// single-use guard. Chose this over JWT-with-revocation-list because it's
+// dead simple, the table stays tiny (60s TTL with hourly cleanup is
+// trivial), and there's no shared secret to thread through.
+
+const STEP_UP_TTL_SECONDS = 60;
+const STEP_UP_SCOPE_ACCOUNT_KEY_FETCH = 'account_key_fetch';
+const VALID_STEP_UP_SCOPES = new Set([STEP_UP_SCOPE_ACCOUNT_KEY_FETCH]);
+
+function generateStepUpToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export async function handleStepUp(request, env, cors) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, cors);
+  }
+
+  const { credential_lookup_key, nonce, signature, scope } = body;
+
+  if (!credential_lookup_key || typeof credential_lookup_key !== 'string') {
+    return errorResponse('credential_lookup_key is required', 400, cors);
+  }
+  if (!nonce || !signature) {
+    return errorResponse('nonce and signature are required', 400, cors);
+  }
+  if (!scope || typeof scope !== 'string') {
+    return errorResponse('scope is required', 400, cors);
+  }
+  if (!VALID_STEP_UP_SCOPES.has(scope)) {
+    return errorResponse(`Unknown scope: ${scope}`, 400, cors);
+  }
+
+  // Same nonce-consumption + signature-verification flow as /auth/verify.
+  // Step-up is intentionally narrower than /auth/verify: it does NOT support
+  // recovery-flow auth (that path is reserved for the recoverAccount
+  // primitive — re-entering the account key yields a recovery JWT, not a
+  // step-up token). Step-up is strictly the password proof.
+  const nonceData = await consumeNonce(env, nonce);
+  if (!nonceData) {
+    return errorResponse('Invalid or expired nonce', 401, cors);
+  }
+  if (nonceData.credentialLookupKey !== credential_lookup_key) {
+    return errorResponse('Nonce credential mismatch', 401, cors);
+  }
+
+  const account = await env.DB.prepare(
+    'SELECT data_lookup_key, public_key FROM accounts WHERE credential_lookup_key = ?1'
+  ).bind(credential_lookup_key).first();
+  if (!account) {
+    return errorResponse('Account not found', 401, cors);
+  }
+
+  let publicKey;
+  try {
+    publicKey = await importPublicKey(account.public_key);
+  } catch {
+    return errorResponse('Stored public key is invalid', 500, cors);
+  }
+  const valid = await verifySignature(publicKey, nonce, signature);
+  if (!valid) {
+    return errorResponse('Invalid signature', 401, cors);
+  }
+
+  // Mint and store the token. issued_at + expires_at are wall-clock millis;
+  // consumed_at is NULL until first use (single-use enforced at fetch time
+  // by a conditional UPDATE).
+  const now = Date.now();
+  const expiresAt = now + STEP_UP_TTL_SECONDS * 1000;
+  const token = generateStepUpToken();
+  await env.DB.prepare(
+    'INSERT INTO step_up_tokens (token, data_lookup_key, scope, issued_at, expires_at, consumed_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL)'
+  ).bind(token, account.data_lookup_key, scope, now, expiresAt).run();
+
+  return jsonResponse({
+    step_up_token: token,
+    expires_at: expiresAt,
+    scope,
+  }, 200, cors);
+}
+
+/**
+ * Consume a step-up token (single-use). Returns the row data on success,
+ * null if missing / expired / already-consumed / wrong scope.
+ *
+ * Atomic single-use guard via UPDATE...RETURNING with a `consumed_at IS NULL`
+ * predicate: if two concurrent requests race for the same token, exactly
+ * one's UPDATE matches a row and returns; the other matches zero rows and
+ * gets null.
+ *
+ * Exported for the account-key fetch route (and any future step-up-gated
+ * endpoints).
+ */
+export async function consumeStepUpToken(env, token, expectedScope) {
+  if (!token || typeof token !== 'string') return null;
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    `UPDATE step_up_tokens
+        SET consumed_at = ?2
+      WHERE token = ?1
+        AND consumed_at IS NULL
+        AND expires_at >= ?2
+      RETURNING data_lookup_key, scope, expires_at`
+  ).bind(token, now).first();
+  if (!row) return null;
+  if (expectedScope && row.scope !== expectedScope) return null;
+  return {
+    data_lookup_key: row.data_lookup_key,
+    scope: row.scope,
+    expires_at: row.expires_at,
+  };
+}
+
+export { STEP_UP_SCOPE_ACCOUNT_KEY_FETCH };
+

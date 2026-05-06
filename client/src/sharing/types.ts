@@ -28,16 +28,16 @@ export type Connection = {
   /** Recipient's signing public key, base64url. Used to verify their share-log entries. */
   signing_pub: string;
   /**
-   * The peer's email under this app, when known.
+   * The peer's username under this app, when known.
    *
-   * Present for email-based handshakes (the email is the lookup that
+   * Present for username-based handshakes (the username is the lookup that
    * found the peer). Often absent for invite-token connections where the
-   * inviter doesn't see the redeemer's email and vice versa.
+   * inviter doesn't see the redeemer's username and vice versa.
    *
    * The most durable human-readable identifier — survives label changes,
    * which is useful for "manage connections" UI.
    */
-  email?: string;
+  username?: string;
   /** Optional human-friendly label set by the user. */
   label?: string;
   /** Whether this connection is currently muted (set by `tarn.connections.mute`). */
@@ -169,8 +169,8 @@ export type RedeemedInvite = {
  * `tarn.connections.accept(request_nonce)`.
  */
 export type IncomingRequest = {
-  /** Sender's email under their app. */
-  email: string;
+  /** Sender's username under their app. */
+  username: string;
   /** Sender's share_pub, base64url. */
   share_pub: string;
   /** Sender's signing_pub, base64url. */

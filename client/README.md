@@ -246,12 +246,51 @@ Tarn issues every account a 24-word BIP39 account key at signup. The account key
 const reg = await tarn.register('me@example.com', 'p@ssw0rd', {
   // First arg is the username. See "Authentication and the username field" below.
   recoveryAcknowledged: true,
+  // storeAccountKey defaults to true (Model B). Pass false for strict
+  // zero-knowledge "no backup stored" registration (Model A).
+  storeAccountKey: true,
 });
 // reg.accountKey       — 24-word string
 // Hand it to the user immediately. Do NOT persist it.
 ```
 
 **Kit format and delivery are the app's job.** Tarn returns the 24-word account-key string and nothing else — no PDF, no rendered bytes. Apps render their own kit (downloadable PDF, printable HTML, clipboard copy, whatever fits) and decide how to surface it to the user. There is no Tarn endpoint that handles plaintext account-key material, even ephemerally; the SDK does not ship an in-bundle PDF renderer either, so apps stay in full control of branding and layout. If the application wants to email the kit, it must operate the transport itself — Tarn will not host a forwarder, since routing account-key material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
+
+### Storage models — Model A vs Model B
+
+Apps pick the storage posture at registration via the `storeAccountKey` option:
+
+- **`storeAccountKey: true` (default, Model B).** The SDK encrypts the account key under the user's gen-1 DEK with AAD `"tarn-wrapped-account-key-v1"` and ships the ciphertext to Tarn. Logged-in users can later retrieve and view the account key from app settings via `tarn.accountKey.view()`. The wrap is opaque to Tarn; only a user who supplies their password can decrypt it.
+- **`storeAccountKey: false` (Model A).** The wrap is omitted entirely. Tarn never holds any form of the account key. Lose the password AND the account key → data is permanently inaccessible (even Tarn cannot help). This is the strict zero-knowledge posture.
+
+Reading the storage state at runtime:
+
+```js
+// After login or register completes:
+tarn.accountKey.isStored();   // true (Model B) | false (Model A) | null (no auth round trip yet)
+```
+
+### Viewing the account key (Model B)
+
+```js
+const { accountKey } = await tarn.accountKey.view({ password: 'freshly-re-entered-password' });
+// 24-word string. Surface it briefly; do not persist.
+```
+
+The flow:
+
+1. The SDK runs a step-up auth dance against the API: fresh nonce → sign with credential signing key derived from the re-entered password → exchange for a single-use 60-second token.
+2. The SDK fetches the encrypted wrap with both the session JWT and the step-up token.
+3. The SDK decrypts the wrap client-side and runs a wrap-pinning check (re-derives the `recovery_lookup_key` from the decrypted phrase and compares to the server-stored value). On mismatch, `view()` throws `AccountKeyPinningError` — surface this distinctly from a "wrong password" or "network error", since it's a security warning.
+
+Failure modes:
+
+- **Wrong password** — step-up authentication fails. The SDK throws an `Error` whose message contains `"step-up"` or `"challenge"`.
+- **Model A account** — the server returns 404. The SDK throws an `Error` whose message contains `"no_account_key_stored"`. Render the appropriate "no backup stored" UI.
+- **Pinning mismatch** — the SDK throws `AccountKeyPinningError`. Treat as a security warning and avoid surfacing the (would-be) phrase.
+- **Network / decryption failure** — propagated as a regular `Error`.
+
+### Account recovery (when the password is lost)
 
 Account recovery itself goes through the top-level `tarn.recoverAccount()` (auth lifecycle):
 

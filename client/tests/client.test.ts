@@ -114,6 +114,18 @@ class StubUnderlying implements IUnderlyingClient {
     return { ok: true };
   }
 
+  // ---- Account-key (Phase 3) ----
+  viewAccountKeyCalls = 0;
+  viewAccountKeyResult: { accountKey: string } = { accountKey: 'stub-phrase' };
+  accountKeyStored: boolean | null = null;
+  async viewAccountKey(_opts: { password: string }) {
+    this.viewAccountKeyCalls++;
+    return this.viewAccountKeyResult;
+  }
+  isAccountKeyStored(): boolean | null {
+    return this.accountKeyStored;
+  }
+
   // ---- Connections ----
   async listConnections() {
     this.listConnectionsCalls++;

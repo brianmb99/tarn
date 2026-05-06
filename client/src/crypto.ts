@@ -529,6 +529,80 @@ export async function decrypt(key: CryptoKey, blob: Uint8Array): Promise<unknown
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
 
+// ============ ACCOUNT-KEY WRAP (Phase 3 — Model B) ============
+//
+// The user's 24-word account-key string, encrypted under the gen-1 DEK with
+// AAD `"tarn-wrapped-account-key-v1"`. Stored on `accounts.wrapped_account_key`
+// and republished in the Arweave credential blob; opaque to Tarn (decryption
+// requires the user's password to derive the gen-1 DEK).
+//
+// AAD is part of the wire format — unwraps that omit or change it MUST fail.
+// Wire layout: IV(12) || ciphertext+GCM-tag(N+16), then base64-encoded.
+//
+// The pinning step that follows decryption (re-derive recovery_lookup_key
+// from the plaintext entropy and compare to the value the server returned)
+// lives in tarn.ts; this module only handles the symmetric-crypto half.
+
+export const WRAPPED_ACCOUNT_KEY_AAD = new TextEncoder().encode(
+  'tarn-wrapped-account-key-v1',
+);
+
+/**
+ * Encrypt the account-key UTF-8 string under the supplied DEK. Returns the
+ * base64-encoded `IV || ciphertext+tag` blob ready to send as the
+ * `wrapped_account_key` field at registration.
+ */
+export async function wrapAccountKey(
+  dekGcm: CryptoKey,
+  accountKey: string,
+): Promise<string> {
+  if (typeof accountKey !== 'string' || accountKey.length === 0) {
+    throw new Error('wrapAccountKey: accountKey must be a non-empty string');
+  }
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(accountKey);
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: bs(iv), additionalData: bs(WRAPPED_ACCOUNT_KEY_AAD) },
+      dekGcm,
+      bs(plaintext),
+    ),
+  );
+  const out = new Uint8Array(iv.length + ciphertext.length);
+  out.set(iv, 0);
+  out.set(ciphertext, iv.length);
+  return bytesToBase64Raw(out);
+}
+
+/**
+ * Decrypt a `wrapped_account_key` ciphertext under the supplied DEK with the
+ * fixed AAD. Returns the recovered account-key string.
+ *
+ * Throws on AAD mismatch or any other AES-GCM failure (caller should map
+ * this to a domain-typed error — e.g., "decryption failed, possibly tampered
+ * wrap" vs "wrong DEK").
+ */
+export async function unwrapAccountKey(
+  dekGcm: CryptoKey,
+  wrappedBase64: string,
+): Promise<string> {
+  if (typeof wrappedBase64 !== 'string' || wrappedBase64.length === 0) {
+    throw new Error('unwrapAccountKey: wrappedBase64 must be a non-empty string');
+  }
+  const blob = base64ToBytesRaw(wrappedBase64);
+  if (blob.length < 12 + 16) {
+    throw new Error('unwrapAccountKey: wrapped blob too short');
+  }
+  const iv = blob.slice(0, 12);
+  const ciphertext = blob.slice(12);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: bs(iv), additionalData: bs(WRAPPED_ACCOUNT_KEY_AAD) },
+    dekGcm,
+    bs(ciphertext),
+  );
+  return new TextDecoder().decode(plaintext);
+}
+
 // ============ PER-CONTENT CEK BLOB FORMAT (issue #11) ============
 
 /**

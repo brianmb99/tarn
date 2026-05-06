@@ -55,7 +55,7 @@ interface UnderlyingRedeemedInvite {
 }
 
 interface UnderlyingIncomingRequest {
-  senderEmail: string;
+  senderUsername: string;
   senderSharePubBase64Url: string;
   senderSigningPubBase64: string;
   senderAppId: string;
@@ -240,7 +240,7 @@ export class ConnectionsNamespace {
     // home on Connection. Each is optional — invite-token connections may
     // lack `email`, very old records may lack `established_at`, etc.
     const out: Connection = { share_pub: raw.share_pub, signing_pub: raw.signing_pub };
-    if (typeof raw.email === 'string') out.email = raw.email;
+    if (typeof raw.username === 'string') out.username = raw.username;
     if (typeof raw.label === 'string') out.label = raw.label;
     if (typeof raw.muted === 'boolean') out.muted = raw.muted;
     if (typeof raw.established_at === 'number') out.established_at = raw.established_at;
@@ -252,7 +252,7 @@ export class ConnectionsNamespace {
 
   #toIncomingRequest(raw: UnderlyingIncomingRequest): IncomingRequest {
     const out: IncomingRequest = {
-      email: raw.senderEmail,
+      username: raw.senderUsername,
       share_pub: raw.senderSharePubBase64Url,
       signing_pub: raw.senderSigningPubBase64,
       app_id: raw.senderAppId,

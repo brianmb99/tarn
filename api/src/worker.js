@@ -7,7 +7,15 @@ import { handleLookup } from './routes/lookup.js';
 import { handleShareLookup } from './routes/share.js';
 import { handleShareInboxPublish, handleShareInboxFetch } from './routes/share-inbox.js';
 import { handleShareLogPublish, handleShareLogFetch } from './routes/share-log.js';
-import { handleRegister, handleChallenge, handleVerify, handleCredentialChange, handleDeleteAccount } from './routes/auth.js';
+import {
+  handleRegister,
+  handleChallenge,
+  handleVerify,
+  handleCredentialChange,
+  handleDeleteAccount,
+  handleStepUp,
+} from './routes/auth.js';
+import { handleGetAccountKey } from './routes/account.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules, handleSetInviteTemplate, handleSetSchema } from './routes/apps.js';
@@ -38,7 +46,7 @@ function getCorsHeaders(request) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Arweave-Tags, X-Idempotency-Key',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Arweave-Tags, X-Idempotency-Key, X-Step-Up-Token',
   };
 }
 
@@ -85,6 +93,16 @@ export default {
       }
       if (path === '/api/v1/auth/verify' && method === 'POST') {
         return await handleVerify(request, env, cors);
+      }
+      if (path === '/api/v1/auth/step-up' && method === 'POST') {
+        return await handleStepUp(request, env, cors);
+      }
+
+      // Account-key Model B retrieval (Phase 3, RECOVERY_PLAN.md). Requires
+      // both a session JWT (Authorization: Bearer …) and a single-use
+      // step-up token (X-Step-Up-Token header).
+      if (path === '/api/v1/account/account-key' && method === 'GET') {
+        return await handleGetAccountKey(request, env, ctx, cors);
       }
 
       // Auth — credential management (authenticated)
@@ -144,7 +162,7 @@ export default {
         return await handleLookup(url, request, env, ctx, cors);
       }
 
-      // Share keypair lookup (issue #13) — returns share_pub by email-only key
+      // Share keypair lookup (issue #13) — returns share_pub by username-only key
       if (path === '/api/v1/share/lookup' && method === 'GET') {
         return await handleShareLookup(url, request, env, cors);
       }

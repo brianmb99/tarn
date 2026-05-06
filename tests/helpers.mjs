@@ -53,6 +53,9 @@ export function randomEmail() {
   return `test-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
 }
 
+// Alias — tests written after the email→username vocabulary shift import this name.
+export const randomUsername = randomEmail;
+
 export async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }

@@ -137,7 +137,7 @@ export type ShareConnection = {
  * signature.
  */
 export type UnderlyingConnection = ShareConnection & {
-  email?: string | null;
+  username?: string | null;
   established_at?: number | null;
   initial_request_nonce?: string | null;
 } & Record<string, unknown>;

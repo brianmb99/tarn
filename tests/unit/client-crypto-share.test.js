@@ -172,8 +172,8 @@ describe('deriveShareLookupKey', () => {
     assert.equal(lk.length, 64);
   });
 
-  it('rejects missing email or app_id', async () => {
-    await assert.rejects(() => deriveShareLookupKey('', TEST_APP), /email is required/);
+  it('rejects missing username or app_id', async () => {
+    await assert.rejects(() => deriveShareLookupKey('', TEST_APP), /username is required/);
     await assert.rejects(() => deriveShareLookupKey(TEST_EMAIL, ''), /appId is required/);
   });
 });

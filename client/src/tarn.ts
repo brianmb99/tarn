@@ -38,6 +38,8 @@ import {
   base64UrlToBytes,
   bytesToBase64,
   bytesToBase64Url,
+  wrapAccountKey,
+  unwrapAccountKey,
   FACTOR_PASSWORD,
   FACTOR_RECOVERY_PHRASE,
 } from './crypto.js';
@@ -144,6 +146,28 @@ function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
 // Re-export the account-key surface so consumers can import them directly
 // from the package root without reaching into ./recovery (private path).
 export { generateAccountKey, validateAccountKey };
+
+/**
+ * Thrown by `viewAccountKey()` when the wrap decrypts cleanly but the
+ * resulting account-key entropy derives a `recovery_lookup_key` that does
+ * NOT match the value the server has on record.
+ *
+ * Possible causes (all security-relevant):
+ *   - The server returned a tampered wrap that decrypts to a *different*
+ *     valid 24-word BIP39 phrase under a colluding/compromised storage
+ *     backend.
+ *   - The server returned a wrap belonging to a different account under a
+ *     mis-binding bug.
+ *
+ * Callers SHOULD surface this distinctly from generic decryption errors —
+ * it is a security warning, not a "wrong password" or "network failure".
+ */
+export class AccountKeyPinningError extends Error {
+  constructor(message = 'Account-key pinning check failed: derived recovery_lookup_key does not match the server') {
+    super(message);
+    this.name = 'AccountKeyPinningError';
+  }
+}
 
 export class TarnClient {
   #apiBase: string;
@@ -256,6 +280,12 @@ export class TarnClient {
   // register/login/recoverAccount; cleared after the verify body is built.
   #pendingDeviceLabel: string | null = null;
 
+  // Phase 3 (RECOVERY_PLAN.md) — Model B indicator surfaced on /auth/verify.
+  // True when the account has a wrap stored on the server (Model B); false
+  // for Model A; null until the first verify completes. Apps read this via
+  // `tarn.session.isAccountKeyStored()` to render the right Settings UI.
+  #accountKeyStored: boolean | null = null;
+
   /**
    * @param apiBaseUrl - Tarn API base URL (e.g., 'https://api.tarn.dev')
    * @param appId - Registered app identifier (e.g., 'bookish')
@@ -289,10 +319,23 @@ export class TarnClient {
    * promptly. Tarn no longer renders kits in-SDK; the app owns the kit
    * format and delivery.
    *
+   * Account-key storage (Phase 3 — RECOVERY_PLAN.md):
+   *   - `storeAccountKey: true` (default) → Model B. The SDK encrypts the
+   *     account-key UTF-8 under the gen-1 DEK with AAD
+   *     `"tarn-wrapped-account-key-v1"` and ships the ciphertext as
+   *     `wrapped_account_key` in the register payload. Logged-in users can
+   *     later retrieve and view the account key via `tarn.accountKey.view()`.
+   *   - `storeAccountKey: false` → Model A. The wrap is omitted; Tarn never
+   *     stores any form of the account key. The user holds the only copy.
+   *
+   * Apps choose at registration time; users can switch later via the toggle
+   * endpoints (Phase 4 — not yet shipped).
+   *
    * @param {string} username
    * @param {string} password
    * @param {{
    *   recoveryAcknowledged: boolean,
+   *   storeAccountKey?: boolean,
    * }} [opts]
    * @returns {Promise<{
    *   dataLookupKey: string,
@@ -303,6 +346,9 @@ export class TarnClient {
     if (!opts || opts.recoveryAcknowledged !== true) {
       throw new Error('register(): recoveryAcknowledged: true is required (issue #12)');
     }
+    // Default Model B per RECOVERY_PLAN.md. Apps that want strict
+    // zero-knowledge "no backup stored" pass `storeAccountKey: false`.
+    const storeAccountKey = opts.storeAccountKey !== false;
     // Sharing keypair publication (issue #13). Defaults to discoverable so a
     // new social-app user can connect by username out of the box. Apps that
     // want a "private by default" stance can pass `shareDiscoverable: false`.
@@ -344,20 +390,30 @@ export class TarnClient {
       { salt: recoverySalt },
     );
 
+    // Phase 3 — Model B: encrypt the account-key UTF-8 under the gen-1 DEK.
+    // The wrap is opaque to Tarn; only a logged-in user (with the password
+    // to derive DEK_gen1) plus a step-up token can fetch and decrypt it.
+    const wrappedAccountKey = storeAccountKey
+      ? await wrapAccountKey(dek.gcmKey, phrase)
+      : null;
+
+    const registerBody: Record<string, unknown> = {
+      credential_lookup_key: keys.credentialLookupKey,
+      public_key: publicKeyBase64,
+      wrapped_data_key: wrappedDataKey,
+      app: this.#appId,
+      recovery_lookup_key: recoveryLookupKey,
+      recovery_public_key: recoveryPublicKeyBase64,
+      share_pub: sharePub,
+      share_discoverable: shareDiscoverable,
+      share_lookup_key: shareLookupKey,
+    };
+    if (wrappedAccountKey) registerBody['wrapped_account_key'] = wrappedAccountKey;
+
     const res = await this.#fetch('/api/v1/auth/register', {
       method: 'POST',
       retry: true, // idempotent since tarn #6 (envelope is byte-stable)
-      body: {
-        credential_lookup_key: keys.credentialLookupKey,
-        public_key: publicKeyBase64,
-        wrapped_data_key: wrappedDataKey,
-        app: this.#appId,
-        recovery_lookup_key: recoveryLookupKey,
-        recovery_public_key: recoveryPublicKeyBase64,
-        share_pub: sharePub,
-        share_discoverable: shareDiscoverable,
-        share_lookup_key: shareLookupKey,
-      },
+      body: registerBody,
     });
 
     if (res.status !== 201) {
@@ -996,6 +1052,137 @@ export class TarnClient {
   async #wrapDekRaw(dekGcmKey: CryptoKey, wrappingKey: CryptoKey): Promise<string> {
     const wrapped = await crypto.subtle.wrapKey('raw', dekGcmKey, wrappingKey, 'AES-KW');
     return bytesToBase64(new Uint8Array(wrapped));
+  }
+
+  /**
+   * Phase 3 (RECOVERY_PLAN.md) — Model B account-key retrieval.
+   *
+   * Orchestrates the full step-up gated flow:
+   *   1. Derive credential keys from the freshly re-entered password.
+   *   2. POST /auth/challenge → nonce
+   *   3. Sign nonce, POST /auth/step-up { scope: "account_key_fetch" }
+   *      → single-use step-up token (60s TTL)
+   *   4. GET /account/account-key with the session JWT + step-up token
+   *      → { wrapped_account_key, recovery_lookup_key, ... }
+   *   5. AES-GCM-decrypt the wrap under DEK_gen1 with AAD
+   *      "tarn-wrapped-account-key-v1".
+   *   6. Wrap-pinning check: derive recovery_lookup_key from the decrypted
+   *      account-key entropy (same chain `recoverAccount` uses) and compare
+   *      to the value the server returned. Mismatch → throw
+   *      AccountKeyPinningError without returning the phrase.
+   *
+   * The SDK does NOT cache or retain the returned account key — the caller
+   * is responsible for surfacing it to the user briefly and dropping the
+   * in-memory copy as soon as possible.
+   *
+   * @param opts - Must contain `password` (the freshly re-entered password).
+   * @returns `{ accountKey: string }` on success.
+   * @throws AccountKeyPinningError on wrap-pinning failure.
+   * @throws Error with message containing "no_account_key_stored" for Model
+   *   A accounts (caller renders "no backup stored" UI).
+   * @throws Error on wrong password (step-up fails), expired token,
+   *   network failure, or AES-GCM decryption failure.
+   */
+  async viewAccountKey(opts: { password: string }): Promise<{ accountKey: string }> {
+    await this.#requireAuth();
+    if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
+      throw new Error('viewAccountKey(): password is required');
+    }
+    if (!this.#username) {
+      throw new Error('viewAccountKey(): username unknown — log in first');
+    }
+    if (!this.#dekByGen || !this.#dekByGen.has(1)) {
+      throw new Error('viewAccountKey(): DEK_gen1 not available (corrupt session?)');
+    }
+    const dekGen1 = this.#dekByGen.get(1)!;
+
+    // Step 1: re-derive credential keys from the freshly-entered password.
+    const reKeys = await deriveAllKeys(this.#username, opts.password, this.#appId);
+
+    // Step 2: fresh challenge for this credential.
+    const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+      method: 'POST',
+      retry: true,
+      body: { credential_lookup_key: reKeys.credentialLookupKey },
+    });
+    if (challengeRes.status !== 200) {
+      throw new Error(`viewAccountKey(): challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
+    }
+
+    // Step 3: sign + step-up.
+    const signature = await signChallenge(reKeys.signingKeyPair.privateKey, challengeRes.json.nonce);
+    const stepUpRes = await this.#fetch('/api/v1/auth/step-up', {
+      method: 'POST',
+      body: {
+        credential_lookup_key: reKeys.credentialLookupKey,
+        nonce: challengeRes.json.nonce,
+        signature,
+        scope: 'account_key_fetch',
+      },
+    });
+    if (stepUpRes.status === 401) {
+      throw new Error('viewAccountKey(): step-up auth failed (wrong password?)');
+    }
+    if (stepUpRes.status !== 200) {
+      throw new Error(`viewAccountKey(): step-up failed: ${stepUpRes.json?.error || stepUpRes.status}`);
+    }
+    const stepUpToken = stepUpRes.json.step_up_token;
+    if (!stepUpToken) {
+      throw new Error('viewAccountKey(): step-up succeeded but no token returned');
+    }
+
+    // Step 4: fetch the wrap. Must include BOTH the session JWT and the
+    // single-use step-up token. Use #fetchRaw so we can attach the custom
+    // X-Step-Up-Token header.
+    const fetchRes = await this.#fetchRaw('/api/v1/account/account-key', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.#jwt}`,
+        'X-Step-Up-Token': stepUpToken,
+        'Content-Type': 'application/json',
+      },
+    });
+    const fetchText = await fetchRes.text();
+    let fetchJson: any = null;
+    try { fetchJson = JSON.parse(fetchText); } catch {}
+
+    if (fetchRes.status === 404 && fetchJson?.error === 'no_account_key_stored') {
+      throw new Error('viewAccountKey(): no_account_key_stored — this account is in Model A');
+    }
+    if (fetchRes.status !== 200) {
+      throw new Error(`viewAccountKey(): fetch failed: ${fetchJson?.error || fetchRes.status}`);
+    }
+    const { wrapped_account_key, recovery_lookup_key } = fetchJson || {};
+    if (!wrapped_account_key) {
+      throw new Error('viewAccountKey(): server returned no wrapped_account_key');
+    }
+
+    // Step 5: decrypt the wrap with DEK_gen1 + fixed AAD.
+    let phrase: string;
+    try {
+      phrase = await unwrapAccountKey(dekGen1.gcmKey, wrapped_account_key);
+    } catch (err: any) {
+      throw new Error(`viewAccountKey(): wrap decryption failed: ${err?.message || err}`);
+    }
+
+    // Step 6: wrap-pinning. Derive recovery_lookup_key from the decrypted
+    // entropy and compare to the server-stored value. Mismatch implies the
+    // wrap doesn't belong to this account — refuse to return it.
+    if (recovery_lookup_key) {
+      const validation = validateAccountKey(phrase);
+      if (!validation.valid) {
+        throw new AccountKeyPinningError(
+          `Decrypted wrap is not a valid account key: ${validation.reason}`,
+        );
+      }
+      const entropy = accountKeyToEntropy(validation.normalized);
+      const derived = await deriveRecoveryLookupKey(entropy, this.#appId);
+      if (derived !== recovery_lookup_key) {
+        throw new AccountKeyPinningError();
+      }
+    }
+
+    return { accountKey: phrase };
   }
 
   /**
@@ -3998,6 +4185,11 @@ export class TarnClient {
       recoveryFactorMeta,
       jwt: this.#jwt,
       sid: this.#sid,
+      // Phase 3: persist the Model B indicator so resumed sessions know
+      // whether to surface "view your account key" without a fresh /verify
+      // round trip. Strict boolean | null — undefined survives JSON.parse
+      // as undefined, which we coerce back to null.
+      accountKeyStored: this.#accountKeyStored,
     };
 
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
@@ -4139,6 +4331,10 @@ export class TarnClient {
         publicKey: base64ToBytes(payload.sharingPublicKey),
       };
       client.#recoveryFactorMeta = recoveryFactorMeta;
+      // Phase 3: rehydrate the Model B indicator. Pre-Phase-3 blobs lack
+      // the field; coerce undefined → null so isStored() reads correctly.
+      client.#accountKeyStored =
+        typeof payload.accountKeyStored === 'boolean' ? payload.accountKeyStored : null;
 
       return client;
     } catch {
@@ -4454,6 +4650,20 @@ export class TarnClient {
 
     this.#jwt = verifyRes.json.jwt;
     this.#sid = this.#extractSidFromJwt(this.#jwt);
+    // Phase 3: server returns account_key_stored on user-role verify so the
+    // app can render Settings appropriately. Null for app-role JWTs.
+    if (typeof verifyRes.json.account_key_stored === 'boolean') {
+      this.#accountKeyStored = verifyRes.json.account_key_stored;
+    }
+  }
+
+  /**
+   * Whether the server stores a wrap of this account's account key
+   * (Model B). Reflects the most recent /auth/verify response. Null before
+   * the first verify (e.g., on a fresh, never-logged-in client).
+   */
+  isAccountKeyStored(): boolean | null {
+    return this.#accountKeyStored;
   }
 
   /**

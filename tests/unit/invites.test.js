@@ -341,7 +341,7 @@ describe('connection-request payload via_invite_token', () => {
   it('round-trips the via_invite_token field', () => {
     const senderSharePub = crypto.getRandomValues(new Uint8Array(32));
     const built = buildConnectionRequestPayload({
-      senderEmail: 'a@b.c',
+      senderUsername: 'a@b.c',
       senderSharePub,
       senderSigningPubBase64: 'spki-stub',
       senderAppId: 'test-app',
@@ -356,7 +356,7 @@ describe('connection-request payload via_invite_token', () => {
   it('treats absent via_invite_token as null on the validated side', () => {
     const senderSharePub = crypto.getRandomValues(new Uint8Array(32));
     const built = buildConnectionRequestPayload({
-      senderEmail: 'a@b.c',
+      senderUsername: 'a@b.c',
       senderSharePub,
       senderSigningPubBase64: 'spki-stub',
       senderAppId: 'test-app',

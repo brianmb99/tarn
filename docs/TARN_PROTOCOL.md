@@ -186,6 +186,79 @@ Two distinct storage modes exist for the account key. The wire protocol supports
 
 **Future passkey support is independent of this choice.** Phase 6 of the roadmap adds WebAuthn-PRF as a third auth factor in the envelope (alongside `password` and `recovery_phrase`). Whether or not an account uses Model A or Model B, it can independently opt in to passkey factors.
 
+#### Wire format details (Phase 3)
+
+**Wrap construction.** The client computes:
+
+```
+wrapped_account_key = AES-GCM(
+  key       = DEK_gen1,
+  plaintext = utf8(account_key),
+  AAD       = utf8("tarn-wrapped-account-key-v1"),
+)
+```
+
+Wire bytes are `IV(12) || ciphertext+GCM-tag(N+16)`, then base64-encoded. The AAD string `"tarn-wrapped-account-key-v1"` is part of the wire format — any future revision of this wrap MUST bump the version suffix and reject the old AAD on read. Decrypts with a different (or absent) AAD MUST fail.
+
+The server validates only that the field is a base64 string of plausible length (100..1024 chars) and stores it verbatim. Server cannot decrypt — DEK_gen1 is derived from the user's password.
+
+**`account_key_stored` indicator.** The `/auth/verify` response carries an `account_key_stored: boolean` field for user-role logins (omitted for app-role JWTs). It reflects whether the row's `wrapped_account_key` is non-null. Apps render the appropriate Settings UI based on this (`true` → "view your account key"; `false` → "no backup stored — enable in settings"). The wrap itself is NOT included on `/auth/verify` — fetching it is a separately gated operation, see below.
+
+#### Step-up auth: `POST /api/v1/auth/step-up`
+
+Issues a short-lived single-use token authorizing one privileged operation. Currently scoped to `account_key_fetch` (the wrap retrieval below); future privileged endpoints (Phase 4 toggles, etc.) reuse the same machinery with new scope strings.
+
+Request body (same shape as `/auth/verify`'s password-side path):
+
+```json
+{
+  "credential_lookup_key": "<64-char hex>",
+  "nonce": "<64-char hex from /auth/challenge>",
+  "signature": "<base64 ECDSA P-256 signature over the nonce>",
+  "scope": "account_key_fetch"
+}
+```
+
+The flow: client calls `/auth/challenge` with `credential_lookup_key`, derives `credential_signing_key` from the freshly re-entered password, signs the nonce, posts to `/auth/step-up` with the same `credential_lookup_key`, the consumed nonce, the signature, and the scope. The signature verifies against the row's stored `public_key` exactly like `/auth/verify`. Recovery-flow auth (`recovery_lookup_key`) is intentionally NOT supported — re-entering the account key yields a recovery JWT via the existing `/auth/verify`, not a step-up token.
+
+Response:
+
+```json
+{
+  "step_up_token": "<64-char hex random token>",
+  "expires_at": <unix-millis>,
+  "scope": "account_key_fetch"
+}
+```
+
+**Token mechanism.** Opaque random 32-byte hex strings stored in the `step_up_tokens` D1 table with a 60-second TTL and a `consumed_at` single-use guard. The single-use guard is enforced atomically via `UPDATE ... WHERE consumed_at IS NULL ... RETURNING ...` — the first reader's UPDATE matches and returns; concurrent re-uses match zero rows and read null. Chosen over JWT-with-revocation-list because the table stays trivially small (60s TTL) and there's no extra signing key to thread through.
+
+#### Account-key fetch: `GET /api/v1/account/account-key`
+
+Returns the stored wrap. Requires BOTH:
+
+- `Authorization: Bearer <session JWT>` — proves the caller is logged into *some* account.
+- `X-Step-Up-Token: <token>` — proves a fresh password re-entry on this device.
+
+The server cross-checks that both bind to the same `data_lookup_key` (defense in depth against a JWT/token mis-binding). Either auth missing → 401.
+
+Response on success (Model B account):
+
+```json
+{
+  "wrapped_account_key": "<base64 ciphertext>",
+  "recovery_salt": "<base64 16 bytes — Argon2id salt from the v1 envelope>",
+  "kdf_params": { "m_kib": 65536, "t": 3, "p": 1 },
+  "recovery_lookup_key": "<64-char hex — pinning check value>"
+}
+```
+
+Response on Model A account (no wrap stored): `404` with body `{"error": "no_account_key_stored"}` so the SDK can render the appropriate UI without conflating with "wrong account."
+
+**Wrap-pinning check (client-side).** After decrypting the wrap, the SDK derives `recovery_lookup_key` from the resulting account-key entropy via the same HMAC chain used elsewhere (`HMAC-SHA256(entropy, "tarn-v1:recovery-lookup:<app_id>:1")` truncated to 32 bytes). It compares this to the `recovery_lookup_key` returned in the fetch response. Mismatch → SDK throws a typed `AccountKeyPinningError` and refuses to return the phrase. The pin check defends against the server returning a wrap that decrypts to a *different* (also valid) 24-word phrase — possible under a colluding storage backend or a wrap mis-binding bug.
+
+**Audit log.** Every successful fetch writes a row to `account_key_fetch_log` (`data_lookup_key`, `fetched_at`, hashed `ip_hash`, truncated `user_agent`). Inserted via `ctx.waitUntil` so a D1 hiccup does not block the response. This enables future "account key was last viewed at X" UX in app settings.
+
 ### Data lookup key
 
 Generated by the API at registration. Random, unique, opaque 64-char hex string. Not derived from any client secret. Returned to the client at registration.
@@ -332,11 +405,12 @@ The credential mapping blob is **not encrypted**. It contains:
   "public_key": "<base64-encoded ECDSA P-256 SPKI public key>",
   "app": "<app_id>",
   "recovery_lookup_key": "<64-char hex>",
-  "recovery_public_key": "<base64-encoded ECDSA P-256 SPKI public key>"
+  "recovery_public_key": "<base64-encoded ECDSA P-256 SPKI public key>",
+  "wrapped_account_key": "<base64 ciphertext — Model B only, omitted for Model A>"
 }
 ```
 
-Every account carries a recovery factor, so `recovery_lookup_key` and `recovery_public_key` are always present.
+Every account carries a recovery factor, so `recovery_lookup_key` and `recovery_public_key` are always present. `wrapped_account_key` (Phase 3) appears for Model B accounts and is omitted for Model A; it is opaque to the server and decryptable only by the user (gen-1 DEK + AAD `"tarn-wrapped-account-key-v1"`).
 
 No value here is secret. Storing unencrypted enables:
 - Single API call for registration (no second client round-trip)

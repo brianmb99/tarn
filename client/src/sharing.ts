@@ -261,7 +261,7 @@ export async function hpkeOpen(opts: {
 // ============ CONNECTION REQUEST / ACCEPT PAYLOADS ============
 
 export type BuildConnectionRequestOpts = {
-  senderEmail: string;
+  senderUsername: string;
   senderSharePub: Uint8Array;
   senderSigningPubBase64: string;
   senderAppId: string;
@@ -284,7 +284,7 @@ export type ConnectionRequestPayload = {
 };
 
 export function buildConnectionRequestPayload(opts: BuildConnectionRequestOpts): ConnectionRequestPayload {
-  const senderEmail = requireString(opts.senderEmail, 'senderEmail');
+  const senderUsername = requireString(opts.senderUsername, 'senderUsername');
   const senderSigningPub = requireString(opts.senderSigningPubBase64, 'senderSigningPubBase64');
   const senderAppId = requireString(opts.senderAppId, 'senderAppId');
   if (!(opts.senderSharePub instanceof Uint8Array) || opts.senderSharePub.length !== 32) {
@@ -307,7 +307,7 @@ export function buildConnectionRequestPayload(opts: BuildConnectionRequestOpts):
 
   const out: ConnectionRequestPayload = {
     type: 'connection_request',
-    sender_email: senderEmail,
+    sender_email: senderUsername,
     sender_share_pub: bytesToBase64Url(opts.senderSharePub),
     sender_signing_pub: senderSigningPub,
     sender_app_id: senderAppId,
@@ -321,7 +321,7 @@ export function buildConnectionRequestPayload(opts: BuildConnectionRequestOpts):
 
 export type NormalizedConnectionRequest = {
   type: 'connection_request';
-  senderEmail: string;
+  senderUsername: string;
   senderSharePub: Uint8Array;
   senderSharePubBase64Url: string;
   senderSigningPubBase64: string;
@@ -408,7 +408,7 @@ export function validateConnectionRequestPayload(
     valid: true,
     normalized: {
       type: 'connection_request',
-      senderEmail: p['sender_email'] as string,
+      senderUsername: p['sender_email'] as string,
       senderSharePub,
       senderSharePubBase64Url: p['sender_share_pub'] as string,
       senderSigningPubBase64: p['sender_signing_pub'] as string,
@@ -423,7 +423,7 @@ export function validateConnectionRequestPayload(
 }
 
 export type BuildConnectionAcceptOpts = {
-  senderEmail: string;
+  senderUsername: string;
   senderSharePub: Uint8Array;
   senderSigningPubBase64: string;
   senderAppId: string;
@@ -442,7 +442,7 @@ export type ConnectionAcceptPayload = {
 };
 
 export function buildConnectionAcceptPayload(opts: BuildConnectionAcceptOpts): ConnectionAcceptPayload {
-  const senderEmail = requireString(opts.senderEmail, 'senderEmail');
+  const senderUsername = requireString(opts.senderUsername, 'senderUsername');
   const senderSigningPub = requireString(opts.senderSigningPubBase64, 'senderSigningPubBase64');
   const senderAppId = requireString(opts.senderAppId, 'senderAppId');
   const inReplyTo = requireString(opts.inReplyToNonceBase64Url, 'inReplyToNonceBase64Url');
@@ -451,7 +451,7 @@ export function buildConnectionAcceptPayload(opts: BuildConnectionAcceptOpts): C
   }
   return {
     type: 'connection_accept',
-    sender_email: senderEmail,
+    sender_email: senderUsername,
     sender_share_pub: bytesToBase64Url(opts.senderSharePub),
     sender_signing_pub: senderSigningPub,
     sender_app_id: senderAppId,
@@ -462,7 +462,7 @@ export function buildConnectionAcceptPayload(opts: BuildConnectionAcceptOpts): C
 
 export type NormalizedConnectionAccept = {
   type: 'connection_accept';
-  senderEmail: string;
+  senderUsername: string;
   senderSharePub: Uint8Array;
   senderSharePubBase64Url: string;
   senderSigningPubBase64: string;
@@ -518,7 +518,7 @@ export function validateConnectionAcceptPayload(
     valid: true,
     normalized: {
       type: 'connection_accept',
-      senderEmail: p['sender_email'] as string,
+      senderUsername: p['sender_email'] as string,
       senderSharePub,
       senderSharePubBase64Url: p['sender_share_pub'] as string,
       senderSigningPubBase64: p['sender_signing_pub'] as string,

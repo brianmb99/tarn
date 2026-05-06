@@ -102,7 +102,7 @@ await test('Alice sendConnectionRequest(bob) succeeds and tracks outbound pendin
   const pending = await alice.getPendingRequests();
   assert(pending.outbound.length === 1, `expected 1 outbound, got ${pending.outbound.length}`);
   assert(pending.outbound[0].request_nonce === requestNonce, 'outbound nonce mismatch');
-  assert(pending.outbound[0].recipient_email === bobEmail, 'outbound recipient mismatch');
+  assert(pending.outbound[0].recipient_username === bobEmail, 'outbound recipient mismatch');
 });
 
 await test('Bob listIncomingRequests() returns Alice\'s request', async () => {
@@ -111,7 +111,7 @@ await test('Bob listIncomingRequests() returns Alice\'s request', async () => {
   await sleep(150);
   const inbox = await bob.listIncomingRequests();
   assert(inbox.length === 1, `expected 1 incoming, got ${inbox.length}`);
-  assert(inbox[0].senderEmail === aliceEmail, `wrong sender: ${inbox[0].senderEmail}`);
+  assert(inbox[0].senderUsername === aliceEmail, `wrong sender: ${inbox[0].senderUsername}`);
   assert(inbox[0].requestNonce === requestNonce, 'request nonce mismatch');
   assert(inbox[0].message === 'hi from alice', `wrong message: ${inbox[0].message}`);
   assert(inbox[0].senderAppId === DEFAULT_APP_ID, 'app_id should match');
@@ -126,7 +126,7 @@ await test('Bob acceptConnectionRequest() adds Alice to Bob\'s connections', asy
 
   const connections = await bob.listConnections();
   assert(connections.length === 1, `Bob should have 1 connection, got ${connections.length}`);
-  assert(connections[0].email === aliceEmail, `wrong connection email: ${connections[0].email}`);
+  assert(connections[0].username === aliceEmail, `wrong connection username: ${connections[0].username}`);
 
   const pending = await bob.getPendingRequests();
   assert(pending.inbound.length === 0, 'Bob inbound should be empty after accept');
@@ -141,7 +141,7 @@ await test('Alice listIncomingRequests() processes accept, adds Bob to her conne
 
   const connections = await alice.listConnections();
   assert(connections.length === 1, `Alice should have 1 connection, got ${connections.length}`);
-  assert(connections[0].email === bobEmail, `wrong connection email: ${connections[0].email}`);
+  assert(connections[0].username === bobEmail, `wrong connection username: ${connections[0].username}`);
 
   const pending = await alice.getPendingRequests();
   assert(pending.outbound.length === 0, 'Alice outbound should be empty after accept-process');
@@ -204,7 +204,7 @@ await test('Accept blob with no matching outbound is silently ignored', async ()
   // construction (Alice never asked Eve to be connections).
   const fakeReplyTo = bytesToBase64(crypto.getRandomValues(new Uint8Array(16))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const acceptPayload = buildConnectionAcceptPayload({
-    senderEmail: eveEmail,
+    senderUsername: eveEmail,
     senderSharePub: eveSharePub,
     senderSigningPubBase64: eveSigningPub,
     senderAppId: DEFAULT_APP_ID,

@@ -232,7 +232,7 @@ describe('buildConnectionRequestPayload', () => {
 
   it('builds a well-formed payload with random nonce', () => {
     const p = buildConnectionRequestPayload({
-      senderEmail: 'alice@test.com',
+      senderUsername: 'alice@test.com',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'fake-spki-base64',
       senderAppId: 'bookish',
@@ -249,7 +249,7 @@ describe('buildConnectionRequestPayload', () => {
 
   it('omits message when not supplied', () => {
     const p = buildConnectionRequestPayload({
-      senderEmail: 'a@b.c',
+      senderUsername: 'a@b.c',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'x',
       senderAppId: 'app',
@@ -259,7 +259,7 @@ describe('buildConnectionRequestPayload', () => {
 
   it('rejects oversized message', () => {
     assert.throws(() => buildConnectionRequestPayload({
-      senderEmail: 'a@b.c',
+      senderUsername: 'a@b.c',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'x',
       senderAppId: 'app',
@@ -269,7 +269,7 @@ describe('buildConnectionRequestPayload', () => {
 
   it('rejects 31-byte share_pub', () => {
     assert.throws(() => buildConnectionRequestPayload({
-      senderEmail: 'a@b.c',
+      senderUsername: 'a@b.c',
       senderSharePub: new Uint8Array(31),
       senderSigningPubBase64: 'x',
       senderAppId: 'app',
@@ -297,7 +297,7 @@ describe('validateConnectionRequestPayload', () => {
   it('accepts a well-formed payload and returns normalized fields', () => {
     const v = validateConnectionRequestPayload(make(), APP);
     assert.equal(v.valid, true);
-    assert.equal(v.normalized.senderEmail, 'alice@test.com');
+    assert.equal(v.normalized.senderUsername, 'alice@test.com');
     assert.equal(v.normalized.senderAppId, APP);
     assert.ok(v.normalized.senderSharePub instanceof Uint8Array);
     assert.equal(v.normalized.senderSharePub.length, 32);
@@ -360,7 +360,7 @@ describe('buildConnectionAcceptPayload + validateConnectionAcceptPayload', () =>
   it('round-trips through validate', () => {
     const inReplyTo = bytesToBase64Url(new Uint8Array(16).fill(2));
     const p = buildConnectionAcceptPayload({
-      senderEmail: 'bob@test.com',
+      senderUsername: 'bob@test.com',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'spki',
       senderAppId: APP,
@@ -377,7 +377,7 @@ describe('buildConnectionAcceptPayload + validateConnectionAcceptPayload', () =>
   it('rejects mismatched app_id', () => {
     const inReplyTo = bytesToBase64Url(new Uint8Array(16).fill(3));
     const p = buildConnectionAcceptPayload({
-      senderEmail: 'bob@test.com',
+      senderUsername: 'bob@test.com',
       senderSharePub: senderPub,
       senderSigningPubBase64: 'spki',
       senderAppId: 'cellar',
