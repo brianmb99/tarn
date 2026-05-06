@@ -42,6 +42,8 @@ import {
   unwrapAccountKey,
   FACTOR_PASSWORD,
   FACTOR_RECOVERY_PHRASE,
+  FACTOR_PASSKEY_PRF,
+  derivePasskeyWrappingKey,
 } from './crypto.js';
 import {
   generateAccountKey,
@@ -272,6 +274,14 @@ export class TarnClient {
   #recoveryFactorMeta: RecoveryFactorMeta | null = null;
   #recoveryLookupKey: string | null = null;
 
+  // Phase 6 — snapshot of passkey wrappings present in the live envelope,
+  // keyed by (gen → array of {credentialId, wrappedBase64}). Same purpose
+  // as #recoveryFactorMeta.wrappingsByGen: lets envelope-mutating flows
+  // (changeCredentials, rotateAccountKey, recoverAccount) preserve passkey
+  // wrappings byte-for-byte even though we don't have the PRF outputs to
+  // re-wrap. Empty Map = no passkeys registered (the common case).
+  #passkeyWrappingsByGen: Map<number, Array<{ credentialId: string; wrappedBase64: string }>> = new Map();
+
   // Section 7.5 (issue #20) — server-side session id from the JWT's `sid` claim.
   // Sent back as `previous_sid` on /auth/verify so the server reuses the same
   // sessions row instead of minting a fresh one. Null until the first verify.
@@ -444,6 +454,7 @@ export class TarnClient {
         kdfParams: re.recovery.kdfParams,
         wrappingsByGen,
       };
+      this.#capturePasskeyWrappings(re);
     }
     this.#recoveryLookupKey = recoveryLookupKey;
 
@@ -562,6 +573,25 @@ export class TarnClient {
     }
     chain.sort((a, b) => a.gen - b.gen);
 
+    // Phase 6: preserve any `passkey_prf` wrappings byte-for-byte. The
+    // existing envelope (`parsed`) carries them; a fresh recovery flow
+    // doesn't have the PRF outputs to re-derive, but the underlying DEKs
+    // didn't change, so the wrappings are still valid.
+    const passkeyExtras = new Map<number, Array<{ factor: string; wrappedBase64: string; credentialId: string }>>();
+    for (const entry of parsed.dekChain) {
+      const list: Array<{ factor: string; wrappedBase64: string; credentialId: string }> = [];
+      for (const w of entry.wrappings) {
+        if (w.factor === FACTOR_PASSKEY_PRF && w.credentialId) {
+          list.push({
+            factor: FACTOR_PASSKEY_PRF,
+            wrappedBase64: w.wrappedBase64,
+            credentialId: w.credentialId,
+          });
+        }
+      }
+      if (list.length > 0) passkeyExtras.set(entry.gen, list);
+    }
+
     const newWrappedDataKey = await wrapDataKeyChainEnvelope(
       chain,
       [
@@ -569,6 +599,7 @@ export class TarnClient {
         { name: FACTOR_RECOVERY_PHRASE, wrappingKey: recoveryKEK.kwKey },
       ],
       { salt: parsed.recovery.salt, kdfParams: parsed.recovery.kdfParams },
+      passkeyExtras,
     );
 
     // recovery_lookup_key + recovery_public_key are derived purely from the
@@ -691,6 +722,7 @@ export class TarnClient {
         kdfParams: reparsed.recovery.kdfParams,
         wrappingsByGen,
       };
+      this.#capturePasskeyWrappings(reparsed);
     }
     this.#recoveryLookupKey = recoveryLookupKey;
     // Pair-key cache is derived from share_priv; recovery rotates it.
@@ -812,6 +844,7 @@ export class TarnClient {
         kdfParams: unwrapped.recovery.kdfParams,
         wrappingsByGen,
       };
+      this.#capturePasskeyWrappings(reparsed);
     }
     this.#recoveryLookupKey = null;
 
@@ -937,12 +970,25 @@ export class TarnClient {
     }
 
     const wireChain = chain.map(({ gen }) => {
-      const wrappings: Array<{ factor: string; wrappedBase64: string }> = [
+      const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> = [
         { factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen)! },
       ];
       const recWrap = recoveryWrappingsByGen.get(gen);
       if (recWrap !== undefined) {
         wrappings.push({ factor: FACTOR_RECOVERY_PHRASE, wrappedBase64: recWrap });
+      }
+      // Phase 6: preserve passkey wrappings byte-for-byte for existing
+      // gens. The new gen N+1 has no passkey wrapping (we don't have any
+      // PRF outputs in this flow) — the user must re-register the
+      // passkey post-credential-change for new-gen data to be passkey-
+      // unwrappable. Documented in TARN_PROTOCOL.md.
+      const passkeyList = this.#passkeyWrappingsByGen.get(gen) ?? [];
+      for (const pk of passkeyList) {
+        wrappings.push({
+          factor: FACTOR_PASSKEY_PRF,
+          wrappedBase64: pk.wrappedBase64,
+          credentialId: pk.credentialId,
+        });
       }
       return { gen, wrappings };
     });
@@ -1088,6 +1134,27 @@ export class TarnClient {
     }
 
     return { rotationAnnouncements };
+  }
+
+  /**
+   * Phase 6 helper. Snapshot all `passkey_prf` wrappings from a parsed
+   * envelope into `#passkeyWrappingsByGen` so envelope-mutating flows
+   * (changeCredentials, rotateAccountKey, recoverAccount) can re-emit
+   * them verbatim without holding the PRF outputs. Cleared and rebuilt
+   * on every successful auth round trip.
+   */
+  #capturePasskeyWrappings(parsed: ReturnType<typeof parseWrappedDataKey>): void {
+    const m = new Map<number, Array<{ credentialId: string; wrappedBase64: string }>>();
+    for (const entry of parsed.dekChain) {
+      const list: Array<{ credentialId: string; wrappedBase64: string }> = [];
+      for (const w of entry.wrappings) {
+        if (w.factor === FACTOR_PASSKEY_PRF && w.credentialId) {
+          list.push({ credentialId: w.credentialId, wrappedBase64: w.wrappedBase64 });
+        }
+      }
+      if (list.length > 0) m.set(entry.gen, list);
+    }
+    this.#passkeyWrappingsByGen = m;
   }
 
   /**
@@ -1497,6 +1564,18 @@ export class TarnClient {
     }
     chain.sort((a, b) => a.gen - b.gen);
 
+    // Phase 6: preserve passkey wrappings byte-for-byte. Rotation
+    // changes the recovery factor only — the underlying DEKs and any
+    // registered passkeys are unaffected.
+    const passkeyExtras = new Map<number, Array<{ factor: string; wrappedBase64: string; credentialId: string }>>();
+    for (const [gen, list] of this.#passkeyWrappingsByGen) {
+      passkeyExtras.set(gen, list.map(p => ({
+        factor: FACTOR_PASSKEY_PRF,
+        wrappedBase64: p.wrappedBase64,
+        credentialId: p.credentialId,
+      })));
+    }
+
     const newWrappedDataKey = await wrapDataKeyChainEnvelope(
       chain,
       [
@@ -1504,6 +1583,7 @@ export class TarnClient {
         { name: FACTOR_RECOVERY_PHRASE, wrappingKey: newRecoveryKEK.kwKey },
       ],
       { salt: newRecoverySalt },
+      passkeyExtras,
     );
 
     // 4. New wrap_account_key only if Model B. We treat #accountKeyStored
@@ -1555,12 +1635,464 @@ export class TarnClient {
         kdfParams: reparsed.recovery.kdfParams,
         wrappingsByGen,
       };
+      this.#capturePasskeyWrappings(reparsed);
     }
     this.#recoveryLookupKey = newRecoveryLookupKey;
     // accountKeyStored is unchanged (rotation does not flip the model).
 
     // 7. Return the new phrase. SDK does NOT cache it.
     return { accountKey: newPhrase };
+  }
+
+  // ============ PASSKEYS (Phase 6) ============
+  //
+  // WebAuthn-PRF passkey factor. Opt-in per account; an account with no
+  // registered passkeys behaves exactly as it did before Phase 6.
+  //
+  // The PRF wrapping is a third independent factor in the dek_chain
+  // envelope. Each registered passkey adds one wrapping per gen, keyed
+  // by credential_id. Removing a passkey strips its wrappings; the
+  // remaining wrappings (password, recovery_phrase, other passkeys)
+  // are preserved verbatim.
+
+  /**
+   * Feature-detect WebAuthn + PRF support on the current device.
+   *
+   * Returns false on:
+   *   - Non-browser environment (no `navigator.credentials`)
+   *   - Browsers without `PublicKeyCredential`
+   *   - Platform without an authenticator (`isUserVerifyingPlatformAuthenticatorAvailable`
+   *     returns false — typical on a desktop without Touch ID, Windows
+   *     Hello, or a security key)
+   *   - Browsers without PRF extension support
+   *
+   * PRF detection is the load-bearing one. The cleanest reliable check
+   * (per WebAuthn WG guidance, mid-2026) is to call the static
+   * `getClientCapabilities()` method when present (Chrome 132+, Safari
+   * 18+ both expose it); if absent, fall back to checking
+   * `PublicKeyCredential.prototype.getClientExtensionResults` exists,
+   * which signals at minimum that `extensions` is a known field.
+   *
+   * Apps call this before surfacing any passkey UX. If false, fall back
+   * to password-only — the SDK does NOT register a passkey on a device
+   * without PRF (the wrap would be unrecoverable on the next login).
+   */
+  async passkeysSupported(): Promise<boolean> {
+    if (typeof navigator === 'undefined' || !navigator.credentials) return false;
+    const G = globalThis as any;
+    if (typeof G.PublicKeyCredential === 'undefined') return false;
+    try {
+      // Platform authenticator presence — required (we don't surface
+      // roaming-only flows in v1).
+      if (typeof G.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'function') {
+        const ok = await G.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+        if (!ok) return false;
+      }
+      // PRF capability check. The standard exposes
+      // `getClientCapabilities()` returning { prf: true } on supporting
+      // browsers. Older builds gate on whether the extension shape is
+      // recognized in `getClientExtensionResults` — coarse but the only
+      // signal pre-getClientCapabilities.
+      if (typeof G.PublicKeyCredential.getClientCapabilities === 'function') {
+        const caps = await G.PublicKeyCredential.getClientCapabilities();
+        return !!(caps && caps.prf === true);
+      }
+      // Fallback: browsers that don't expose getClientCapabilities and
+      // don't recognize PRF will silently drop the extension and return
+      // an empty results map — there's no reliable a-priori signal short
+      // of attempting a registration. Return false to be safe; apps that
+      // want to opportunistically try can call `register()` directly and
+      // catch the failure.
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Register a new passkey for the logged-in account. Re-wraps the
+   * existing DEK chain to add a `passkey_prf` wrapping per gen, keyed
+   * by the new credential_id, and submits both the credential metadata
+   * and the new envelope atomically.
+   *
+   * Flow:
+   *   1. POST /auth/passkey/register-options → { options, prf_salt }
+   *   2. navigator.credentials.create(options) — user authenticates via
+   *      Touch ID / Face ID / Windows Hello / etc. The PRF extension
+   *      yields a 32-byte deterministic secret bound to (passkey, salt).
+   *   3. Derive an AES-KW wrapping key from the PRF output via HKDF
+   *      with the `tarn-passkey-prf-v1` info string.
+   *   4. Wrap every gen of the existing DEK chain under the new key.
+   *   5. POST /auth/passkey/register with the credential, prf_salt, and
+   *      the new envelope. Server stores the credential and atomically
+   *      replaces the envelope.
+   *
+   * @returns `{ credentialId, deviceLabel }`. Apps render the
+   *   credentialId in Settings UI (truncated for display) so the user
+   *   can identify which device a passkey corresponds to. The SDK
+   *   never retains the PRF output.
+   *
+   * @throws if PRF is not supported on this device, the user cancels,
+   *   the WebAuthn ceremony fails, or the server rejects the
+   *   registration.
+   */
+  async registerPasskey(opts: { deviceLabel?: string } = {}): Promise<{ credentialId: string; deviceLabel: string | null }> {
+    await this.#requireAuth();
+    if (!this.#dekByGen || this.#dekByGen.size === 0) {
+      throw new Error('registerPasskey(): DEK chain unavailable (corrupt session?)');
+    }
+    if (!this.#recoveryFactorMeta) {
+      throw new Error('registerPasskey(): missing recovery-factor metadata');
+    }
+
+    // 1. Fetch options + the server-generated PRF salt.
+    const optsRes = await this.#fetch('/api/v1/auth/passkey/register-options', {
+      method: 'POST',
+      auth: true,
+      retry: false, // single-use challenge — retrying could leak rows
+      body: { device_label: opts.deviceLabel ?? null },
+    });
+    if (optsRes.status !== 200) {
+      throw new Error(`registerPasskey(): options failed: ${optsRes.json?.error || optsRes.status}`);
+    }
+    const { options: pkOptions, prf_salt: prfSaltB64Url } = optsRes.json;
+    if (!pkOptions || !prfSaltB64Url) {
+      throw new Error('registerPasskey(): server did not return options + prf_salt');
+    }
+
+    // 2. Convert the JSON-friendly option payload back to BufferSource
+    //    fields and call navigator.credentials.create. Use the helper
+    //    from @simplewebauthn/browser for the round trip.
+    const { startRegistration } = await import('@simplewebauthn/browser');
+    const credential = await startRegistration({ optionsJSON: pkOptions });
+
+    // 3. Extract the PRF output and derive the wrapping key.
+    const prfResults = (credential as any)?.clientExtensionResults?.prf?.results?.first;
+    if (!prfResults) {
+      throw new Error('registerPasskey(): PRF extension produced no output (browser may not support PRF)');
+    }
+    const prfOutput = new Uint8Array(prfResults);
+    const { kwKey: passkeyKEK } = await derivePasskeyWrappingKey(prfOutput);
+
+    // 4. Re-wrap every gen under the existing factors PLUS the new passkey.
+    //    Existing wrappings are preserved verbatim (AES-KW is deterministic;
+    //    the recovery wrappings come from the cached snapshot).
+    const credentialId = credential.id; // base64url string
+    const newEnvelope = await this.#rebuildEnvelopeWithExtraPasskey(
+      credentialId,
+      passkeyKEK,
+    );
+
+    // 5. Submit. Server verifies the WebAuthn ceremony, stores the
+    //    credential row, swaps the envelope, and republishes to Arweave.
+    const regRes = await this.#fetch('/api/v1/auth/passkey/register', {
+      method: 'POST',
+      auth: true,
+      body: {
+        credential,
+        prf_salt: prfSaltB64Url,
+        new_envelope: newEnvelope,
+        device_label: opts.deviceLabel ?? null,
+      },
+    });
+    if (regRes.status !== 201) {
+      throw new Error(`registerPasskey(): register failed: ${regRes.json?.error || regRes.status}`);
+    }
+
+    return {
+      credentialId,
+      deviceLabel: regRes.json?.device_label ?? null,
+    };
+  }
+
+  /**
+   * Authenticate with a passkey. No prior session required — this is an
+   * alternative to `login()`. On success the client behaves identically
+   * to a logged-in client.
+   *
+   * Flow:
+   *   1. POST /auth/passkey/authentication-options → { options,
+   *      allow_credentials: [{ credential_id, prf_salt }, ...] }
+   *   2. navigator.credentials.get(options) — user authenticates.
+   *   3. Extract the PRF output for the credential the user picked.
+   *   4. POST /auth/passkey/authenticate → { jwt, wrapped_data_key, ... }
+   *   5. Derive the passkey wrapping key from the PRF output, unwrap
+   *      the DEK chain, install session state.
+   */
+  async authenticateWithPasskey(opts: { deviceLabel?: string; credentialId?: string } = {}): Promise<{ dataLookupKey: string }> {
+    if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
+
+    // 1. Auth options.
+    const optsRes = await this.#fetch('/api/v1/auth/passkey/authentication-options', {
+      method: 'POST',
+      retry: false,
+      body: opts.credentialId ? { credential_id: opts.credentialId } : {},
+    });
+    if (optsRes.status !== 200) {
+      throw new Error(`authenticateWithPasskey(): options failed: ${optsRes.json?.error || optsRes.status}`);
+    }
+    const pkOptions = optsRes.json?.options;
+    if (!pkOptions) {
+      throw new Error('authenticateWithPasskey(): server did not return options');
+    }
+
+    // 2. Get the assertion + PRF output.
+    const { startAuthentication } = await import('@simplewebauthn/browser');
+    const credential = await startAuthentication({ optionsJSON: pkOptions });
+    const prfResults = (credential as any)?.clientExtensionResults?.prf?.results?.first;
+    if (!prfResults) {
+      throw new Error('authenticateWithPasskey(): PRF extension produced no output');
+    }
+    const prfOutput = new Uint8Array(prfResults);
+    const { kwKey: passkeyKEK } = await derivePasskeyWrappingKey(prfOutput);
+
+    // 3. Submit assertion. Server verifies, returns JWT + envelope.
+    const authRes = await this.#fetch('/api/v1/auth/passkey/authenticate', {
+      method: 'POST',
+      body: {
+        credential,
+        previous_sid: this.#sid,
+        device_label: opts.deviceLabel ?? null,
+      },
+    });
+    if (authRes.status !== 200) {
+      throw new Error(`authenticateWithPasskey(): authenticate failed: ${authRes.json?.error || authRes.status}`);
+    }
+    const {
+      jwt,
+      data_lookup_key,
+      wrapped_data_key,
+      account_key_stored,
+      credential_id,
+    } = authRes.json;
+    if (!jwt || !wrapped_data_key || !credential_id) {
+      throw new Error('authenticateWithPasskey(): server response missing required fields');
+    }
+
+    // 4. Unwrap the DEK chain via the passkey factor for THIS credential_id.
+    const unwrapped = await unwrapDataKeyChain(
+      wrapped_data_key,
+      passkeyKEK,
+      FACTOR_PASSKEY_PRF,
+      credential_id,
+    );
+
+    // 5. Install session state. Mirrors the tail of login() — same fields
+    //    populated, same caches reset (they were already empty on a fresh
+    //    client). Note we don't have a username here (passkey login is
+    //    discoverable / username-less), so #username remains null until
+    //    the user explicitly sets one via subsequent operations. This
+    //    means certain follow-up operations that require the username
+    //    (changeCredentials, viewAccountKey, enable/disable/rotate
+    //    account-key, sharing handshake) will fail; passkey-only sessions
+    //    are intended for read access and entry CRUD that doesn't need
+    //    the master_key.
+    this.#jwt = jwt;
+    this.#sid = this.#extractSidFromJwt(jwt);
+    this.#dataLookupKey = data_lookup_key;
+    this.#dekByGen = unwrapped.dekByGen;
+    this.#currentGen = unwrapped.currentGen;
+    this.#accountKeyStored =
+      typeof account_key_stored === 'boolean' ? account_key_stored : null;
+    // Snapshot recovery wrapping bytes so a future write that DOES have the
+    // password can preserve them. (We don't have the recovery KEK here —
+    // same as login.)
+    {
+      const reparsed = parseWrappedDataKey(wrapped_data_key);
+      const wrappingsByGen = new Map<number, string>();
+      for (const entry of reparsed.dekChain) {
+        const w = entry.wrappings.find(w => w.factor === FACTOR_RECOVERY_PHRASE);
+        if (w) wrappingsByGen.set(entry.gen, w.wrappedBase64);
+      }
+      this.#recoveryFactorMeta = {
+        salt: unwrapped.recovery.salt,
+        kdfParams: unwrapped.recovery.kdfParams,
+        wrappingsByGen,
+      };
+    }
+
+    return { dataLookupKey: this.#dataLookupKey! };
+  }
+
+  /**
+   * List the passkeys registered against this account. Each entry is one
+   * device the user has enrolled.
+   */
+  async listPasskeys(): Promise<Array<{
+    credentialId: string;
+    deviceLabel: string | null;
+    createdAt: number;
+    lastUsedAt: number | null;
+  }>> {
+    await this.#requireAuth();
+    const res = await this.#fetch('/api/v1/account/passkeys', { method: 'GET', auth: true });
+    if (res.status !== 200) {
+      throw new Error(`listPasskeys(): failed: ${res.json?.error || res.status}`);
+    }
+    const rows = Array.isArray(res.json?.passkeys) ? res.json.passkeys : [];
+    return rows.map((r: any) => ({
+      credentialId: r.credential_id,
+      deviceLabel: r.device_label ?? null,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at ?? null,
+    }));
+  }
+
+  /**
+   * Remove a registered passkey. Step-up gated (caller passes a fresh
+   * password). Strips the corresponding `passkey_prf` wrappings from the
+   * envelope and republishes.
+   *
+   * @throws on wrong password, unknown credentialId, or network failure.
+   */
+  async removePasskey(opts: { credentialId: string; password: string }): Promise<void> {
+    await this.#requireAuth();
+    if (!opts || typeof opts.credentialId !== 'string' || opts.credentialId.length === 0) {
+      throw new Error('removePasskey(): credentialId is required');
+    }
+    if (typeof opts.password !== 'string' || opts.password.length === 0) {
+      throw new Error('removePasskey(): password is required');
+    }
+    if (!this.#username) {
+      throw new Error('removePasskey(): username unknown — log in with password first');
+    }
+
+    // Re-derive the password KEK so #rebuildEnvelopeWithoutPasskey can
+    // emit the password wrapping even on passkey-authenticated sessions
+    // (where #credentialEncryptionKey was never set).
+    if (!this.#credentialEncryptionKey) {
+      const reKeys = await deriveAllKeys(this.#username, opts.password, this.#appId);
+      this.#credentialEncryptionKey = reKeys.credentialEncryptionKey;
+    }
+
+    const stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
+
+    // Re-wrap the existing chain dropping the targeted credential_id.
+    // Preserve all other wrappings byte-for-byte (no decryption; the
+    // server doesn't have the keys to verify, just the shape).
+    const newEnvelope = await this.#rebuildEnvelopeWithoutPasskey(opts.credentialId);
+
+    const res = await this.#fetchRaw(
+      `/api/v1/account/passkeys/${encodeURIComponent(opts.credentialId)}`,
+      {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${this.#jwt}`,
+          'X-Step-Up-Token': stepUpToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ new_envelope: newEnvelope }),
+      },
+    );
+    const text = await res.text();
+    let json: any = null;
+    try { json = JSON.parse(text); } catch {}
+    if (res.status !== 200) {
+      throw new Error(`removePasskey(): failed: ${json?.error || res.status}`);
+    }
+  }
+
+  /**
+   * Build a fresh envelope from the cached client state + add a NEW
+   * `passkey_prf` wrapping (one per gen) for the supplied
+   * (credentialId, KEK) pair. Existing password/recovery/passkey
+   * wrappings are emitted from the cached snapshots — no extra network
+   * round trip.
+   *
+   * Concurrency caveat: a wrapping added by another device since this
+   * session's last refresh will NOT appear here, and submitting this
+   * envelope will overwrite that change. Acceptable for v1 — multi-device
+   * passkey concurrency is rare and the recovery is "re-register the
+   * passkey on the missing device". A stricter implementation would
+   * re-fetch via /auth/challenge before submitting.
+   */
+  async #rebuildEnvelopeWithExtraPasskey(
+    credentialId: string,
+    passkeyKEK: CryptoKey,
+  ): Promise<string> {
+    if (!this.#dekByGen || !this.#recoveryFactorMeta || !this.#credentialEncryptionKey) {
+      throw new Error('#rebuildEnvelopeWithExtraPasskey: missing client state');
+    }
+
+    const wireChain: Array<{ gen: number; wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> }> = [];
+    for (const [gen, dekPair] of this.#dekByGen) {
+      const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> = [];
+      // Re-wrap under the live password KEK (deterministic — produces
+      // identical bytes to the previous wrapping).
+      const passwordWrapped = await this.#wrapDekRaw(
+        dekPair.gcmKey,
+        this.#credentialEncryptionKey.kwKey,
+      );
+      wrappings.push({ factor: FACTOR_PASSWORD, wrappedBase64: passwordWrapped });
+      // Recovery wrapping preserved verbatim from cached snapshot.
+      const recWrap = this.#recoveryFactorMeta.wrappingsByGen.get(gen);
+      if (recWrap !== undefined) {
+        wrappings.push({ factor: FACTOR_RECOVERY_PHRASE, wrappedBase64: recWrap });
+      }
+      // Existing passkey wrappings preserved verbatim.
+      const existingPasskeys = this.#passkeyWrappingsByGen.get(gen) ?? [];
+      for (const pk of existingPasskeys) {
+        wrappings.push({
+          factor: FACTOR_PASSKEY_PRF,
+          wrappedBase64: pk.wrappedBase64,
+          credentialId: pk.credentialId,
+        });
+      }
+      // New passkey wrapping for this gen.
+      const newWrapped = await this.#wrapDekRaw(dekPair.gcmKey, passkeyKEK);
+      wrappings.push({
+        factor: FACTOR_PASSKEY_PRF,
+        wrappedBase64: newWrapped,
+        credentialId,
+      });
+      wireChain.push({ gen, wrappings });
+    }
+    return buildEnvelope(wireChain, {
+      salt: this.#recoveryFactorMeta.salt,
+      kdfParams: this.#recoveryFactorMeta.kdfParams,
+    });
+  }
+
+  /**
+   * Build a fresh envelope by stripping all `passkey_prf` wrappings whose
+   * credentialId matches the supplied value. All other wrappings are
+   * preserved byte-for-byte from the cached client state.
+   */
+  async #rebuildEnvelopeWithoutPasskey(credentialId: string): Promise<string> {
+    if (!this.#dekByGen || !this.#recoveryFactorMeta || !this.#credentialEncryptionKey) {
+      throw new Error('#rebuildEnvelopeWithoutPasskey: missing client state');
+    }
+    const wireChain: Array<{ gen: number; wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> }> = [];
+    for (const [gen, dekPair] of this.#dekByGen) {
+      const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> = [];
+      const passwordWrapped = await this.#wrapDekRaw(
+        dekPair.gcmKey,
+        this.#credentialEncryptionKey.kwKey,
+      );
+      wrappings.push({ factor: FACTOR_PASSWORD, wrappedBase64: passwordWrapped });
+      const recWrap = this.#recoveryFactorMeta.wrappingsByGen.get(gen);
+      if (recWrap !== undefined) {
+        wrappings.push({ factor: FACTOR_RECOVERY_PHRASE, wrappedBase64: recWrap });
+      }
+      const existingPasskeys = this.#passkeyWrappingsByGen.get(gen) ?? [];
+      for (const pk of existingPasskeys) {
+        if (pk.credentialId === credentialId) continue;
+        wrappings.push({
+          factor: FACTOR_PASSKEY_PRF,
+          wrappedBase64: pk.wrappedBase64,
+          credentialId: pk.credentialId,
+        });
+      }
+      if (wrappings.length === 1) {
+        // Only the password wrapping remains — fine, but note for the
+        // future password-removal scenario.
+      }
+      wireChain.push({ gen, wrappings });
+    }
+    return buildEnvelope(wireChain, {
+      salt: this.#recoveryFactorMeta.salt,
+      kdfParams: this.#recoveryFactorMeta.kdfParams,
+    });
   }
 
   /**
@@ -1590,6 +2122,7 @@ export class TarnClient {
     this.#signingKeyPair = null;
     this.#recoveryFactorMeta = null;
     this.#recoveryLookupKey = null;
+    this.#passkeyWrappingsByGen = new Map();
     this.#username = null;
     this.#sharingKeyPair = null;
     this.#replayNonceCache = makeReplayNonceCache();

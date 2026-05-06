@@ -144,6 +144,31 @@ class StubUnderlying implements IUnderlyingClient {
     return this.accountKeyStored;
   }
 
+  // ---- Passkeys (Phase 6) ----
+  passkeysSupportedResult = false;
+  registerPasskeyCalls = 0;
+  authenticateWithPasskeyCalls = 0;
+  listPasskeysResult: Array<{
+    credentialId: string;
+    deviceLabel: string | null;
+    createdAt: number;
+    lastUsedAt: number | null;
+  }> = [];
+  removePasskeyCalls = 0;
+  async passkeysSupported() { return this.passkeysSupportedResult; }
+  async registerPasskey(_opts?: { deviceLabel?: string }) {
+    this.registerPasskeyCalls++;
+    return { credentialId: 'stub-cred-id', deviceLabel: _opts?.deviceLabel ?? null };
+  }
+  async authenticateWithPasskey(_opts?: { deviceLabel?: string; credentialId?: string }) {
+    this.authenticateWithPasskeyCalls++;
+    return { dataLookupKey: 'stub-dlk' };
+  }
+  async listPasskeys() { return this.listPasskeysResult.slice(); }
+  async removePasskey(_opts: { credentialId: string; password: string }) {
+    this.removePasskeyCalls++;
+  }
+
   // ---- Connections ----
   async listConnections() {
     this.listConnectionsCalls++;

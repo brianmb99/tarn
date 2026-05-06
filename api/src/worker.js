@@ -21,6 +21,14 @@ import {
   handleDeleteAccountKey,
   handleRotateAccountKey,
 } from './routes/account.js';
+import {
+  handlePasskeyRegisterOptions,
+  handlePasskeyRegister,
+  handlePasskeyAuthOptions,
+  handlePasskeyAuthenticate,
+  handleListPasskeys,
+  handleDeletePasskey,
+} from './routes/passkeys.js';
 import { handleCreateEntry, handleBatchCreate, handleEditEntry, handleDeleteEntry } from './routes/write.js';
 import { handleSyncStatus, handleSyncAck } from './routes/sync.js';
 import { handleSetRules, handleSetInviteTemplate, handleSetSchema } from './routes/apps.js';
@@ -122,6 +130,32 @@ export default {
       // phrase before this is reachable).
       if (path === '/api/v1/account/rotate-account-key' && method === 'POST') {
         return await handleRotateAccountKey(request, env, ctx, cors);
+      }
+
+      // Phase 6: WebAuthn passkey factor (RECOVERY_PLAN.md §6).
+      // Registration is JWT-authed (logged-in users add a passkey to
+      // their account); authentication is public (the assertion proves
+      // possession without a prior session).
+      if (path === '/api/v1/auth/passkey/register-options' && method === 'POST') {
+        return await handlePasskeyRegisterOptions(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/auth/passkey/register' && method === 'POST') {
+        return await handlePasskeyRegister(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/auth/passkey/authentication-options' && method === 'POST') {
+        return await handlePasskeyAuthOptions(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/auth/passkey/authenticate' && method === 'POST') {
+        return await handlePasskeyAuthenticate(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/account/passkeys' && method === 'GET') {
+        return await handleListPasskeys(request, env, ctx, cors);
+      }
+      if (path.startsWith('/api/v1/account/passkeys/') && method === 'DELETE') {
+        const credentialId = decodeURIComponent(path.slice('/api/v1/account/passkeys/'.length));
+        if (credentialId && !credentialId.includes('/')) {
+          return await handleDeletePasskey(request, env, ctx, credentialId, cors);
+        }
       }
 
       // Auth — credential management (authenticated)

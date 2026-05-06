@@ -71,9 +71,18 @@ function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
 // factors; any factor's KEK independently unwraps the DEK.
 //   PASSWORD        — derived from username+password via deriveCredentialEncryptionKey
 //   RECOVERY_PHRASE — derived from BIP39 phrase via deriveRecoveryKey
+//   PASSKEY_PRF     — derived from a WebAuthn PRF output via HKDF
+//                     (Phase 6, RECOVERY_PLAN.md). Each registered passkey
+//                     yields a distinct PRF output and therefore a distinct
+//                     wrapping; passkey wrappings carry a `credential_id`
+//                     to disambiguate which passkey unwraps which entry.
 export const FACTOR_PASSWORD = 'password' as const;
 export const FACTOR_RECOVERY_PHRASE = 'recovery_phrase' as const;
-export type Factor = typeof FACTOR_PASSWORD | typeof FACTOR_RECOVERY_PHRASE;
+export const FACTOR_PASSKEY_PRF = 'passkey_prf' as const;
+export type Factor =
+  | typeof FACTOR_PASSWORD
+  | typeof FACTOR_RECOVERY_PHRASE
+  | typeof FACTOR_PASSKEY_PRF;
 
 const ARGON2ID_MEMORY_KIB = 64 * 1024; // 64 MiB
 const ARGON2ID_ITERATIONS = 3;
@@ -603,6 +612,42 @@ export async function unwrapAccountKey(
   return new TextDecoder().decode(plaintext);
 }
 
+// ============ PASSKEY PRF DERIVATION (Phase 6) ============
+
+/**
+ * Derive an AES-KW wrapping key from a WebAuthn PRF output. The PRF
+ * extension yields a deterministic 32-byte secret per (passkey, salt)
+ * pair; we run it through a single-block HKDF expand with a fixed
+ * info string so the resulting wrapping key is bound to "Tarn passkey
+ * factor v1" — preventing accidental cross-protocol reuse if the same
+ * authenticator is later asked to PRF-derive material for a different
+ * relying party context.
+ *
+ * Returns both the AES-KW handle (for wrap/unwrap) and the raw 32 bytes
+ * (for tests / future use cases). The AES-KW handle is non-extractable.
+ */
+export const PASSKEY_PRF_HKDF_INFO = 'tarn-passkey-prf-v1';
+
+export async function derivePasskeyWrappingKey(
+  prfOutput: Uint8Array,
+): Promise<{ kwKey: CryptoKey; rawBytes: Uint8Array }> {
+  if (!(prfOutput instanceof Uint8Array) || prfOutput.length < 16) {
+    throw new Error('derivePasskeyWrappingKey: prfOutput must be a Uint8Array of >=16 bytes');
+  }
+  // Single-block HKDF-Expand: HMAC(prfOutput, info || 0x01).
+  const hmacKey = await crypto.subtle.importKey(
+    'raw', bs(prfOutput), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const info = new Uint8Array(PASSKEY_PRF_HKDF_INFO.length + 1);
+  info.set(new TextEncoder().encode(PASSKEY_PRF_HKDF_INFO), 0);
+  info[PASSKEY_PRF_HKDF_INFO.length] = 0x01;
+  const out = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, bs(info)));
+  const kwKey = await crypto.subtle.importKey(
+    'raw', bs(out), 'AES-KW', false, ['wrapKey', 'unwrapKey'],
+  );
+  return { kwKey, rawBytes: out };
+}
+
 // ============ PER-CONTENT CEK BLOB FORMAT (issue #11) ============
 
 /**
@@ -788,6 +833,10 @@ export const ENVELOPE_VERSION: EnvelopeVersion = 1;
 export type ChainWrapping = {
   factor: string; // narrowed to Factor by the wrap helpers
   wrappedBase64: string;
+  // Phase 6 — populated for `passkey_prf` wrappings only. Disambiguates
+  // which registered passkey produced this wrapping (an account may have
+  // multiple). Absent for `password` and `recovery_phrase` wrappings.
+  credentialId?: string;
 };
 
 export type DekChainEntry = {
@@ -876,14 +925,31 @@ export function parseWrappedDataKey(wireValue: string): ParsedWrappedDataKey {
       ) {
         throw new Error(`wrapped_data_key envelope dek_chain[${idx}].wrappings[${wIdx}] is malformed`);
       }
-      return { factor: wo['factor'] as string, wrappedBase64: wo['wrapped'] as string };
+      const factor = wo['factor'] as string;
+      const wrapping: ChainWrapping = {
+        factor,
+        wrappedBase64: wo['wrapped'] as string,
+      };
+      if (factor === FACTOR_PASSKEY_PRF) {
+        if (typeof wo['credential_id'] !== 'string' || (wo['credential_id'] as string).length === 0) {
+          throw new Error(`wrapped_data_key envelope dek_chain[${idx}].wrappings[${wIdx}] passkey_prf entry missing credential_id`);
+        }
+        wrapping.credentialId = wo['credential_id'] as string;
+      }
+      return wrapping;
     });
+    // Dedupe across (factor, credentialId). Password/recovery dedupe by
+    // factor alone; passkey_prf entries may co-exist as long as their
+    // credential_ids differ.
     const factorSeen = new Set<string>();
     for (const w of wrappings) {
-      if (factorSeen.has(w.factor)) {
-        throw new Error(`wrapped_data_key envelope dek_chain[${idx}] has duplicate factor: ${w.factor}`);
+      const key = w.factor === FACTOR_PASSKEY_PRF
+        ? `${w.factor}:${w.credentialId ?? ''}`
+        : w.factor;
+      if (factorSeen.has(key)) {
+        throw new Error(`wrapped_data_key envelope dek_chain[${idx}] has duplicate factor: ${key}`);
       }
-      factorSeen.add(w.factor);
+      factorSeen.add(key);
     }
     return { gen: e['gen'] as number, wrappings };
   });
@@ -958,18 +1024,32 @@ export type UnwrappedDekChain = {
  * for the same 32-byte DEK:
  *   - `gcmKey`: AES-GCM, extractable
  *   - `kwKey`:  AES-KW, used to wrap/unwrap per-content CEKs
+ *
+ * For `FACTOR_PASSKEY_PRF`, an additional `credentialId` argument selects
+ * which passkey wrapping to consume (an account may have multiple
+ * registered passkeys).
  */
 export async function unwrapDataKeyChain(
   wireValue: string,
   unwrappingKey: CryptoKey,
   factor: string = FACTOR_PASSWORD,
+  credentialId?: string,
 ): Promise<UnwrappedDekChain> {
   const parsed = parseWrappedDataKey(wireValue);
   const dekByGen = new Map<number, DataKeyPair>();
   for (const entry of parsed.dekChain) {
-    const wrapping = entry.wrappings.find(w => w.factor === factor);
+    const wrapping = entry.wrappings.find(w => {
+      if (w.factor !== factor) return false;
+      if (factor === FACTOR_PASSKEY_PRF) {
+        return w.credentialId === credentialId;
+      }
+      return true;
+    });
     if (!wrapping) {
-      throw new Error(`No '${factor}' wrapping for gen ${entry.gen}`);
+      const detail = factor === FACTOR_PASSKEY_PRF
+        ? `'${factor}' (credentialId=${credentialId})`
+        : `'${factor}'`;
+      throw new Error(`No ${detail} wrapping for gen ${entry.gen}`);
     }
     const wrapped = base64ToBytesRaw(wrapping.wrappedBase64);
     const [gcmKey, kwKey] = await Promise.all([
@@ -1048,7 +1128,16 @@ export function buildEnvelope(
     },
     dek_chain: sorted.map((e: ChainEntry) => ({
       gen: e.gen,
-      wrappings: e.wrappings.map((w: ChainWrapping) => ({ factor: w.factor, wrapped: w.wrappedBase64 })),
+      wrappings: e.wrappings.map((w: ChainWrapping) => {
+        const wireWrap: Record<string, string> = { factor: w.factor, wrapped: w.wrappedBase64 };
+        if (w.factor === FACTOR_PASSKEY_PRF) {
+          if (!w.credentialId) {
+            throw new Error('passkey_prf wrapping requires credentialId');
+          }
+          wireWrap['credential_id'] = w.credentialId;
+        }
+        return wireWrap;
+      }),
     })),
   }));
 }
@@ -1060,11 +1149,18 @@ export function buildEnvelope(
  * `factors` must include both `FACTOR_PASSWORD` and `FACTOR_RECOVERY_PHRASE`
  * (every account carries both); the writer can pass either one as the first
  * factor — order doesn't affect the result.
+ *
+ * `extraWrappingsByGen` (Phase 6) is an optional map of gen → array of
+ * already-wrapped {factor, wrappedBase64, credentialId?} entries that get
+ * merged into each gen's wrappings. Used by recoverAccount /
+ * rotateAccountKey to preserve passkey wrappings byte-for-byte without
+ * needing the PRF outputs.
  */
 export async function wrapDataKeyChainEnvelope(
   chain: ReadonlyArray<{ gen: number; key: CryptoKey }>,
   factors: ReadonlyArray<FactorInput>,
   recovery: Recovery,
+  extraWrappingsByGen?: ReadonlyMap<number, ReadonlyArray<ChainWrapping>>,
 ): Promise<WrappedDataKeyEnvelope> {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
@@ -1092,6 +1188,14 @@ export async function wrapDataKeyChainEnvelope(
     for (const f of factors) {
       const wrappedBase64 = await wrapDataKey(entry.key, f.wrappingKey);
       wrappings.push({ factor: f.name, wrappedBase64 });
+    }
+    const extras = extraWrappingsByGen?.get(entry.gen) ?? [];
+    for (const e of extras) {
+      wrappings.push({
+        factor: e.factor,
+        wrappedBase64: e.wrappedBase64,
+        ...(e.credentialId ? { credentialId: e.credentialId } : {}),
+      });
     }
     wrappedChain.push({ gen: entry.gen, wrappings });
   }

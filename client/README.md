@@ -378,6 +378,49 @@ Tarn does not validate the username's format. It's a UTF-8 string used as a KDF 
 
 ---
 
+## Passkeys
+
+Passkeys are an opt-in third independent factor for both encryption (the DEK chain gains a per-passkey wrapping derived via the WebAuthn PRF extension) and authentication (the assertion proves possession without prior session state). A user can register zero, one, or many passkeys per account; each one independently unwraps the data and each one can log in.
+
+Passkeys require WebAuthn + the PRF extension. Coverage in mid-2026: Chrome 132+, Safari 18+, recent Edge. Firefox is still patchy. Apps **must** feature-detect before surfacing the affordance.
+
+```js
+// Feature-detect first — render the UI only when this returns true.
+if (await tarn.passkeys.isSupported()) {
+  // Register a new passkey for the logged-in account. Triggers the platform
+  // authenticator prompt (Touch ID / Face ID / Windows Hello / security key).
+  // Pass a label so the user can recognize the device in their settings later.
+  const { credentialId } = await tarn.passkeys.register({
+    deviceLabel: 'Brian\'s iPhone',
+  });
+
+  // List registered passkeys (Settings UI).
+  const all = await tarn.passkeys.list();
+  // [{ credentialId, deviceLabel, createdAt, lastUsedAt }, ...]
+
+  // Remove a passkey. Step-up gated — caller passes the freshly-typed password.
+  await tarn.passkeys.remove({
+    credentialId: all[0].credentialId,
+    password: 'the-password',
+  });
+}
+
+// Authenticate with a passkey instead of password. Returns the same logged-in
+// state as `tarn.login()`; subsequent collection / sharing / settings calls
+// work normally.
+await tarn.authenticateWithPasskey({ deviceLabel: 'Brian\'s iPhone' });
+```
+
+**What passkey support gets you.** A registered passkey lets the user (1) log in without typing a password — the platform authenticator's biometric prompt is enough — and (2) decrypt all existing data without holding the password. The DEK chain gains a `passkey_prf` wrapping per gen at registration; subsequent reads through that passkey unwrap normally.
+
+**What passkey support does NOT change.** Adding a passkey does not weaken the password or account-key paths — the existing wrappings stay in place. Removing a passkey strips its wrappings without touching the others. Rotating credentials (`changeCredentials`, `rotateAccountKey`, `recoverAccount`) preserves passkey wrappings byte-for-byte on existing generations; the new generation created by `changeCredentials` does NOT receive a passkey wrapping (the SDK does not have the PRF outputs in that flow), so the user must re-register each passkey post-credential-change for new-generation data to be passkey-unwrappable. `rotateAccountKey` and `recoverAccount` do not mint a new generation, so passkey unwrappability survives both unchanged.
+
+**Fallback.** If `tarn.passkeys.isSupported()` returns false (Firefox, Chrome on a Linux box without a platform authenticator, etc.), apps should not surface the passkey affordance and should fall back to password-only auth. The SDK refuses to register a passkey on a device without PRF (the wrap would be unrecoverable), so a hopeful "let's just try" is not safe.
+
+**Multi-device.** Apple iCloud Keychain and Google Password Manager sync passkeys across the user's devices; in those cases, registering on one device makes the credential available on all. For non-syncing authenticators (Windows Hello, hardware security keys), the user must register one per device they want to log in from.
+
+---
+
 ## Account + Session
 
 ```js

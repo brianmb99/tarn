@@ -25,6 +25,7 @@ import { ConnectionsNamespace, type IConnectionsClient } from './namespaces/conn
 import { AccountNamespace, type IAccountClient } from './namespaces/account.js';
 import { SessionNamespace, type ISessionClient } from './namespaces/session.js';
 import { AccountKeyNamespace, type IAccountKeyClient } from './namespaces/recovery.js';
+import { PasskeysNamespace, type IPasskeysClient } from './namespaces/passkeys.js';
 import { AdvancedNamespace, type IAdvancedClient } from './namespaces/advanced.js';
 
 // The bundled legacy protocol client. Now that tarn.ts is itself TypeScript
@@ -45,6 +46,7 @@ export type IUnderlyingClient =
   & IAccountClient
   & ISessionClient
   & IAccountKeyClient
+  & IPasskeysClient
   & IAdvancedClient
   & {
     // Auth lifecycle.
@@ -103,6 +105,7 @@ export class TarnClient<S extends AnySchema> {
   readonly account: AccountNamespace;
   readonly session: SessionNamespace;
   readonly accountKey: AccountKeyNamespace;
+  readonly passkeys: PasskeysNamespace;
   readonly advanced: AdvancedNamespace;
 
   // Dynamic collection namespace — populated from the schema in `create()`.
@@ -127,6 +130,7 @@ export class TarnClient<S extends AnySchema> {
     this.account = new AccountNamespace(args.underlying, () => this.#onLogout());
     this.session = new SessionNamespace(args.underlying, () => this.#onLogout());
     this.accountKey = new AccountKeyNamespace(args.underlying, args.appId);
+    this.passkeys = new PasskeysNamespace(args.underlying);
     this.advanced = new AdvancedNamespace(args.underlying);
   }
 
@@ -220,6 +224,21 @@ export class TarnClient<S extends AnySchema> {
    */
   async recoverAccount(args: Record<string, unknown>): Promise<unknown> {
     const result = await this.#underlying.recoverAccount(args);
+    await this.#persistSession();
+    return result;
+  }
+
+  /**
+   * Authenticate with a registered passkey (Phase 6). Triggers the
+   * platform authenticator prompt; on success the client is logged in
+   * exactly as if the user had called `login()`.
+   *
+   * Apps decide which auth path to surface (passkey-first, password-
+   * first, both side-by-side). Passkey auth requires PRF support — see
+   * `tarn.passkeys.isSupported()`.
+   */
+  async authenticateWithPasskey(opts: { deviceLabel?: string; credentialId?: string } = {}): Promise<unknown> {
+    const result = await this.#underlying.authenticateWithPasskey(opts);
     await this.#persistSession();
     return result;
   }

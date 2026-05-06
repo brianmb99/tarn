@@ -105,7 +105,7 @@ After a credential change, every existing chain entry is re-wrapped under the ne
 
 The API stores `wrapped_data_key` as opaque text. The string is a self-describing JSON envelope; the client validates `v` and `kdf` on read and rejects anything else.
 
-**v1 — multi-factor DEK chain.** Each chain entry is wrapped under both the `password` and `recovery_phrase` factors; either factor's KEK independently unwraps the DEK. The `recovery` block holds the recovery KDF's params + per-account salt. Both factors are mandatory at registration; the envelope is invalid without a recovery block.
+**v1 — multi-factor DEK chain.** Each chain entry is wrapped under one or more factors; any factor's KEK independently unwraps the DEK. Three factor types exist: `"password"` and `"recovery_phrase"` (mandatory — every account carries both) and `"passkey_prf"` (Phase 6, opt-in — zero or more per account, one per registered passkey). The `recovery` block holds the recovery KDF's params + per-account salt and is required.
 
 ```json
 {
@@ -120,7 +120,9 @@ The API stores `wrapped_data_key` as opaque text. The string is a self-describin
   "dek_chain": [
     { "gen": 1, "wrappings": [
       { "factor": "password",        "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" },
-      { "factor": "recovery_phrase", "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" }
+      { "factor": "recovery_phrase", "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" },
+      { "factor": "passkey_prf",     "credential_id": "<base64url credential ID>",
+                                     "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" }
     ]},
     { "gen": 2, "wrappings": [
       { "factor": "password",        "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" }
@@ -130,7 +132,9 @@ The API stores `wrapped_data_key` as opaque text. The string is a self-describin
 ```
 
 - Each `dek_chain` entry's `wrappings` array carries the same DEK wrapped under each factor's KEK. AES-KW is deterministic, so the same (DEK, KEK) pair always produces the same ciphertext bytes — preserving register-retry idempotency.
+- `passkey_prf` wrappings carry an additional `credential_id` field (base64url-encoded WebAuthn credential ID) so the SDK can pick the right wrapping when more than one passkey is registered. Within a single `wrappings` array, `(factor, credential_id)` must be unique — duplicate `passkey_prf` entries with the same credential ID are rejected at parse time. `password` and `recovery_phrase` carry no credential ID and may appear at most once per gen.
 - When `changeCredentials` runs without the account key (caller passed `acceptRecoveryGap: true`): old gens preserve their existing recovery wrappings verbatim (re-wrapping under the same KEK is byte-identical anyway), and the new gen N+1 has only a `password` wrapping. The gap is closed by `recoverAccount` or by `rotateAccountKey` (Phase 4 — `POST /api/v1/account/rotate-account-key`, exposed as `tarn.accountKey.rotate()`), both of which re-wrap every gen under the recovery factor. By default the SDK requires `phrase` and refuses the rotation if it would create a gap.
+- Passkey wrappings are preserved verbatim by every envelope-mutating SDK path (`changeCredentials`, `rotateAccountKey`, `recoverAccount`) since AES-KW is deterministic and the underlying DEKs do not change. The new gen N+1 created by `changeCredentials` does NOT receive a passkey wrapping (the SDK does not have the PRF outputs in that flow); the user must re-register each passkey for new-gen data to be passkey-unwrappable. `rotateAccountKey` and `recoverAccount` do NOT mint a new gen, so they preserve passkey unwrappability across the rotation.
 - The current generation (used for new writes) is the entry with the highest `gen`. Old gens stay in the chain so older content blobs remain decryptable.
 
 The envelope is byte-stable for the same `(username, password, app, recovery_phrase, recovery_salt)` inputs (AES-KW is deterministic; `JSON.stringify` is insertion-ordered; chain entries are written in generation order). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
@@ -184,7 +188,7 @@ Two distinct storage modes exist for the account key. The wire protocol supports
 
 **Users can switch later.** Toggle endpoints `PUT /api/v1/account/account-key` (enable, Model A → B) and `DELETE /api/v1/account/account-key` (disable, Model B → A) are documented below — both require the same JWT + step-up token posture as the fetch endpoint. Either toggle republishes the credential blob to Arweave so the rebuild path stays in sync. The SDK exposes them as `tarn.accountKey.enableKeyStorage()` and `tarn.accountKey.disableKeyStorage()`.
 
-**Future passkey support is independent of this choice.** Phase 6 of the roadmap adds WebAuthn-PRF as a third auth factor in the envelope (alongside `password` and `recovery_phrase`). Whether or not an account uses Model A or Model B, it can independently opt in to passkey factors.
+**Passkey support is independent of this choice.** Passkeys (Phase 6) add WebAuthn-PRF as a third auth factor in the envelope (alongside `password` and `recovery_phrase`). Whether or not an account uses Model A or Model B, it can independently opt in to passkey factors. See [Passkey factor (Phase 6)](#passkey-factor-phase-6) below.
 
 #### Wire format details (Phase 3)
 
@@ -327,6 +331,66 @@ Errors:
 When `false` (default), `recoverAccount` behaves exactly as documented in §7a: the phrase stays the same after recovery; the result has no `accountKey` field. Existing apps see no behavior change.
 
 The implementation reuses the rotation primitive directly — no new endpoint. If the inline rotation fails after a successful recovery, `recoverAccount` throws a partial-success error pointing at `tarn.accountKey.rotate()` for retry; the user is logged in under the new credentials and the OLD account key still works.
+
+### Passkey factor (Phase 6)
+
+Phase 6 adds a third independent encryption factor: a WebAuthn passkey using the PRF (pseudo-random function) extension. A registered passkey can both unwrap the DEK chain (via a PRF-derived AES-KW key) and authenticate a session (via the standard WebAuthn signature against a stored public key).
+
+Passkeys are **opt-in per account, opt-in per device**. An account with no registered passkeys behaves exactly as it did pre-Phase-6 — nothing on the wire changes, no new fields appear, all existing flows are untouched. An account may register zero, one, or many passkeys; each one independently unwraps the chain.
+
+#### PRF derivation
+
+The WebAuthn PRF extension lets the relying party hand the authenticator a 32-byte salt and receive back a deterministic 32-byte secret bound to (passkey, salt). Tarn runs that secret through HKDF-Expand with a fixed info string to derive the AES-KW wrapping key:
+
+```
+prf_output  = navigator.credentials.{create,get}({ extensions: { prf: { eval: { first: prf_salt } } } })
+                .clientExtensionResults.prf.results.first       (32 bytes)
+
+passkey_KEK = HMAC-SHA256(prf_output, "tarn-passkey-prf-v1" || 0x01)   (single-block HKDF-Expand)
+```
+
+The `prf_salt` is fresh random 32 bytes generated by the server at registration time and persisted in the `passkey_credentials` row alongside the credential's public key. Authentication reads the same salt back out so the PRF derivation produces the same secret deterministically.
+
+Reusing the same passkey across different relying parties cannot collide because the PRF input includes the relying-party-id (browser-enforced). Reusing the same passkey within Tarn for a different purpose cannot collide either: the HKDF info string `"tarn-passkey-prf-v1"` namespaces the derivation away from any future PRF-based primitive.
+
+#### `passkey_credentials` table
+
+```sql
+CREATE TABLE passkey_credentials (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id   TEXT NOT NULL,            -- accounts.data_lookup_key
+  credential_id TEXT NOT NULL UNIQUE,    -- WebAuthn credential ID, base64url
+  public_key   TEXT NOT NULL,            -- COSE-encoded public key, base64url
+  prf_salt     TEXT NOT NULL,            -- 32 random bytes, base64url
+  sign_count   INTEGER NOT NULL DEFAULT 0,
+  device_label TEXT,                     -- user-supplied, ≤256 chars
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER
+);
+```
+
+`sign_count` is the WebAuthn replay counter. Tarn records it but does NOT enforce strict monotonicity — synced cross-device passkeys (iCloud Keychain, Google Password Manager) legitimately keep it at 0. Treat it as a soft signal.
+
+#### Endpoints
+
+- `POST /api/v1/auth/passkey/register-options` — JWT-authed (logged-in user). Returns `{ options, prf_salt }`. Server stores the registration challenge in `webauthn_challenges` (60 s TTL, single-use).
+- `POST /api/v1/auth/passkey/register` — JWT-authed. Body: `{ credential, prf_salt, new_envelope, device_label? }`. Server verifies the WebAuthn registration response, stores the credential row, atomically replaces the envelope, republishes to Arweave. Returns `{ credential_id, device_label, created_at }`.
+- `POST /api/v1/auth/passkey/authentication-options` — public. Returns `{ options, allow_credentials: [{ credential_id, prf_salt }, ...], rp_id }`. Server stores the authentication challenge in `webauthn_challenges` (60 s TTL).
+- `POST /api/v1/auth/passkey/authenticate` — public. Body: `{ credential, previous_sid?, device_label? }`. Server verifies the assertion against the stored public key, increments sign_count, mints a session JWT. Returns the same payload shape as `/auth/verify` (`{ jwt, expiresIn, data_lookup_key, wrapped_data_key, account_key_stored, credential_id }`).
+- `GET /api/v1/account/passkeys` — JWT-authed. Returns `{ passkeys: [{ credential_id, device_label, created_at, last_used_at }, ...] }`. Public keys and PRF salts are NOT exposed (those are auth-internal).
+- `DELETE /api/v1/account/passkeys/:credential_id` — JWT + step-up token. Body: `{ new_envelope }`. Strips the credential row and the matching wrappings, republishes to Arweave. Step-up reuses the existing `account_key_fetch` scope (the security posture is identical to the account-key toggles).
+
+#### RP-ID and origin handling
+
+The relying-party-id is derived from the request's `Origin` header against a server-side allowlist (`getbookish.app`, `dev.getbookish.app`, `tarn.dev`, plus `localhost` for dev). A request from an unrecognized origin is rejected at the route boundary. The allowlist mirrors the CORS handler — keep them in sync when adding a new front-end host.
+
+#### Audit
+
+All passkey lifecycle events (`passkey_register`, `passkey_authenticate`, `passkey_remove`) write rows into the existing `account_key_fetch_log` table (the post-Phase-4 unified account-security audit table) so a Settings UI can show "Passkey added on X, last used Y, removed Z".
+
+#### Library choice
+
+`@simplewebauthn/server` v13 handles the CBOR/COSE parsing and signature verification on the server. `@simplewebauthn/browser` v13 provides the small client wrapper that converts the JSON-friendly options blob into the BufferSource fields `navigator.credentials.create/get` expect. Both satisfy the supply-chain rule (latest >7 days old at time of work).
 
 ### Data lookup key
 
