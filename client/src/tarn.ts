@@ -45,7 +45,6 @@ import {
   generateAccountKey,
   validateAccountKey,
   accountKeyToEntropy,
-  renderRecoveryPDF,
 } from './recovery.js';
 import {
   encryptSessionBlob,
@@ -144,7 +143,7 @@ function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
 
 // Re-export the account-key surface so consumers can import them directly
 // from the package root without reaching into ./recovery (private path).
-export { generateAccountKey, validateAccountKey, renderRecoveryPDF };
+export { generateAccountKey, validateAccountKey };
 
 export class TarnClient {
   #apiBase: string;
@@ -283,30 +282,27 @@ export class TarnClient {
    * fails synchronously with no network call. This is the SDK enforcement of
    * the design-doc requirement that the account key is mandatory at signup.
    *
-   * The account key is returned to the caller in the result payload alongside
-   * the rendered PDF bytes. The TarnClient instance does NOT cache the key —
-   * the caller is responsible for surfacing it to the user (download, print,
-   * or any out-of-band delivery the app wants to wire up) and dropping the
-   * in-memory copy promptly. Re-rendering a fresh PDF later requires the user
-   * to provide the account key again.
+   * The account key is returned to the caller in the result payload. The
+   * TarnClient instance does NOT cache the key — the caller is responsible
+   * for surfacing it to the user (downloadable kit, printable page,
+   * app-operated delivery channel, etc.) and dropping the in-memory copy
+   * promptly. Tarn no longer renders kits in-SDK; the app owns the kit
+   * format and delivery.
    *
    * @param {string} username
    * @param {string} password
    * @param {{
    *   recoveryAcknowledged: boolean,
-   *   appName?: string,                   // PDF branding
    * }} [opts]
    * @returns {Promise<{
    *   dataLookupKey: string,
    *   accountKey: string,
-   *   pdfBytes: Uint8Array,
    *   }>}
    */
   async register(username: string, password: string, opts: any = {}): Promise<any> {
     if (!opts || opts.recoveryAcknowledged !== true) {
       throw new Error('register(): recoveryAcknowledged: true is required (issue #12)');
     }
-    const appName = opts.appName;
     // Sharing keypair publication (issue #13). Defaults to discoverable so a
     // new social-app user can connect by username out of the box. Apps that
     // want a "private by default" stance can pass `shareDiscoverable: false`.
@@ -397,40 +393,10 @@ export class TarnClient {
 
     await this.#authenticate();
 
-    const pdfBytes = renderRecoveryPDF({ phrase, appName });
-
     return {
       dataLookupKey: this.#dataLookupKey,
       accountKey: phrase,
-      pdfBytes,
     };
-  }
-
-  /**
-   * Render a fresh recovery PDF for the account key the user already holds.
-   * The account key is unchanged — Tarn does not store it, so the caller must
-   * provide it. Pure client-side rendering — no network call, no auth requirement.
-   *
-   * Returns the normalized form of the account key alongside the rendered bytes
-   * so callers reflecting the kit back to a user (e.g. the `format: 'json'`
-   * path on the typed namespace) can surface a canonicalized version.
-   *
-   * @param {{
-   *   phrase: string,
-   *   appName?: string,
-   * }} opts
-   * @returns {Promise<{ phrase: string, pdfBytes: Uint8Array }>}
-   */
-  async regenerateRecoveryKit(opts: any = {}): Promise<any> {
-    const { phrase, appName } = opts;
-
-    const validation = validateAccountKey(phrase);
-    if (!validation.valid) {
-      throw new Error(`regenerateRecoveryKit(): ${validation.reason}`);
-    }
-
-    const pdfBytes = renderRecoveryPDF({ phrase: validation.normalized, appName });
-    return { phrase: validation.normalized, pdfBytes };
   }
 
   /**
@@ -769,11 +735,10 @@ export class TarnClient {
    * - The NEW gen (N+1) gets a recovery wrapping when the caller passes
    *   `phrase`. Required by default: without it, the new gen has only a
    *   password wrapping, and recovery for data written under that gen is not
-   *   possible until the user runs `regenerateRecoveryKit` or `recoverAccount`
-   *   to repair the gap. Apps with a non-interactive flow that knowingly
-   *   accepts the gap may pass `acceptRecoveryGap: true`. (A future
-   *   `rotateAccountKey` primitive — not yet implemented — will be the
-   *   canonical closer for this gap.)
+   *   possible until the user runs `recoverAccount` (or, once implemented,
+   *   the planned `rotateAccountKey` primitive) to repair the gap. Apps with
+   *   a non-interactive flow that knowingly accepts the gap may pass
+   *   `acceptRecoveryGap: true`.
    *
    * Connection-side identity rotation (sharing §13.5): after the credential
    * blob is published, this method announces the new sharing + signing pubkeys

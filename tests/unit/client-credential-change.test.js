@@ -122,7 +122,7 @@ describe('TarnClient.changeCredentials — forward-secret DEK rotation (issue #1
 
     // Gen 2 has a password wrapping (always) but NO recovery wrapping
     // (caller didn't pass `phrase`). This is the documented gap that
-    // recoverAccount/regenerateRecoveryKit closes.
+    // recoverAccount (or the planned rotateAccountKey) closes.
     const gen2Wrappings = newEnvelope.dek_chain[1].wrappings;
     assert.equal(gen2Wrappings.length, 1);
     assert.equal(gen2Wrappings[0].factor, 'password');

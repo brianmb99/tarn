@@ -5,10 +5,9 @@
  * The account key is the user's parallel access path to their data,
  * independent of the password. This example:
  *   1. Registers a new account.
- *   2. Captures the account key + the recovery PDF bytes (writes the PDF to
- *      disk). The kit never leaves the device — Tarn does not deliver it for
- *      you; apps decide how to surface it (download, print, app-specific
- *      channel).
+ *   2. Captures the account key. Apps decide how to surface it to the user
+ *      (download a kit, render a printable page, copy to clipboard, etc.) —
+ *      Tarn returns the 24-word string and nothing else.
  *   3. Writes a record under the original account.
  *   4. Constructs a FRESH client (simulating the user being on a different
  *      device or having forgotten their password) and recovers using the
@@ -17,7 +16,6 @@
  *      decryptable under the new credentials.
  */
 
-import { writeFile } from 'node:fs/promises';
 import { TarnClient, TarnStorage, defineSchema } from 'tarn-client';
 
 async function maybeGrantLocalRules(apiBase, dlk) {
@@ -61,19 +59,13 @@ const tarn1 = await TarnClient.create({
 
 const reg = await tarn1.register(username, password, {
   recoveryAcknowledged: true,
-  appName:              'Tarn Example 04',
 });
 
 await maybeGrantLocalRules(API_BASE, reg.dataLookupKey);
 
 console.log('  accountKey: <captured, not logged for safety>');
-console.log('  pdfBytes:       Uint8Array of', reg.pdfBytes.length, 'bytes');
-
-// In a real app the PDF goes straight to the user via download / share.
-// Here we drop it to disk so you can inspect it.
-const pdfPath = './recovery-kit.pdf';
-await writeFile(pdfPath, reg.pdfBytes);
-console.log('  wrote', pdfPath);
+console.log('  (a real app would render a recovery kit from this string —');
+console.log('   PDF, printable HTML, clipboard copy, etc. — and surface it to the user)');
 
 // Capture the account key only in this process. Apps must NEVER persist the
 // account key to disk or any storage system — the user is the only durable store.

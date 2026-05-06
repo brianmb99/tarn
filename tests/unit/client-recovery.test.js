@@ -8,9 +8,7 @@
 //   - register() emits v1 with both password and recovery_phrase wrappings
 //   - register() makes no recovery-email network call (kit delivery is the
 //     app's responsibility — Tarn never handles plaintext kit material)
-//   - PDF rendering (basic structure, deterministic output for fixed inputs)
 //   - recoverAccount() round-trip (register → simulate forget password → recover with account key → re-login)
-//   - regenerateRecoveryKit() returns a fresh PDF for the same account key
 //
 // Mocks fetch to keep tests fast; uses real KDFs so the crypto under test is
 // the real implementation.
@@ -23,7 +21,6 @@ import {
   TarnClient,
   generateAccountKey,
   validateAccountKey,
-  renderRecoveryPDF,
 } from '../../client/src/tarn.js';
 import {
   parseWrappedDataKey,
@@ -331,7 +328,7 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     assert.equal(fetchCalls.length, 0);
   });
 
-  it('emits a v1 envelope with both factors + returns phrase + PDF', async () => {
+  it('emits a v1 envelope with both factors + returns the account key', async () => {
     mockFetch([
       { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
       { status: 200, body: JSON.stringify({ nonce: 'b'.repeat(64) }) },
@@ -343,10 +340,8 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     });
     assert.ok(result.accountKey);
     assert.equal(result.accountKey.split(' ').length, 24);
-    assert.ok(result.pdfBytes instanceof Uint8Array);
-    assert.ok(result.pdfBytes.length > 0);
-    // First 5 bytes are the PDF header "%PDF-".
-    assert.deepEqual(Array.from(result.pdfBytes.slice(0, 5)), [0x25, 0x50, 0x44, 0x46, 0x2d]);
+    // Tarn no longer renders kits in-SDK — only the account-key string is returned.
+    assert.equal(result.pdfBytes, undefined);
 
     // Inspect the envelope sent to /auth/register.
     const registerCall = fetchCalls.find(c => c.url.endsWith('/auth/register'));
@@ -370,7 +365,6 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     const client = new TarnClient('https://api.tarn.dev', APP);
     await client.register('rec-test@example.com', 'password-2026', {
       recoveryAcknowledged: true,
-      appName: 'Bookish',
     });
     const emailCall = fetchCalls.find(c => c.url.includes('/recovery/email'));
     assert.equal(emailCall, undefined, 'must not POST /api/v1/recovery/email — endpoint is gone');
@@ -488,81 +482,6 @@ describe('TarnClient.recoverAccount — round trip', () => {
       }),
       /no account found/,
     );
-  });
-});
-
-// ============ regenerateRecoveryKit ============
-
-describe('TarnClient.regenerateRecoveryKit', () => {
-  afterEach(restoreFetch);
-
-  it('returns the normalized phrase + PDF for a valid phrase, makes no network call', async () => {
-    mockFetch([]);
-    const client = new TarnClient('https://api.tarn.dev', APP);
-    const phrase = generateAccountKey();
-    const r = await client.regenerateRecoveryKit({ phrase });
-    assert.ok(r.pdfBytes instanceof Uint8Array);
-    assert.equal(r.phrase, phrase, 'returns the normalized phrase for the JSON-export path');
-    assert.equal(fetchCalls.length, 0);
-  });
-
-  it('normalizes whitespace + case in the returned phrase', async () => {
-    mockFetch([]);
-    const client = new TarnClient('https://api.tarn.dev', APP);
-    const phrase = generateAccountKey();
-    const messy = '  ' + phrase.toUpperCase().split(' ').join('   ') + '  ';
-    const r = await client.regenerateRecoveryKit({ phrase: messy });
-    assert.equal(r.phrase, phrase);
-  });
-
-  it('rejects an invalid phrase', async () => {
-    const client = new TarnClient('https://api.tarn.dev', APP);
-    await assert.rejects(
-      () => client.regenerateRecoveryKit({ phrase: 'bad phrase' }),
-      /expected 24|invalid/,
-    );
-  });
-});
-
-// ============ PDF ============
-
-describe('renderRecoveryPDF', () => {
-  it('produces a valid PDF (starts with %PDF- and ends with %%EOF)', () => {
-    const phrase = generateAccountKey();
-    const pdf = renderRecoveryPDF({ phrase, appName: 'Bookish' });
-    const head = new TextDecoder().decode(pdf.slice(0, 5));
-    assert.equal(head, '%PDF-');
-    const tail = new TextDecoder().decode(pdf.slice(-6));
-    assert.equal(tail, '%%EOF\n');
-  });
-
-  it('is deterministic for fixed inputs (phrase + branding + generatedAt)', () => {
-    const phrase = generateAccountKey();
-    const a = renderRecoveryPDF({ phrase, appName: 'Bookish', generatedAt: '2026-04-28' });
-    const b = renderRecoveryPDF({ phrase, appName: 'Bookish', generatedAt: '2026-04-28' });
-    assert.deepEqual(a, b);
-  });
-
-  it('different phrase → different bytes', () => {
-    const a = renderRecoveryPDF({ phrase: generateAccountKey(), appName: 'X', generatedAt: 'd' });
-    const b = renderRecoveryPDF({ phrase: generateAccountKey(), appName: 'X', generatedAt: 'd' });
-    assert.notDeepEqual(a, b);
-  });
-
-  it('rejects a non-24-word phrase', () => {
-    assert.throws(
-      () => renderRecoveryPDF({ phrase: 'too short' }),
-      /expected 24-word account key/,
-    );
-  });
-
-  it('contains all 24 words in the rendered content stream', () => {
-    const phrase = generateAccountKey();
-    const pdf = renderRecoveryPDF({ phrase });
-    const text = new TextDecoder().decode(pdf);
-    for (const word of phrase.split(' ')) {
-      assert.ok(text.includes(word), `PDF should contain word "${word}"`);
-    }
   });
 });
 

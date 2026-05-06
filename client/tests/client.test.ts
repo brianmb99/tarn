@@ -46,7 +46,6 @@ class StubUnderlying implements IUnderlyingClient {
   listIncomingRequestsCalls = 0;
   createInviteTokenCalls = 0;
   redeemInviteTokenCalls = 0;
-  regenerateRecoveryKitCalls = 0;
 
   entries: DecryptedEntry[] = [];
   shareKeyByTxid = new Map<string, string>();
@@ -113,17 +112,6 @@ class StubUnderlying implements IUnderlyingClient {
     this.deleteAccountCalls++;
     this.loggedIn = false;
     return { ok: true };
-  }
-
-  // ---- Recovery ----
-  lastRegenerateOpts: { phrase: string; appName?: string } | null = null;
-  async regenerateRecoveryKit(opts: { phrase: string; appName?: string }) {
-    this.regenerateRecoveryKitCalls++;
-    this.lastRegenerateOpts = opts;
-    return {
-      phrase: opts.phrase,
-      pdfBytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]), // %PDF
-    };
   }
 
   // ---- Connections ----
@@ -831,24 +819,6 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
   it('account.changeCredentials delegates', async () => {
     await tarn.account.changeCredentials('new@e.com', 'newpw');
     assert.equal(stub.changeCredentialsCalls, 1);
-  });
-
-  it('accountKey.export({ format: pdf }) returns the PDF bytes and forwards the account key', async () => {
-    const phrase = 'one two three four five six seven eight nine ten eleven twelve';
-    const result = await tarn.accountKey.export({ format: 'pdf', phrase });
-    assert.ok(result instanceof Uint8Array);
-    assert.equal(stub.regenerateRecoveryKitCalls, 1);
-    assert.equal(stub.lastRegenerateOpts?.phrase, phrase, 'must pass account key through to underlying');
-  });
-
-  it('accountKey.export({ format: json }) returns the structured kit', async () => {
-    const phrase = 'one two three four five six seven eight nine ten eleven twelve';
-    const result = await tarn.accountKey.export({ format: 'json', phrase, appName: 'Bookish' });
-    assert.ok(!(result instanceof Uint8Array));
-    const json = result as { phrase: string; appName: string; generatedAt: string };
-    assert.equal(json.phrase, phrase);
-    assert.equal(json.appName, 'Bookish');
-    assert.ok(json.generatedAt);
   });
 
   it('session.listDevices delegates', async () => {

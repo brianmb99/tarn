@@ -656,7 +656,7 @@ DELETE /api/v1/auth
 
 Tarn intentionally does **not** expose a recovery-kit transport endpoint. Earlier protocol drafts included `POST /api/v1/recovery/email` as a "no-storage, brief in-memory visibility" forwarder; that endpoint has been removed. Even ephemeral handling of plaintext account-key material on Tarn-operated infrastructure was a violation of the zero-knowledge framing the rest of the protocol enforces, and any operational compromise (logs, supply-chain, subpoena, future bug introducing persistence) would have exposed the most sensitive payload in the entire system.
 
-Tarn also does not render recovery kits. The SDK exposes the account-key string (and the gen-1 DEK, when Model B is in use); apps render their own kit format and decide how to surface it to the user (download, print, app-operated transport). The historical in-SDK PDF renderer is being removed; apps that want a PDF render one with their own toolchain. This keeps the SDK bundle smaller and gives apps full control over branding and layout.
+Tarn also does not render recovery kits. The SDK exposes the account-key string (and the gen-1 DEK, when Model B is in use); apps render their own kit format and decide how to surface it to the user (download, print, app-operated transport). The historical in-SDK PDF renderer has been removed; apps that want a PDF render one with their own toolchain. This keeps the SDK bundle smaller and gives apps full control over branding and layout.
 
 ### App endpoints
 

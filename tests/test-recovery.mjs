@@ -67,12 +67,12 @@ await test('register publishes v1 envelope with both factors', async () => {
   });
   assert(result.dataLookupKey, 'should return dataLookupKey');
   assert(result.accountKey, 'should return accountKey');
-  assert.equal !== undefined;
   if (result.accountKey.split(' ').length !== 24) {
     throw new Error(`expected 24-word account key, got ${result.accountKey.split(' ').length}`);
   }
-  if (!(result.pdfBytes instanceof Uint8Array) || result.pdfBytes.length === 0) {
-    throw new Error('expected non-empty pdfBytes');
+  // Tarn no longer renders kits in-SDK — apps build their own from the account key.
+  if (result.pdfBytes !== undefined) {
+    throw new Error('register() must not return pdfBytes (in-SDK PDF renderer was removed)');
   }
 });
 

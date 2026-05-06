@@ -60,9 +60,9 @@ The generator requires Python with `reportlab` and `markdown-it-py` (`python -m 
   This tests the full lifecycle (health, register, app auth, set rules, login, write, read, Turbo gateway, status, delete) against the live API. Do not consider a deploy complete until this passes.
 - The bookish app private key (`TARN_APP_KEY_BOOKISH`) is in `api/.dev.vars` (local) and Cloudflare Worker secrets (production).
 
-### Recovery-kit delivery is an app concern, not a Tarn concern
+### Recovery-kit format and delivery are an app concern, not a Tarn concern
 
-Tarn deliberately has no endpoint that handles a recovery PDF, recovery phrase, or any other plaintext recovery material — even ephemerally. The kit is rendered client-side (`renderRecoveryPDF` / `tarn.recovery.export`) and the bytes never leave the user's device on Tarn's account. Apps decide how to surface the kit to the user (download, print, app-operated email, etc.); the platform's job ends at producing the bytes. If you find yourself adding a route under `/api/v1/recovery/*` that takes phrase or PDF material as input, stop — that's a zero-knowledge boundary violation.
+Tarn deliberately has no endpoint that handles an account key, recovery PDF, or any other plaintext kit material — even ephemerally. The SDK itself also no longer renders kits: `tarn.register()` returns the 24-word account-key string and nothing else, and apps build their own kit (downloadable PDF, printable HTML, clipboard copy, etc.) using whatever rendering toolchain fits. The platform's job ends at producing the account-key string on the user's device. If you find yourself adding a route under `/api/v1/recovery/*` that takes account-key or kit material as input — or reintroducing a PDF generator into `client/src/` — stop. Either is a zero-knowledge boundary violation.
 
 ## D1 Database
 

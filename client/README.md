@@ -246,21 +246,12 @@ Tarn issues every account a 24-word BIP39 account key at signup. The account key
 const reg = await tarn.register('me@example.com', 'p@ssw0rd', {
   // First arg is the username. See "Authentication and the username field" below.
   recoveryAcknowledged: true,
-  appName: 'My App',              // PDF branding
 });
 // reg.accountKey       — 24-word string
-// reg.pdfBytes         — Uint8Array of the rendered PDF
-// Hand both to the user immediately. Do NOT persist either.
-
-// Re-render the kit later for the same account key. Pure client-side; no auth
-// required. The caller must supply the account key — Tarn never persists it.
-const pdfBytes = await tarn.accountKey.export({ format: 'pdf', phrase });
-// or: structured JSON for apps rendering their own format.
-const json = await tarn.accountKey.export({ format: 'json', phrase });
-// json: { phrase, appName, generatedAt }
+// Hand it to the user immediately. Do NOT persist it.
 ```
 
-**Delivery is the app's job.** Tarn renders the kit entirely on the client and never sees the account key or the PDF — there is no Tarn endpoint that handles plaintext account-key material, even ephemerally. Apps decide how to surface the bytes: a download is the recommended default (universally available, no third party); print and app-operated email are also fine. If the application wants to email the kit, it must operate the forwarder itself — Tarn will not host one, since routing account-key material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
+**Kit format and delivery are the app's job.** Tarn returns the 24-word account-key string and nothing else — no PDF, no rendered bytes. Apps render their own kit (downloadable PDF, printable HTML, clipboard copy, whatever fits) and decide how to surface it to the user. There is no Tarn endpoint that handles plaintext account-key material, even ephemerally; the SDK does not ship an in-bundle PDF renderer either, so apps stay in full control of branding and layout. If the application wants to email the kit, it must operate the transport itself — Tarn will not host a forwarder, since routing account-key material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
 
 Account recovery itself goes through the top-level `tarn.recoverAccount()` (auth lifecycle):
 

@@ -6,7 +6,6 @@
  *   await tarn.login(username, password);
  *   await tarn.<collection>.create({...});         // typed from schema
  *   await tarn.connections.list();
- *   const pdf = await tarn.accountKey.export({ format: 'pdf' });
  *   await tarn.session.clear();
  *
  * Implementation: wraps the existing JS TarnClient (in tarn.js) — step 6 of

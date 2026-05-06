@@ -1,72 +1,23 @@
 /**
- * `tarn.accountKey.*` — re-render the recovery kit for an account key the
- * user already holds.
+ * `tarn.accountKey.*` — account-key lifecycle namespace.
  *
- * The kit format options:
- *   - 'pdf'  → PDF bytes with the default Tarn-branded layout (uses the
- *     existing `renderRecoveryPDF` from the recovery module).
- *   - 'json' → structured object with `phrase` and `appName` for apps
- *     that want to render their own format. Bytes only — no PDF library.
+ * Currently a stub. Future phases land here:
+ *   - Phase 3: `view()` (Model B step-up retrieval of the stored account key)
+ *   - Phase 4: `rotate()` (account-key rotation)
+ *   - Phase 4: `enableKeyStorage()` / `disableKeyStorage()` (Model A/B toggle)
  *
- * Tarn never delivers the kit anywhere — apps are responsible for surfacing
- * the bytes to the user (download, print, or any other channel the app
- * decides is appropriate). The account key is also never persisted by the
- * SDK; the caller must pass it back in for every re-export.
+ * The SDK no longer renders recovery kits — apps render their own from the
+ * account-key string returned by `register()` / `recoverAccount()` / future
+ * `view()`. There is therefore no underlying-client interface to thread
+ * through yet; namespace state below is intentionally empty.
  */
 
-export type AccountKeyFormat = 'pdf' | 'json';
-
-export type AccountKeyJson = {
-  phrase: string;
-  appName: string;
-  generatedAt: string; // ISO 8601
-};
-
-export interface IAccountKeyClient {
-  regenerateRecoveryKit(opts: {
-    phrase: string;
-    appName?: string;
-  }): Promise<{ phrase: string; pdfBytes: Uint8Array }>;
-}
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+export interface IAccountKeyClient {}
 
 export class AccountKeyNamespace {
-  readonly #client: IAccountKeyClient;
-  readonly #appId: string;
-
-  constructor(client: IAccountKeyClient, appId: string) {
-    this.#client = client;
-    this.#appId = appId;
-  }
-
-  /**
-   * Re-render the recovery kit for an account key the user already has. With
-   * `format: 'pdf'` returns the rendered PDF as `Uint8Array` (wrap in
-   * `new Blob([bytes], { type: 'application/pdf' })` if you need a Blob).
-   * With `format: 'json'` returns the structured kit data for apps that
-   * want to render their own format.
-   *
-   * Pure client-side — no network call, no auth requirement. The account key
-   * is validated against the BIP39 wordlist + checksum; an invalid key
-   * throws synchronously. The same (phrase, appName) tuple always produces
-   * an identical kit — re-export is idempotent and does NOT rotate any
-   * server-side state. (Account-key rotation is a separate, deliberately-absent
-   * operation — losing your account key requires recoverAccount + a new
-   * registration-equivalent flow, not a casual re-export.)
-   */
-  async export(opts: {
-    format: AccountKeyFormat;
-    phrase: string;
-    appName?: string;
-  }): Promise<Uint8Array | AccountKeyJson> {
-    const appName = opts.appName ?? this.#appId;
-    const result = await this.#client.regenerateRecoveryKit({ phrase: opts.phrase, appName });
-    if (opts.format === 'pdf') {
-      return result.pdfBytes;
-    }
-    return {
-      phrase: result.phrase,
-      appName,
-      generatedAt: new Date().toISOString(),
-    };
+  // Future methods (view, rotate, enable/disableKeyStorage) land here.
+  constructor(_client: IAccountKeyClient, _appId: string) {
+    // no-op
   }
 }
