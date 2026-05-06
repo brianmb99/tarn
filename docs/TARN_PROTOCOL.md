@@ -47,8 +47,8 @@ sub_key = HMAC-SHA256(master_key, info)
 ### Full derivation chain
 
 ```
-email + password (user input, never leaves client)
-  -> master_key                  Argon2id(password, SHA-256(normalizedEmail), m=64MiB, t=3, p=1)
+username + password (user input, never leaves client)
+  -> master_key                  Argon2id(password, SHA-256(normalizedUsername), m=64MiB, t=3, p=1)
 
 master_key + app_id:
   -> credential_lookup_key       HMAC-SHA256(master_key, "tarn" || "lookup"  || app_id || "1" || 0x01)
@@ -61,13 +61,17 @@ master_key + app_id:
 
 ### Master-key KDF
 
-Argon2id is the only supported KDF. Parameters: m=64 MiB, t=3, p=1, hash length 32 bytes. Salt is `SHA-256(normalizedEmail)` — deterministic from the account identifier, no per-account salt at this layer (the recovery factor's `Argon2id(phrase, recovery_salt)` does carry a random salt; see [Recovery factor](#recovery-factor)).
+Argon2id is the only supported KDF. Parameters: m=64 MiB, t=3, p=1, hash length 32 bytes. Salt is `SHA-256(normalizedUsername)` — deterministic from the account identifier, no per-account salt at this layer (the recovery factor's `Argon2id(phrase, recovery_salt)` does carry a random salt; see [Recovery factor](#recovery-factor)).
 
 Parameters were chosen against a ~2s slow-device login budget: 64 MiB memory + 3 iterations + 1-way parallelism (single-threaded; aligns with browser realities). The memory-hard property neutralizes GPU/ASIC parallelism in line with the OWASP Argon2id recommendation.
 
 > **Note on prior KDFs.** Earlier drafts of Tarn supported PBKDF2-SHA256 (600K iters) as a legacy path, with login dispatch trying Argon2id first and falling back. That back-compat was cut cleanly when Tarn still had a single user — the only KDF clients ever derive is Argon2id. There is no dispatch.
 
-**Per-app isolation:** Every derived key includes `app_id`. The same email+password produces completely independent identities per app. Different credential_lookup_key, different encryption_key, different signing key. A Bookish user and a Cellar user with the same email+password cannot see each other's data, share sessions, or even detect each other's existence.
+#### Username field — format-agnostic
+
+Tarn does not validate the username's format. It's a UTF-8 string used as a KDF salt input (after `trim().toLowerCase()` normalization) and as a public user-lookup key for connection bootstrap. Apps choose whether to enforce email-shape, handle-shape, phone-shape, or anything else. The implementation neutrally calls the parameter `username`; many apps will populate it with an email address, but Tarn does not require this. Earlier protocol drafts called this field `email` and that name still appears in some legacy on-Arweave records (see [Connection record back-compat](#connection-record-back-compat) below); the wire-protocol field name is now `username`.
+
+**Per-app isolation:** Every derived key includes `app_id`. The same username+password produces completely independent identities per app. Different credential_lookup_key, different encryption_key, different signing key. A Bookish user and a Cellar user with the same username+password cannot see each other's data, share sessions, or even detect each other's existence.
 
 ### P-256 private key derivation
 
@@ -126,10 +130,10 @@ The API stores `wrapped_data_key` as opaque text. The string is a self-describin
 ```
 
 - Each `dek_chain` entry's `wrappings` array carries the same DEK wrapped under each factor's KEK. AES-KW is deterministic, so the same (DEK, KEK) pair always produces the same ciphertext bytes — preserving register-retry idempotency.
-- When `changeCredentials` runs without the recovery phrase (caller passed `acceptRecoveryGap: true`): old gens preserve their existing recovery wrappings verbatim (re-wrapping under the same KEK is byte-identical anyway), and the new gen N+1 has only a `password` wrapping. The gap is closed by `recoverAccount` or `regenerateRecoveryKit`, which re-wrap every gen under the recovery factor. By default the SDK requires `phrase` and refuses the rotation if it would create a gap.
+- When `changeCredentials` runs without the account key (caller passed `acceptRecoveryGap: true`): old gens preserve their existing recovery wrappings verbatim (re-wrapping under the same KEK is byte-identical anyway), and the new gen N+1 has only a `password` wrapping. The gap is closed by `recoverAccount` or, when shipped, the planned `rotateAccountKey` primitive (Phase 4 of the recovery roadmap; not yet implemented), which re-wrap every gen under the recovery factor. By default the SDK requires `phrase` and refuses the rotation if it would create a gap.
 - The current generation (used for new writes) is the entry with the highest `gen`. Old gens stay in the chain so older content blobs remain decryptable.
 
-The envelope is byte-stable for the same `(email, password, app, recovery_phrase, recovery_salt)` inputs (AES-KW is deterministic; `JSON.stringify` is insertion-ordered; chain entries are written in generation order). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
+The envelope is byte-stable for the same `(username, password, app, recovery_phrase, recovery_salt)` inputs (AES-KW is deterministic; `JSON.stringify` is insertion-ordered; chain entries are written in generation order). This preserves the register-retry idempotency check (server compares the stored `wrapped_data_key` to the incoming one byte-for-byte; a retry of an interrupted register sends the same bytes).
 
 > **Note on prior envelope versions.** Earlier drafts supported a v1 bare-base64 single-key shape (PBKDF2-era), a v2 single-key JSON envelope (early Argon2id), and a v3 single-factor chain envelope (forward-secret rotation pre-recovery-factor). The `v` field was renumbered to `1` after those legacy paths were cut, so the current shape's `v: 1` is the post-cleanup definition above — not the pre-cleanup bare-base64 shape.
 
@@ -141,22 +145,46 @@ This is the only forward-secrecy property Tarn provides today. Old credential bl
 
 ### Recovery factor
 
-Every account publishes a `recovery_lookup_key` and `recovery_public_key` alongside the password-derived `credential_lookup_key` / `public_key`. Both are derived from the user's BIP39 recovery phrase (24-word, 256-bit entropy) and let the user authenticate to the API for credential rotation when they have lost their password.
+Every account publishes a `recovery_lookup_key` and `recovery_public_key` alongside the password-derived `credential_lookup_key` / `public_key`. Both are derived from the user's BIP39 account key (24-word, 256-bit entropy) and let the user authenticate to the API for credential rotation when they have lost their password.
 
 Derivation:
 
 ```
-phrase_entropy           = BIP39 entropy bytes (32 for 24-word phrase)
+phrase_entropy           = BIP39 entropy bytes (32 for 24-word account key)
 recovery_lookup_key      = HMAC-SHA256(phrase_entropy, "tarn" || "recovery-lookup" || app_id || "1" || 0x01)
 recovery_signing_seed    = HMAC-SHA256(phrase_entropy, "tarn" || "recovery-sign"   || app_id || "1" || 0x01)
 recovery_signing_key     = ECDSA P-256 from recovery_signing_seed (same retry rule as the password-derived signing seed)
-recovery_KEK             = Argon2id(phrase, recovery_salt, m=64MiB, t=3, p=1)
+recovery_KEK             = Argon2id(account_key, recovery_salt, m=64MiB, t=3, p=1)
                            (recovery_salt is per-account random, lives in the envelope's `recovery.salt`)
 ```
 
-`recovery_lookup_key` and `recovery_signing_key` derive from the raw phrase entropy directly (no salt), so they are stable across credential changes — the phrase remains the same secret regardless of how many times the password rotates. The `recovery_KEK` derives via Argon2id with the per-account salt, providing the slow-brute-force defense at unwrap time.
+`recovery_lookup_key` and `recovery_signing_key` derive from the raw account-key entropy directly (no salt), so they are stable across credential changes — the account key remains the same secret regardless of how many times the password rotates. The `recovery_KEK` derives via Argon2id with the per-account salt, providing the slow-brute-force defense at unwrap time.
 
-The recovery phrase is **mandatory at signup** — the SDK enforces this with a synchronous `recoveryAcknowledged: true` flag on `register()`. The kit (PDF or structured JSON) is rendered entirely on the client; Tarn never sees the phrase, the entropy, the KEK, or the rendered PDF. Apps are responsible for surfacing the kit to the user (download, print, or any out-of-band channel the app implements). Tarn does not provide email delivery or any other transport for recovery material — that would require Tarn to handle plaintext kit bytes, which is incompatible with the zero-knowledge framing.
+> **Note on naming.** The wire-protocol identifiers all use the historical "recovery" / "recovery_phrase" terminology (`recovery_lookup_key`, `recovery_public_key`, the `"recovery_phrase"` factor string, `FACTOR_RECOVERY_PHRASE`, and HMAC info-string components like `"recovery-lookup"`). The user-facing term in the SDK and product surfaces is "account key" — the secret IS the account credential, not an optional fallback. The wire identifiers are deliberately frozen to preserve compatibility; only human-facing surfaces use the new term.
+
+The account key is **mandatory at signup** — the SDK enforces this with a synchronous `recoveryAcknowledged: true` flag on `register()`. The kit (PDF or structured JSON) is rendered entirely on the client; Tarn never sees the account key, the entropy, the KEK, or the rendered PDF. Apps are responsible for surfacing the kit to the user (download, print, or any out-of-band channel the app implements). Tarn does not provide email delivery or any other transport for account-key material — that would require Tarn to handle plaintext kit bytes, which is incompatible with the zero-knowledge framing.
+
+### Account-key storage models — Model A vs Model B
+
+Two distinct storage modes exist for the account key. The wire protocol supports both; an app picks one per registration by sending or omitting a `wrapped_account_key` field in the register payload. There is no separate protocol flag — the field's presence is the signal.
+
+**Model A — no backup stored.** Tarn never stores any form of the account key. The user holds the only copy (printed, in a password manager, etc.). The `wrapped_account_key` field is absent at registration and remains null in the `accounts` row.
+
+- Lose your password AND your account key → data is permanently inaccessible. Even Tarn cannot help; nothing on the server contains the key material.
+- **Credential compromise alone does NOT yield the account key.** A phished password authenticates to Tarn and decrypts content (via the password-side DEK chain), but the account key itself is not derivable from anything Tarn holds. To obtain the account key, the attacker must compromise some separate channel where the user actually stored it (their password manager, their physical safe, the email they sent to themselves, etc.).
+- This is the strict zero-knowledge posture and the historical Tarn default.
+
+**Model B — encrypted backup stored.** At registration, the client wraps the account key under the gen-1 DEK (`wrapped_account_key = AES-GCM(key=DEK_gen1, plaintext=account_key_utf8, aad="tarn-wrapped-account-key-v1")`) and sends the ciphertext as `wrapped_account_key` in the register payload. The API stores it on the `accounts` row and publishes it as part of the account record on Arweave (so the "Tarn infra is rebuildable from Arweave" property holds).
+
+- A logged-in user can retrieve and view the account key from app settings at any time. The retrieval flow is gated by step-up auth (re-derived password proof) and decryption happens client-side: fetch the ciphertext, derive DEK from the (re-entered) password, AES-GCM-decrypt locally.
+- **Credential compromise DOES yield the account key.** A phished password derives the DEK, the DEK decrypts the wrap, the attacker has the account key. The account key in this model is no longer a password-independent lifeline — it is a credential-recoverable item like everything else, modulo whatever authorization gate sits in front of fetch (step-up at minimum; apps may layer additional out-of-band challenges).
+- Trade-off: this dramatically narrows the population that loses access through "saved my password but not the key, now I can't find the key." The cost is the model shift above.
+
+**Apps choose by sending or not sending `wrapped_account_key` at registration.** The wire format is identical otherwise.
+
+**Users can switch later.** Toggle endpoints (`PUT /api/v1/account/account-key` to enable, `DELETE /api/v1/account/account-key` to disable) will be added in Phase 4 of the recovery roadmap. They are not yet implemented; the field is mentioned here so apps know the storage choice is not permanent.
+
+**Future passkey support is independent of this choice.** Phase 6 of the roadmap adds WebAuthn-PRF as a third auth factor in the envelope (alongside `password` and `recovery_phrase`). Whether or not an account uses Model A or Model B, it can independently opt in to passkey factors.
 
 ### Data lookup key
 
@@ -168,7 +196,7 @@ Generated by the API at registration. Random, unique, opaque 64-char hex string.
 
 ### Threat model
 
-Tarn assumes credentials are never compromised. Credential changes are a convenience feature (e.g., new email address), not a security remediation tool. All encrypted data is publicly visible on Arweave — security depends entirely on password entropy + Argon2id cost.
+Tarn assumes credentials are never compromised. Credential changes are a convenience feature (e.g., switching the username to a new identifier), not a security remediation tool. All encrypted data is publicly visible on Arweave — security depends entirely on password entropy + Argon2id cost.
 
 ### Forward secrecy on credential change
 
@@ -189,7 +217,7 @@ Since Arweave data is publicly available (encrypted), the security boundary is p
 
 ### Per-app isolation
 
-Different apps derive completely independent key sets from the same email+password. A compromise of one app's credential_lookup_key reveals nothing about the user's identity in another app. Even Arweave observers cannot link a user's Bookish account to their Cellar account.
+Different apps derive completely independent key sets from the same username+password. A compromise of one app's credential_lookup_key reveals nothing about the user's identity in another app. Even Arweave observers cannot link a user's Bookish account to their Cellar account.
 
 ### What the API knows vs. doesn't know
 
@@ -197,7 +225,7 @@ Different apps derive completely independent key sets from the same email+passwo
 |--------------------------------------|----------------------------------|
 | public_key (for signature verification) | private_key (signing)          |
 | credential_lookup_key                | master_key                       |
-| data_lookup_key (it generated it)    | email, password                  |
+| data_lookup_key (it generated it)    | username, password               |
 | wrapped_data_key (opaque, AES-KW)    | data_encryption_key              |
 | encrypted data blobs (opaque)        | credential_encryption_key        |
 | app_id (which app the user registered for) | plaintext of any data blob |
@@ -405,7 +433,7 @@ Tarn is the sole write path for any data associated with a (`data_lookup_key`, `
 
 ```
 CLIENT (local):
-  1. Derive master_key from email + password (Argon2id, salt=SHA-256(normalizedEmail))
+  1. Derive master_key from username + password (Argon2id, salt=SHA-256(normalizedUsername))
   2. Derive credential_lookup_key, credential_encryption_key, signing_key_pair
      (all include app_id in HKDF info)
   3. Generate recovery: phrase = BIP39 24 words, recovery_salt = 16 random bytes,
@@ -498,7 +526,7 @@ Tags include Op: tombstone, Ref: target_txid. Entry hidden by resolution.
 
 ```
 CLIENT (authenticated with old credentials, holds DEK chain DEK[1..N]):
-  1. Derive NEW keys from new email + password (same app_id)
+  1. Derive NEW keys from new username + password (same app_id)
   2. Mint DEK[N+1] = crypto.getRandomValues(32)
   3. Re-wrap every gen under the new password KEK; preserve old gens' recovery
      wrappings byte-for-byte (AES-KW is deterministic, so re-wrapping under
@@ -522,12 +550,12 @@ data_lookup_key unchanged. Existing data untouched. Old gens stay readable;
 new writes go to the new gen.
 ```
 
-### 7a. Account recovery (via recovery phrase)
+### 7a. Account recovery (via account key)
 
 When the user has lost their password (or wants a security-grade reset, per the design-doc positioning of recovery as the response to suspected compromise):
 
 ```
-CLIENT (local — only the recovery phrase + new credentials):
+CLIENT (local — only the account key + new credentials):
   1. phrase_entropy = BIP39.mnemonicToEntropy(phrase)
   2. recovery_lookup_key  = HMAC(phrase_entropy, "tarn" || "recovery-lookup" || app_id || "1" || 0x01)
   3. recovery_signing_key = ECDSA P-256 from HMAC(phrase_entropy, "tarn" || "recovery-sign" || app_id || "1" || 0x01)
@@ -547,7 +575,7 @@ CLIENT -> API:
      Returns: { jwt }   (JWT carries via_recovery: true)
 
 CLIENT (local):
-  10. Derive new password keys from (newEmail, newPassword)
+  10. Derive new password keys from (newUsername, newPassword)
   11. Re-wrap entire DEK chain under {new_password_KEK, recovery_KEK} factors
       (preserving the existing recovery salt; recovery wrappings are byte-identical
        to the originals by AES-KW determinism)
@@ -624,11 +652,11 @@ DELETE /api/v1/auth
   Errors: 401
 ```
 
-#### Recovery-kit delivery is not a Tarn responsibility
+#### Recovery-kit delivery and rendering are not Tarn responsibilities
 
-Tarn intentionally does **not** expose a recovery-kit transport endpoint. Earlier protocol drafts included `POST /api/v1/recovery/email` as a "no-storage, brief in-memory visibility" forwarder; that endpoint has been removed. Even ephemeral handling of plaintext recovery material on Tarn-operated infrastructure was a violation of the zero-knowledge framing the rest of the protocol enforces, and any operational compromise (logs, supply-chain, subpoena, future bug introducing persistence) would have exposed the most sensitive payload in the entire system.
+Tarn intentionally does **not** expose a recovery-kit transport endpoint. Earlier protocol drafts included `POST /api/v1/recovery/email` as a "no-storage, brief in-memory visibility" forwarder; that endpoint has been removed. Even ephemeral handling of plaintext account-key material on Tarn-operated infrastructure was a violation of the zero-knowledge framing the rest of the protocol enforces, and any operational compromise (logs, supply-chain, subpoena, future bug introducing persistence) would have exposed the most sensitive payload in the entire system.
 
-The kit is rendered client-side by the SDK (`renderRecoveryPDF`) and delivery is the application's responsibility — typically a download, optionally a print, optionally a transport that the application itself operates. Applications that want email delivery must run their own forwarder; Tarn will not host one.
+Tarn also does not render recovery kits. The SDK exposes the account-key string (and the gen-1 DEK, when Model B is in use); apps render their own kit format and decide how to surface it to the user (download, print, app-operated transport). The historical in-SDK PDF renderer is being removed; apps that want a PDF render one with their own toolchain. This keeps the SDK bundle smaller and gives apps full control over branding and layout.
 
 ### App endpoints
 
@@ -686,7 +714,7 @@ Raw `SHA-256(key || domain)` is vulnerable to length-extension attacks. HMAC (wh
 AES-KW (RFC 3394) is purpose-built for key wrapping: deterministic (no IV management), minimal overhead (8 bytes), built-in integrity checking, and available in WebCrypto natively via `wrapKey`/`unwrapKey`. AES-GCM works but is not the specialist tool.
 
 ### Why per-app account isolation
-Same email+password produces independent identities per app via the `app_id` in the HKDF info string. This prevents cross-app data leakage, cross-app session sharing, and cross-app identity correlation on Arweave. It also means apps must be registered before users can create accounts, which closes the "anyone can freeload on Tarn's Arweave wallet" gap.
+Same username+password produces independent identities per app via the `app_id` in the HKDF info string. This prevents cross-app data leakage, cross-app session sharing, and cross-app identity correlation on Arweave. It also means apps must be registered before users can create accounts, which closes the "anyone can freeload on Tarn's Arweave wallet" gap.
 
 ### Why app validation at registration
 Write endpoints check `App` tag against `jwt.app`. The JWT's `app` claim is set at login based on the account's registered app. Unregistered apps cannot create accounts, therefore cannot get JWTs, therefore cannot write data. This is enforced at the identity layer, not the write layer.
@@ -785,7 +813,7 @@ The plaintext payload below is what gets encrypted under the at-rest wrapping ke
   "expiresAt": <unix-seconds>,
   "apiBase": "https://api.tarn.dev",
   "appId": "bookish",
-  "email": "user@example.com",
+  "username": "user@example.com",
   "dataLookupKey": "<64-char hex>",
   "credentialLookupKey": "<64-char hex>",
   "kdfVersion": 2,
@@ -1056,8 +1084,8 @@ client.revokeOtherSessions(): Promise<void>
 Plus optional `deviceLabel` parameters on the existing entry points:
 
 ```
-client.register(email, password, { ..., deviceLabel?: string })
-client.login(email, password, { deviceLabel?: string })
+client.register(username, password, { ..., deviceLabel?: string })
+client.login(username, password, { deviceLabel?: string })
 client.recoverAccount({ ..., deviceLabel?: string })
 ```
 
@@ -1074,7 +1102,7 @@ client.recoverAccount({ ..., deviceLabel?: string })
 
 ## Invite tokens (Section 8, issue #22)
 
-The connection-handshake primitives shipped under Sections 5a–5d let two users form an end-to-end-encrypted connection if and only if the sender already knows the recipient's email and the recipient is a Tarn user with `share_discoverable=true`. For a large class of consumer-app flows — "scan this QR to add me", "send this link to your friend in Slack", "register and click my invite link" — those preconditions don't hold. Section 8 adds a complementary primitive: **opaque, single-use, time-limited invite tokens** that let the inviter publish a redemption slot without knowing the recipient's identity, and let the recipient redeem it (potentially after signing up) without ever transmitting the inviter's identifier through the channel that carried the link.
+The connection-handshake primitives shipped under Sections 5a–5d let two users form an end-to-end-encrypted connection if and only if the sender already knows the recipient's username and the recipient is a Tarn user with `share_discoverable=true`. For a large class of consumer-app flows — "scan this QR to add me", "send this link to your friend in Slack", "register and click my invite link" — those preconditions don't hold. Section 8 adds a complementary primitive: **opaque, single-use, time-limited invite tokens** that let the inviter publish a redemption slot without knowing the recipient's identity, and let the recipient redeem it (potentially after signing up) without ever transmitting the inviter's identifier through the channel that carried the link.
 
 ### Why server-mediated
 
@@ -1227,7 +1255,11 @@ All three fail open on rate-store outage (consistent with existing patterns).
 
 ### Connection.label primitive
 
-The current connections record stores `share_pub`, `signing_pub`, `email`, `established_at`, `initial_request_nonce`. The `listConnections` JSDoc ([client/src/tarn.js](../client/src/tarn.js)) lists `label?: string` as an optional field, but no code reads or writes it — vestigial.
+The current connections record stores `share_pub`, `signing_pub`, `username`, `established_at`, `initial_request_nonce`. The `listConnections` JSDoc ([client/src/tarn.js](../client/src/tarn.js)) lists `label?: string` as an optional field, but no code reads or writes it — vestigial.
+
+#### Connection record back-compat
+
+Older connection records on Arweave were written with an `email` field instead of `username`. The SDK reads both: when deserializing a connection record, an `email` field is mapped to `username` if no `username` field is present. New writes use `username` exclusively. Apps and recovery clients should treat the two as the same field, with `username` as the canonical name and `email` as a legacy alias accepted on read only.
 
 Section 8 makes it a first-class primitive:
 
@@ -1270,7 +1302,7 @@ DEK-encrypted. Synced across the inviter's devices via standard data-blob storag
 ### Threat model
 
 - **Leaked invite link** (screenshot, accidental Slack post). Mitigations: 7-day default expiry, hard 30-day max, single-use, sender-visible `redeemer_share_pub_fingerprint` so inviter can detect surprise redemption and revoke + reissue.
-- **Malicious recipient redeems but refuses the handshake**. Token consumed; inviter must reissue. No worse than the email-flow case where a recipient declines.
+- **Malicious recipient redeems but refuses the handshake**. Token consumed; inviter must reissue. No worse than the username-handshake case where a recipient declines.
 - **Server compromise**. Attacker can enumerate live tokens via the `invites` table but cannot decrypt payloads (the `payload_key` lives only in URL fragments held by recipients). Best they can do is mark tokens used (denial-of-service) or redirect connection-request handshakes (which fail signature verification on the inviter side because the attacker doesn't have the recipient's identity to sign as).
 - **Token enumeration**. 256-bit space is brute-force-infeasible regardless. The 100/hour/IP preview rate-limit is defense-in-depth.
 - **Inviter-identity exposure to API operators**. Operators see `(inviter_dlk, token_id, time, redeemer_fingerprint)` per row. They do **not** see `inviter_share_pub` or `inviter_signing_pub` — those are inside the encrypted payload.
@@ -1331,7 +1363,7 @@ Tarn protects content (and the keys protecting content) end-to-end, but a number
 - All share-log entries (per-pair shared content) — encrypted under per-pair `K_AB`.
 - All connection-handshake payloads (request + accept) — HPKE-sealed to recipient's `share_pub`.
 - All friend-graph relationships — neither Tarn nor an Arweave observer can extract who is connected to whom from the protocol alone.
-- All recovery phrases — generated client-side, never persisted by Tarn.
+- All account keys — generated client-side. In Model A (no backup stored) Tarn never holds any form of the key; in Model B Tarn holds only the DEK-encrypted ciphertext, which is opaque without password-derived keys.
 
 **What's publicly observable (no keys needed):**
 
@@ -1342,7 +1374,7 @@ Tarn protects content (and the keys protecting content) end-to-end, but a number
 
   The contents stay encrypted; only HPKE recipient (the user) can open them. But "user X received N connection requests on day D" is publicly extractable.
 
-- **Account existence via discoverability.** If a user has `share_discoverable=true`, anyone who knows their email can look up their `share_pub` via `GET /api/v1/share/lookup`. This confirms the email is a registered Tarn user. If `share_discoverable=false`, the lookup returns `share_pub: null` — but existing connections already cached `share_pub` from the original handshake.
+- **Account existence via discoverability.** If a user has `share_discoverable=true`, anyone who knows their username can look up their `share_pub` via `GET /api/v1/share/lookup`. This confirms the username is a registered Tarn user. If `share_discoverable=false`, the lookup returns `share_pub: null` — but existing connections already cached `share_pub` from the original handshake.
 
 - **Per-recipient activity from share-log writes.** Tarn's per-tag uniqueness check at `POST /api/v1/share/log/publish` means an observer querying tag-existence can confirm specific tags are taken. Tags are pseudorandom (HMAC under per-pair secret), so this doesn't reveal relationships, but bulk-enumeration of common patterns isn't ruled out at scale.
 
@@ -1350,7 +1382,7 @@ Tarn protects content (and the keys protecting content) end-to-end, but a number
 
 **Acceptable residual leaks documented for v1** (per sharing design §11.5):
 
-1. **Email-based discoverability lookup leaks "user A is interested in user B"** at handshake time. Once connected, all subsequent traffic is unlinkable — the per-pair tags are stealth-addressed.
+1. **Username-based discoverability lookup leaks "user A is interested in user B"** at handshake time. Once connected, all subsequent traffic is unlinkable — the per-pair tags are stealth-addressed.
 2. **Tarn-side correlation** of write/read timing per session may allow Tarn (the operator) to infer some relationships statistically. Mitigation deferred (would require dummy traffic, mixing networks, etc.).
 3. **Per-recipient inbox metadata** (the bullet above) — accepted because the unauthenticated fetch is a hard requirement for fresh-device recovery flows.
 
@@ -1358,8 +1390,8 @@ Tarn protects content (and the keys protecting content) end-to-end, but a number
 
 Apps building on Tarn should communicate in user-facing privacy docs that:
 
-- Connection-request **timing and volume** can be observed by anyone who has seen the user's `share_pub` (typically: their email contacts + accepted connections).
-- Setting `share_discoverable=false` prevents new strangers from discovering the user's `share_pub` via email lookup, but does not retroactively hide it from anyone who already cached it.
+- Connection-request **timing and volume** can be observed by anyone who has seen the user's `share_pub` (typically: anyone they've shared their username with, plus accepted connections).
+- Setting `share_discoverable=false` prevents new strangers from discovering the user's `share_pub` via username lookup, but does not retroactively hide it from anyone who already cached it.
 - **Content** is protected by end-to-end encryption; only the people the user explicitly shares with can read what they share.
 
 For most use cases (private reading lists, friend-circle apps), these properties are appropriate trade-offs. For higher-stakes sensitive data, additional mitigations (decoy traffic, alternative discovery flows) would be needed; sharing roadmap §14.2 + §14.7 covers that direction.

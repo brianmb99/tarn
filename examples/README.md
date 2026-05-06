@@ -7,7 +7,7 @@ Four progressive examples for the [Tarn client SDK](../client/README.md). Each i
 | 1 | [`01-hello-world/`](./01-hello-world/) | The smallest possible Tarn app — register, create one record, list it. ~30 lines. |
 | 2 | [`02-crud/`](./02-crud/) | Full CRUD on two collections (`notes` + `settings`). Shows partial-merge updates, schema validation, multiple collections in one schema. |
 | 3 | [`03-sharing/`](./03-sharing/) | Two clients form a connection via the invite-token flow, sender shares its notes with all connections, recipient lists shared records. |
-| 4 | [`04-recovery/`](./04-recovery/) | Register, capture the recovery phrase, simulate password loss, recover the account on a fresh client. |
+| 4 | [`04-recovery/`](./04-recovery/) | Register, capture the account key, simulate password loss, recover the account on a fresh client. |
 
 ## Setup (once)
 

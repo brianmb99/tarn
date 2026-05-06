@@ -49,7 +49,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message || 'Assertion failed');
 }
 
-function randomEmail() {
+function randomUsername() {
   return `sess-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 }
 
@@ -77,7 +77,7 @@ console.log('\n=== Section 7.5 — sessions ===');
 await test('1. fresh /auth/verify mints a sid; listSessions shows it (isCurrent: true)', async () => {
   await resetClientState();
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client.register(randomEmail(), 'pw', { recoveryAcknowledged: true, deviceLabel: 'laptop' });
+  await client.register(randomUsername(), 'pw', { recoveryAcknowledged: true, deviceLabel: 'laptop' });
   const sessions = await client.listSessions();
   assert(sessions.length === 1, `expected 1 session, got ${sessions.length}`);
   assert(sessions[0].isCurrent === true, 'session should be marked isCurrent');
@@ -91,10 +91,10 @@ await test('1. fresh /auth/verify mints a sid; listSessions shows it (isCurrent:
 
 await test('2. re-verify with valid previous_sid reuses the same sid', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true });
+  await c1.register(username, password, { recoveryAcknowledged: true });
   const before = await c1.listSessions();
   const sidBefore = before[0].sid;
 
@@ -110,10 +110,10 @@ await test('2. re-verify with valid previous_sid reuses the same sid', async () 
 
 await test('3. re-verify with stale previous_sid mints a fresh sid + new row', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true });
+  await c1.register(username, password, { recoveryAcknowledged: true });
   const sidBefore = (await c1.listSessions())[0].sid;
 
   // Revoke the only session — simulates the "previous_sid is no longer valid"
@@ -133,16 +133,16 @@ await test('3. re-verify with stale previous_sid mints a fresh sid + new row', a
 
 await test('4. revokeSession on a peer device 401s the peer immediately on this isolate', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true, deviceLabel: 'A' });
+  await c1.register(username, password, { recoveryAcknowledged: true, deviceLabel: 'A' });
 
   // "Other device" — fresh client, login from scratch. This produces a second
   // session row with a distinct sid.
   await resetClientState();
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c2.login(email, password, { deviceLabel: 'B' });
+  await c2.login(username, password, { deviceLabel: 'B' });
 
   // c1 still has its session blob in memory. List from c1 — should see both.
   const fromC1 = await c1.listSessions();
@@ -167,7 +167,7 @@ await test('4. revokeSession on a peer device 401s the peer immediately on this 
 await test('5. revokeAllSessions kills the calling session too', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
+  await c.register(randomUsername(), 'pw', { recoveryAcknowledged: true });
   await c.revokeAllSessions();
 
   // Force a re-auth attempt via the cached keypair — the server should mint a
@@ -185,7 +185,7 @@ await test('5. revokeAllSessions kills the calling session too', async () => {
 await test('5b. old JWT after revokeAllSessions 401s on a raw replay', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
+  await c.register(randomUsername(), 'pw', { recoveryAcknowledged: true });
   const oldJwt = c._testJwt();
   assert(oldJwt, 'should have a JWT before revoke');
   await c.revokeAllSessions();
@@ -201,18 +201,18 @@ await test('5b. old JWT after revokeAllSessions 401s on a raw replay', async () 
 
 await test('6. revokeOtherSessions preserves the calling sid', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw';
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c1.register(email, password, { recoveryAcknowledged: true });
+  await c1.register(username, password, { recoveryAcknowledged: true });
 
   await resetClientState();
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c2.login(email, password);
+  await c2.login(username, password);
 
   await resetClientState();
   const c3 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c3.login(email, password);
+  await c3.login(username, password);
 
   // c1 keeps its current; revoke the other two.
   const before = await c1.listSessions();
@@ -227,18 +227,18 @@ await test('6. revokeOtherSessions preserves the calling sid', async () => {
 
 await test('7. changeCredentials revokes all sessions for the dlk', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw1';
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { recoveryPhrase } = await c.register(email, password, { recoveryAcknowledged: true });
+  const { accountKey } = await c.register(username, password, { recoveryAcknowledged: true });
 
   // Build a peer session; we'll observe it disappear post-change.
   await resetClientState();
   const peer = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await peer.login(email, password);
+  await peer.login(username, password);
   const peerJwt = peer._testJwt();
 
-  await c.changeCredentials(email, 'pw2', { phrase: recoveryPhrase });
+  await c.changeCredentials(username, 'pw2', { phrase: accountKey });
 
   // Peer's old JWT must 401.
   const { status } = await fetchJSON('/api/v1/sessions', {
@@ -256,20 +256,20 @@ await test('7. changeCredentials revokes all sessions for the dlk', async () => 
 
 await test('8. recoverAccount revokes all sessions', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw';
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { recoveryPhrase } = await c.register(email, password, { recoveryAcknowledged: true });
+  const { accountKey } = await c.register(username, password, { recoveryAcknowledged: true });
 
   await resetClientState();
   const peer = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await peer.login(email, password);
+  await peer.login(username, password);
   const peerJwt = peer._testJwt();
 
   // Recover from a fresh client (typical recovery flow — user lost password).
   await resetClientState();
   const recoverer = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await recoverer.recoverAccount({ phrase: recoveryPhrase, newEmail: email, newPassword: 'pw-recovered' });
+  await recoverer.recoverAccount({ phrase: accountKey, newUsername: username, newPassword: 'pw-recovered' });
 
   // Peer's old JWT must 401.
   const { status } = await fetchJSON('/api/v1/sessions', {
@@ -287,14 +287,14 @@ await test('8. recoverAccount revokes all sessions', async () => {
 
 await test('9. deleteAccount revokes all sessions', async () => {
   await resetClientState();
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'pw';
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.register(email, password, { recoveryAcknowledged: true });
+  await c.register(username, password, { recoveryAcknowledged: true });
 
   await resetClientState();
   const peer = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await peer.login(email, password);
+  await peer.login(username, password);
   const peerJwt = peer._testJwt();
 
   await c.deleteAccount();
@@ -312,7 +312,7 @@ await test('9. deleteAccount revokes all sessions', async () => {
 await test('10. pre-7.5 JWT (no sid claim) authenticates via grandfather path', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
+  const { dataLookupKey } = await c.register(randomUsername(), 'pw', { recoveryAcknowledged: true });
 
   // Hand-mint a JWT for the same dlk WITHOUT a sid claim using the same
   // JWT_SECRET wrangler dev uses (loaded from api/.dev.vars).
@@ -352,7 +352,7 @@ await test('10. pre-7.5 JWT (no sid claim) authenticates via grandfather path', 
 await test('11. lazy-prune removes stale rows on next /auth/verify', async () => {
   await resetClientState();
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const { dataLookupKey } = await c.register(randomEmail(), 'pw', { recoveryAcknowledged: true });
+  const { dataLookupKey } = await c.register(randomUsername(), 'pw', { recoveryAcknowledged: true });
 
   // Insert a stale row directly (last_seen_at = 1, well past 24h).
   const { execSync } = await import('child_process');
@@ -377,7 +377,7 @@ await test('12a. deviceLabel oversize → 400 from /auth/verify', async () => {
   let saw400 = false;
   try {
     // 65 chars (1 over MAX_DEVICE_LABEL_LEN).
-    await c.register(randomEmail(), 'pw', {
+    await c.register(randomUsername(), 'pw', {
       recoveryAcknowledged: true,
       deviceLabel: 'x'.repeat(65),
     });
@@ -392,7 +392,7 @@ await test('12b. deviceLabel control chars → 400', async () => {
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
   let saw400 = false;
   try {
-    await c.register(randomEmail(), 'pw', {
+    await c.register(randomUsername(), 'pw', {
       recoveryAcknowledged: true,
       deviceLabel: 'has\nnewline',
     });

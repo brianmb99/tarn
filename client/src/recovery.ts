@@ -1,44 +1,44 @@
-// Tarn Client — Recovery primitive (issue #12)
+// Tarn Client — Account-key primitive (issue #12)
 //
-// BIP39-style recovery phrase generation, recovery KEK derivation, PDF
+// BIP39-style account-key generation, recovery KEK derivation, PDF
 // rendering, and the account-recovery flow. All operations are client-side
-// — the Tarn API never sees the phrase, the entropy, the KEK, or the
+// — the Tarn API never sees the account key, the entropy, the KEK, or the
 // rendered PDF. Apps that want to deliver the kit out-of-band (email,
 // download, print) do so themselves.
 
 import { generateMnemonic, mnemonicToEntropy, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 
-// 24-word phrase = 256 bits of entropy. Per the design doc this is the
-// stronger choice over 12-word; the recovery factor is the user's permanent
+// 24-word account key = 256 bits of entropy. Per the design doc this is the
+// stronger choice over 12-word; the account key is the user's permanent
 // vault key and we want the entropy budget to be comfortable.
 const PHRASE_STRENGTH_BITS = 256;
 
-// ============ PHRASE GENERATION + VALIDATION ============
+// ============ ACCOUNT KEY GENERATION + VALIDATION ============
 
 /**
- * Generate a fresh 24-word BIP39 mnemonic phrase using cryptographically
+ * Generate a fresh 24-word BIP39 mnemonic account key using cryptographically
  * secure randomness. Returns a single space-separated string.
  */
-export function generateRecoveryPhrase(): string {
+export function generateAccountKey(): string {
   return generateMnemonic(wordlist, PHRASE_STRENGTH_BITS);
 }
 
-/** Result of phrase validation. `normalized` is filled even on failure (best-effort). */
+/** Result of account-key validation. `normalized` is filled even on failure (best-effort). */
 export type PhraseValidation =
   | { valid: true; normalized: string }
   | { valid: false; normalized: string; reason: string };
 
 /**
- * Validate a phrase against the BIP39 English wordlist (word membership +
- * checksum). The user-typed phrase is normalized — leading/trailing
+ * Validate an account key against the BIP39 English wordlist (word membership +
+ * checksum). The user-typed key is normalized — leading/trailing
  * whitespace trimmed, internal whitespace collapsed, lowercased — before
  * validation, mirroring the normalization applied during recovery KEK
  * derivation.
  */
-export function validateRecoveryPhrase(phrase: string): PhraseValidation {
+export function validateAccountKey(phrase: string): PhraseValidation {
   if (!phrase || typeof phrase !== 'string') {
-    return { valid: false, normalized: '', reason: 'phrase must be a non-empty string' };
+    return { valid: false, normalized: '', reason: 'account key must be a non-empty string' };
   }
   const normalized = normalizePhrase(phrase);
   const words = normalized.split(' ');
@@ -52,14 +52,14 @@ export function validateRecoveryPhrase(phrase: string): PhraseValidation {
 }
 
 /**
- * Recover the raw entropy bytes from a phrase. Useful for tests and for
- * sharing-protocol §14.11 work where the recovery phrase will derive an
+ * Recover the raw entropy bytes from an account key. Useful for tests and for
+ * sharing-protocol §14.11 work where the account key will derive an
  * additional sub-key — the entropy is the canonical seed, not the derived
  * recovery KEK.
  */
-export function recoveryPhraseToEntropy(phrase: string): Uint8Array {
-  const v = validateRecoveryPhrase(phrase);
-  if (!v.valid) throw new Error(`Invalid recovery phrase: ${v.reason}`);
+export function accountKeyToEntropy(phrase: string): Uint8Array {
+  const v = validateAccountKey(phrase);
+  if (!v.valid) throw new Error(`Invalid account key: ${v.reason}`);
   return mnemonicToEntropy(v.normalized, wordlist);
 }
 
@@ -73,7 +73,7 @@ function normalizePhrase(phrase: string): string {
 //
 // We intentionally do not depend on a third-party PDF library. The output we
 // need is a single page of static text — title, branding line, the 24-word
-// phrase laid out in a 6×4 numbered grid, instructions, and an explicit
+// account key laid out in a 6×4 numbered grid, instructions, and an explicit
 // "save and delete this email" nudge. A hand-rolled PDF keeps the client
 // bundle small (no jsPDF/pdf-lib pull), and the generator is short enough
 // that its correctness is easy to audit.
@@ -104,7 +104,7 @@ export type RenderRecoveryOpts = {
 };
 
 /**
- * Render the recovery PDF for a phrase + optional branding metadata.
+ * Render the recovery PDF for an account key + optional branding metadata.
  * Returns the raw PDF bytes (Uint8Array) suitable for download.
  *
  * The output is deterministic for the same (phrase, branding, generatedAt)
@@ -118,33 +118,33 @@ export function renderRecoveryPDF({ phrase, appName, generatedAt }: RenderRecove
   const normalized = normalizePhrase(phrase);
   const words = normalized.split(' ');
   if (words.length !== 24) {
-    throw new Error(`expected 24-word phrase, got ${words.length} words`);
+    throw new Error(`expected 24-word account key, got ${words.length} words`);
   }
 
   const branding = appName
-    ? `Recovery kit for your ${appName} account (powered by Tarn).`
-    : 'Tarn account recovery kit.';
+    ? `Account key for your ${appName} account (powered by Tarn).`
+    : 'Tarn account key.';
   const dateLine = generatedAt
     ? `Generated: ${generatedAt}`
     : `Generated: ${new Date().toISOString().slice(0, 10)}`;
 
   const lines: TextRun[] = [
-    { y: 730, font: 'F1', size: 24, text: 'Recovery phrase' },
+    { y: 730, font: 'F1', size: 24, text: 'Account key' },
     { y: 700, font: 'F2', size: 11, text: branding },
     { y: 684, font: 'F2', size: 11, text: dateLine },
 
     { y: 640, font: 'F1', size: 13, text: 'Your 24 words:' },
-    // Phrase grid (positions filled in below).
+    // Account-key grid (positions filled in below).
 
     { y: 350, font: 'F1', size: 13, text: 'How to use this kit' },
     { y: 328, font: 'F2', size: 11, text: '1. Print this PDF or save it to a place only you can access (a safe, a' },
     { y: 314, font: 'F2', size: 11, text: '   password manager, an encrypted drive). Anyone with these 24 words' },
     { y: 300, font: 'F2', size: 11, text: '   can recover your account and read everything in it.' },
     { y: 280, font: 'F2', size: 11, text: '2. If you ever lose your password or change devices, enter the words' },
-    { y: 266, font: 'F2', size: 11, text: '   at recovery time and pick a new email and password.' },
+    { y: 266, font: 'F2', size: 11, text: '   at recovery time and pick a new username and password.' },
     { y: 246, font: 'F2', size: 11, text: '3. The order matters. Words must be entered in the same order shown.' },
 
-    { y: 110, font: 'F2', size: 9, text: 'Tarn never stores your recovery phrase. This kit was generated entirely' },
+    { y: 110, font: 'F2', size: 9, text: 'Tarn never stores your account key. This kit was generated entirely' },
     { y: 98, font: 'F2', size: 9, text: 'on your device — these bytes have not been transmitted anywhere.' },
   ];
 

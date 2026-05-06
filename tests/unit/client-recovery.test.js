@@ -1,16 +1,16 @@
 // Unit tests for the recovery factor (issue #12).
 //
 // Covers:
-//   - BIP39 phrase generation + validation
-//   - Recovery KEK derivation (Argon2id over phrase + per-account salt)
+//   - BIP39 account-key generation + validation
+//   - Recovery KEK derivation (Argon2id over account key + per-account salt)
 //   - v1 envelope shape (multi-factor wrappings, recovery metadata block)
 //   - register() requires recoveryAcknowledged: true
 //   - register() emits v1 with both password and recovery_phrase wrappings
 //   - register() makes no recovery-email network call (kit delivery is the
 //     app's responsibility — Tarn never handles plaintext kit material)
 //   - PDF rendering (basic structure, deterministic output for fixed inputs)
-//   - recoverAccount() round-trip (register → simulate forget password → recover with phrase → re-login)
-//   - regenerateRecoveryKit() returns a fresh PDF for the same phrase
+//   - recoverAccount() round-trip (register → simulate forget password → recover with account key → re-login)
+//   - regenerateRecoveryKit() returns a fresh PDF for the same account key
 //
 // Mocks fetch to keep tests fast; uses real KDFs so the crypto under test is
 // the real implementation.
@@ -21,8 +21,8 @@ import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   TarnClient,
-  generateRecoveryPhrase,
-  validateRecoveryPhrase,
+  generateAccountKey,
+  validateAccountKey,
   renderRecoveryPDF,
 } from '../../client/src/tarn.js';
 import {
@@ -40,7 +40,7 @@ import {
   FACTOR_PASSWORD,
   FACTOR_RECOVERY_PHRASE,
 } from '../../client/src/crypto.js';
-import { recoveryPhraseToEntropy } from '../../client/src/recovery.js';
+import { accountKeyToEntropy } from '../../client/src/recovery.js';
 
 const APP = 'bookish';
 
@@ -78,52 +78,52 @@ function fakeJwt(label = 'jwt') {
   return `${header}.${payload}.`;
 }
 
-// ============ PHRASE GENERATION ============
+// ============ ACCOUNT KEY GENERATION ============
 
-describe('BIP39 recovery phrase', () => {
-  it('generateRecoveryPhrase returns a valid 24-word phrase', () => {
-    const phrase = generateRecoveryPhrase();
+describe('BIP39 account key', () => {
+  it('generateAccountKey returns a valid 24-word account key', () => {
+    const phrase = generateAccountKey();
     const words = phrase.split(' ');
     assert.equal(words.length, 24);
-    const v = validateRecoveryPhrase(phrase);
+    const v = validateAccountKey(phrase);
     assert.equal(v.valid, true);
     assert.equal(v.normalized, phrase);
   });
 
-  it('generates DIFFERENT phrases on each call (entropy check)', () => {
-    const a = generateRecoveryPhrase();
-    const b = generateRecoveryPhrase();
+  it('generates DIFFERENT account keys on each call (entropy check)', () => {
+    const a = generateAccountKey();
+    const b = generateAccountKey();
     assert.notEqual(a, b);
   });
 
-  it('validateRecoveryPhrase normalizes whitespace + case', () => {
-    const phrase = generateRecoveryPhrase();
+  it('validateAccountKey normalizes whitespace + case', () => {
+    const phrase = generateAccountKey();
     const messy = '  ' + phrase.toUpperCase().split(' ').join('   ') + '  ';
-    const v = validateRecoveryPhrase(messy);
+    const v = validateAccountKey(messy);
     assert.equal(v.valid, true);
     assert.equal(v.normalized, phrase);
   });
 
-  it('validateRecoveryPhrase rejects 12-word phrase (we require 24)', () => {
+  it('validateAccountKey rejects 12-word phrase (we require 24)', () => {
     // A valid 12-word BIP39 phrase from the test vectors.
     const twelve = 'legal winner thank year wave sausage worth useful legal winner thank yellow';
-    const v = validateRecoveryPhrase(twelve);
+    const v = validateAccountKey(twelve);
     assert.equal(v.valid, false);
     assert.match(v.reason, /expected 24 words/);
   });
 
-  it('validateRecoveryPhrase rejects bad checksum', () => {
-    const phrase = generateRecoveryPhrase();
+  it('validateAccountKey rejects bad checksum', () => {
+    const phrase = generateAccountKey();
     // Swap two words to break the checksum (overwhelmingly likely to fail).
     const words = phrase.split(' ');
     [words[0], words[1]] = [words[1], words[0]];
-    const v = validateRecoveryPhrase(words.join(' '));
+    const v = validateAccountKey(words.join(' '));
     assert.equal(v.valid, false);
   });
 
-  it('recoveryPhraseToEntropy produces 32 bytes for a 24-word phrase', () => {
-    const phrase = generateRecoveryPhrase();
-    const entropy = recoveryPhraseToEntropy(phrase);
+  it('accountKeyToEntropy produces 32 bytes for a 24-word account key', () => {
+    const phrase = generateAccountKey();
+    const entropy = accountKeyToEntropy(phrase);
     assert.equal(entropy.length, 32);
   });
 });
@@ -132,7 +132,7 @@ describe('BIP39 recovery phrase', () => {
 
 describe('deriveRecoveryKey', () => {
   it('produces deterministic AES handles for fixed (phrase, salt)', async () => {
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const salt = generateRecoverySalt();
     const k1 = await deriveRecoveryKey(phrase, salt);
     const k2 = await deriveRecoveryKey(phrase, salt);
@@ -141,7 +141,7 @@ describe('deriveRecoveryKey', () => {
   });
 
   it('produces different KEKs for different salts', async () => {
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const salt1 = generateRecoverySalt();
     const salt2 = generateRecoverySalt();
     const k1 = await deriveRecoveryKey(phrase, salt1);
@@ -151,8 +151,8 @@ describe('deriveRecoveryKey', () => {
 
   it('produces different KEKs for different phrases', async () => {
     const salt = generateRecoverySalt();
-    const k1 = await deriveRecoveryKey(generateRecoveryPhrase(), salt);
-    const k2 = await deriveRecoveryKey(generateRecoveryPhrase(), salt);
+    const k1 = await deriveRecoveryKey(generateAccountKey(), salt);
+    const k2 = await deriveRecoveryKey(generateAccountKey(), salt);
     assert.notDeepEqual(k1.rawBytes, k2.rawBytes);
   });
 });
@@ -161,7 +161,7 @@ describe('deriveRecoveryKey', () => {
 
 describe('deriveRecoveryLookupKey + deriveRecoverySigningKeyPair', () => {
   it('lookup key is deterministic per (phrase entropy, app)', async () => {
-    const entropy = recoveryPhraseToEntropy(generateRecoveryPhrase());
+    const entropy = accountKeyToEntropy(generateAccountKey());
     const k1 = await deriveRecoveryLookupKey(entropy, APP);
     const k2 = await deriveRecoveryLookupKey(entropy, APP);
     assert.equal(k1, k2);
@@ -169,14 +169,14 @@ describe('deriveRecoveryLookupKey + deriveRecoverySigningKeyPair', () => {
   });
 
   it('lookup key differs per app (per-app isolation)', async () => {
-    const entropy = recoveryPhraseToEntropy(generateRecoveryPhrase());
+    const entropy = accountKeyToEntropy(generateAccountKey());
     const a = await deriveRecoveryLookupKey(entropy, 'bookish');
     const b = await deriveRecoveryLookupKey(entropy, 'cellar');
     assert.notEqual(a, b);
   });
 
   it('signing keypair is deterministic per (phrase entropy, app)', async () => {
-    const entropy = recoveryPhraseToEntropy(generateRecoveryPhrase());
+    const entropy = accountKeyToEntropy(generateAccountKey());
     const p1 = await deriveRecoverySigningKeyPair(entropy, APP);
     const p2 = await deriveRecoverySigningKeyPair(entropy, APP);
     const pk1 = await exportPublicKey(p1.publicKey);
@@ -185,7 +185,7 @@ describe('deriveRecoveryLookupKey + deriveRecoverySigningKeyPair', () => {
   });
 
   it('signing keypair signs and verifies a nonce', async () => {
-    const entropy = recoveryPhraseToEntropy(generateRecoveryPhrase());
+    const entropy = accountKeyToEntropy(generateAccountKey());
     const pair = await deriveRecoverySigningKeyPair(entropy, APP);
     const nonce = 'a'.repeat(64);
     const sig = await signChallenge(pair.privateKey, nonce);
@@ -262,8 +262,8 @@ describe('v1 envelope wire format', () => {
   it('round-trip: wrapDataKeyChainEnvelope → parseWrappedDataKey → unwrapDataKeyChain (both factors)', async () => {
     const dek = await generateRandomDataKey();
     const recoverySalt = generateRecoverySalt();
-    const recoveryPhrase = generateRecoveryPhrase();
-    const recKEK = await deriveRecoveryKey(recoveryPhrase, recoverySalt);
+    const accountKey = generateAccountKey();
+    const recKEK = await deriveRecoveryKey(accountKey, recoverySalt);
     const pwKEK = await generateRandomDataKey(); // stand-in for credential_encryption_key
 
     const wire = await wrapDataKeyChainEnvelope(
@@ -341,8 +341,8 @@ describe('TarnClient.register — recovery acknowledgment + v1 envelope', () => 
     const result = await client.register('rec-test@example.com', 'password-2026', {
       recoveryAcknowledged: true,
     });
-    assert.ok(result.recoveryPhrase);
-    assert.equal(result.recoveryPhrase.split(' ').length, 24);
+    assert.ok(result.accountKey);
+    assert.equal(result.accountKey.split(' ').length, 24);
     assert.ok(result.pdfBytes instanceof Uint8Array);
     assert.ok(result.pdfBytes.length > 0);
     // First 5 bytes are the PDF header "%PDF-".
@@ -401,7 +401,7 @@ describe('TarnClient.recoverAccount — round trip', () => {
     const reg = await c1.register('orig@example.com', 'orig-password', {
       recoveryAcknowledged: true,
     });
-    const phrase = reg.recoveryPhrase;
+    const phrase = reg.accountKey;
     storedDataLookupKey = reg.dataLookupKey;
 
     // Capture what was published to the API.
@@ -434,7 +434,7 @@ describe('TarnClient.recoverAccount — round trip', () => {
     const c2 = new TarnClient('https://api.tarn.dev', APP);
     const rec = await c2.recoverAccount({
       phrase,
-      newEmail: 'new@example.com',
+      newUsername: 'new@example.com',
       newPassword: 'new-password',
     });
     assert.equal(rec.dataLookupKey, storedDataLookupKey, 'dataLookupKey survives recovery');
@@ -466,7 +466,7 @@ describe('TarnClient.recoverAccount — round trip', () => {
     await assert.rejects(
       () => client.recoverAccount({
         phrase: 'not a real phrase',
-        newEmail: 'a@b.com',
+        newUsername: 'a@b.com',
         newPassword: 'pw',
       }),
       /invalid|expected 24/,
@@ -479,11 +479,11 @@ describe('TarnClient.recoverAccount — round trip', () => {
       { status: 404, body: JSON.stringify({ error: 'Unknown recovery_lookup_key' }) },
     ]);
     const client = new TarnClient('https://api.tarn.dev', APP);
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     await assert.rejects(
       () => client.recoverAccount({
         phrase,
-        newEmail: 'a@b.com',
+        newUsername: 'a@b.com',
         newPassword: 'pw',
       }),
       /no account found/,
@@ -499,7 +499,7 @@ describe('TarnClient.regenerateRecoveryKit', () => {
   it('returns the normalized phrase + PDF for a valid phrase, makes no network call', async () => {
     mockFetch([]);
     const client = new TarnClient('https://api.tarn.dev', APP);
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const r = await client.regenerateRecoveryKit({ phrase });
     assert.ok(r.pdfBytes instanceof Uint8Array);
     assert.equal(r.phrase, phrase, 'returns the normalized phrase for the JSON-export path');
@@ -509,7 +509,7 @@ describe('TarnClient.regenerateRecoveryKit', () => {
   it('normalizes whitespace + case in the returned phrase', async () => {
     mockFetch([]);
     const client = new TarnClient('https://api.tarn.dev', APP);
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const messy = '  ' + phrase.toUpperCase().split(' ').join('   ') + '  ';
     const r = await client.regenerateRecoveryKit({ phrase: messy });
     assert.equal(r.phrase, phrase);
@@ -528,7 +528,7 @@ describe('TarnClient.regenerateRecoveryKit', () => {
 
 describe('renderRecoveryPDF', () => {
   it('produces a valid PDF (starts with %PDF- and ends with %%EOF)', () => {
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const pdf = renderRecoveryPDF({ phrase, appName: 'Bookish' });
     const head = new TextDecoder().decode(pdf.slice(0, 5));
     assert.equal(head, '%PDF-');
@@ -537,27 +537,27 @@ describe('renderRecoveryPDF', () => {
   });
 
   it('is deterministic for fixed inputs (phrase + branding + generatedAt)', () => {
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const a = renderRecoveryPDF({ phrase, appName: 'Bookish', generatedAt: '2026-04-28' });
     const b = renderRecoveryPDF({ phrase, appName: 'Bookish', generatedAt: '2026-04-28' });
     assert.deepEqual(a, b);
   });
 
   it('different phrase → different bytes', () => {
-    const a = renderRecoveryPDF({ phrase: generateRecoveryPhrase(), appName: 'X', generatedAt: 'd' });
-    const b = renderRecoveryPDF({ phrase: generateRecoveryPhrase(), appName: 'X', generatedAt: 'd' });
+    const a = renderRecoveryPDF({ phrase: generateAccountKey(), appName: 'X', generatedAt: 'd' });
+    const b = renderRecoveryPDF({ phrase: generateAccountKey(), appName: 'X', generatedAt: 'd' });
     assert.notDeepEqual(a, b);
   });
 
   it('rejects a non-24-word phrase', () => {
     assert.throws(
       () => renderRecoveryPDF({ phrase: 'too short' }),
-      /expected 24-word phrase/,
+      /expected 24-word account key/,
     );
   });
 
   it('contains all 24 words in the rendered content stream', () => {
-    const phrase = generateRecoveryPhrase();
+    const phrase = generateAccountKey();
     const pdf = renderRecoveryPDF({ phrase });
     const text = new TextDecoder().decode(pdf);
     for (const word of phrase.split(' ')) {

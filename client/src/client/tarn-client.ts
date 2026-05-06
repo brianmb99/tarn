@@ -3,10 +3,10 @@
  *
  * App-facing model:
  *   const tarn = await TarnClient.create({ apiBase, appId, schema, storage });
- *   await tarn.login(email, password);
+ *   await tarn.login(username, password);
  *   await tarn.<collection>.create({...});         // typed from schema
  *   await tarn.connections.list();
- *   const pdf = await tarn.recovery.export({ format: 'pdf' });
+ *   const pdf = await tarn.accountKey.export({ format: 'pdf' });
  *   await tarn.session.clear();
  *
  * Implementation: wraps the existing JS TarnClient (in tarn.js) — step 6 of
@@ -25,7 +25,7 @@ import type { AnySchema, ClientConfig, CollectionsOf } from './types.js';
 import { ConnectionsNamespace, type IConnectionsClient } from './namespaces/connections.js';
 import { AccountNamespace, type IAccountClient } from './namespaces/account.js';
 import { SessionNamespace, type ISessionClient } from './namespaces/session.js';
-import { RecoveryNamespace, type IRecoveryClient } from './namespaces/recovery.js';
+import { AccountKeyNamespace, type IAccountKeyClient } from './namespaces/recovery.js';
 import { AdvancedNamespace, type IAdvancedClient } from './namespaces/advanced.js';
 
 // The bundled legacy protocol client. Now that tarn.ts is itself TypeScript
@@ -45,12 +45,12 @@ export type IUnderlyingClient =
   & IConnectionsClient
   & IAccountClient
   & ISessionClient
-  & IRecoveryClient
+  & IAccountKeyClient
   & IAdvancedClient
   & {
     // Auth lifecycle.
-    register(email: string, password: string, opts?: Record<string, unknown>): Promise<unknown>;
-    login(email: string, password: string, opts?: Record<string, unknown>): Promise<unknown>;
+    register(username: string, password: string, opts?: Record<string, unknown>): Promise<unknown>;
+    login(username: string, password: string, opts?: Record<string, unknown>): Promise<unknown>;
     recoverAccount(args: Record<string, unknown>): Promise<unknown>;
     serializeSession(): Promise<string>;
   };
@@ -103,7 +103,7 @@ export class TarnClient<S extends AnySchema> {
   readonly connections: ConnectionsNamespace;
   readonly account: AccountNamespace;
   readonly session: SessionNamespace;
-  readonly recovery: RecoveryNamespace;
+  readonly accountKey: AccountKeyNamespace;
   readonly advanced: AdvancedNamespace;
 
   // Dynamic collection namespace — populated from the schema in `create()`.
@@ -127,7 +127,7 @@ export class TarnClient<S extends AnySchema> {
     this.connections = new ConnectionsNamespace(args.underlying);
     this.account = new AccountNamespace(args.underlying, () => this.#onLogout());
     this.session = new SessionNamespace(args.underlying, () => this.#onLogout());
-    this.recovery = new RecoveryNamespace(args.underlying, args.appId);
+    this.accountKey = new AccountKeyNamespace(args.underlying, args.appId);
     this.advanced = new AdvancedNamespace(args.underlying);
   }
 
@@ -199,8 +199,8 @@ export class TarnClient<S extends AnySchema> {
    * in (subsequent `tarn.<collection>` calls work) and the session is
    * persisted via the storage adapter.
    */
-  async register(email: string, password: string, opts: Record<string, unknown> = {}): Promise<unknown> {
-    const result = await this.#underlying.register(email, password, opts);
+  async register(username: string, password: string, opts: Record<string, unknown> = {}): Promise<unknown> {
+    const result = await this.#underlying.register(username, password, opts);
     await this.#persistSession();
     return result;
   }
@@ -209,14 +209,14 @@ export class TarnClient<S extends AnySchema> {
    * Log into an existing account. On success the client is logged in and
    * the session is persisted.
    */
-  async login(email: string, password: string, opts: Record<string, unknown> = {}): Promise<unknown> {
-    const result = await this.#underlying.login(email, password, opts);
+  async login(username: string, password: string, opts: Record<string, unknown> = {}): Promise<unknown> {
+    const result = await this.#underlying.login(username, password, opts);
     await this.#persistSession();
     return result;
   }
 
   /**
-   * Recover an account from a recovery phrase. New email + password establish
+   * Recover an account from an account key. New username + password establish
    * fresh credentials; the prior data is preserved (forward-secret DEK chain).
    */
   async recoverAccount(args: Record<string, unknown>): Promise<unknown> {

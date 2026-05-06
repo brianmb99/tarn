@@ -58,12 +58,12 @@ class StubUnderlying implements IUnderlyingClient {
   #shareKeyCounter = 0;
 
   // ---- Auth ----
-  async register(_email: string, _password: string, _opts?: Record<string, unknown>) {
+  async register(_username: string, _password: string, _opts?: Record<string, unknown>) {
     this.registerCalls++;
     this.loggedIn = true;
     return { ok: true };
   }
-  async login(_email: string, _password: string, _opts?: Record<string, unknown>) {
+  async login(_username: string, _password: string, _opts?: Record<string, unknown>) {
     this.loginCalls++;
     this.loggedIn = true;
     return { ok: true };
@@ -153,7 +153,7 @@ class StubUnderlying implements IUnderlyingClient {
     this.removeConnectionCalls++;
     return { ok: true };
   }
-  async sendConnectionRequest(_email: string) {
+  async sendConnectionRequest(_username: string) {
     this.sendConnectionRequestCalls++;
     return { ok: true };
   }
@@ -165,7 +165,7 @@ class StubUnderlying implements IUnderlyingClient {
   // Tests can mutate these directly to shape what listIncomingRequests / etc.
   // return without re-stubbing the methods.
   incomingRequests: Array<{
-    senderEmail: string;
+    senderUsername: string;
     senderSharePubBase64Url: string;
     senderSigningPubBase64: string;
     senderAppId: string;
@@ -335,7 +335,7 @@ describe('TarnClient.create', () => {
     assert.ok(tarn.connections);
     assert.ok(tarn.account);
     assert.ok(tarn.session);
-    assert.ok(tarn.recovery);
+    assert.ok(tarn.accountKey);
     assert.ok(tarn.advanced);
     assert.ok(tarn.advanced.entries);
     assert.ok(tarn.advanced.shareLog);
@@ -647,17 +647,17 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     assert.equal(list[1]!.label, undefined);
   });
 
-  it('connections.list surfaces email / established_at / initial_request_nonce', async () => {
+  it('connections.list surfaces username / established_at / initial_request_nonce', async () => {
     stub.connections = [
       {
         share_pub: 'sp1',
         signing_pub: 'sg1',
-        email: 'maya@example.com',
+        username: 'maya@example.com',
         established_at: 1714521600,
         initial_request_nonce: 'nonce-abc',
         label: 'Maya',
       },
-      // Invite-token connection: no email, but still has established_at.
+      // Invite-token connection: no username, but still has established_at.
       {
         share_pub: 'sp2',
         signing_pub: 'sg2',
@@ -665,10 +665,10 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
       },
     ];
     const list = await tarn.connections.list();
-    assert.equal(list[0]!.email, 'maya@example.com');
+    assert.equal(list[0]!.username, 'maya@example.com');
     assert.equal(list[0]!.established_at, 1714521600);
     assert.equal(list[0]!.initial_request_nonce, 'nonce-abc');
-    assert.equal(list[1]!.email, undefined, 'invite-token connections may lack email');
+    assert.equal(list[1]!.username, undefined, 'invite-token connections may lack username');
     assert.equal(list[1]!.established_at, 1714525200);
     assert.equal(list[1]!.initial_request_nonce, undefined);
   });
@@ -680,14 +680,14 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
       {
         share_pub: 'sp1',
         signing_pub: 'sg1',
-        email: null,
+        username: null,
         established_at: null,
         initial_request_nonce: null,
       },
     ];
     const list = await tarn.connections.list();
     const c = list[0]!;
-    assert.equal(c.email, undefined);
+    assert.equal(c.username, undefined);
     assert.equal(c.established_at, undefined);
     assert.equal(c.initial_request_nonce, undefined);
     // Stable identifiers always present.
@@ -783,7 +783,7 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
   it('connections.listIncomingRequests normalizes camelCase → snake_case', async () => {
     stub.incomingRequests = [
       {
-        senderEmail: 'alice@example.com',
+        senderUsername: 'alice@example.com',
         senderSharePubBase64Url: 'sp-alice',
         senderSigningPubBase64: 'sg-alice',
         senderAppId: 'bookish',
@@ -794,8 +794,8 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
         txid: 'tx-1',
       },
       {
-        // No viaInviteToken — direct email handshake.
-        senderEmail: 'bob@example.com',
+        // No viaInviteToken — direct username handshake.
+        senderUsername: 'bob@example.com',
         senderSharePubBase64Url: 'sp-bob',
         senderSigningPubBase64: 'sg-bob',
         senderAppId: 'bookish',
@@ -807,7 +807,7 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     ];
     const list = await tarn.connections.listIncomingRequests();
     assert.equal(list.length, 2);
-    assert.equal(list[0]!.email, 'alice@example.com');
+    assert.equal(list[0]!.username, 'alice@example.com');
     assert.equal(list[0]!.share_pub, 'sp-alice');
     assert.equal(list[0]!.signing_pub, 'sg-alice');
     assert.equal(list[0]!.app_id, 'bookish');
@@ -833,17 +833,17 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
     assert.equal(stub.changeCredentialsCalls, 1);
   });
 
-  it('recovery.export({ format: pdf }) returns the PDF bytes and forwards the phrase', async () => {
+  it('accountKey.export({ format: pdf }) returns the PDF bytes and forwards the account key', async () => {
     const phrase = 'one two three four five six seven eight nine ten eleven twelve';
-    const result = await tarn.recovery.export({ format: 'pdf', phrase });
+    const result = await tarn.accountKey.export({ format: 'pdf', phrase });
     assert.ok(result instanceof Uint8Array);
     assert.equal(stub.regenerateRecoveryKitCalls, 1);
-    assert.equal(stub.lastRegenerateOpts?.phrase, phrase, 'must pass phrase through to underlying');
+    assert.equal(stub.lastRegenerateOpts?.phrase, phrase, 'must pass account key through to underlying');
   });
 
-  it('recovery.export({ format: json }) returns the structured kit', async () => {
+  it('accountKey.export({ format: json }) returns the structured kit', async () => {
     const phrase = 'one two three four five six seven eight nine ten eleven twelve';
-    const result = await tarn.recovery.export({ format: 'json', phrase, appName: 'Bookish' });
+    const result = await tarn.accountKey.export({ format: 'json', phrase, appName: 'Bookish' });
     assert.ok(!(result instanceof Uint8Array));
     const json = result as { phrase: string; appName: string; generatedAt: string };
     assert.equal(json.phrase, phrase);

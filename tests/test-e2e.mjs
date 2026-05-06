@@ -38,7 +38,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message || 'Assertion failed');
 }
 
-function randomEmail() {
+function randomUsername() {
   return `e2e-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
 }
 
@@ -60,9 +60,9 @@ async function fetchJSON(path, opts = {}) {
 
 // Helper: register + login with raw API (not TarnClient), returns keys + jwt
 async function rawRegisterAndLogin() {
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'e2e-test-pass';
-  const keys = await deriveAllKeys(email, password, DEFAULT_APP_ID);
+  const keys = await deriveAllKeys(username, password, DEFAULT_APP_ID);
   const pub = await exportPublicKey(keys.signingKeyPair.publicKey);
   const wdk = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
 
@@ -110,7 +110,7 @@ async function rawRegisterAndLogin() {
   } catch {}
 
   return {
-    email, password, keys, dlk, jwt: vRes.json.jwt,
+    username, password, keys, dlk, jwt: vRes.json.jwt,
     dataEncryptionKey: keys.credentialEncryptionKey.gcmKey,
   };
 }
@@ -498,15 +498,15 @@ await test('Missing tags header: rejected', async () => {
 console.log('\n=== 7. Credential Change + Data Continuity ===');
 
 await test('Change credentials: existing entries still readable', async () => {
-  const oldEmail = randomEmail();
+  const oldUsername = randomUsername();
   const oldPassword = 'old-pass-e2e';
-  const newEmail = randomEmail();
+  const newUsername = randomUsername();
   const newPassword = 'new-pass-e2e';
 
   // Register + login via TarnClient
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const reg = await client.register(oldEmail, oldPassword, { recoveryAcknowledged: true });
-  const phrase = reg.recoveryPhrase;
+  const reg = await client.register(oldUsername, oldPassword, { recoveryAcknowledged: true });
+  const phrase = reg.accountKey;
   const dlk = client.dataLookupKey;
 
   // Set rules (TarnClient register doesn't set rules — app must do it)
@@ -518,7 +518,7 @@ await test('Change credentials: existing entries still readable', async () => {
 
   // Create entries with old credentials
   // (Use raw API since TarnClient.createEntry calls Turbo which may fail in local dev)
-  const oldKeys = await deriveAllKeys(oldEmail, oldPassword, DEFAULT_APP_ID);
+  const oldKeys = await deriveAllKeys(oldUsername, oldPassword, DEFAULT_APP_ID);
 
   // Challenge + verify to get JWT (client already did this, but let's get our own)
   const cRes1 = await fetchJSON('/api/v1/auth/challenge', {
@@ -537,11 +537,11 @@ await test('Change credentials: existing entries still readable', async () => {
   await sleep(200);
 
   // Change credentials
-  await client.changeCredentials(newEmail, newPassword, { phrase });
+  await client.changeCredentials(newUsername, newPassword, { phrase });
 
   // Login with new credentials
   const client2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await client2.login(newEmail, newPassword);
+  await client2.login(newUsername, newPassword);
   assert(client2.dataLookupKey === dlk, 'data_lookup_key should be preserved');
 
   // Read entries — should still see them

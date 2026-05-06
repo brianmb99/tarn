@@ -40,7 +40,7 @@ const tarn = await TarnClient.create({
   storage: TarnStorage.localStorage(),
 });
 
-await tarn.login(email, password);
+await tarn.login(username, password);
 await tarn.notes.create({ noteId: 'n1', title: 'Hello, Tarn' });
 const all = await tarn.notes.list();
 await tarn.notes.share(connection, 'n1');
@@ -49,10 +49,10 @@ await tarn.notes.share(connection, 'n1');
 `tarn` carries six top-level namespaces, plus one typed namespace per collection in the schema:
 
 - **`tarn.<collection>`** — typed CRUD per collection (`create`, `update`, `get`, `list`, `delete`). Collections marked `shareable: true` also get `share`, `shareWithAll`, `unshare`, `listShared`. Updates are partial-merge: the SDK reads, merges the patch, re-validates the full record, and writes a chained entry. Apps work in primary-key space and never see Arweave txids.
-- **`tarn.connections`** — the full connection lifecycle: `invite` (email handshake), `createInvite`/`previewInvite`/`redeemInvite` (link/QR token flow with non-consuming preview), `accept`, `list`/`listIncomingRequests`, `listIssuedInvites`/`revokeIssuedInvite`, `mute`/`unmute`, `setLabel`, `remove`. Connections are SDK objects (`{ share_pub, signing_pub, email?, label?, muted?, established_at?, initial_request_nonce? }`); apps pass them around without touching the underlying X25519 keys. Invite-flow returns are typed too — `InviteToken`, `InvitePreview`, `IssuedInvite`, `RedeemedInvite`, `IncomingRequest`.
-- **`tarn.account`** — `changeCredentials(newEmail, newPassword, { phrase? })`, `delete()`. Routine credential rotation; `phrase` extends the recovery factor to the new generation.
+- **`tarn.connections`** — the full connection lifecycle: `invite` (username-based handshake), `createInvite`/`previewInvite`/`redeemInvite` (link/QR token flow with non-consuming preview), `accept`, `list`/`listIncomingRequests`, `listIssuedInvites`/`revokeIssuedInvite`, `mute`/`unmute`, `setLabel`, `remove`. Connections are SDK objects (`{ share_pub, signing_pub, username?, label?, muted?, established_at?, initial_request_nonce? }`); apps pass them around without touching the underlying X25519 keys. Invite-flow returns are typed too — `InviteToken`, `InvitePreview`, `IssuedInvite`, `RedeemedInvite`, `IncomingRequest`.
+- **`tarn.account`** — `changeCredentials(newUsername, newPassword, { phrase? })`, `delete()`. Routine credential rotation; `phrase` extends the recovery factor to the new generation.
 - **`tarn.session`** — `isLoggedIn()`, `clear()`, plus the multi-device server-side surface (`listDevices`, `revokeDevice`, `revokeAllOthers`, `revokeAll`).
-- **`tarn.recovery`** — `export({ format: 'pdf' | 'json', phrase, appName? })` to re-render the recovery kit for a phrase the caller already holds. Rendering is purely client-side; Tarn never sees the phrase or the rendered bytes, and the SDK never persists the phrase across calls (the caller must supply it every time). Same input always produces the same output — re-export does not rotate any server-side state. Delivery to the user (download, print, app-operated transport) is the application's responsibility; the SDK deliberately exposes no transport surface for recovery material. Account recovery itself is on the top-level client (`tarn.recoverAccount({ phrase, newEmail, newPassword })`) since it's pre-auth.
+- **`tarn.accountKey`** — `export({ format: 'pdf' | 'json', phrase, appName? })` to re-render the recovery kit for an account key the caller already holds. Rendering is purely client-side; Tarn never sees the account key or the rendered bytes, and the SDK never persists the account key across calls (the caller must supply it every time). Same input always produces the same output — re-export does not rotate any server-side state. Delivery to the user (download, print, app-operated transport) is the application's responsibility; the SDK deliberately exposes no transport surface for account-key material. Account recovery itself is on the top-level client (`tarn.recoverAccount({ phrase, newUsername, newPassword })`) since it's pre-auth.
 - **`tarn.advanced`** — schema-less entry CRUD, raw blob fetch, direct share-log access. Power-user escape hatches; most apps never reach for these.
 
 Lifecycle methods that don't fit a noun namespace stay on the top-level client: `login`, `register`, `recoverAccount`. Session persistence is automatic — `TarnClient.create()` reads the configured storage adapter and rehydrates a logged-in client when a valid blob is present, so PWAs and re-opened tabs come back already authenticated. `tarn.session.clear()` (or any logout-equivalent path) wipes the persisted blob.
@@ -226,7 +226,7 @@ Four layers, each catching different things:
 
 ## 7. The recovery property
 
-Schemas are published to Arweave under `Type='app-schema', App=<app_id>, V=<version>` via `tools/publish-schema.mjs`. Anyone with read access to Arweave (i.e., everyone, via a public gateway) can fetch the schema by app and version. Combined with the wrapped-data-key envelope being recoverable from `Type='cred'` blobs and content blobs being recoverable from `Type='entry'` blobs, this means: a "Tarn recovery" client could be built that reads everything it needs straight from Arweave gateways via GraphQL, with no Tarn API in the loop, given only the user's email + password (or recovery phrase) and the app id.
+Schemas are published to Arweave under `Type='app-schema', App=<app_id>, V=<version>` via `tools/publish-schema.mjs`. Anyone with read access to Arweave (i.e., everyone, via a public gateway) can fetch the schema by app and version. Combined with the wrapped-data-key envelope being recoverable from `Type='cred'` blobs and content blobs being recoverable from `Type='entry'` blobs, this means: a "Tarn recovery" client could be built that reads everything it needs straight from Arweave gateways via GraphQL, with no Tarn API in the loop, given only the user's username + password (or account key) and the app id.
 
 That client is on the roadmap, not shipped. The protocol-level enabling work — schema publication endpoint, fixed `Type` tag, deterministic envelope formats — is done. Apps inherit the property by virtue of using the SDK; nothing app-side needs to change to make it true.
 

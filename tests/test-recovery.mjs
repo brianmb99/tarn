@@ -6,7 +6,7 @@
 //   - register() publishes a v1 envelope with both factors
 //   - login() reads back the v1 envelope and recovers the DEK chain
 //   - createEntry/getEntries round-trip works under v1 (per-content CEK)
-//   - recoverAccount() with the phrase recovers the DEK chain via the
+//   - recoverAccount() with the account key recovers the DEK chain via the
 //     recovery factor and rotates credentials
 //   - Post-recovery login() with new credentials reads pre-recovery data
 
@@ -40,7 +40,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message || 'Assertion failed');
 }
 
-function randomEmail() {
+function randomUsername() {
   return `recovery-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 }
 
@@ -61,15 +61,15 @@ console.log('\n=== Recovery round trip ===');
 
 await test('register publishes v1 envelope with both factors', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const email = randomEmail();
-  const result = await client.register(email, 'orig-password-2026', {
+  const username = randomUsername();
+  const result = await client.register(username, 'orig-password-2026', {
     recoveryAcknowledged: true,
   });
   assert(result.dataLookupKey, 'should return dataLookupKey');
-  assert(result.recoveryPhrase, 'should return recoveryPhrase');
+  assert(result.accountKey, 'should return accountKey');
   assert.equal !== undefined;
-  if (result.recoveryPhrase.split(' ').length !== 24) {
-    throw new Error(`expected 24-word phrase, got ${result.recoveryPhrase.split(' ').length}`);
+  if (result.accountKey.split(' ').length !== 24) {
+    throw new Error(`expected 24-word account key, got ${result.accountKey.split(' ').length}`);
   }
   if (!(result.pdfBytes instanceof Uint8Array) || result.pdfBytes.length === 0) {
     throw new Error('expected non-empty pdfBytes');
@@ -82,16 +82,16 @@ await test('login → fresh client reads back v1 envelope chain', async () => {
   // test focuses on what's NEW for issue #12: the v1 envelope is correctly
   // round-trippable through the API + login.
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const email = randomEmail();
+  const username = randomUsername();
   const password = 'test-password-2026';
-  await client.register(email, password, {
+  await client.register(username, password, {
     recoveryAcknowledged: true,
   });
 
   // Fresh client logs in successfully — proves the API stored + returned the
   // v1 wrapped_data_key intact and the password factor unwraps the chain.
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const r = await c2.login(email, password);
+  const r = await c2.login(username, password);
   if (!r.dataLookupKey || r.dataLookupKey.length !== 64) {
     throw new Error(`bad dataLookupKey from login: ${r.dataLookupKey}`);
   }
@@ -100,19 +100,19 @@ await test('login → fresh client reads back v1 envelope chain', async () => {
 await test('recoverAccount with phrase rotates credentials (no writes)', async () => {
   // 1. Register an account.
   const c1 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const oldEmail = randomEmail();
+  const oldUsername = randomUsername();
   const oldPassword = 'old-password-2026';
-  const reg = await c1.register(oldEmail, oldPassword, {
+  const reg = await c1.register(oldUsername, oldPassword, {
     recoveryAcknowledged: true,
   });
 
   // 2. Simulate "user lost their password" — fresh client, only the phrase.
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const newEmail = randomEmail();
+  const newUsername = randomUsername();
   const newPassword = 'new-password-2026';
   const rec = await c2.recoverAccount({
-    phrase: reg.recoveryPhrase,
-    newEmail,
+    phrase: reg.accountKey,
+    newUsername,
     newPassword,
   });
   if (rec.dataLookupKey !== reg.dataLookupKey) {
@@ -123,7 +123,7 @@ await test('recoverAccount with phrase rotates credentials (no writes)', async (
   const cOld = new TarnClient(API_BASE, DEFAULT_APP_ID);
   let oldLoginThrew = false;
   try {
-    await cOld.login(oldEmail, oldPassword);
+    await cOld.login(oldUsername, oldPassword);
   } catch {
     oldLoginThrew = true;
   }
@@ -133,7 +133,7 @@ await test('recoverAccount with phrase rotates credentials (no writes)', async (
 
   // 4. New credentials log in cleanly under the SAME data_lookup_key.
   const cNew = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  const newLoginRes = await cNew.login(newEmail, newPassword);
+  const newLoginRes = await cNew.login(newUsername, newPassword);
   if (newLoginRes.dataLookupKey !== reg.dataLookupKey) {
     throw new Error(`new-credential login should see the original dataLookupKey`);
   }
@@ -142,8 +142,8 @@ await test('recoverAccount with phrase rotates credentials (no writes)', async (
   //    factor is preserved across credential changes.
   const c3 = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const rec2 = await c3.recoverAccount({
-    phrase: reg.recoveryPhrase,
-    newEmail: randomEmail(),
+    phrase: reg.accountKey,
+    newUsername: randomUsername(),
     newPassword: 'second-recovery-pw',
   });
   if (rec2.dataLookupKey !== reg.dataLookupKey) {
@@ -162,7 +162,7 @@ await test('recoverAccount with wrong phrase fails (404 from API)', async () => 
   try {
     await client.recoverAccount({
       phrase: garbagePhrase,
-      newEmail: randomEmail(),
+      newUsername: randomUsername(),
       newPassword: 'pw',
     });
   } catch (err) {

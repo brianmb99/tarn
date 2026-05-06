@@ -32,7 +32,7 @@ import {
   OP_ADD, OP_UPDATE, OP_ROTATE, OP_REMOVE, OP_SNAPSHOT,
 } from '../client/src/share-log.js';
 import {
-  seedTestApp, DEFAULT_APP_ID, randomEmail, forceAllowRulesForAccount, sleep,
+  seedTestApp, DEFAULT_APP_ID, randomUsername, forceAllowRulesForAccount, sleep,
 } from './helpers.mjs';
 
 const BASE_URL = process.argv[2] || 'http://localhost:8787';
@@ -65,8 +65,8 @@ function assert(condition, message) {
   if (!condition) throw new Error(message || 'Assertion failed');
 }
 
-async function registerWithRules(client, email, password) {
-  const { dataLookupKey } = await client.register(email, password, {
+async function registerWithRules(client, username, password) {
+  const { dataLookupKey } = await client.register(username, password, {
     recoveryAcknowledged: true,
   });
   await forceAllowRulesForAccount(dataLookupKey);
@@ -77,9 +77,9 @@ async function registerWithRules(client, email, password) {
 
 console.log('\n=== 1. Handshake → seq=0 snapshots in both directions ===');
 
-const aliceEmail = randomEmail();
+const aliceUsername = randomUsername();
 const alicePassword = 'pw-' + Date.now();
-const bobEmail = randomEmail();
+const bobUsername = randomUsername();
 const bobPassword = 'pw-bob-' + Date.now();
 const alice = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const bob = new TarnClient(BASE_URL, DEFAULT_APP_ID);
@@ -88,13 +88,13 @@ let aliceConnectionOfBob; // bob's connection record entry from alice's perspect
 let bobConnectionOfAlice;
 
 await test('Alice + Bob register', async () => {
-  await registerWithRules(alice, aliceEmail, alicePassword);
-  await registerWithRules(bob, bobEmail, bobPassword);
+  await registerWithRules(alice, aliceUsername, alicePassword);
+  await registerWithRules(bob, bobUsername, bobPassword);
 });
 
 let requestNonce;
 await test('Alice sends connection request, Bob accepts (publishes seq=0 snapshot)', async () => {
-  const send = await alice.sendConnectionRequest(bobEmail);
+  const send = await alice.sendConnectionRequest(bobUsername);
   requestNonce = send.requestNonce;
   await sleep(300);
   const incoming = await bob.listIncomingRequests();
@@ -108,10 +108,10 @@ await test('Alice processes the accept (publishes her own seq=0 snapshot)', asyn
   await sleep(300);
   await alice.listIncomingRequests();
   const aliceConnections = await alice.listConnections();
-  bobConnectionOfAlice = aliceConnections.find(f => f.email === bobEmail);
+  bobConnectionOfAlice = aliceConnections.find(f => f.username === bobUsername);
   assert(bobConnectionOfAlice, 'Bob not in Alice\'s connections record');
   const bobConnections = await bob.listConnections();
-  aliceConnectionOfBob = bobConnections.find(f => f.email === aliceEmail);
+  aliceConnectionOfBob = bobConnections.find(f => f.username === aliceUsername);
   assert(aliceConnectionOfBob, 'Alice not in Bob\'s connections record');
 });
 
@@ -590,9 +590,9 @@ await test('Concurrent publish race: two parallel writers at the same tag → ex
 console.log('\n=== 9. Revocation: removeConnection (silent + notify modes) ===');
 
 // Use a fresh pair so the prior tests' state doesn't pollute revocation tests.
-const charlieEmail = randomEmail();
+const charlieUsername = randomUsername();
 const charliePassword = 'pw-charlie-' + Date.now();
-const dianaEmail = randomEmail();
+const dianaUsername = randomUsername();
 const dianaPassword = 'pw-diana-' + Date.now();
 const charlie = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const diana = new TarnClient(BASE_URL, DEFAULT_APP_ID);
@@ -601,16 +601,16 @@ let dianaConnectionOfCharlie;
 let charlieConnectionOfDiana;
 
 await test('Charlie + Diana register and connection each other', async () => {
-  await registerWithRules(charlie, charlieEmail, charliePassword);
-  await registerWithRules(diana, dianaEmail, dianaPassword);
-  const send = await charlie.sendConnectionRequest(dianaEmail);
+  await registerWithRules(charlie, charlieUsername, charliePassword);
+  await registerWithRules(diana, dianaUsername, dianaPassword);
+  const send = await charlie.sendConnectionRequest(dianaUsername);
   await sleep(200);
   await diana.listIncomingRequests();
   await diana.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await charlie.listIncomingRequests();
-  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.email === dianaEmail);
-  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.email === charlieEmail);
+  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.username === dianaUsername);
+  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.username === charlieUsername);
   assert(charlieConnectionOfDiana, 'Charlie missing Diana');
   assert(dianaConnectionOfCharlie, 'Diana missing Charlie');
 });
@@ -623,12 +623,12 @@ await test('removeConnection (silent): connection dropped from listConnections, 
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
   const before = await charlie.listConnections();
-  assert(before.some(f => f.email === dianaEmail), 'Diana should still be a connection');
+  assert(before.some(f => f.username === dianaUsername), 'Diana should still be a connection');
   const r = await charlie.removeConnection(charlieConnectionOfDiana);
   assert(r.removed === true, 'removeConnection should report removal');
   assert(!r.notifications, 'silent removeConnection should not produce notifications');
   const after = await charlie.listConnections();
-  assert(!after.some(f => f.email === dianaEmail), 'Diana should be gone after removeConnection');
+  assert(!after.some(f => f.username === dianaUsername), 'Diana should be gone after removeConnection');
 });
 
 await test('removeConnection (idempotent): re-removing a non-connection returns removed:false', async () => {
@@ -638,14 +638,14 @@ await test('removeConnection (idempotent): re-removing a non-connection returns 
 
 // Re-connection Charlie + Diana to test the notify-mode removeConnection.
 await test('Re-establish Charlie+Diana for notify-mode test', async () => {
-  const send2 = await diana.sendConnectionRequest(charlieEmail);
+  const send2 = await diana.sendConnectionRequest(charlieUsername);
   await sleep(200);
   await charlie.listIncomingRequests();
   await charlie.acceptConnectionRequest(send2.requestNonce);
   await sleep(200);
   await diana.listIncomingRequests();
-  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.email === dianaEmail);
-  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.email === charlieEmail);
+  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.username === dianaUsername);
+  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.username === charlieUsername);
   assert(charlieConnectionOfDiana, 'Re-connection failed for Charlie');
   assert(dianaConnectionOfCharlie, 'Re-connection failed for Diana');
   // Charlie publishes 2 add ops to have something to revoke.
@@ -695,11 +695,11 @@ await test('removeConnection ({notify: true}): publishes a final remove for ever
 
 console.log('\n=== 9b. Revocation: revokeContentFromConnections (CEK rotation) ===');
 
-const eveEmail = randomEmail();
+const eveUsername = randomUsername();
 const evePassword = 'pw-eve-' + Date.now();
-const frankEmail = randomEmail();
+const frankUsername = randomUsername();
 const frankPassword = 'pw-frank-' + Date.now();
-const garyEmail = randomEmail();
+const garyUsername = randomUsername();
 const garyPassword = 'pw-gary-' + Date.now();
 const eve = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const frank = new TarnClient(BASE_URL, DEFAULT_APP_ID);
@@ -711,18 +711,18 @@ const sharedContentId = 'book-' + Date.now();
 const originalCek = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 
 await test('Eve registers, connections Frank and Gary, shares same content with both', async () => {
-  await registerWithRules(eve, eveEmail, evePassword);
-  await registerWithRules(frank, frankEmail, frankPassword);
-  await registerWithRules(gary, garyEmail, garyPassword);
+  await registerWithRules(eve, eveUsername, evePassword);
+  await registerWithRules(frank, frankUsername, frankPassword);
+  await registerWithRules(gary, garyUsername, garyPassword);
 
-  const r1 = await eve.sendConnectionRequest(frankEmail);
+  const r1 = await eve.sendConnectionRequest(frankUsername);
   await sleep(200);
   await frank.listIncomingRequests();
   await frank.acceptConnectionRequest(r1.requestNonce);
   await sleep(200);
   await eve.listIncomingRequests();
 
-  const r2 = await eve.sendConnectionRequest(garyEmail);
+  const r2 = await eve.sendConnectionRequest(garyUsername);
   await sleep(200);
   await gary.listIncomingRequests();
   await gary.acceptConnectionRequest(r2.requestNonce);
@@ -730,10 +730,10 @@ await test('Eve registers, connections Frank and Gary, shares same content with 
   await eve.listIncomingRequests();
 
   const eveConnections = await eve.listConnections();
-  frankConnectionOfEve = eveConnections.find(f => f.email === frankEmail);
-  garyConnectionOfEve = eveConnections.find(f => f.email === garyEmail);
-  eveConnectionOfFrank = (await frank.listConnections()).find(f => f.email === eveEmail);
-  eveConnectionOfGary = (await gary.listConnections()).find(f => f.email === eveEmail);
+  frankConnectionOfEve = eveConnections.find(f => f.username === frankUsername);
+  garyConnectionOfEve = eveConnections.find(f => f.username === garyUsername);
+  eveConnectionOfFrank = (await frank.listConnections()).find(f => f.username === eveUsername);
+  eveConnectionOfGary = (await gary.listConnections()).find(f => f.username === eveUsername);
   assert(frankConnectionOfEve && garyConnectionOfEve, 'Eve\'s connection list incomplete');
   assert(eveConnectionOfFrank && eveConnectionOfGary, 'Frank/Gary missing Eve');
 
@@ -771,9 +771,9 @@ await test('Gary syncs and sees the new CEK; Frank still has old CEK in his last
 
 console.log('\n=== 9c. Identity rotation: changeCredentials → connection picks up new keys ===');
 
-const helenEmail = randomEmail();
+const helenUsername = randomUsername();
 const helenPassword = 'pw-helen-' + Date.now();
-const ivanEmail = randomEmail();
+const ivanUsername = randomUsername();
 const ivanPassword = 'pw-ivan-' + Date.now();
 const helen = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const ivan = new TarnClient(BASE_URL, DEFAULT_APP_ID);
@@ -782,22 +782,22 @@ let helenPhrase;
 let helenSharePubBeforeRotate;
 
 await test('Helen + Ivan register + handshake; Helen shares a content item', async () => {
-  const reg = await helen.register(helenEmail, helenPassword, {
+  const reg = await helen.register(helenUsername, helenPassword, {
     recoveryAcknowledged: true,
   });
-  helenPhrase = reg.recoveryPhrase;
+  helenPhrase = reg.accountKey;
   await forceAllowRulesForAccount(reg.dataLookupKey);
-  await registerWithRules(ivan, ivanEmail, ivanPassword);
+  await registerWithRules(ivan, ivanUsername, ivanPassword);
 
-  const send = await helen.sendConnectionRequest(ivanEmail);
+  const send = await helen.sendConnectionRequest(ivanUsername);
   await sleep(200);
   await ivan.listIncomingRequests();
   await ivan.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await helen.listIncomingRequests();
 
-  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.email === ivanEmail);
-  helenConnectionOfIvan = (await ivan.listConnections()).find(f => f.email === helenEmail);
+  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.username === ivanUsername);
+  helenConnectionOfIvan = (await ivan.listConnections()).find(f => f.username === helenUsername);
   assert(ivanConnectionOfHelen, 'Helen missing Ivan');
   assert(helenConnectionOfIvan, 'Ivan missing Helen');
   helenSharePubBeforeRotate = helenConnectionOfIvan.share_pub;
@@ -815,9 +815,9 @@ await test('Ivan reads pre-rotation state', async () => {
   assert(state['rotate-target-1'], 'Ivan should see rotate-target-1 before rotation');
 });
 
-await test('Helen rotates credentials (email + password change)', async () => {
-  const newEmail = `rotated-${Date.now()}@test.com`;
-  const result = await helen.changeCredentials(newEmail, 'new-pw-' + Date.now(), {
+await test('Helen rotates credentials (username + password change)', async () => {
+  const newUsername = `rotated-${Date.now()}@test.com`;
+  const result = await helen.changeCredentials(newUsername, 'new-pw-' + Date.now(), {
     phrase: helenPhrase,
   });
   assert(Array.isArray(result.rotationAnnouncements), 'should return rotationAnnouncements');
@@ -848,7 +848,7 @@ await test('Ivan syncs: detects rotate_identity, updates connection record, swit
 await test('Helen publishes a new share post-rotation; Ivan picks it up via sync', async () => {
   // Helen's connections record was updated by changeCredentials: but the
   // ivanConnectionOfHelen reference is stale post-rotation. Refresh it.
-  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.email === ivanEmail);
+  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.username === ivanUsername);
   await helen.shareContent(
     ivanConnectionOfHelen,
     'post-rotate-target',
@@ -858,7 +858,7 @@ await test('Helen publishes a new share post-rotation; Ivan picks it up via sync
   await sleep(300);
   // Refresh Ivan's connection pointer too.
   const ivanConnections = await ivan.listConnections();
-  const helenFromIvan = ivanConnections.find(f => f.email !== helenEmail || f.share_pub) || ivanConnections[0];
+  const helenFromIvan = ivanConnections.find(f => f.username !== helenUsername || f.share_pub) || ivanConnections[0];
   const stateAfter = await ivan.syncShareLog(helenFromIvan);
   assert(stateAfter['post-rotate-target'], 'Ivan should pick up post-rotation share via NEW-log keys');
 });
@@ -879,24 +879,24 @@ await test('Re-reading rotate_identity is idempotent (replay produces same final
 
 console.log('\n=== 10. Mute lifecycle: per-side filter, syncs across devices ===');
 
-const karlEmail = randomEmail();
+const karlUsername = randomUsername();
 const karlPassword = 'pw-karl-' + Date.now();
-const lilyEmail = randomEmail();
+const lilyUsername = randomUsername();
 const lilyPassword = 'pw-lily-' + Date.now();
 const karl = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 const lily = new TarnClient(BASE_URL, DEFAULT_APP_ID);
 let lilyConnectionOfKarl;
 
 await test('Karl + Lily register and connection each other', async () => {
-  await registerWithRules(karl, karlEmail, karlPassword);
-  await registerWithRules(lily, lilyEmail, lilyPassword);
-  const send = await karl.sendConnectionRequest(lilyEmail);
+  await registerWithRules(karl, karlUsername, karlPassword);
+  await registerWithRules(lily, lilyUsername, lilyPassword);
+  const send = await karl.sendConnectionRequest(lilyUsername);
   await sleep(200);
   await lily.listIncomingRequests();
   await lily.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await karl.listIncomingRequests();
-  lilyConnectionOfKarl = (await karl.listConnections()).find(c => c.email === lilyEmail);
+  lilyConnectionOfKarl = (await karl.listConnections()).find(c => c.username === lilyUsername);
   assert(lilyConnectionOfKarl, 'Karl missing Lily');
 });
 
@@ -926,7 +926,7 @@ await test('muteConnection is idempotent', async () => {
 await test('muting does NOT block readShareLog from surfacing the connection', async () => {
   // Lily shares something so Karl has content to read.
   await lily.shareContent(
-    (await lily.listConnections()).find(c => c.email === karlEmail),
+    (await lily.listConnections()).find(c => c.username === karlUsername),
     'mute-visibility-test',
     'arweave-mute-test',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
@@ -939,7 +939,7 @@ await test('muting does NOT block readShareLog from surfacing the connection', a
 
 await test('mute state syncs across devices: device B sees the mute after a fresh login', async () => {
   const karl2 = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  await karl2.login(karlEmail, karlPassword);
+  await karl2.login(karlUsername, karlPassword);
   const muted = await karl2.listMutedConnections();
   assert(muted.length === 1, `device B should see 1 muted entry, got ${muted.length}`);
   assert(muted[0].share_pub === lilyConnectionOfKarl.share_pub, 'device B share_pub mismatch');
@@ -954,7 +954,7 @@ await test('unmuteConnection removes the mute and persists across devices', asyn
   assert(muted.length === 0, `muted list should be empty, got ${muted.length}`);
 
   const karl3 = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  await karl3.login(karlEmail, karlPassword);
+  await karl3.login(karlUsername, karlPassword);
   assert(!(await karl3.isMuted(lilyConnectionOfKarl)),
     'device C (fresh login) should see the unmute');
 });

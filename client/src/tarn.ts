@@ -2,7 +2,7 @@
 // Handles key derivation, encryption/decryption, and all API interactions.
 // Works in browsers and Node.js 15+.
 //
-// Each TarnClient instance is scoped to one app. Same email+password with
+// Each TarnClient instance is scoped to one app. Same username+password with
 // different app IDs produces completely isolated accounts.
 //
 // NOTE: Protocol version ('0.4.0') is hardcoded in tag construction below.
@@ -42,9 +42,9 @@ import {
   FACTOR_RECOVERY_PHRASE,
 } from './crypto.js';
 import {
-  generateRecoveryPhrase,
-  validateRecoveryPhrase,
-  recoveryPhraseToEntropy,
+  generateAccountKey,
+  validateAccountKey,
+  accountKeyToEntropy,
   renderRecoveryPDF,
 } from './recovery.js';
 import {
@@ -142,9 +142,9 @@ function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
   return b as BufferSource;
 }
 
-// Re-export the recovery-side surface so consumers can import them directly
+// Re-export the account-key surface so consumers can import them directly
 // from the package root without reaching into ./recovery (private path).
-export { generateRecoveryPhrase, validateRecoveryPhrase, renderRecoveryPDF };
+export { generateAccountKey, validateAccountKey, renderRecoveryPDF };
 
 export class TarnClient {
   #apiBase: string;
@@ -167,7 +167,7 @@ export class TarnClient {
   // register/login/changeCredentials/recoverAccount path so the connection
   // handshake methods can HPKE-Open inbox blobs without re-deriving from
   // master_key on every call. share_priv NEVER leaves the device.
-  #email: string | null = null;
+  #username: string | null = null;
   #sharingKeyPair: SharingKeyPair | null = null;
   #replayNonceCache: ReplayNonceCache = makeReplayNonceCache();
 
@@ -274,23 +274,23 @@ export class TarnClient {
    * mandatory recovery factor).
    *
    * Generates a fresh random 32-byte DEK at gen 1 (issue #11) and a 24-word
-   * BIP39 recovery phrase. The DEK is wrapped twice into a v4 envelope:
+   * BIP39 account key. The DEK is wrapped twice into a v4 envelope:
    *   - under the password-derived KEK (factor: "password")
-   *   - under a phrase-derived KEK (factor: "recovery_phrase")
+   *   - under an account-key-derived KEK (factor: "recovery_phrase")
    * The envelope is opaque to the API (passes the existing length/type check).
    *
    * The caller MUST pass `recoveryAcknowledged: true` — without it, register
    * fails synchronously with no network call. This is the SDK enforcement of
-   * the design-doc requirement that recovery is mandatory at signup.
+   * the design-doc requirement that the account key is mandatory at signup.
    *
-   * The phrase is returned to the caller in the result payload alongside the
-   * rendered PDF bytes. The TarnClient instance does NOT cache the phrase —
+   * The account key is returned to the caller in the result payload alongside
+   * the rendered PDF bytes. The TarnClient instance does NOT cache the key —
    * the caller is responsible for surfacing it to the user (download, print,
    * or any out-of-band delivery the app wants to wire up) and dropping the
    * in-memory copy promptly. Re-rendering a fresh PDF later requires the user
-   * to provide the phrase again.
+   * to provide the account key again.
    *
-   * @param {string} email
+   * @param {string} username
    * @param {string} password
    * @param {{
    *   recoveryAcknowledged: boolean,
@@ -298,37 +298,37 @@ export class TarnClient {
    * }} [opts]
    * @returns {Promise<{
    *   dataLookupKey: string,
-   *   recoveryPhrase: string,
+   *   accountKey: string,
    *   pdfBytes: Uint8Array,
    *   }>}
    */
-  async register(email: string, password: string, opts: any = {}): Promise<any> {
+  async register(username: string, password: string, opts: any = {}): Promise<any> {
     if (!opts || opts.recoveryAcknowledged !== true) {
       throw new Error('register(): recoveryAcknowledged: true is required (issue #12)');
     }
     const appName = opts.appName;
     // Sharing keypair publication (issue #13). Defaults to discoverable so a
-    // new social-app user can connect by email out of the box. Apps that
+    // new social-app user can connect by username out of the box. Apps that
     // want a "private by default" stance can pass `shareDiscoverable: false`.
     const shareDiscoverable = opts.shareDiscoverable !== false;
     // Section 7.5 (issue #20): optional human-readable label for this device,
     // surfaced via listSessions on every device tied to this account.
     if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
-    // Derive password-side keys + recovery-phrase-side keys + share-lookup
+    // Derive password-side keys + account-key-side keys + share-lookup
     // key in parallel — Argon2id calls dominate registration latency, so
-    // overlap them. share_lookup_key is HKDF over SHA-256(email), independent
+    // overlap them. share_lookup_key is HKDF over SHA-256(username), independent
     // of the password.
-    const phrase = generateRecoveryPhrase();
-    const phraseEntropy = recoveryPhraseToEntropy(phrase);
+    const phrase = generateAccountKey();
+    const phraseEntropy = accountKeyToEntropy(phrase);
     const recoverySalt = generateRecoverySalt();
 
     const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair, shareLookupKey] = await Promise.all([
-      deriveAllKeys(email, password, this.#appId),
+      deriveAllKeys(username, password, this.#appId),
       deriveRecoveryKey(phrase, recoverySalt),
       deriveRecoveryLookupKey(phraseEntropy, this.#appId),
       deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
-      deriveShareLookupKey(email, this.#appId),
+      deriveShareLookupKey(username, this.#appId),
     ]);
 
     const [publicKeyBase64, recoveryPublicKeyBase64] = await Promise.all([
@@ -374,7 +374,7 @@ export class TarnClient {
     this.#dataLookupKey = res.json.data_lookup_key;
     this.#dekByGen = new Map([[1, { gcmKey: dek.gcmKey, kwKey: dek.kwKey }]]);
     this.#currentGen = 1;
-    this.#email = email;
+    this.#username = username;
     this.#sharingKeyPair = keys.sharingKeyPair;
     // Snapshot the recovery wrapping bytes for the freshly-registered chain
     // so a subsequent changeCredentials() can preserve them without needing
@@ -401,17 +401,17 @@ export class TarnClient {
 
     return {
       dataLookupKey: this.#dataLookupKey,
-      recoveryPhrase: phrase,
+      accountKey: phrase,
       pdfBytes,
     };
   }
 
   /**
-   * Render a fresh recovery PDF for the phrase the user already holds. The
-   * phrase is unchanged — Tarn does not store it, so the caller must provide
-   * it. Pure client-side rendering — no network call, no auth requirement.
+   * Render a fresh recovery PDF for the account key the user already holds.
+   * The account key is unchanged — Tarn does not store it, so the caller must
+   * provide it. Pure client-side rendering — no network call, no auth requirement.
    *
-   * Returns the normalized form of the phrase alongside the rendered bytes
+   * Returns the normalized form of the account key alongside the rendered bytes
    * so callers reflecting the kit back to a user (e.g. the `format: 'json'`
    * path on the typed namespace) can surface a canonicalized version.
    *
@@ -424,7 +424,7 @@ export class TarnClient {
   async regenerateRecoveryKit(opts: any = {}): Promise<any> {
     const { phrase, appName } = opts;
 
-    const validation = validateRecoveryPhrase(phrase);
+    const validation = validateAccountKey(phrase);
     if (!validation.valid) {
       throw new Error(`regenerateRecoveryKit(): ${validation.reason}`);
     }
@@ -434,43 +434,43 @@ export class TarnClient {
   }
 
   /**
-   * Recover an account using only the recovery phrase + new credentials.
+   * Recover an account using only the account key + new credentials.
    * Used when the user has lost their password (or wants a security-grade
    * reset that the design-doc positions as "the response to suspected
    * compromise").
    *
    * Flow:
-   *   1. Derive recovery_lookup_key + recovery signing key from the phrase
+   *   1. Derive recovery_lookup_key + recovery signing key from the account key
    *   2. POST /auth/challenge { recovery_lookup_key } → get the existing
    *      credential blob's wrapped_data_key + a nonce
    *   3. Parse the v4 envelope, extract the recovery salt, derive recovery KEK
    *   4. Unwrap the DEK chain via the recovery factor
    *   5. Sign the nonce with the recovery signing private key → JWT (the API
    *      verifies against the stored recovery_public_key)
-   *   6. Derive new password KEK from (newEmail, newPassword)
+   *   6. Derive new password KEK from (newUsername, newPassword)
    *   7. Re-wrap the DEK chain under both new password KEK + (kept) recovery
    *      KEK and PUT /auth to publish the new credential blob
    *
    * On success the client is authenticated under the new credentials and
    * holds the full DEK chain — old data is still readable.
    *
-   * @param {{ phrase: string, newEmail: string, newPassword: string }} opts
+   * @param {{ phrase: string, newUsername: string, newPassword: string }} opts
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async recoverAccount(args: any = {}): Promise<any> {
-    const { phrase, newEmail, newPassword, ...opts } = args;
-    const validation = validateRecoveryPhrase(phrase);
+    const { phrase, newUsername, newPassword, ...opts } = args;
+    const validation = validateAccountKey(phrase);
     if (!validation.valid) {
       throw new Error(`recoverAccount(): ${validation.reason}`);
     }
-    if (!newEmail || !newPassword) {
-      throw new Error('recoverAccount(): newEmail and newPassword are required');
+    if (!newUsername || !newPassword) {
+      throw new Error('recoverAccount(): newUsername and newPassword are required');
     }
     // Section 7.5 (issue #20): optional deviceLabel applied to the post-recover
     // re-auth (the second #authenticate below, after credentials rotate).
     if (opts && opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
-    const phraseEntropy = recoveryPhraseToEntropy(validation.normalized);
+    const phraseEntropy = accountKeyToEntropy(validation.normalized);
     const [recoveryLookupKey, recoverySigningKeyPair] = await Promise.all([
       deriveRecoveryLookupKey(phraseEntropy, this.#appId),
       deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
@@ -483,7 +483,7 @@ export class TarnClient {
       body: { recovery_lookup_key: recoveryLookupKey },
     });
     if (challengeRes.status === 404) {
-      throw new Error('recoverAccount(): no account found for this recovery phrase + app');
+      throw new Error('recoverAccount(): no account found for this account key + app');
     }
     if (challengeRes.status !== 200) {
       throw new Error(`recoverAccount(): challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
@@ -528,8 +528,8 @@ export class TarnClient {
     // recovered account stays discoverable post-recovery (or non-discoverable,
     // if the caller passed `shareDiscoverable: false`).
     const [newKeys, newShareLookupKey] = await Promise.all([
-      deriveAllKeys(newEmail, newPassword, this.#appId),
-      deriveShareLookupKey(newEmail, this.#appId),
+      deriveAllKeys(newUsername, newPassword, this.#appId),
+      deriveShareLookupKey(newUsername, this.#appId),
     ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
     const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
@@ -650,7 +650,7 @@ export class TarnClient {
     this.#signingKeyPair = newKeys.signingKeyPair;
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
-    this.#email = newEmail;
+    this.#username = newUsername;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
     // Pair-key cache is derived from share_priv; recovery rotates it.
     this.#pairKeyCache.clear();
@@ -685,19 +685,19 @@ export class TarnClient {
 
   /**
    * Log in to an existing account for this app.
-   * @param {string} email
+   * @param {string} username
    * @param {string} password
    * @param {{ deviceLabel?: string }} [opts]
    * @returns {Promise<{dataLookupKey: string}>}
    */
-  async login(email: string, password: string, opts: any = {}): Promise<any> {
+  async login(username: string, password: string, opts: any = {}): Promise<any> {
     // Section 7.5 (issue #20): one-shot device label, consumed by the next
     // /auth/verify call inside #verifyChallenge below.
     if (opts && opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
     // Single-KDF login: Argon2id is the only path. Legacy PBKDF2 accounts no
     // longer exist (back-compat was cut cleanly when there was still only one
     // user — see TARN_PROTOCOL.md §2).
-    const keys = await deriveAllKeys(email, password, this.#appId);
+    const keys = await deriveAllKeys(username, password, this.#appId);
     const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
       retry: true, // generates a fresh nonce per call — safe to retry
@@ -723,7 +723,7 @@ export class TarnClient {
     );
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
-    this.#email = email;
+    this.#username = username;
     this.#sharingKeyPair = keys.sharingKeyPair;
     // Capture the recovery-factor metadata so a subsequent changeCredentials()
     // can preserve existing recovery wrappings without requiring the user to
@@ -753,7 +753,7 @@ export class TarnClient {
   }
 
   /**
-   * Change credentials (email and/or password). Requires an active session.
+   * Change credentials (username and/or password). Requires an active session.
    *
    * Forward-secret DEK rotation: on every credential change, mint a fresh
    * random DEK at gen N+1 and append to the chain. Existing gens stay
@@ -771,7 +771,9 @@ export class TarnClient {
    *   password wrapping, and recovery for data written under that gen is not
    *   possible until the user runs `regenerateRecoveryKit` or `recoverAccount`
    *   to repair the gap. Apps with a non-interactive flow that knowingly
-   *   accepts the gap may pass `acceptRecoveryGap: true`.
+   *   accepts the gap may pass `acceptRecoveryGap: true`. (A future
+   *   `rotateAccountKey` primitive — not yet implemented — will be the
+   *   canonical closer for this gap.)
    *
    * Connection-side identity rotation (sharing §13.5): after the credential
    * blob is published, this method announces the new sharing + signing pubkeys
@@ -782,14 +784,14 @@ export class TarnClient {
    * about rotation under compromised OLD keys (sharing §13.5) is accepted for
    * v1; out-of-band recovery is the documented response.
    *
-   * @param {string} newEmail
+   * @param {string} newUsername
    * @param {string} newPassword
    * @param {{
    *   phrase?: string,
    *   acceptRecoveryGap?: boolean,
    *   skipRotationAnnounce?: boolean,
    * }} [opts]
-   *   - `phrase`: BIP39 recovery phrase. Required unless `acceptRecoveryGap:
+   *   - `phrase`: BIP39 account key. Required unless `acceptRecoveryGap:
    *     true` is set. Extends the recovery wrapping to gen N+1.
    *   - `acceptRecoveryGap`: opt out of the phrase requirement. The new gen
    *     ships without a recovery wrapping.
@@ -798,7 +800,7 @@ export class TarnClient {
    *     identity rotation themselves; production callers should leave it
    *     unset (default false).
    */
-  async changeCredentials(newEmail: string, newPassword: string, opts: any = {}): Promise<any> {
+  async changeCredentials(newUsername: string, newPassword: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
 
     // Phrase is required by default. Skipping it leaves the new gen without a
@@ -806,18 +808,18 @@ export class TarnClient {
     // under the new gen is lost.
     if (!opts.phrase && opts.acceptRecoveryGap !== true) {
       throw new Error(
-        'changeCredentials(): must supply `phrase` (the recovery phrase) ' +
+        'changeCredentials(): must supply `phrase` (the account key) ' +
         'so the new generation gets a recovery wrapping. Pass `acceptRecoveryGap: true` ' +
-        'to override (the new gen will be unrecoverable via phrase until repaired).',
+        'to override (the new gen will be unrecoverable via the account key until repaired).',
       );
     }
 
     const [newKeys, newShareLookupKey] = await Promise.all([
-      deriveAllKeys(newEmail, newPassword, this.#appId),
-      deriveShareLookupKey(newEmail, this.#appId),
+      deriveAllKeys(newUsername, newPassword, this.#appId),
+      deriveShareLookupKey(newUsername, this.#appId),
     ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-    // Sharing keypair rotates with master_key (depends on both email and
+    // Sharing keypair rotates with master_key (depends on both username and
     // password). The discoverability flag is preserved by the API when
     // omitted; let `opts.shareDiscoverable` override it for callers that also
     // want to flip it as part of the credential change.
@@ -853,7 +855,7 @@ export class TarnClient {
       recoveryWrappingsByGen.set(gen, b64);
     }
     if (opts.phrase) {
-      const validation = validateRecoveryPhrase(opts.phrase);
+      const validation = validateAccountKey(opts.phrase);
       if (!validation.valid) {
         throw new Error(`changeCredentials(): invalid phrase: ${validation.reason}`);
       }
@@ -984,7 +986,7 @@ export class TarnClient {
     this.#dekByGen = newDekByGen;
     this.#currentGen = newCurrentGen;
     this.#recoveryFactorMeta = newRecoveryFactorMeta;
-    this.#email = newEmail;
+    this.#username = newUsername;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
     // Per-pair S_AB is derived from share_priv, which just rotated — every
     // cached entry is stale. The NEW pair keys are derived lazily on first
@@ -1058,7 +1060,7 @@ export class TarnClient {
     this.#signingKeyPair = null;
     this.#recoveryFactorMeta = null;
     this.#recoveryLookupKey = null;
-    this.#email = null;
+    this.#username = null;
     this.#sharingKeyPair = null;
     this.#replayNonceCache = makeReplayNonceCache();
     this.#pairKeyCache.clear();
@@ -1444,7 +1446,7 @@ export class TarnClient {
   // ============ SHARING (issue #13) ============
 
   /**
-   * Look up a recipient's published X25519 sharing public key by email + this
+   * Look up a recipient's published X25519 sharing public key by username + this
    * client's app_id. Used by the connection-handshake bootstrap (Section 5 work)
    * to encrypt-to-pubkey before any pairwise shared secret has been
    * established.
@@ -1455,21 +1457,21 @@ export class TarnClient {
    *   - The recipient's account predates issue #13 and has not republished.
    *   - The recipient has set `share_discoverable=false`.
    *
-   * The lookup is unauthenticated and IP rate-limited at the API. Per-email
+   * The lookup is unauthenticated and IP rate-limited at the API. Per-username
    * leakage ("Alice queried Bob's share key") is an accepted residual leak
    * (sharing §11.5) — once the handshake completes, all subsequent traffic is
    * unlinkable.
    *
-   * @param {string} email
+   * @param {string} username
    * @returns {Promise<{
    *   sharePub: Uint8Array | null,
    *   sharePubBase64Url: string | null,
    *   discoverable: boolean,
    * }>}
    */
-  async getRecipientShareKey(email: string): Promise<any> {
-    if (!email) throw new Error('email is required');
-    const shareLookupKey = await deriveShareLookupKey(email, this.#appId);
+  async getRecipientShareKey(username: string): Promise<any> {
+    if (!username) throw new Error('username is required');
+    const shareLookupKey = await deriveShareLookupKey(username, this.#appId);
     const url = `/api/v1/share/lookup?app=${encodeURIComponent(this.#appId)}&key=${shareLookupKey}`;
     const res = await this.#fetch(url);
     if (res.status !== 200) {
@@ -1502,7 +1504,7 @@ export class TarnClient {
    *   1. Look up recipient's `share_pub` via `getRecipientShareKey`. If absent
    *      (pre-#13 account, or non-discoverable), fail with a recognizable
    *      error so the caller can surface "this person isn't connectable" UX.
-   *   2. Build the request payload (sender_email, sender_share_pub,
+   *   2. Build the request payload (sender_username, sender_share_pub,
    *      sender_signing_pub, sender_app_id, nonce, timestamp, optional message).
    *   3. HPKE_Seal to the recipient under info "tarn-connection-request-v1".
    *   4. Compute the recipient's current-window inbox tag.
@@ -1515,7 +1517,7 @@ export class TarnClient {
    * request from the recipient's standpoint; the protocol does not collapse
    * duplicates.
    *
-   * @param {string} recipientEmail
+   * @param {string} recipientUsername
    * @param {{ message?: string }} [opts]
    * @returns {Promise<{
    *   txid: string,                    // Arweave tx_id of the published request
@@ -1523,16 +1525,16 @@ export class TarnClient {
    *   recipientSharePubBase64Url: string,
    * }>}
    */
-  async sendConnectionRequest(recipientEmail: string, opts: any = {}): Promise<any> {
+  async sendConnectionRequest(recipientUsername: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
     if (!this.#sharingKeyPair) {
       throw new Error('sendConnectionRequest(): no sharing keypair — login first');
     }
-    if (!this.#email) {
-      throw new Error('sendConnectionRequest(): client missing sender email — re-login');
+    if (!this.#username) {
+      throw new Error('sendConnectionRequest(): client missing sender username — re-login');
     }
 
-    const { sharePub, sharePubBase64Url } = await this.getRecipientShareKey(recipientEmail);
+    const { sharePub, sharePubBase64Url } = await this.getRecipientShareKey(recipientUsername);
     if (!sharePub) {
       // Three causes are indistinguishable to the caller (sharing §11.5): the
       // recipient doesn't exist, the recipient's account predates #13, or the
@@ -1545,7 +1547,7 @@ export class TarnClient {
 
     const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const payload = buildConnectionRequestPayload({
-      senderEmail: this.#email!,
+      senderUsername: this.#username!,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -1584,7 +1586,7 @@ export class TarnClient {
     // hit the forged-accept defense and be dropped.)
     const pending = await this.#loadPendingRequestsRecord();
     const outbound = {
-      recipient_email: recipientEmail,
+      recipient_username: recipientUsername,
       recipient_share_pub: sharePubBase64Url,
       request_nonce: payload.nonce,
       sent_at: payload.timestamp,
@@ -1614,7 +1616,7 @@ export class TarnClient {
    *
    * @param {{ windows?: number }} [opts]
    * @returns {Promise<Array<{
-   *   senderEmail: string,
+   *   senderUsername: string,
    *   senderSharePubBase64Url: string,
    *   senderSigningPubBase64: string,
    *   senderAppId: string,
@@ -1697,7 +1699,7 @@ export class TarnClient {
           // Surface from existing record (so the caller sees a stable view)
           // but don't duplicate-write.
           surfaced.push({
-            senderEmail: validation.normalized.senderEmail,
+            senderUsername: validation.normalized.senderUsername,
             senderSharePubBase64Url: validation.normalized.senderSharePubBase64Url,
             senderSigningPubBase64: validation.normalized.senderSigningPubBase64,
             senderAppId: validation.normalized.senderAppId,
@@ -1713,7 +1715,7 @@ export class TarnClient {
         // Persist into inbound pending so the user can act on it later
         // (acceptConnectionRequest uses this list to find the matching request).
         pendingRecord = addInboundPending(pendingRecord, {
-          sender_email: validation.normalized.senderEmail,
+          sender_username: validation.normalized.senderUsername,
           sender_share_pub: validation.normalized.senderSharePubBase64Url,
           sender_signing_pub: validation.normalized.senderSigningPubBase64,
           sender_app_id: validation.normalized.senderAppId,
@@ -1725,7 +1727,7 @@ export class TarnClient {
         pendingDirty = true;
 
         surfaced.push({
-          senderEmail: validation.normalized.senderEmail,
+          senderUsername: validation.normalized.senderUsername,
           senderSharePubBase64Url: validation.normalized.senderSharePubBase64Url,
           senderSigningPubBase64: validation.normalized.senderSigningPubBase64,
           senderAppId: validation.normalized.senderAppId,
@@ -1830,7 +1832,7 @@ export class TarnClient {
 
     const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const payload = buildConnectionAcceptPayload({
-      senderEmail: this.#email!,
+      senderUsername: this.#username!,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -1864,7 +1866,7 @@ export class TarnClient {
     // connections-record upsertConnection is keyed on share_pub).
     const connectionsState = await this.#loadConnectionsRecord();
     const newConnection = {
-      email: inbound.sender_email,
+      username: inbound.sender_username,
       share_pub: inbound.sender_share_pub,
       signing_pub: inbound.sender_signing_pub,
       established_at: payload.timestamp,
@@ -1913,7 +1915,7 @@ export class TarnClient {
    * entries (pre-Section 8) that lack the field are surfaced with `label: null`.
    *
    * @returns {Promise<Array<{
-   *   email: string,
+   *   username: string,
    *   share_pub: string,
    *   signing_pub: string,
    *   established_at: number,
@@ -1924,10 +1926,14 @@ export class TarnClient {
   async listConnections() {
     await this.#requireAuth();
     const state = await this.#loadConnectionsRecord();
-    return state.record.connections.map((c: any) => ({
-      ...c,
-      label: c.label != null ? c.label : null,
-    }));
+    return state.record.connections.map((c: any) => {
+      const { email, ...rest } = c;
+      return {
+        ...rest,
+        username: rest.username ?? email,
+        label: rest.label != null ? rest.label : null,
+      };
+    });
   }
 
   /**
@@ -2087,8 +2093,8 @@ export class TarnClient {
     if (!this.#sharingKeyPair) {
       throw new Error('createInviteToken(): no sharing keypair — login first');
     }
-    if (!this.#email) {
-      throw new Error('createInviteToken(): client missing sender email — re-login');
+    if (!this.#username) {
+      throw new Error('createInviteToken(): client missing sender username — re-login');
     }
     // Local-only label: stored in the inviter's issued-invites record so
     // listIssuedInvites + the auto-accept path can label the resulting
@@ -2257,8 +2263,8 @@ export class TarnClient {
     if (!this.#sharingKeyPair) {
       throw new Error('redeemInviteToken(): no sharing keypair — login first');
     }
-    if (!this.#email) {
-      throw new Error('redeemInviteToken(): client missing sender email — re-login');
+    if (!this.#username) {
+      throw new Error('redeemInviteToken(): client missing sender username — re-login');
     }
     if (typeof tokenId !== 'string' || tokenId.length === 0) {
       throw new Error('redeemInviteToken(): tokenId is required');
@@ -2312,11 +2318,11 @@ export class TarnClient {
     // Build + send the connection-request HPKE-sealed back to the inviter.
     // Same primitives as sendConnectionRequest, but addressed by the
     // inviter's share_pub from the decrypted payload (we never knew their
-    // email) and tagged with via_invite_token so the inviter's auto-accept
+    // username) and tagged with via_invite_token so the inviter's auto-accept
     // path matches it.
     const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
     const reqPayload = buildConnectionRequestPayload({
-      senderEmail: this.#email!,
+      senderUsername: this.#username!,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -2346,7 +2352,7 @@ export class TarnClient {
     const pending = await this.#loadPendingRequestsRecord();
     const inviterSharePubBase64Url = plaintext.inviter_share_pub;
     const outbound = {
-      recipient_email: '',
+      recipient_username: '',
       recipient_share_pub: inviterSharePubBase64Url,
       request_nonce: reqPayload.nonce,
       sent_at: reqPayload.timestamp,
@@ -3777,7 +3783,7 @@ export class TarnClient {
         }
 
         const newConnection = {
-          email: v.normalized.senderEmail,
+          username: v.normalized.senderUsername,
           share_pub: v.normalized.senderSharePubBase64Url,
           signing_pub: v.normalized.senderSigningPubBase64,
           established_at: v.normalized.timestamp,
@@ -3806,7 +3812,7 @@ export class TarnClient {
           await this._publishInitialSnapshot(newConnection);
         } catch (err: any) {
           console.warn(
-            `[TarnClient] processing accept from ${v.normalized.senderEmail}: initial snapshot publish failed: ${err.message}`,
+            `[TarnClient] processing accept from ${v.normalized.senderUsername}: initial snapshot publish failed: ${err.message}`,
           );
         }
       }
@@ -4015,7 +4021,7 @@ export class TarnClient {
       expiresAt,
       apiBase: this.#apiBase,
       appId: this.#appId,
-      email: this.#email,
+      username: this.#username,
       dataLookupKey: this.#dataLookupKey,
       credentialLookupKey: this.#credentialLookupKey,
       currentGen: this.#currentGen,
@@ -4093,7 +4099,7 @@ export class TarnClient {
       if (payload.appId !== appId) return null;
 
       const required = [
-        'createdAt', 'expiresAt', 'email', 'dataLookupKey', 'credentialLookupKey',
+        'createdAt', 'expiresAt', 'username', 'dataLookupKey', 'credentialLookupKey',
         'currentGen', 'dekByGen',
         'signingPrivateKey', 'signingPublicKey', 'sharingPrivateKey', 'sharingPublicKey',
       ];
@@ -4162,7 +4168,7 @@ export class TarnClient {
       client.#signingKeyPair = { privateKey: signingPrivateKey, publicKey: signingPublicKey };
       client.#dekByGen = dekByGen;
       client.#currentGen = payload.currentGen;
-      client.#email = payload.email;
+      client.#username = payload.username;
       client.#sharingKeyPair = {
         privateKey: base64ToBytes(payload.sharingPrivateKey),
         publicKey: base64ToBytes(payload.sharingPublicKey),

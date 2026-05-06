@@ -2,7 +2,7 @@
 
 App-facing SDK for [Tarn](https://github.com/brianmb99/tarn) — permanent, encrypted, user-owned data on Arweave.
 
-The SDK is schema-first: you declare collections and fields up front, and the client gives you typed CRUD per collection plus typed namespaces for connections, sharing, recovery, account management, and sessions. Apps never touch Arweave txids, content-encryption keys, share-log seq numbers, or HPKE handshakes — those stay inside the SDK.
+The SDK is schema-first: you declare collections and fields up front, and the client gives you typed CRUD per collection plus typed namespaces for connections, sharing, the account key, account management, and sessions. Apps never touch Arweave txids, content-encryption keys, share-log seq numbers, or HPKE handshakes — those stay inside the SDK.
 
 Ships full TypeScript declarations. Works in browsers and Node.js 18+.
 
@@ -38,6 +38,8 @@ const tarn = await TarnClient.create({
 });
 
 await tarn.register('me@example.com', 'p@ssw0rd', { recoveryAcknowledged: true });
+// The first argument is the username (any UTF-8 string the app chooses — many
+// apps populate it with an email address; Tarn does not require email format).
 
 await tarn.notes.create({ noteId: 'n1', title: 'Hello, Tarn' });
 console.log(await tarn.notes.list());
@@ -108,10 +110,17 @@ Three rules cover the common cases:
 | **Tighten an enum** (drop a value) | **no** | Older records carrying the dropped value fail. Don't drop; deprecate. |
 | **Loosen an enum** (add a value) | yes | Older records still satisfy the union. |
 
-**Migration pattern.** Tarn doesn't ship a `migrate()` helper — apps write their own walk because the right semantics (one-shot vs. lazy, error handling, partial-failure recovery) are app-specific. The pattern is straightforward:
+**Migration pattern.** Tarn doesn't ship a `migrate()` helper — apps write their own walk because the right semantics (one-shot vs. lazy, error handling, partial-failure recovery) are app-specific.
+
+**Cost matters.** Every `update()` is a new permanent Arweave entry, paid via Turbo from the app's funder. Records aren't mutated in place — chained entries append a new version each time, and old versions stay on Arweave forever. A one-shot migration of N records on K users is N×K permanent paid writes. Small entries currently fall under Turbo's free tier, but that's pricing policy, not a guarantee.
+
+**Prefer schema changes that don't require migration.** The first three rows of the table above — additive optional fields, additive required fields with defaults, loosened enums — cost zero writes. Reach for them first. Deprecate fields instead of removing them. Loosen enums instead of tightening. Most schema evolution can be designed to avoid migration entirely if you plan additively from the start.
+
+**When migration is unavoidable**, the pattern is straightforward:
 
 ```js
 // One-shot migration: read all, transform, re-write under the new schema.
+// Each update is a new permanent Arweave entry — budget accordingly.
 const all = await tarn.notes.list();
 for (const note of all) {
   if (note.body == null) {
@@ -159,7 +168,7 @@ const friends = await tarn.connections.list();
 // Share one record with one friend.
 await tarn.notes.share(friends[0], 'n1');
 
-// Share with everyone (skips muted connections). Returns counts and per-conn failures.
+// Share with all connections (skips muted). Returns counts and per-conn failures.
 const result = await tarn.notes.shareWithAll('n1');
 // { ok: 3, failed: [{ connection, error }] }
 
@@ -179,7 +188,7 @@ Calling `share()` on a non-`shareable` collection throws — the schema is the g
 `tarn.connections.*` covers the full lifecycle of friend connections.
 
 ```js
-// Email-based handshake (requires recipient to be a discoverable Tarn user).
+// Username-based handshake (requires recipient to be a discoverable Tarn user).
 await tarn.connections.invite('alice@example.com');
 
 // Recipient lists incoming requests via the advanced surface, then accepts:
@@ -204,7 +213,7 @@ await tarn.connections.remove(conns[0]);
 
 ### Invite tokens — link / QR flow
 
-For consumer apps where the inviter doesn't know the recipient's email (or the recipient isn't a Tarn user yet):
+For consumer apps where the inviter doesn't know the recipient's username (or the recipient isn't a Tarn user yet):
 
 ```js
 // Inviter — generate a single-use, time-limited link.
@@ -229,47 +238,52 @@ The URL fragment (`#`) is never transmitted to the API — the payload key stays
 
 ---
 
-## Recovery
+## Account key
 
-Tarn issues every account a 24-word BIP39 recovery phrase at signup. The phrase is a parallel access path to the user's data — independent of the password. Apps **must** surface the phrase to the user during registration; passing `recoveryAcknowledged: true` is the SDK's way of forcing the conversation.
+Tarn issues every account a 24-word BIP39 account key at signup. The account key is a parallel access path to the user's data — independent of the password. Apps **must** surface the account key to the user during registration; passing `recoveryAcknowledged: true` is the SDK's way of forcing the conversation.
 
 ```js
 const reg = await tarn.register('me@example.com', 'p@ssw0rd', {
+  // First arg is the username. See "Authentication and the username field" below.
   recoveryAcknowledged: true,
   appName: 'My App',              // PDF branding
 });
-// reg.recoveryPhrase   — 24-word string
+// reg.accountKey       — 24-word string
 // reg.pdfBytes         — Uint8Array of the rendered PDF
 // Hand both to the user immediately. Do NOT persist either.
 
-// Re-render the kit later for the same phrase. Pure client-side; no auth
-// required. The caller must supply the phrase — Tarn never persists it.
-const pdfBytes = await tarn.recovery.export({ format: 'pdf', phrase });
+// Re-render the kit later for the same account key. Pure client-side; no auth
+// required. The caller must supply the account key — Tarn never persists it.
+const pdfBytes = await tarn.accountKey.export({ format: 'pdf', phrase });
 // or: structured JSON for apps rendering their own format.
-const json = await tarn.recovery.export({ format: 'json', phrase });
+const json = await tarn.accountKey.export({ format: 'json', phrase });
 // json: { phrase, appName, generatedAt }
 ```
 
-**Delivery is the app's job.** Tarn renders the kit entirely on the client and never sees the phrase or the PDF — there is no Tarn endpoint that handles plaintext recovery material, even ephemerally. Apps decide how to surface the bytes: a download is the recommended default (universally available, no third party); print and app-operated email are also fine. If the application wants to email the kit, it must operate the forwarder itself — Tarn will not host one, since routing recovery material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
+**Delivery is the app's job.** Tarn renders the kit entirely on the client and never sees the account key or the PDF — there is no Tarn endpoint that handles plaintext account-key material, even ephemerally. Apps decide how to surface the bytes: a download is the recommended default (universally available, no third party); print and app-operated email are also fine. If the application wants to email the kit, it must operate the forwarder itself — Tarn will not host one, since routing account-key material through Tarn-operated infrastructure would weaken the zero-knowledge guarantee that applies to everything else in the protocol.
 
-Recovery itself goes through the top-level `tarn.recoverAccount()` (auth lifecycle):
+Account recovery itself goes through the top-level `tarn.recoverAccount()` (auth lifecycle):
 
 ```js
 await tarn.recoverAccount({
   phrase:      '24 words ...',
-  newEmail:    'me@example.com',
+  newUsername: 'me@example.com',
   newPassword: 'fresh-password',
 });
-// All pre-recovery data is decryptable under the new credentials.
+// New credentials re-wrap the existing data keys; all pre-recovery data is decryptable.
 ```
+
+### Authentication and the username field
+
+Tarn does not validate the username's format. It's a UTF-8 string used as a KDF salt input (after `trim().toLowerCase()` normalization) and as a public user-lookup key for connection bootstrap. Apps choose whether to enforce email-shape, handle-shape, phone-shape, or anything else; the SDK neutrally calls the parameter `username`. Many apps will populate it with an email address — that's fine and expected — but Tarn does not require this.
 
 ---
 
 ## Account + Session
 
 ```js
-// Rotate credentials (routine email/password change). Existing data stays decryptable.
-// Pass phrase to extend the recovery factor to the new generation.
+// Rotate credentials (routine username/password change). Existing data stays decryptable.
+// Pass the account key to extend the recovery factor to the new generation.
 await tarn.account.changeCredentials('new@example.com', 'new-password', { phrase });
 
 // Permanently delete. Tombstones credentials, clears server-side state, wipes local session.
@@ -288,7 +302,7 @@ await tarn.session.revokeAllOthers();              // "log out everywhere else"
 await tarn.session.revokeAll();                    // log out everywhere including here
 ```
 
-Apps can attach a device label at login time — `tarn.login(email, password, { deviceLabel: 'Chrome on MacBook' })` — which surfaces in `listDevices()`.
+Apps **should** attach a device label at login time — `tarn.login(username, password, { deviceLabel: 'Chrome on MacBook' })` — so users can identify their sessions in `listDevices()`. If omitted, `deviceLabel` is `null` and users only see the opaque `sid` and timestamps. Pick something the user will recognize: a User-Agent summary, a hostname, or a name the user typed at signup.
 
 ---
 
@@ -387,7 +401,7 @@ Four progressive examples live in [`../examples/`](../examples/):
 - `01-hello-world` — register, write one record, list it.
 - `02-crud` — full CRUD on two collections.
 - `03-sharing` — invite-token handshake + share-with-all flow.
-- `04-recovery` — register, export PDF, simulate password loss + recoverAccount.
+- `04-recovery` — register, export the account-key PDF, simulate password loss + recoverAccount.
 
 Each example is a standalone npm package linking to this client via `file:../../client`. See `examples/README.md` for setup.
 
@@ -420,7 +434,7 @@ Plain JavaScript works too — the inference simply doesn't run. The runtime val
 - **Argon2id KDF.** Memory-hard (m=64 MiB, t=3, p=1) for password→master-key. Sub-keys derived via HKDF-Expand.
 - **ECDSA P-256 auth.** Challenge-response signing. No passwords transmitted; server stores only the public key.
 - **Per-content CEK + forward-secret DEK rotation.** Each blob is encrypted with its own random CEK, wrapped under a generation-indexed DEK chain. Credential changes append a fresh DEK so post-rotation writes are unreachable from old credentials.
-- **Multi-factor DEK chain.** Each chain entry is wrapped twice — once under a password-derived KEK, once under a phrase-derived KEK. Either factor independently unwraps the chain.
+- **Multi-factor DEK chain.** Each chain entry is wrapped twice — once under a password-derived KEK, once under an account-key-derived KEK. Either factor independently unwraps the chain.
 - **Arweave permanence.** Data is stored permanently on Arweave. Encrypted blobs are publicly visible but unreadable without the key.
 
 ### Publicly observable metadata
@@ -428,7 +442,7 @@ Plain JavaScript works too — the inference simply doesn't run. The runtime val
 Tarn protects content end-to-end, but a few metadata properties remain visible:
 
 - **Connection-request inbox volume + timing** is observable to anyone who knows a user's `share_pub`. Casual social use is fine; sensitive contexts should consider `share_discoverable: false`.
-- **Account existence via discoverability lookup** — a `share_discoverable: true` account leaks "this email is a Tarn user" to anyone who runs the lookup.
+- **Account existence via discoverability lookup** — a `share_discoverable: true` account leaks "this username is a Tarn user" to anyone who runs the lookup.
 - **Once connected, share-log traffic is unlinkable** — per-pair tags are stealth-addressed; an Arweave observer cannot extract the connection graph from the protocol alone.
 
 See [TARN_PROTOCOL.md § Publicly observable metadata](../docs/TARN_PROTOCOL.md#publicly-observable-metadata) for the full breakdown, and [TARN_PROTOCOL.md](../docs/TARN_PROTOCOL.md) for the wire-protocol spec.

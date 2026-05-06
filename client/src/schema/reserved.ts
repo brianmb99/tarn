@@ -3,7 +3,7 @@
  *
  * Apps cannot declare collections with these names — they identify entry types
  * managed by SDK primitives (`tarn.connections.*`, `tarn.account.*`,
- * `tarn.recovery.*`, etc.) and the protocol layer beneath them. Collisions
+ * `tarn.accountKey.*`, etc.) and the protocol layer beneath them. Collisions
  * would let app data shadow Tarn-internal records.
  *
  * If a future SDK feature claims a new reserved type, add the name here AND

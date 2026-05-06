@@ -69,7 +69,7 @@ function bs(b: ArrayBufferView | ArrayBuffer): BufferSource {
 
 // Wrapping factors. Each entry in a dek_chain is wrapped under one or more
 // factors; any factor's KEK independently unwraps the DEK.
-//   PASSWORD        — derived from email+password via deriveCredentialEncryptionKey
+//   PASSWORD        — derived from username+password via deriveCredentialEncryptionKey
 //   RECOVERY_PHRASE — derived from BIP39 phrase via deriveRecoveryKey
 export const FACTOR_PASSWORD = 'password' as const;
 export const FACTOR_RECOVERY_PHRASE = 'recovery_phrase' as const;
@@ -169,11 +169,14 @@ export type RecoveryMetadata = {
   salt: Uint8Array;
 };
 
-// ============ EMAIL NORMALIZATION ============
+// ============ USERNAME NORMALIZATION ============
 
-export function normalizeEmail(email: string): string {
-  if (!email || typeof email !== 'string') throw new Error('Email is required');
-  return email.trim().toLowerCase();
+// Tarn does not require usernames to be email-formatted. The string is used as
+// a KDF salt input and a connection-lookup key — apps choose whether to enforce
+// any format (email, handle, phone, etc.) at their own layer.
+export function normalizeUsername(username: string): string {
+  if (!username || typeof username !== 'string') throw new Error('Username is required');
+  return username.trim().toLowerCase();
 }
 
 // ============ HKDF-EXPAND (RFC 5869) ============
@@ -213,23 +216,23 @@ async function hkdfExpand(
 // ============ KEY DERIVATION ============
 
 /**
- * Derive master_key from email + password via Argon2id.
+ * Derive master_key from username + password via Argon2id.
  *
  * The master_key is app-independent — app isolation happens in sub-key
- * derivation. Salt = SHA-256(normalizedEmail) so an account's salt is
+ * derivation. Salt = SHA-256(normalizedUsername) so an account's salt is
  * deterministic from its identifier.
  */
 export async function deriveMasterKey(
-  email: string,
+  username: string,
   password: string,
 ): Promise<Uint8Array> {
-  if (!email || !password) throw new Error('Email and password are required');
+  if (!username || !password) throw new Error('Username and password are required');
 
-  const normalizedEmail = normalizeEmail(email);
+  const normalizedUsername = normalizeUsername(username);
   const encoder = new TextEncoder();
 
   const salt = new Uint8Array(
-    await crypto.subtle.digest('SHA-256', bs(encoder.encode(normalizedEmail))),
+    await crypto.subtle.digest('SHA-256', bs(encoder.encode(normalizedUsername))),
   );
 
   const out = await argon2idHash({
@@ -322,7 +325,7 @@ export async function deriveRecoveryLookupKey(phraseEntropy: Uint8Array, appId: 
  * Derive the recovery ECDSA P-256 signing key pair from phrase entropy for a
  * specific app (issue #12). The public key is published in the credential
  * blob; the private key signs the recovery-flow challenge nonce so the API
- * can verify the user holds the recovery phrase before issuing a JWT.
+ * can verify the user holds the account key before issuing a JWT.
  *
  * Mirrors {@link deriveSigningKeyPair}'s P-256 scalar validation + retry
  * (probability ~2^-128 of needing the second counter byte).
@@ -430,30 +433,30 @@ export async function exportPublicKey(publicKey: CryptoKey): Promise<Base64> {
 // ============ SHARING KEYPAIR (issue #13) ============
 
 /**
- * Derive an email-only `share_lookup_key` for the connection-handshake bootstrap
+ * Derive a username-only `share_lookup_key` for the connection-handshake bootstrap
  * (issue #13). This is the index Tarn uses to find a recipient's `share_pub`
- * when the requester knows only the recipient's email + app — i.e., before any
+ * when the requester knows only the recipient's username + app — i.e., before any
  * handshake has happened, when no shared secret exists yet.
  *
  * Derivation does NOT use master_key — it uses the SHA-256 of the normalized
- * email (already the salt for `master_key`) as the HKDF PRK. Anyone who knows
- * the recipient's email can compute this value and check whether the recipient
- * is registered. That's the inherent semantics of "look up Bob by email" and
+ * username (already the salt for `master_key`) as the HKDF PRK. Anyone who knows
+ * the recipient's username can compute this value and check whether the recipient
+ * is registered. That's the inherent semantics of "look up Bob by username" and
  * is documented as an accepted residual leak (sharing §11.5).
  *
  * Per-app isolated via the same HKDF info pattern as every other sub-key, so
- * the same email registered to Bookish and Cellar produces distinct lookup
+ * the same username registered to two different apps produces distinct lookup
  * keys.
  */
-export async function deriveShareLookupKey(email: string, appId: string): Promise<LookupKey> {
-  if (!email) throw new Error('email is required');
+export async function deriveShareLookupKey(username: string, appId: string): Promise<LookupKey> {
+  if (!username) throw new Error('username is required');
   if (!appId) throw new Error('appId is required');
-  const normalized = normalizeEmail(email);
+  const normalized = normalizeUsername(username);
   const encoder = new TextEncoder();
-  const emailHash = new Uint8Array(
+  const usernameHash = new Uint8Array(
     await crypto.subtle.digest('SHA-256', bs(encoder.encode(normalized))),
   );
-  const out = await hkdfExpand(emailHash, 'share-lookup', appId);
+  const out = await hkdfExpand(usernameHash, 'share-lookup', appId);
   return asLookupKey(bytesToHex(out));
 }
 
@@ -462,8 +465,8 @@ export async function deriveShareLookupKey(email: string, appId: string): Promis
  *
  * The seed is HKDF-Expand(master_key, "tarn"||"share"||app_id||"1"||0x01) —
  * same single-block info pattern as the existing `lookup`/`encrypt`/`sign`
- * sub-keys. Per-app isolation is preserved: the same email+password registered
- * to Bookish vs. Cellar produces distinct sharing keypairs.
+ * sub-keys. Per-app isolation is preserved: the same username+password registered
+ * to two different apps produces distinct sharing keypairs.
  */
 export async function deriveSharingKeyPair(masterKey: Uint8Array, appId: string): Promise<SharingKeyPair> {
   if (!appId) throw new Error('appId is required');
@@ -1043,20 +1046,20 @@ export type AllKeys = {
 };
 
 /**
- * Derive all keys from email + password + app in one call.
+ * Derive all keys from username + password + app in one call.
  *
  * Derives the sharing keypair too so callers that need to publish a
  * `share_pub` (register, changeCredentials) get it without an extra HKDF
  * call. All keys are per-app — different `app_id` values produce
- * completely independent identities for the same email+password.
+ * completely independent identities for the same username+password.
  */
 export async function deriveAllKeys(
-  email: string,
+  username: string,
   password: string,
   appId: string,
 ): Promise<AllKeys> {
   if (!appId) throw new Error('appId is required');
-  const masterKey = await deriveMasterKey(email, password);
+  const masterKey = await deriveMasterKey(username, password);
   const [credentialLookupKey, credentialEncryptionKey, signingKeyPair, sharingKeyPair] = await Promise.all([
     deriveCredentialLookupKey(masterKey, appId),
     deriveCredentialEncryptionKey(masterKey, appId),

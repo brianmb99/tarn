@@ -58,7 +58,7 @@ function assert(condition, message) {
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-const testEmail = `deploy-test-${Date.now()}@test.com`;
+const testUsername = `deploy-test-${Date.now()}@test.com`;
 const testPassword = 'deploy-test-pass-' + Date.now();
 let testDlk;
 
@@ -82,7 +82,7 @@ console.log('\n=== 2. Registration ===');
 
 await test('Register new user', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  const { dataLookupKey } = await tarn.register(testEmail, testPassword, { recoveryAcknowledged: true });
+  const { dataLookupKey } = await tarn.register(testUsername, testPassword, { recoveryAcknowledged: true });
   assert(dataLookupKey, 'No dataLookupKey');
   assert(dataLookupKey.length === 64, 'Bad dataLookupKey length');
   assert(tarn.isAuthenticated, 'Not authenticated');
@@ -149,7 +149,7 @@ console.log('\n=== 4. Login ===');
 
 await test('Login on "another device"', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  const { dataLookupKey } = await tarn.login(testEmail, testPassword);
+  const { dataLookupKey } = await tarn.login(testUsername, testPassword);
   assert(dataLookupKey === testDlk, 'DLK mismatch');
   assert(tarn.isAuthenticated, 'Not authenticated');
 });
@@ -162,7 +162,7 @@ let entryTxid;
 
 await test('Create entry', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
   const { txid } = await tarn.createEntry('entry', {
     title: 'Deployment Test',
     author: 'Tarn CI',
@@ -178,7 +178,7 @@ await test('Idempotent write: retry with same X-Idempotency-Key returns same txi
   // assert the second returns the txid from the first — the server short-
   // circuits on the cached response instead of signing a new DataItem.
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
 
   // Server doesn't decrypt the body, it just signs + caches. Any bytes work.
   const payload = new TextEncoder().encode(JSON.stringify({ _: 'idempotency-test', t: Date.now() }));
@@ -236,7 +236,7 @@ console.log('\n=== 5b. Session Persistence ===');
 
 await test('serializeSession + resumeSession round-trips against deployed API', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
 
   const blob = await tarn.serializeSession();
   assert(typeof blob === 'string' && blob.length > 0, 'serializeSession returned non-empty string');
@@ -254,7 +254,7 @@ await test('serializeSession + resumeSession round-trips against deployed API', 
 
 await test('resumeSession returns null on tampered blob', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
   const blob = await tarn.serializeSession();
   const idx = Math.floor(blob.length / 2);
   const flip = blob[idx] === 'A' ? 'B' : 'A';
@@ -269,7 +269,7 @@ console.log('\n=== 5c. Session Management ===');
 
 await test('listSessions returns at least one session, marked isCurrent', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
   const sessions = await tarn.listSessions();
   assert(Array.isArray(sessions), 'listSessions returns an array');
   assert(sessions.length >= 1, `expected ≥1 session, got ${sessions.length}`);
@@ -279,10 +279,10 @@ await test('listSessions returns at least one session, marked isCurrent', async 
 await test('revokeOtherSessions preserves the calling session', async () => {
   // Login as a "second device" so we have something to revoke.
   const peer = new TarnClient(API_BASE, APP_ID);
-  await peer.login(testEmail, testPassword);
+  await peer.login(testUsername, testPassword);
 
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
 
   await tarn.revokeOtherSessions();
   const after = await tarn.listSessions();
@@ -296,10 +296,10 @@ console.log('\n=== 6. Status ===');
 
 await test('Status endpoint returns operational data', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
 
   // Use raw fetch since TarnClient doesn't expose status
-  const keys = await deriveAllKeys(testEmail, testPassword, APP_ID);
+  const keys = await deriveAllKeys(testUsername, testPassword, APP_ID);
   const cRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -331,20 +331,20 @@ console.log('\n=== 7. Sharing keypair lookup ===');
 
 await test('getRecipientShareKey returns the published share_pub', async () => {
   const expected = encodeSharePub(
-    (await deriveAllKeys(testEmail, testPassword, APP_ID)).sharingKeyPair.publicKey,
+    (await deriveAllKeys(testUsername, testPassword, APP_ID)).sharingKeyPair.publicKey,
   );
   const stranger = new TarnClient(API_BASE, APP_ID);
-  const { sharePubBase64Url, discoverable, sharePub } = await stranger.getRecipientShareKey(testEmail);
+  const { sharePubBase64Url, discoverable, sharePub } = await stranger.getRecipientShareKey(testUsername);
   assert(discoverable === true, `expected discoverable=true, got ${discoverable}`);
   assert(sharePubBase64Url === expected, `share_pub mismatch:\n  got:  ${sharePubBase64Url}\n  want: ${expected}`);
   assert(sharePub instanceof Uint8Array && sharePub.length === 32, 'sharePub should decode to 32 raw bytes');
 });
 
-await test('getRecipientShareKey for unknown email returns null + discoverable=false', async () => {
+await test('getRecipientShareKey for unknown username returns null + discoverable=false', async () => {
   const stranger = new TarnClient(API_BASE, APP_ID);
   const { sharePub, discoverable } = await stranger.getRecipientShareKey(`nobody-${Date.now()}@nowhere.test`);
-  assert(sharePub === null, 'unknown email should return null sharePub');
-  assert(discoverable === false, 'unknown email should be opaque');
+  assert(sharePub === null, 'unknown username should return null sharePub');
+  assert(discoverable === false, 'unknown username should be opaque');
 });
 
 await test('share_lookup_key is per-app isolated (cross-app probe misses)', async () => {
@@ -352,7 +352,7 @@ await test('share_lookup_key is per-app isolated (cross-app probe misses)', asyn
   // API, so this lookup will miss for two reasons — different app + different
   // share_lookup_key — both consistent with the design).
   const wrongApp = new TarnClient(API_BASE, 'definitely-not-a-real-app');
-  const { sharePub, discoverable } = await wrongApp.getRecipientShareKey(testEmail);
+  const { sharePub, discoverable } = await wrongApp.getRecipientShareKey(testUsername);
   assert(sharePub === null, 'cross-app lookup should miss');
   assert(discoverable === false, 'cross-app lookup should be opaque');
 });
@@ -363,10 +363,10 @@ console.log('\n=== 8. Connection handshake (HPKE inbox) ===');
 
 let handshakeAlice;
 let handshakeBob;
-let handshakeAliceEmail;
+let handshakeAliceUsername;
 let handshakeAliceDlk;
 let handshakeAlicePassword;
-let handshakeBobEmail;
+let handshakeBobUsername;
 let handshakeBobDlk;
 let handshakeRequestNonce;
 
@@ -378,15 +378,15 @@ await test('Two test users register + complete a mutual handshake against the de
   // test would fail; the smoke-test rule set is `max_entries: 5, app:
   // bookish` and we use 2 entries per user (connections + pending), so we have
   // headroom.
-  handshakeAliceEmail = `deploy-handshake-a-${Date.now()}@test.com`;
-  handshakeBobEmail = `deploy-handshake-b-${Date.now()}@test.com`;
+  handshakeAliceUsername = `deploy-handshake-a-${Date.now()}@test.com`;
+  handshakeBobUsername = `deploy-handshake-b-${Date.now()}@test.com`;
   const password = 'handshake-test-' + Date.now();
   handshakeAlicePassword = password;
 
   handshakeAlice = new TarnClient(API_BASE, APP_ID);
   handshakeBob = new TarnClient(API_BASE, APP_ID);
-  const a = await handshakeAlice.register(handshakeAliceEmail, password, { recoveryAcknowledged: true });
-  const b = await handshakeBob.register(handshakeBobEmail, password, { recoveryAcknowledged: true });
+  const a = await handshakeAlice.register(handshakeAliceUsername, password, { recoveryAcknowledged: true });
+  const b = await handshakeBob.register(handshakeBobUsername, password, { recoveryAcknowledged: true });
   handshakeAliceDlk = a.dataLookupKey;
   handshakeBobDlk = b.dataLookupKey;
 
@@ -421,7 +421,7 @@ await test('Two test users register + complete a mutual handshake against the de
   }
 
   // Alice → Bob connection request.
-  const send = await handshakeAlice.sendConnectionRequest(handshakeBobEmail, { message: 'hi from deployed test' });
+  const send = await handshakeAlice.sendConnectionRequest(handshakeBobUsername, { message: 'hi from deployed test' });
   assert(send.requestNonce, 'no requestNonce');
   handshakeRequestNonce = send.requestNonce;
 
@@ -434,13 +434,13 @@ await test('Two test users register + complete a mutual handshake against the de
   // Bob accepts.
   await handshakeBob.acceptConnectionRequest(handshakeRequestNonce);
   const bobConnections = await handshakeBob.listConnections();
-  assert(bobConnections.some(f => f.email === handshakeAliceEmail), 'Alice not in Bob\'s connections');
+  assert(bobConnections.some(f => f.username === handshakeAliceUsername), 'Alice not in Bob\'s connections');
 
   // Alice processes the accept.
   await sleep(500);
   await handshakeAlice.listIncomingRequests();
   const aliceConnections = await handshakeAlice.listConnections();
-  assert(aliceConnections.some(f => f.email === handshakeBobEmail), 'Bob not in Alice\'s connections');
+  assert(aliceConnections.some(f => f.username === handshakeBobUsername), 'Bob not in Alice\'s connections');
 });
 
 // ============ 9. SHARE LOG (issue #15, Section 5b) ============
@@ -453,8 +453,8 @@ await test('Connections from §8 can publish + fetch share log entries with veri
   // handshake-acceptance flow.
   const aliceConnections = await handshakeAlice.listConnections();
   const bobConnections = await handshakeBob.listConnections();
-  const bobConnectionOfAlice = aliceConnections.find(f => f.email === handshakeBobEmail);
-  const aliceConnectionOfBob = bobConnections.find(f => f.email === handshakeAliceEmail);
+  const bobConnectionOfAlice = aliceConnections.find(f => f.username === handshakeBobUsername);
+  const aliceConnectionOfBob = bobConnections.find(f => f.username === handshakeAliceUsername);
   assert(bobConnectionOfAlice, 'Bob missing from Alice\'s connections');
   assert(aliceConnectionOfBob, 'Alice missing from Bob\'s connections');
 
@@ -522,8 +522,8 @@ await test('readShareLog: Bob bootstraps Alice\'s log, sees content shared by Al
   // Re-resolve connection records (handshakeAlice/Bob persist from §8/§9).
   const aliceConnections = await handshakeAlice.listConnections();
   const bobConnections = await handshakeBob.listConnections();
-  const bobConnectionOfAlice = aliceConnections.find(f => f.email === handshakeBobEmail);
-  const aliceConnectionOfBob = bobConnections.find(f => f.email === handshakeAliceEmail);
+  const bobConnectionOfAlice = aliceConnections.find(f => f.username === handshakeBobUsername);
+  const aliceConnectionOfBob = bobConnections.find(f => f.username === handshakeAliceUsername);
   assert(bobConnectionOfAlice && aliceConnectionOfBob, 'connection records missing');
 
   const cek1 = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
@@ -543,8 +543,8 @@ await test('readShareLog: Bob bootstraps Alice\'s log, sees content shared by Al
 await test('syncShareLog: incremental update + remove flows through to Bob', async () => {
   const aliceConnections = await handshakeAlice.listConnections();
   const bobConnections = await handshakeBob.listConnections();
-  const bobConnectionOfAlice = aliceConnections.find(f => f.email === handshakeBobEmail);
-  const aliceConnectionOfBob = bobConnections.find(f => f.email === handshakeAliceEmail);
+  const bobConnectionOfAlice = aliceConnections.find(f => f.username === handshakeBobUsername);
+  const aliceConnectionOfBob = bobConnections.find(f => f.username === handshakeAliceUsername);
 
   await handshakeAlice.updateShareContent(bobConnectionOfAlice, 'deploy-5c-A', 'tx-5c-A-v2');
   await handshakeAlice.unshareContent(bobConnectionOfAlice, 'deploy-5c-B');
@@ -599,9 +599,9 @@ console.log('\n=== 9c. Revocation + identity rotation (Section 5d) ===');
 //      Pat's NEW share_pub + signing_pub; subsequent shares from Pat under
 //      the NEW pair keys reach Quinn.
 
-const patEmail = `tarn-pat-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
+const patUsername = `tarn-pat-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
 const patPassword = 'pat-pw-' + Date.now();
-const quinnEmail = `tarn-quinn-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
+const quinnUsername = `tarn-quinn-${Date.now()}-${Math.random().toString(36).slice(2)}@test.com`;
 const quinnPassword = 'quinn-pw-' + Date.now();
 
 let pat, quinn;
@@ -612,11 +612,11 @@ let patSharePubBeforeRotate;
 await test('Pat + Quinn register + handshake against deployed API', async () => {
   pat = new TarnClient(API_BASE, APP_ID);
   quinn = new TarnClient(API_BASE, APP_ID);
-  const patReg = await pat.register(patEmail, patPassword, {
+  const patReg = await pat.register(patUsername, patPassword, {
     recoveryAcknowledged: true,
   });
-  patPhrase = patReg.recoveryPhrase;
-  const quinnReg = await quinn.register(quinnEmail, quinnPassword, {
+  patPhrase = patReg.accountKey;
+  const quinnReg = await quinn.register(quinnUsername, quinnPassword, {
     recoveryAcknowledged: true,
   });
 
@@ -651,14 +651,14 @@ await test('Pat + Quinn register + handshake against deployed API', async () => 
     assert(r.status === 200, `Set rules failed for ${dlk}: ${r.status}`);
   }
 
-  const send = await pat.sendConnectionRequest(quinnEmail);
+  const send = await pat.sendConnectionRequest(quinnUsername);
   await sleep(500);
   await quinn.listIncomingRequests();
   await quinn.acceptConnectionRequest(send.requestNonce);
   await sleep(500);
   await pat.listIncomingRequests();
-  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.email === quinnEmail);
-  patConnectionOfQuinn = (await quinn.listConnections()).find(f => f.email === patEmail);
+  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.username === quinnUsername);
+  patConnectionOfQuinn = (await quinn.listConnections()).find(f => f.username === patUsername);
   assert(quinnConnectionOfPat, 'Pat missing Quinn after handshake');
   assert(patConnectionOfQuinn, 'Quinn missing Pat after handshake');
   patSharePubBeforeRotate = patConnectionOfQuinn.share_pub;
@@ -674,8 +674,8 @@ await test('Pat shares a content item with Quinn', async () => {
 });
 
 await test('Pat changes credentials → publishes rotate_identity to Quinn (deployed API)', async () => {
-  const newEmail = `tarn-pat-rotated-${Date.now()}@test.com`;
-  const result = await pat.changeCredentials(newEmail, 'new-pw-' + Date.now(), {
+  const newUsername = `tarn-pat-rotated-${Date.now()}@test.com`;
+  const result = await pat.changeCredentials(newUsername, 'new-pw-' + Date.now(), {
     phrase: patPhrase,
   });
   assert(Array.isArray(result.rotationAnnouncements), 'expected rotationAnnouncements');
@@ -701,7 +701,7 @@ await test('Pat publishes a post-rotation share; Quinn picks it up via NEW-log k
   // Refresh references — Pat's connection record was updated by the rotation
   // (no, actually Pat's view of Quinn is unchanged; only Quinn's view of
   // Pat rotated). But re-fetch defensively.
-  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.email === quinnEmail);
+  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.username === quinnUsername);
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   await pat.shareContent(quinnConnectionOfPat, 'rot-target-2-postrotate', 'arweave-rot-post', cek);
@@ -724,7 +724,7 @@ console.log('\n=== 9d. Mute lifecycle (per-side filter, syncs across devices) ==
 await test('muteConnection persists; isMuted reflects state; unmute reverses; multi-device sync', async () => {
   // Reuse handshake Alice + Bob from §8 — they're still mutual connections.
   const aliceConnections = await handshakeAlice.listConnections();
-  const bobOfAlice = aliceConnections.find(c => c.email === handshakeBobEmail);
+  const bobOfAlice = aliceConnections.find(c => c.username === handshakeBobUsername);
   assert(bobOfAlice, 'Alice missing Bob (handshake §8 setup gone?)');
 
   // Baseline.
@@ -747,7 +747,7 @@ await test('muteConnection persists; isMuted reflects state; unmute reverses; mu
   // Read flow not short-circuited: Alice can still read Bob's outbound log.
   // (The setup published a seq=0 snapshot from Bob during §8 acceptance.)
   const bobAlice = await handshakeBob.listConnections();
-  const aliceOfBob = bobAlice.find(c => c.email === handshakeAliceEmail);
+  const aliceOfBob = bobAlice.find(c => c.username === handshakeAliceUsername);
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   await handshakeBob.shareContent(aliceOfBob, 'mute-visibility-deployed', 'arweave-mute-deploy', cek);
@@ -758,7 +758,7 @@ await test('muteConnection persists; isMuted reflects state; unmute reverses; mu
 
   // Multi-device sync: a fresh Alice client (different "device") sees the mute.
   const alice2 = new TarnClient(API_BASE, APP_ID);
-  await alice2.login(handshakeAliceEmail, handshakeAlicePassword);
+  await alice2.login(handshakeAliceUsername, handshakeAlicePassword);
   const muted2 = await alice2.listMutedConnections();
   assert(muted2.length === 1 && muted2[0].share_pub === bobOfAlice.share_pub,
     'device B should see the mute set on device A');
@@ -769,7 +769,7 @@ await test('muteConnection persists; isMuted reflects state; unmute reverses; mu
   assert(unmuteRes.unmuted === true, 'first unmute should report unmuted: true');
   assert((await handshakeAlice.isMuted(bobOfAlice)) === false, 'isMuted false after unmute');
   const alice3 = new TarnClient(API_BASE, APP_ID);
-  await alice3.login(handshakeAliceEmail, handshakeAlicePassword);
+  await alice3.login(handshakeAliceUsername, handshakeAlicePassword);
   assert((await alice3.isMuted(bobOfAlice)) === false, 'device C should see the unmute');
 
   // Idempotent unmute.
@@ -788,18 +788,18 @@ console.log('\n=== 9e. Invite tokens (single-use, time-limited bootstrap) ===');
 
 let inviteInviter;
 let inviteRedeemer;
-let inviteInviterEmail;
-let inviteRedeemerEmail;
+let inviteInviterUsername;
+let inviteRedeemerUsername;
 
 await test('Invite inviter + redeemer register', async () => {
   inviteInviter = new TarnClient(API_BASE, APP_ID);
   inviteRedeemer = new TarnClient(API_BASE, APP_ID);
-  inviteInviterEmail = `inv-inviter-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
-  inviteRedeemerEmail = `inv-redeemer-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
-  const inviterReg = await inviteInviter.register(inviteInviterEmail, 'pw-inv-' + Date.now(), {
+  inviteInviterUsername = `inv-inviter-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
+  inviteRedeemerUsername = `inv-redeemer-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
+  const inviterReg = await inviteInviter.register(inviteInviterUsername, 'pw-inv-' + Date.now(), {
     recoveryAcknowledged: true,
   });
-  const redeemerReg = await inviteRedeemer.register(inviteRedeemerEmail, 'pw-red-' + Date.now(), {
+  const redeemerReg = await inviteRedeemer.register(inviteRedeemerUsername, 'pw-red-' + Date.now(), {
     recoveryAcknowledged: true,
   });
 
@@ -877,14 +877,14 @@ console.log('\n=== 10. Cleanup ===');
 
 await test('Delete test account', async () => {
   const tarn = new TarnClient(API_BASE, APP_ID);
-  await tarn.login(testEmail, testPassword);
+  await tarn.login(testUsername, testPassword);
   await tarn.deleteAccount();
   assert(!tarn.isAuthenticated, 'Still authenticated after deletion');
 
   // Verify login fails
   const tarn2 = new TarnClient(API_BASE, APP_ID);
   try {
-    await tarn2.login(testEmail, testPassword);
+    await tarn2.login(testUsername, testPassword);
     assert(false, 'Login should fail after deletion');
   } catch (err) {
     assert(err.message.includes('not found') || err.message.includes('404'), `Unexpected error: ${err.message}`);
