@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebAuthn PRF consistency test</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 720px;
+      margin: 1.5em auto;
+      padding: 1em;
+      line-height: 1.5;
+      color: #222;
+    }
+    h1 { margin-top: 0; }
+    h2 { margin-top: 1.6em; border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
+    button {
+      font-size: 1.05em;
+      padding: 0.7em 1.4em;
+      margin: 0.5em 0.4em 0.5em 0;
+      cursor: pointer;
+      border: 1px solid #888;
+      background: #fafafa;
+      border-radius: 6px;
+    }
+    button:hover { background: #eee; }
+    button:active { background: #ddd; }
+    pre {
+      background: #f4f4f4;
+      padding: 0.8em;
+      overflow-x: auto;
+      word-break: break-all;
+      white-space: pre-wrap;
+      border-radius: 4px;
+      font-size: 0.95em;
+    }
+    .ok { border-left: 4px solid #2a8; padding-left: 0.7em; }
+    .err { border-left: 4px solid #c33; padding-left: 0.7em; color: #900; }
+    .label { font-weight: 600; margin-top: 1em; }
+    code { background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
+    .meta { color: #666; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>WebAuthn PRF consistency test</h1>
+  <p>Verifies the assumption that an OS-synced passkey produces the <strong>same PRF output</strong> on every device that shares the credential (iCloud Keychain across Apple devices, Google Password Manager across Android/Chrome devices, etc.).</p>
+  <p class="meta">Page must be served over HTTPS or <code>localhost</code>. Uses a fixed salt so PRF outputs are directly comparable across devices and runs.</p>
+
+  <h2>How to use</h2>
+  <ol>
+    <li>On <strong>Device A</strong> (e.g. Mac), click <strong>Register passkey</strong>. Approve the platform-authenticator prompt (Touch ID / Face ID / Windows Hello).</li>
+    <li>Wait a minute for OS sync to propagate the passkey to your other devices on the same account.</li>
+    <li>On Device A, click <strong>Authenticate (PRF)</strong>. Note the printed credential ID and PRF hex.</li>
+    <li>On <strong>Device B</strong> (e.g. iPhone, same Apple ID), open this page and click <strong>Authenticate (PRF)</strong> — the synced passkey should be offered. Pick it. Note the credential ID and PRF hex.</li>
+    <li>Compare:
+      <ul>
+        <li><strong>Same credential ID + same PRF hex</strong> = assumption holds. Multi-device passkey continuity works.</li>
+        <li><strong>Same credential ID + different PRF hex</strong> = assumption fails. Synced credential, but PRF outputs differ across devices.</li>
+        <li>Different credential IDs = the synced credential wasn't found, you authenticated with a different one. Try again, picking the synced passkey explicitly.</li>
+      </ul>
+    </li>
+  </ol>
+  <p>Repeat for each device pair under test (Mac↔iPhone, Windows↔Android, etc.).</p>
+
+  <h2>Actions</h2>
+  <button id="register">Register passkey (Device A only)</button>
+  <button id="authenticate">Authenticate (PRF)</button>
+
+  <div class="label">Result:</div>
+  <pre id="out">(no result yet)</pre>
+
+  <div class="label">Salt (fixed, for reproducibility):</div>
+  <pre id="salt"></pre>
+
+  <script>
+    // Fixed 32-byte salt. Same input on every device → PRF output is the only
+    // variable. Document name + date so this can't be confused with random
+    // garbage if the file gets re-used later.
+    const SALT_STR = "tarn-prf-consistency-test-2026-05-06-fixed-salt";
+    const SALT = new TextEncoder().encode(SALT_STR);
+    document.getElementById('salt').textContent = SALT_STR + "\n(SHA-256 hex: computing...)";
+    crypto.subtle.digest('SHA-256', SALT).then(d =>
+      document.getElementById('salt').textContent = SALT_STR + "\nSHA-256 hex: " + bufToHex(d)
+    );
+
+    const RP_ID = location.hostname || 'localhost';
+    const RP_NAME = "PRF Consistency Test";
+
+    function out(msg, isErr) {
+      const el = document.getElementById('out');
+      el.textContent = msg;
+      el.className = isErr ? 'err' : 'ok';
+    }
+
+    function bufToHex(buf) {
+      return Array.from(new Uint8Array(buf))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+
+    function bufToB64Url(buf) {
+      const bytes = new Uint8Array(buf);
+      let str = '';
+      for (let i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+      return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    document.getElementById('register').onclick = async () => {
+      try {
+        out('Registering passkey…');
+        const userId = crypto.getRandomValues(new Uint8Array(16));
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+        const cred = await navigator.credentials.create({
+          publicKey: {
+            rp: { id: RP_ID, name: RP_NAME },
+            user: {
+              id: userId,
+              name: 'prf-test-' + Date.now(),
+              displayName: 'PRF Consistency Test'
+            },
+            challenge,
+            pubKeyCredParams: [
+              { type: 'public-key', alg: -7 },   // ES256
+              { type: 'public-key', alg: -257 }  // RS256
+            ],
+            authenticatorSelection: {
+              residentKey: 'required',          // discoverable, syncs via OS
+              userVerification: 'required',
+              authenticatorAttachment: 'platform'
+            },
+            extensions: {
+              prf: { eval: { first: SALT } }
+            }
+          }
+        });
+        const credId = bufToB64Url(cred.rawId);
+        const ext = cred.getClientExtensionResults();
+        const prfOut = ext.prf?.results?.first;
+        let report = "Registered.\n\n";
+        report += "Credential ID (base64url):\n" + credId + "\n\n";
+        report += "PRF supported at registration: " + (ext.prf?.enabled ?? 'unknown') + "\n";
+        if (prfOut) {
+          report += "PRF output at register (hex):\n" + bufToHex(prfOut) + "\n\n";
+        } else {
+          report += "(No PRF output at register — many authenticators only return PRF at authentication time. Click Authenticate next.)\n\n";
+        }
+        report += "Now: wait ~1 minute for OS sync, then Authenticate on this device and on Device B.";
+        out(report);
+      } catch (e) {
+        out('Register failed: ' + (e.name ? e.name + ': ' : '') + (e.message || e), true);
+      }
+    };
+
+    document.getElementById('authenticate').onclick = async () => {
+      try {
+        out('Authenticating…');
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+        const cred = await navigator.credentials.get({
+          publicKey: {
+            challenge,
+            rpId: RP_ID,
+            userVerification: 'required',
+            // allowCredentials omitted → discoverable flow, user picks
+            extensions: {
+              prf: { eval: { first: SALT } }
+            }
+          }
+        });
+        const credId = bufToB64Url(cred.rawId);
+        const ext = cred.getClientExtensionResults();
+        const prfOut = ext.prf?.results?.first;
+        let report = "Authenticated.\n\n";
+        report += "Credential ID (base64url):\n" + credId + "\n\n";
+        if (prfOut) {
+          report += "PRF output (hex):\n" + bufToHex(prfOut) + "\n\n";
+          report += "→ Compare this PRF hex against the same credential ID on the other device.";
+        } else {
+          report += "ERROR: No PRF output. The browser/authenticator didn't return PRF results. Either (a) PRF extension isn't supported here, or (b) the credential wasn't created with PRF enabled.";
+          out(report, true);
+          return;
+        }
+        out(report);
+      } catch (e) {
+        out('Authenticate failed: ' + (e.name ? e.name + ': ' : '') + (e.message || e), true);
+      }
+    };
+  </script>
+</body>
+</html>
