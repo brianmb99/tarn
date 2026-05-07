@@ -1799,6 +1799,21 @@ export class TarnClient {
       throw new Error(`registerPasskey(): register failed: ${regRes.json?.error || regRes.status}`);
     }
 
+    // Refresh the local snapshot of passkey wrappings so subsequent
+    // envelope-mutating flows in the same session (a second
+    // registerPasskey, rotateAccountKey, changeCredentials) preserve
+    // this credential's wrapping. Without this, the snapshot stays
+    // pinned to whatever was on the envelope at login time and the next
+    // envelope rebuild silently drops the passkey we just enrolled.
+    try {
+      const reparsed = parseWrappedDataKey(newEnvelope);
+      this.#capturePasskeyWrappings(reparsed);
+    } catch {
+      // Failure to reparse the freshly-built envelope would indicate a
+      // serious bug; the server would also have rejected it. Log and
+      // continue rather than failing the user-visible operation.
+    }
+
     return {
       credentialId,
       deviceLabel: regRes.json?.device_label ?? null,
@@ -1909,6 +1924,10 @@ export class TarnClient {
         kdfParams: unwrapped.recovery.kdfParams,
         wrappingsByGen,
       };
+      // Snapshot existing passkey wrappings (including this one) so a
+      // follow-up envelope mutation in the same session preserves them.
+      // Mirrors the call sites in login()/recoverAccount()/rotation.
+      this.#capturePasskeyWrappings(reparsed);
     }
 
     return { dataLookupKey: this.#dataLookupKey! };
@@ -1990,6 +2009,14 @@ export class TarnClient {
     if (res.status !== 200) {
       throw new Error(`removePasskey(): failed: ${json?.error || res.status}`);
     }
+
+    // Refresh local snapshot so a subsequent envelope-mutating flow
+    // (e.g. removing a second passkey, rotating account-key) reflects
+    // the now-stripped wrapping.
+    try {
+      const reparsed = parseWrappedDataKey(newEnvelope);
+      this.#capturePasskeyWrappings(reparsed);
+    } catch {}
   }
 
   /**

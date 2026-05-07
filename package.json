@@ -15,6 +15,7 @@
     "test:handshake":"node --import tsx tests/test-handshake.mjs",
     "test:recovery": "node --import tsx tests/test-recovery.mjs",
     "test:account-key": "node --import tsx tests/test-account-key.mjs",
+    "test:passkeys": "node --import tsx tests/test-passkeys.mjs",
     "test:sessions": "node --import tsx tests/test-sessions.mjs",
     "test:invites":  "node --import tsx tests/test-invites.mjs",
     "test:deployed": "node --import tsx tests/test-deployed.mjs"
