@@ -261,23 +261,33 @@ await test('removing one of two passkeys leaves the other working', async () => 
 
 // ============ ENVELOPE PRESERVATION ============
 
-section('changeCredentials preserves passkey wrappings');
+section('changeCredentials passkey re-tap (Phase 6.1)');
 
-await test('changeCredentials preserves existing-gen passkey wrappings byte-for-byte', async () => {
-  // Phase 6 design: changeCredentials creates a new gen N+1. The new
-  // gen has no passkey wrapping — the user wasn't prompted to tap their
-  // passkey during the password change, so the SDK has no PRF output to
-  // wrap DEK_gen2 with. As a result, the passkey can no longer
-  // authenticate (unwrapDataKeyChain requires a wrapping at every gen).
-  // The user-visible recovery is "re-register the passkey under the new
-  // password."
-  //
-  // What this test pins is the SDK's atomic behavior: passkey wrappings
-  // for *existing gens* (gen 1) are preserved byte-for-byte through the
-  // credential change. We assert by reading the envelope from D1 before
-  // and after the change and comparing the gen-1 passkey wrapping bytes.
+await test('changeCredentials WITHOUT passkeyTapHandler throws when passkeys are registered', async () => {
+  // The new contract: silently producing stale credentials would be a
+  // worse UX failure than refusing to proceed. Apps must opt in by
+  // supplying a handler.
   const a = await registerAccount();
-  const { auth } = await registerPasskeyOn(a.client, { deviceLabel: 'cc-test' });
+  await registerPasskeyOn(a.client, { deviceLabel: 'no-handler-test' });
+
+  let threw = null;
+  try {
+    await a.client.changeCredentials(a.username, 'changed-' + Date.now(), { phrase: a.reg.accountKey });
+  } catch (err) {
+    threw = err;
+  }
+  assert(threw, 'expected changeCredentials() to throw without handler');
+  assert(/passkeyTapHandler/i.test(threw.message), `expected helpful error mentioning passkeyTapHandler, got: ${threw.message}`);
+});
+
+await test('changeCredentials WITH re-tap re-wraps the new gen so the passkey can read post-change data', async () => {
+  // The new contract under Phase 6.1: when the user re-taps, the new
+  // gen (N+1) gains a passkey_prf wrapping for that credential. After
+  // the change, an authentication-with-passkey unwraps every gen
+  // including the new one, and writes/reads against the new gen
+  // succeed.
+  const a = await registerAccount();
+  const { auth } = await registerPasskeyOn(a.client, { deviceLabel: 'retap-test' });
 
   const before = JSON.parse(
     (await d1Query(`SELECT wrapped_data_key FROM accounts WHERE data_lookup_key = '${a.client.dataLookupKey}'`))[0].wrapped_data_key,
@@ -288,11 +298,18 @@ await test('changeCredentials preserves existing-gen passkey wrappings byte-for-
   assert(beforeGen1Pk, 'precondition: gen-1 passkey wrapping present pre-changeCredentials');
 
   const newPw = 'changed-' + Date.now();
-  await a.client.changeCredentials(a.username, newPw, { phrase: a.reg.accountKey });
+  await a.client.changeCredentials(a.username, newPw, {
+    phrase: a.reg.accountKey,
+    passkeyTapHandler: async (cred) => {
+      assert(cred.credentialId === auth.credentialIdB64Url, 'handler called with the registered credentialId');
+      return true;
+    },
+  });
 
   const after = JSON.parse(
     (await d1Query(`SELECT wrapped_data_key FROM accounts WHERE data_lookup_key = '${a.client.dataLookupKey}'`))[0].wrapped_data_key,
   );
+  // Gen 1 wrapping preserved byte-for-byte.
   const afterGen1Pk = after.dek_chain.find(e => e.gen === 1)?.wrappings.find(
     w => w.factor === 'passkey_prf' && w.credential_id === auth.credentialIdB64Url,
   );
@@ -301,9 +318,134 @@ await test('changeCredentials preserves existing-gen passkey wrappings byte-for-
     afterGen1Pk.wrapped === beforeGen1Pk.wrapped,
     'gen-1 passkey wrapping bytes must be preserved byte-for-byte',
   );
-  // Gen 2 should NOT have a passkey wrapping (documented limitation).
-  const afterGen2Pk = after.dek_chain.find(e => e.gen === 2)?.wrappings.find(w => w.factor === 'passkey_prf');
-  assert(!afterGen2Pk, 'gen-2 has no passkey wrapping (documented design limit)');
+  // Gen 2 (the new gen) MUST now have a passkey wrapping for the same credential.
+  const afterGen2Pk = after.dek_chain.find(e => e.gen === 2)?.wrappings.find(
+    w => w.factor === 'passkey_prf' && w.credential_id === auth.credentialIdB64Url,
+  );
+  assert(afterGen2Pk, 'gen-2 must have a passkey_prf wrapping after re-tap');
+
+  // Authenticate with the passkey on a fresh client; verify auth and that the latest gen unwraps.
+  const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  env.pinNextAuth(auth.credentialIdB64Url);
+  const r = await c.authenticateWithPasskey();
+  env.clearNextAuth();
+  assert(r.dataLookupKey === a.client.dataLookupKey, 'passkey still authenticates the same account');
+});
+
+await test('changeCredentials with handler returning false leaves credential stale; refresh repairs it', async () => {
+  // The user dismisses the tap → credential becomes stale on the new gen.
+  // A subsequent authenticateWithPasskey returns stale_credential:true.
+  // With a stalePasskeyHandler that supplies the password, the SDK
+  // transparently re-wraps the latest gen and the credential is no
+  // longer stale.
+  const a = await registerAccount();
+  const { auth } = await registerPasskeyOn(a.client, { deviceLabel: 'stale-test' });
+
+  const newPw = 'changed-' + Date.now();
+  let handlerCalls = 0;
+  await a.client.changeCredentials(a.username, newPw, {
+    phrase: a.reg.accountKey,
+    passkeyTapHandler: async () => { handlerCalls += 1; return false; },
+  });
+  assert(handlerCalls === 1, 'handler called exactly once for one credential');
+
+  // Verify gen 2 has NO passkey wrapping.
+  const afterChange = JSON.parse(
+    (await d1Query(`SELECT wrapped_data_key FROM accounts WHERE data_lookup_key = '${a.client.dataLookupKey}'`))[0].wrapped_data_key,
+  );
+  const gen2Pk = afterChange.dek_chain.find(e => e.gen === 2)?.wrappings.find(w => w.factor === 'passkey_prf');
+  assert(!gen2Pk, 'gen-2 should have no passkey wrapping (user skipped re-tap)');
+
+  // Login with the passkey + stale handler → should succeed and re-wrap.
+  // Use a NEW client (passkey-only path), then call login() first to
+  // populate username so the stale handler can do the password-side unwrap.
+  const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await c.login(a.username, newPw); // primes username + dlk + dekByGen
+  // Now log out from the password side and exercise the passkey path
+  // — but we need a fresh client. Re-design: log in with passkey first,
+  // then call refresh-credential through the stale handler. Because
+  // #username is null on a passkey-only session, the repair throws
+  // (documented limitation). Instead drive the flow on a client that
+  // already has #username populated (the post-changeCredentials
+  // `a.client` itself, which still holds the post-change credentials).
+  // Re-validate the contract: stale handler is invoked, repair runs
+  // through, gen 2 re-gains its passkey wrapping.
+  const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  await c2.login(a.username, newPw);
+  let stalePromptCount = 0;
+  env.pinNextAuth(auth.credentialIdB64Url);
+  const r = await c2.authenticateWithPasskey({
+    stalePasskeyHandler: async () => { stalePromptCount += 1; return newPw; },
+  });
+  env.clearNextAuth();
+  assert(r.dataLookupKey === a.client.dataLookupKey, 'passkey authenticates with refresh path');
+  assert(stalePromptCount === 1, 'stalePasskeyHandler called exactly once during repair');
+
+  // Envelope now should include a gen-2 passkey wrapping.
+  const repaired = JSON.parse(
+    (await d1Query(`SELECT wrapped_data_key FROM accounts WHERE data_lookup_key = '${a.client.dataLookupKey}'`))[0].wrapped_data_key,
+  );
+  const gen2PkAfter = repaired.dek_chain.find(e => e.gen === 2)?.wrappings.find(
+    w => w.factor === 'passkey_prf' && w.credential_id === auth.credentialIdB64Url,
+  );
+  assert(gen2PkAfter, 'gen-2 must have a passkey_prf wrapping post-repair');
+
+  // Subsequent auth has stale_credential=false (via a fresh client).
+  const c3 = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  env.pinNextAuth(auth.credentialIdB64Url);
+  let staleHandlerCalled = 0;
+  await c3.authenticateWithPasskey({
+    stalePasskeyHandler: async () => { staleHandlerCalled += 1; return null; },
+  });
+  env.clearNextAuth();
+  assert(staleHandlerCalled === 0, 'after repair the stale handler is not called');
+});
+
+await test('multiple credentials: re-tap one, skip another → only the skipped one is stale', async () => {
+  const a = await registerAccount();
+  const { auth: aA } = await registerPasskeyOn(a.client, { deviceLabel: 'multi-A' });
+  const { auth: aB } = await registerPasskeyOn(a.client, { deviceLabel: 'multi-B' });
+
+  const newPw = 'changed-' + Date.now();
+  await a.client.changeCredentials(a.username, newPw, {
+    phrase: a.reg.accountKey,
+    passkeyTapHandler: async (cred) => {
+      // Re-tap A, skip B.
+      env.pinNextAuth(aA.credentialIdB64Url); // ensure ceremony goes to A's authenticator
+      try {
+        return cred.credentialId === aA.credentialIdB64Url;
+      } finally {
+        env.clearNextAuth();
+      }
+    },
+  });
+
+  const after = JSON.parse(
+    (await d1Query(`SELECT wrapped_data_key FROM accounts WHERE data_lookup_key = '${a.client.dataLookupKey}'`))[0].wrapped_data_key,
+  );
+  const gen2 = after.dek_chain.find(e => e.gen === 2);
+  const gen2A = gen2?.wrappings.find(w => w.factor === 'passkey_prf' && w.credential_id === aA.credentialIdB64Url);
+  const gen2B = gen2?.wrappings.find(w => w.factor === 'passkey_prf' && w.credential_id === aB.credentialIdB64Url);
+  assert(gen2A, 'A should have a gen-2 wrapping (re-tapped)');
+  assert(!gen2B, 'B should NOT have a gen-2 wrapping (skipped)');
+
+  // Authenticate with A → fresh.
+  const cA = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  env.pinNextAuth(aA.credentialIdB64Url);
+  let staleA = 0;
+  await cA.authenticateWithPasskey({ stalePasskeyHandler: async () => { staleA += 1; return null; } });
+  env.clearNextAuth();
+  assert(staleA === 0, 'A is fresh — handler should not be called');
+
+  // Authenticate with B → stale. With no handler, throws.
+  const cB = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  env.pinNextAuth(aB.credentialIdB64Url);
+  let threw = null;
+  try { await cB.authenticateWithPasskey(); } catch (err) { threw = err; }
+  env.clearNextAuth();
+  assert(threw, 'B is stale — should throw without handler');
+  assert(threw.name === 'StalePasskeyError', `expected StalePasskeyError, got ${threw.name}: ${threw.message}`);
+  assert(threw.credentialId === aB.credentialIdB64Url, 'error carries the stale credentialId');
 });
 
 section('rotateAccountKey preserves passkey wrappings');

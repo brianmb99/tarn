@@ -120,6 +120,7 @@ import type {
   Argon2idParams,
   DataKeyHandles,
   DataKeyPair,
+  RecoveryMetadata,
   SigningKeyPair,
   SharingKeyPair,
 } from './crypto.js';
@@ -168,6 +169,39 @@ export class AccountKeyPinningError extends Error {
   constructor(message = 'Account-key pinning check failed: derived recovery_lookup_key does not match the server') {
     super(message);
     this.name = 'AccountKeyPinningError';
+  }
+}
+
+/**
+ * Thrown by `authenticateWithPasskey` when the server flags the just-used
+ * credential as stale (no `passkey_prf` wrapping on the latest gen) AND
+ * the caller did not provide a `stalePasskeyHandler` to repair it inline.
+ *
+ * "Stale" happens when an envelope-mutating flow on another device
+ * (typically `changeCredentials`) created a new gen and the user did not
+ * re-tap this passkey at change-time. The credential can still unwrap
+ * pre-change gens, so the auth response still carries useful state — but
+ * the latest gen is unreachable through this passkey alone, and any data
+ * written post-change is therefore unreadable until the wrap is repaired.
+ *
+ * The repair requires a second factor: typically the password (path 1 —
+ * supply a `stalePasskeyHandler` that prompts for it) or a re-registration
+ * of the passkey from a logged-in session. Apps catching this error can
+ * surface either path.
+ */
+export class StalePasskeyError extends Error {
+  readonly credentialId: string;
+  readonly requiresReregistration: boolean;
+  constructor(args: { credentialId: string; message?: string }) {
+    super(
+      args.message ??
+        `Passkey ${args.credentialId.slice(0, 8)}… has no wrapping for the current generation. ` +
+          'Repair it by re-authenticating with a stalePasskeyHandler that supplies the password, ' +
+          'or by re-registering the passkey from a password-authenticated session.',
+    );
+    this.name = 'StalePasskeyError';
+    this.credentialId = args.credentialId;
+    this.requiresReregistration = true;
   }
 }
 
@@ -885,12 +919,29 @@ export class TarnClient {
    * about rotation under compromised OLD keys (sharing §13.5) is accepted for
    * v1; out-of-band recovery is the documented response.
    *
+   * Passkey re-tap (Phase 6.1):
+   * - If the account has any registered passkeys, the SDK MUST re-wrap the
+   *   new gen under each of them so the passkey factor stays usable for
+   *   data written post-change. The SDK has no PRF outputs cached, so the
+   *   user must physically re-tap each registered authenticator at change
+   *   time. The caller supplies a `passkeyTapHandler` that surfaces the
+   *   per-credential tap UI; the handler returns true to proceed or false
+   *   to skip. If WebAuthn fails (authenticator unavailable, user
+   *   dismissed, etc.) the credential is left without a new-gen wrapping
+   *   and becomes "stale" — the next `authenticateWithPasskey()` for that
+   *   credential will surface a stale-credential repair flow.
+   * - If passkeys are registered and `passkeyTapHandler` is omitted, this
+   *   method throws. Apps are expected to know about the tap requirement
+   *   and supply a handler — silently producing stale credentials would
+   *   be a worse UX failure than refusing to proceed.
+   *
    * @param {string} newUsername
    * @param {string} newPassword
    * @param {{
    *   phrase?: string,
    *   acceptRecoveryGap?: boolean,
    *   skipRotationAnnounce?: boolean,
+   *   passkeyTapHandler?: (cred: { credentialId: string; deviceLabel: string | null }) => Promise<boolean>,
    * }} [opts]
    *   - `phrase`: BIP39 account key. Required unless `acceptRecoveryGap:
    *     true` is set. Extends the recovery wrapping to gen N+1.
@@ -969,6 +1020,18 @@ export class TarnClient {
       recoveryWrappingsByGen.set(nextGen, wrappedNewGen);
     }
 
+    // Phase 6.1: passkey re-tap. If the account has registered passkeys we
+    // need to re-wrap the new-gen DEK under each one's PRF-derived wrapping
+    // key so passkey auth still unwraps post-change data. The PRF output is
+    // not in our cache (PRF outputs are never persisted) — the user must
+    // physically tap each authenticator. Credentials whose tap is skipped
+    // or fails become "stale" — no new-gen wrapping — and the next
+    // authenticate-with-passkey hits the stale-credential refresh path.
+    const newGenPasskeyWraps = await this.#collectNewGenPasskeyWraps(
+      newDek.gcmKey,
+      opts.passkeyTapHandler,
+    );
+
     const wireChain = chain.map(({ gen }) => {
       const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> = [
         { factor: FACTOR_PASSWORD, wrappedBase64: reWrappedPassword.get(gen)! },
@@ -978,10 +1041,8 @@ export class TarnClient {
         wrappings.push({ factor: FACTOR_RECOVERY_PHRASE, wrappedBase64: recWrap });
       }
       // Phase 6: preserve passkey wrappings byte-for-byte for existing
-      // gens. The new gen N+1 has no passkey wrapping (we don't have any
-      // PRF outputs in this flow) — the user must re-register the
-      // passkey post-credential-change for new-gen data to be passkey-
-      // unwrappable. Documented in TARN_PROTOCOL.md.
+      // gens. AES-KW is deterministic, so a re-wrap under the same PRF
+      // KEK would produce identical bytes — preserving avoids the tap.
       const passkeyList = this.#passkeyWrappingsByGen.get(gen) ?? [];
       for (const pk of passkeyList) {
         wrappings.push({
@@ -989,6 +1050,18 @@ export class TarnClient {
           wrappedBase64: pk.wrappedBase64,
           credentialId: pk.credentialId,
         });
+      }
+      // Phase 6.1: new-gen passkey wrappings, one per credential the user
+      // re-tapped. Credentials whose tap was skipped/failed simply have
+      // no entry here (handled by the stale-credential refresh path).
+      if (gen === nextGen) {
+        for (const pk of newGenPasskeyWraps) {
+          wrappings.push({
+            factor: FACTOR_PASSKEY_PRF,
+            wrappedBase64: pk.wrappedBase64,
+            credentialId: pk.credentialId,
+          });
+        }
       }
       return { gen, wrappings };
     });
@@ -1100,6 +1173,17 @@ export class TarnClient {
     this.#dekByGen = newDekByGen;
     this.#currentGen = newCurrentGen;
     this.#recoveryFactorMeta = newRecoveryFactorMeta;
+    // Phase 6.1: refresh the passkey-wrappings snapshot so subsequent
+    // envelope-mutating ops in this session preserve the just-emitted
+    // wrappings (including any new-gen wrappings the user re-tapped for).
+    try {
+      this.#capturePasskeyWrappings(parseWrappedDataKey(newWrappedDataKey));
+    } catch {
+      // Reparse failure is theoretically impossible — we just built the
+      // envelope. Fall back to clearing the snapshot rather than leaving
+      // it stale; the next login() rehydrates anyway.
+      this.#passkeyWrappingsByGen = new Map();
+    }
     this.#username = newUsername;
     this.#sharingKeyPair = newKeys.sharingKeyPair;
     // Per-pair S_AB is derived from share_priv, which just rotated — every
@@ -1166,6 +1250,135 @@ export class TarnClient {
   async #wrapDekRaw(dekGcmKey: CryptoKey, wrappingKey: CryptoKey): Promise<string> {
     const wrapped = await crypto.subtle.wrapKey('raw', dekGcmKey, wrappingKey, 'AES-KW');
     return bytesToBase64(new Uint8Array(wrapped));
+  }
+
+  /**
+   * Phase 6.1 — collect new-gen passkey wrappings during `changeCredentials`.
+   *
+   * For each registered passkey on the account, surface a per-credential
+   * tap prompt via the supplied handler. If the user proceeds and the
+   * WebAuthn ceremony completes, derive the PRF-based wrapping key and
+   * wrap the new-gen DEK under it. Returns an array of
+   * `{credentialId, wrappedBase64}` for every credential that succeeded;
+   * skipped/failed credentials are simply absent from the result (they
+   * become "stale" on the new gen and the next authenticateWithPasskey
+   * call surfaces the refresh path).
+   *
+   * Throws if the account has registered passkeys and no handler was
+   * supplied — silent stale credentials would be a worse UX failure than
+   * refusing to proceed.
+   */
+  async #collectNewGenPasskeyWraps(
+    newDekGcmKey: CryptoKey,
+    handler?: (cred: { credentialId: string; deviceLabel: string | null }) => Promise<boolean>,
+  ): Promise<Array<{ credentialId: string; wrappedBase64: string }>> {
+    // Distinct credentialIds across all gens. The snapshot may have a
+    // credential present at gen 1 but absent at the latest gen (legacy
+    // stale state from a prior changeCredentials that ran without a
+    // handler). Treat the union as "registered passkeys" — re-tapping
+    // any of them gives us a chance to repair the gap.
+    const credentialIds = new Set<string>();
+    for (const list of this.#passkeyWrappingsByGen.values()) {
+      for (const pk of list) credentialIds.add(pk.credentialId);
+    }
+    if (credentialIds.size === 0) return [];
+
+    if (typeof handler !== 'function') {
+      throw new Error(
+        'changeCredentials(): account has registered passkeys but no `passkeyTapHandler` ' +
+          'was supplied. Pass a handler that prompts the user to tap each authenticator, ' +
+          'or remove the passkey(s) first via tarn.passkeys.remove().',
+      );
+    }
+
+    // Best-effort: enrich with device labels from the server so the
+    // handler can surface a friendly prompt. A network failure here is
+    // not fatal — fall back to credentialId-only entries.
+    let labels = new Map<string, string | null>();
+    try {
+      const list = await this.listPasskeys();
+      for (const p of list) labels.set(p.credentialId, p.deviceLabel);
+    } catch (err: any) {
+      console.warn(
+        `[TarnClient] changeCredentials: listPasskeys() failed (continuing without device labels): ${err?.message || err}`,
+      );
+    }
+
+    const results: Array<{ credentialId: string; wrappedBase64: string }> = [];
+    // Sequential — the WebAuthn ceremony is modal per browser, so the
+    // user can only tap one authenticator at a time.
+    for (const credentialId of credentialIds) {
+      const deviceLabel = labels.get(credentialId) ?? null;
+      let proceed = false;
+      try {
+        proceed = await handler({ credentialId, deviceLabel });
+      } catch (err: any) {
+        console.warn(
+          `[TarnClient] changeCredentials: passkeyTapHandler threw for ${credentialId.slice(0, 8)}…; treating as skip: ${err?.message || err}`,
+        );
+        proceed = false;
+      }
+      if (!proceed) continue;
+
+      let wrappedBase64: string | null = null;
+      try {
+        wrappedBase64 = await this.#deriveAndWrapForPasskey(credentialId, newDekGcmKey);
+      } catch (err: any) {
+        // WebAuthn failure (user dismissed, no authenticator, sig fail).
+        // Mark stale by simply not adding to results.
+        console.warn(
+          `[TarnClient] changeCredentials: re-tap failed for ${credentialId.slice(0, 8)}…; credential will be stale on new gen: ${err?.message || err}`,
+        );
+        wrappedBase64 = null;
+      }
+      if (wrappedBase64) {
+        results.push({ credentialId, wrappedBase64 });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Drive a WebAuthn assertion against a specific credential, derive the
+   * PRF-based wrapping key, and wrap the supplied DEK under it. Returns
+   * the base64-encoded wrap. Throws on any WebAuthn / PRF failure.
+   *
+   * Used both by `#collectNewGenPasskeyWraps` (re-tap during
+   * changeCredentials) and `authenticateWithPasskey` (the stale-credential
+   * refresh helper). Centralized here so both paths use the identical
+   * options-fetch + assertion + KEK-derivation chain.
+   */
+  async #deriveAndWrapForPasskey(credentialId: string, dekGcmKey: CryptoKey): Promise<string> {
+    const optsRes = await this.#fetch('/api/v1/auth/passkey/authentication-options', {
+      method: 'POST',
+      retry: false,
+      body: { credential_id: credentialId },
+    });
+    if (optsRes.status !== 200) {
+      throw new Error(
+        `passkey authentication-options failed: ${optsRes.json?.error || optsRes.status}`,
+      );
+    }
+    const pkOptions = optsRes.json?.options;
+    if (!pkOptions) {
+      throw new Error('passkey authentication-options: server did not return options');
+    }
+    // Note: we deliberately do NOT submit the assertion to
+    // /auth/passkey/authenticate here — we only need the PRF output to
+    // derive a wrapping key. The challenge will eventually time out and
+    // get pruned (60 s TTL); no replay risk because consume-on-use binds
+    // it to /authenticate. For environments where this matters, a future
+    // /auth/passkey/prf-only options endpoint could mint a non-auth
+    // challenge specifically for re-wrapping ceremonies.
+    const { startAuthentication } = await import('@simplewebauthn/browser');
+    const credential = await startAuthentication({ optionsJSON: pkOptions });
+    const prfResults = (credential as any)?.clientExtensionResults?.prf?.results?.first;
+    if (!prfResults) {
+      throw new Error('passkey re-tap: PRF extension produced no output');
+    }
+    const prfOutput = new Uint8Array(prfResults);
+    const { kwKey: passkeyKEK } = await derivePasskeyWrappingKey(prfOutput);
+    return this.#wrapDekRaw(dekGcmKey, passkeyKEK);
   }
 
   /**
@@ -1834,7 +2047,20 @@ export class TarnClient {
    *   5. Derive the passkey wrapping key from the PRF output, unwrap
    *      the DEK chain, install session state.
    */
-  async authenticateWithPasskey(opts: { deviceLabel?: string; credentialId?: string } = {}): Promise<{ dataLookupKey: string }> {
+  async authenticateWithPasskey(opts: {
+    deviceLabel?: string;
+    credentialId?: string;
+    /**
+     * Phase 6.1 — handler invoked when the server flags the just-used
+     * credential as stale (no `passkey_prf` wrapping on the latest gen).
+     * The handler should prompt the user for their password and resolve
+     * with it; resolving with null aborts the repair and surfaces a
+     * `StalePasskeyError` instead. If no handler is supplied and a stale
+     * credential is detected, this method throws `StalePasskeyError`
+     * directly so the app can surface a re-registration UI.
+     */
+    stalePasskeyHandler?: () => Promise<string | null>;
+  } = {}): Promise<{ dataLookupKey: string }> {
     if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
     // 1. Auth options.
@@ -1879,18 +2105,26 @@ export class TarnClient {
       wrapped_data_key,
       account_key_stored,
       credential_id,
+      stale_credential,
     } = authRes.json;
     if (!jwt || !wrapped_data_key || !credential_id) {
       throw new Error('authenticateWithPasskey(): server response missing required fields');
     }
 
     // 4. Unwrap the DEK chain via the passkey factor for THIS credential_id.
-    const unwrapped = await unwrapDataKeyChain(
-      wrapped_data_key,
-      passkeyKEK,
-      FACTOR_PASSKEY_PRF,
-      credential_id,
-    );
+    //    For stale credentials, only the gens that DO have a passkey
+    //    wrapping for this credential are unwrappable here — the latest
+    //    gen needs the password-side repair below. Everything is funnelled
+    //    through #unwrapPasskeyChainPartial so the call site does not
+    //    need to discriminate.
+    const unwrapped = stale_credential
+      ? await this.#unwrapPasskeyChainPartial(wrapped_data_key, passkeyKEK, credential_id)
+      : await unwrapDataKeyChain(
+          wrapped_data_key,
+          passkeyKEK,
+          FACTOR_PASSKEY_PRF,
+          credential_id,
+        );
 
     // 5. Install session state. Mirrors the tail of login() — same fields
     //    populated, same caches reset (they were already empty on a fresh
@@ -1930,7 +2164,240 @@ export class TarnClient {
       this.#capturePasskeyWrappings(reparsed);
     }
 
+    // 6. Stale-credential repair. The latest gen has no `passkey_prf`
+    //    wrapping for this credential — typically because another device
+    //    ran changeCredentials and the user did not re-tap this passkey.
+    //    Repair path 1: prompt for the password (via handler), unwrap
+    //    the latest gen via the password factor, re-wrap it under THIS
+    //    passkey's PRF KEK, submit the updated envelope. After this the
+    //    credential is no longer stale.
+    //    Repair path 2 (no handler): throw `StalePasskeyError` so the
+    //    app can prompt the user to re-register the passkey from a
+    //    password-authenticated session.
+    if (stale_credential) {
+      if (typeof opts.stalePasskeyHandler !== 'function') {
+        throw new StalePasskeyError({ credentialId: credential_id });
+      }
+      const password = await opts.stalePasskeyHandler();
+      if (typeof password !== 'string' || password.length === 0) {
+        throw new StalePasskeyError({
+          credentialId: credential_id,
+          message:
+            `Passkey ${credential_id.slice(0, 8)}… is stale and the stalePasskeyHandler ` +
+            'returned no password — re-register the passkey to repair.',
+        });
+      }
+      await this.#repairStaleCredential({
+        credentialId: credential_id,
+        password,
+        passkeyKEK,
+        wrappedDataKey: wrapped_data_key,
+      });
+    }
+
     return { dataLookupKey: this.#dataLookupKey! };
+  }
+
+  /**
+   * Phase 6.1 — partial unwrap for a stale-credential authenticate.
+   *
+   * Identical to `unwrapDataKeyChain(_, _, FACTOR_PASSKEY_PRF, credId)`
+   * except that gens lacking a passkey wrapping for this credential are
+   * silently skipped instead of throwing. Used when the server has
+   * flagged the credential as stale: the latest gen will be unwrapped
+   * via the password factor in the repair step.
+   */
+  async #unwrapPasskeyChainPartial(
+    wireValue: string,
+    passkeyKEK: CryptoKey,
+    credentialId: string,
+  ): Promise<{
+    dekByGen: Map<number, DataKeyPair>;
+    currentGen: number;
+    envelopeVersion: 1;
+    kdfParams: Argon2idParams;
+    recovery: RecoveryMetadata;
+  }> {
+    const parsed = parseWrappedDataKey(wireValue);
+    const dekByGen = new Map<number, DataKeyPair>();
+    for (const entry of parsed.dekChain) {
+      const wrapping = entry.wrappings.find(
+        w => w.factor === FACTOR_PASSKEY_PRF && w.credentialId === credentialId,
+      );
+      if (!wrapping) continue; // stale gen — repair step fills it in
+      const wrapped = base64ToBytes(wrapping.wrappedBase64);
+      const [gcmKey, kwKey] = await Promise.all([
+        crypto.subtle.unwrapKey(
+          'raw', bs(wrapped), passkeyKEK, 'AES-KW',
+          { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
+        ),
+        crypto.subtle.unwrapKey(
+          'raw', bs(wrapped), passkeyKEK, 'AES-KW',
+          'AES-KW', false, ['wrapKey', 'unwrapKey'],
+        ),
+      ]);
+      dekByGen.set(entry.gen, { gcmKey, kwKey });
+    }
+    const currentGen = parsed.dekChain[parsed.dekChain.length - 1]!.gen;
+    return {
+      dekByGen,
+      currentGen,
+      envelopeVersion: parsed.envelopeVersion,
+      kdfParams: parsed.kdfParams,
+      recovery: parsed.recovery,
+    };
+  }
+
+  /**
+   * Phase 6.1 — repair a stale credential by:
+   *   1. Looking up the username via /auth/passkey/whoami (server replies
+   *      with the credential blob the SDK already has — we already have
+   *      the dataLookupKey from the auth response, but we need a
+   *      username-side credential_lookup_key to finish the password
+   *      challenge). Fall back to deriving from the in-memory username if
+   *      the caller previously called `login()` on the same client.
+   *   2. Deriving password keys from the supplied password.
+   *   3. Unwrapping the LATEST gen via the password factor.
+   *   4. Wrapping it under the passkey's PRF KEK.
+   *   5. Submitting the rebuilt envelope to the refresh-credential endpoint.
+   *
+   * After step 5 the credential is no longer stale; the local
+   * `#dekByGen` snapshot is updated in place to include the (now-repaired)
+   * latest gen.
+   *
+   * Note: the SDK does not look up the username at the server (Tarn never
+   * stores plaintext usernames). The handler-supplied password alone is
+   * enough — credential_lookup_key derives from (username, password,
+   * appId), and the user would have only set the password they're
+   * supplying now if it goes with the username on this account. So we
+   * try the in-memory `#username` (set when the client previously logged
+   * in via password); if absent, the repair fails with a clear message
+   * directing the app to use re-registration instead. This is acceptable
+   * because the typical app flow stores the username in a way that can
+   * be plumbed back through (re-render the login form), and the
+   * less-typical "log in via passkey only, then change password on a
+   * different device" pattern is rare enough to leave to re-registration.
+   */
+  async #repairStaleCredential(args: {
+    credentialId: string;
+    password: string;
+    passkeyKEK: CryptoKey;
+    wrappedDataKey: string;
+  }): Promise<void> {
+    if (!this.#dataLookupKey) {
+      throw new StalePasskeyError({
+        credentialId: args.credentialId,
+        message: 'stale-credential repair requires an authenticated passkey session',
+      });
+    }
+    // Parse the live envelope. The latest gen is what we need to unwrap
+    // via password and re-wrap under the passkey.
+    const parsed = parseWrappedDataKey(args.wrappedDataKey);
+    const latest = parsed.dekChain[parsed.dekChain.length - 1]!;
+    const passwordWrap = latest.wrappings.find(w => w.factor === FACTOR_PASSWORD);
+    if (!passwordWrap) {
+      // Theoretically impossible — the parser asserts a password wrapping
+      // on the current gen. Belt-and-braces.
+      throw new StalePasskeyError({
+        credentialId: args.credentialId,
+        message: 'stale-credential repair: latest gen has no password wrapping',
+      });
+    }
+
+    // We need the username to derive the password KEK. The simplest
+    // path: the app re-uses a TarnClient that was previously
+    // password-logged-in (username cached). If the client started via
+    // authenticateWithPasskey alone, we can't derive the password KEK
+    // here — surface a clear error. In practice the stale-handler is
+    // typically invoked on the same client where the user is filling in
+    // a password form, and apps can call `tarn.login()` first to
+    // establish the username. A future endpoint could let the server
+    // supply the username back to the client; deferred to a follow-up.
+    if (!this.#username) {
+      throw new StalePasskeyError({
+        credentialId: args.credentialId,
+        message:
+          'stale-credential repair requires a username — call tarn.login() first or ' +
+          're-register the passkey via tarn.passkeys.register() from a password session.',
+      });
+    }
+    const reKeys = await deriveAllKeys(this.#username, args.password, this.#appId);
+
+    // Unwrap the latest gen via the password factor, then wrap it under
+    // the passkey KEK.
+    const passwordWrapped = base64ToBytes(passwordWrap.wrappedBase64);
+    let latestGcmKey: CryptoKey;
+    let latestKwKey: CryptoKey;
+    try {
+      [latestGcmKey, latestKwKey] = await Promise.all([
+        crypto.subtle.unwrapKey(
+          'raw', bs(passwordWrapped), reKeys.credentialEncryptionKey.kwKey, 'AES-KW',
+          { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
+        ),
+        crypto.subtle.unwrapKey(
+          'raw', bs(passwordWrapped), reKeys.credentialEncryptionKey.kwKey, 'AES-KW',
+          'AES-KW', false, ['wrapKey', 'unwrapKey'],
+        ),
+      ]);
+    } catch (err: any) {
+      throw new StalePasskeyError({
+        credentialId: args.credentialId,
+        message: 'stale-credential repair: password did not unwrap latest gen (wrong password?)',
+      });
+    }
+    const newWrapped = await this.#wrapDekRaw(latestGcmKey, args.passkeyKEK);
+
+    // Build the updated envelope: identical to the live envelope plus a
+    // single new wrapping at the latest gen.
+    const wireChain = parsed.dekChain.map(entry => {
+      const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> =
+        entry.wrappings.map(w => ({
+          factor: w.factor,
+          wrappedBase64: w.wrappedBase64,
+          ...(w.credentialId ? { credentialId: w.credentialId } : {}),
+        }));
+      if (entry.gen === latest.gen) {
+        // Defensive: if a (passkey_prf, credId) wrapping somehow already
+        // exists on the latest gen (race with another device), don't
+        // duplicate — overwrite by removing any prior copy.
+        const filtered = wrappings.filter(
+          w => !(w.factor === FACTOR_PASSKEY_PRF && w.credentialId === args.credentialId),
+        );
+        filtered.push({
+          factor: FACTOR_PASSKEY_PRF,
+          wrappedBase64: newWrapped,
+          credentialId: args.credentialId,
+        });
+        return { gen: entry.gen, wrappings: filtered };
+      }
+      return { gen: entry.gen, wrappings };
+    });
+    const newEnvelope = buildEnvelope(wireChain, {
+      salt: parsed.recovery.salt,
+      kdfParams: parsed.recovery.kdfParams,
+    });
+
+    const refreshRes = await this.#fetch('/api/v1/auth/passkey/refresh-credential', {
+      method: 'POST',
+      auth: true,
+      body: {
+        credential_id: args.credentialId,
+        new_envelope: newEnvelope,
+      },
+    });
+    if (refreshRes.status !== 200) {
+      throw new Error(
+        `stale-credential repair: refresh-credential failed: ${refreshRes.json?.error || refreshRes.status}`,
+      );
+    }
+
+    // Update local DEK chain to include the now-repaired latest gen.
+    this.#dekByGen!.set(latest.gen, { gcmKey: latestGcmKey, kwKey: latestKwKey });
+    this.#currentGen = latest.gen;
+    // Refresh passkey-wrappings snapshot.
+    try {
+      this.#capturePasskeyWrappings(parseWrappedDataKey(newEnvelope));
+    } catch {}
   }
 
   /**

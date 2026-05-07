@@ -237,7 +237,11 @@ export class TarnClient<S extends AnySchema> {
    * first, both side-by-side). Passkey auth requires PRF support — see
    * `tarn.passkeys.isSupported()`.
    */
-  async authenticateWithPasskey(opts: { deviceLabel?: string; credentialId?: string } = {}): Promise<unknown> {
+  async authenticateWithPasskey(opts: {
+    deviceLabel?: string;
+    credentialId?: string;
+    stalePasskeyHandler?: () => Promise<string | null>;
+  } = {}): Promise<unknown> {
     const result = await this.#underlying.authenticateWithPasskey(opts);
     await this.#persistSession();
     return result;

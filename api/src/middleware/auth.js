@@ -40,5 +40,11 @@ export async function requireAuth(request, env, ctx) {
     role,
     app: payload.app || null,
     sid,
+    // Phase 6.1 — surfaced for the passkey refresh-credential path so it
+    // can require a passkey-authenticated JWT and verify the credential
+    // being refreshed matches the one that signed in. Absent on
+    // password-side / recovery-side / app JWTs.
+    via_passkey: payload.via_passkey === true,
+    passkey_cred_id: typeof payload.passkey_cred_id === 'string' ? payload.passkey_cred_id : null,
   };
 }

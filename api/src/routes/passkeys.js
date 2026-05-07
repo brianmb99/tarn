@@ -601,12 +601,40 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
     'UPDATE passkey_credentials SET sign_count = ?2, last_used_at = ?3 WHERE id = ?1'
   ).bind(credRow.id, verification.authenticationInfo.newCounter, Date.now()).run();
 
+  // Phase 6.1 — stale-credential detection. A credential is "stale" when
+  // its passkey_credentials row exists but no `passkey_prf` wrapping for
+  // this credential_id is present at the LATEST gen of the envelope.
+  // This typically happens when changeCredentials ran on another device
+  // without re-tapping this passkey. Auth still succeeds (the JWT is
+  // minted, older gens unwrap normally) but the client needs to repair
+  // the wrap before it can decrypt anything written under the new gen.
+  // The wire signal lets the SDK transparently surface a refresh path.
+  let staleCredential = false;
+  try {
+    const env_ = JSON.parse(account.wrapped_data_key);
+    if (env_ && Array.isArray(env_.dek_chain) && env_.dek_chain.length > 0) {
+      const latest = env_.dek_chain[env_.dek_chain.length - 1];
+      const wraps = Array.isArray(latest?.wrappings) ? latest.wrappings : [];
+      const hit = wraps.some(
+        w => w?.factor === 'passkey_prf' && w?.credential_id === credRow.credential_id,
+      );
+      staleCredential = !hit;
+    }
+  } catch {
+    // Envelope parse failure — treat as not stale; the SDK will hit a
+    // different error code-path on its own unwrap attempt.
+  }
+
   // Mint a session JWT — same shape as /auth/verify for user logins.
+  // Include the credential_id used for this auth so the refresh-credential
+  // endpoint can verify the caller is updating their own credential and
+  // not arbitrarily overwriting someone else's wrapping.
   const jwtPayload = {
     sub: account.data_lookup_key,
     role: 'user',
     app: account.app,
     via_passkey: true,
+    passkey_cred_id: credRow.credential_id,
   };
   const nowSeconds = Math.floor(Date.now() / 1000);
   await pruneStaleSessions(env, account.data_lookup_key, nowSeconds);
@@ -630,6 +658,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
     wrapped_data_key: account.wrapped_data_key,
     account_key_stored: account.wrapped_account_key != null,
     credential_id: credRow.credential_id,
+    stale_credential: staleCredential,
   }, 200, cors);
 }
 
@@ -656,6 +685,119 @@ export async function handleListPasskeys(request, env, ctx, cors) {
     last_used_at: r.last_used_at,
   }));
   return jsonResponse({ passkeys }, 200, cors);
+}
+
+// ============ POST /api/v1/auth/passkey/refresh-credential ============
+//
+// Phase 6.1 — repair a stale passkey credential. "Stale" means the
+// credential's row exists in passkey_credentials but the latest gen of
+// the account's envelope has no `passkey_prf` wrapping for it (typically
+// because changeCredentials ran on another device without a re-tap of
+// this passkey). The client has just authenticated with the passkey,
+// also obtained the password from the user, unwrapped the latest gen
+// via the password, and re-wrapped it under the passkey PRF KEK; this
+// endpoint stores the rebuilt envelope.
+//
+// Auth posture:
+//   - JWT required, role=user.
+//   - JWT MUST carry `via_passkey: true` AND `passkey_cred_id` matching
+//     the credential being refreshed. This proves the caller actually
+//     authenticated with the passkey they're now repairing — they cannot
+//     use a password-side JWT to overwrite someone else's wrapping.
+//   - The credential MUST belong to the authenticated account.
+//   - Envelope shape is validated; other than the new wrapping the
+//     server can't verify the contents (zero-knowledge), but it can
+//     ensure the shape is well-formed.
+//
+// No step-up token is required: the passkey assertion that produced the
+// JWT IS the proof of possession (it's the moral equivalent of the
+// step-up password re-entry the DELETE path uses). The narrow scope
+// (single credential, restricted to the same passkey that just signed
+// in) means the blast radius of any compromise is identical to the
+// session that just established.
+export async function handlePasskeyRefreshCredential(request, env, ctx, cors) {
+  const auth = await requireAuth(request, env, ctx);
+  if (!auth) return errorResponse('Unauthorized', 401, cors);
+  if (auth.role !== 'user') {
+    return errorResponse('Only user accounts can refresh passkey credentials', 403, cors);
+  }
+  if (!auth.via_passkey || !auth.passkey_cred_id) {
+    return errorResponse(
+      'refresh-credential requires a passkey-authenticated session',
+      403,
+      cors,
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, cors);
+  }
+  const { credential_id, new_envelope } = body || {};
+  if (typeof credential_id !== 'string' || credential_id.length === 0) {
+    return errorResponse('credential_id is required', 400, cors);
+  }
+  if (credential_id !== auth.passkey_cred_id) {
+    return errorResponse(
+      'credential_id must match the passkey that established this session',
+      403,
+      cors,
+    );
+  }
+  const envErr = validateEnvelopeShape(new_envelope);
+  if (envErr) return errorResponse(`new_envelope: ${envErr}`, 400, cors);
+
+  // Confirm the credential belongs to this account (defense in depth —
+  // the JWT already proved it, but we re-check at the DB).
+  const credRow = await env.DB.prepare(
+    'SELECT id FROM passkey_credentials WHERE credential_id = ?1 AND account_id = ?2'
+  ).bind(credential_id, auth.data_lookup_key).first();
+  if (!credRow) {
+    return errorResponse('Passkey not found', 404, cors);
+  }
+
+  // Sanity check: the new envelope MUST have a passkey_prf wrapping for
+  // this credential at the latest gen. Otherwise we'd accept a write
+  // that re-establishes the exact stale state we're trying to fix.
+  try {
+    const parsed = JSON.parse(new_envelope);
+    const latest = parsed.dek_chain[parsed.dek_chain.length - 1];
+    const hit = (latest?.wrappings || []).some(
+      w => w?.factor === 'passkey_prf' && w?.credential_id === credential_id,
+    );
+    if (!hit) {
+      return errorResponse(
+        'new_envelope: latest gen must include a passkey_prf wrapping for this credential',
+        400,
+        cors,
+      );
+    }
+  } catch {
+    return errorResponse('new_envelope: parse failed during stale-state check', 400, cors);
+  }
+
+  const updated = await env.DB.prepare(
+    `UPDATE accounts
+        SET wrapped_data_key = ?2
+      WHERE data_lookup_key = ?1
+      RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
+                recovery_lookup_key, recovery_public_key,
+                share_pub, share_discoverable, share_lookup_key,
+                wrapped_account_key, data_lookup_key`
+  ).bind(auth.data_lookup_key, new_envelope).first();
+  if (!updated) {
+    return errorResponse('Account not found', 404, cors);
+  }
+
+  writePasskeyAudit(ctx, env, request, auth.data_lookup_key, 'passkey_refresh_credential');
+  persistCredentialBlobFromRowWithEnvelope(ctx, env, updated);
+
+  return jsonResponse({
+    refreshed: true,
+    credential_id,
+  }, 200, cors);
 }
 
 // ============ DELETE /api/v1/account/passkeys/:credential_id ============

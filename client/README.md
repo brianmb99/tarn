@@ -408,16 +408,57 @@ if (await tarn.passkeys.isSupported()) {
 // Authenticate with a passkey instead of password. Returns the same logged-in
 // state as `tarn.login()`; subsequent collection / sharing / settings calls
 // work normally.
-await tarn.authenticateWithPasskey({ deviceLabel: 'Brian\'s iPhone' });
+await tarn.authenticateWithPasskey({
+  deviceLabel: 'Brian\'s iPhone',
+  // Optional: handler for the stale-credential path (see "What happens
+  // when you change your password" below).
+  stalePasskeyHandler: async () => prompt('Confirm your password to repair this passkey'),
+});
 ```
 
 **What passkey support gets you.** A registered passkey lets the user (1) log in without typing a password — the platform authenticator's biometric prompt is enough — and (2) decrypt all existing data without holding the password. The DEK chain gains a `passkey_prf` wrapping per gen at registration; subsequent reads through that passkey unwrap normally.
 
-**What passkey support does NOT change.** Adding a passkey does not weaken the password or account-key paths — the existing wrappings stay in place. Removing a passkey strips its wrappings without touching the others. Rotating credentials (`changeCredentials`, `rotateAccountKey`, `recoverAccount`) preserves passkey wrappings byte-for-byte on existing generations; the new generation created by `changeCredentials` does NOT receive a passkey wrapping (the SDK does not have the PRF outputs in that flow), so the user must re-register each passkey post-credential-change for new-generation data to be passkey-unwrappable. `rotateAccountKey` and `recoverAccount` do not mint a new generation, so passkey unwrappability survives both unchanged.
+**What passkey support does NOT change.** Adding a passkey does not weaken the password or account-key paths — the existing wrappings stay in place. Removing a passkey strips its wrappings without touching the others. `rotateAccountKey` and `recoverAccount` do not mint a new generation, so passkey unwrappability survives both unchanged.
 
 **Fallback.** If `tarn.passkeys.isSupported()` returns false (Firefox, Chrome on a Linux box without a platform authenticator, etc.), apps should not surface the passkey affordance and should fall back to password-only auth. The SDK refuses to register a passkey on a device without PRF (the wrap would be unrecoverable), so a hopeful "let's just try" is not safe.
 
 **Multi-device.** Apple iCloud Keychain and Google Password Manager sync passkeys across the user's devices; in those cases, registering on one device makes the credential available on all. For non-syncing authenticators (Windows Hello, hardware security keys), the user must register one per device they want to log in from.
+
+### What happens when you change your password
+
+`changeCredentials` mints a new generation of the data key. For password and account-key factors that's fine — the SDK has both KEKs in hand and re-wraps the new gen automatically. For passkeys, the SDK does NOT have the PRF output (it never persists it), so the new gen would ship without any passkey wrapping unless the user re-taps each registered authenticator at change time. Without that, passkey-only sessions could read pre-change data but not anything written under the new gen — a real break in the passkey UX promise.
+
+The SDK closes the gap with two coordinated callbacks:
+
+```js
+// At credential-change time, prompt for each registered passkey.
+await tarn.account.changeCredentials(newEmail, newPw, {
+  phrase: accountKey,
+  passkeyTapHandler: async ({ credentialId, deviceLabel }) => {
+    // Surface a UI: "Tap your passkey on '<deviceLabel>'."
+    return await app.confirmPasskeyTap(deviceLabel ?? credentialId);
+  },
+});
+```
+
+If the account has registered passkeys and `passkeyTapHandler` is omitted, `changeCredentials` throws — silent stale credentials would be a worse failure than refusing to proceed. The handler returns `true` to proceed (SDK invokes WebAuthn for that credential, derives the wrapping key, attaches a wrapping to the new gen) or `false` to skip (credential ships without a new-gen wrapping → becomes "stale"). If the user dismisses the WebAuthn prompt or the authenticator is unavailable, the credential is also marked stale; this is not an error.
+
+Stale credentials are repaired transparently on next authenticate-with-passkey:
+
+```js
+// On the next login with a stale passkey, supply a handler that
+// returns the password. The SDK derives the password KEK locally,
+// unwraps the latest gen via password, re-wraps it under the
+// passkey, and submits the repaired envelope. After this round-trip
+// the credential is no longer stale.
+await tarn.authenticateWithPasskey({
+  stalePasskeyHandler: async () => app.promptForPassword(),
+});
+```
+
+If `stalePasskeyHandler` is omitted and the credential is stale, the SDK throws `StalePasskeyError` (exported from the package) so the app can prompt re-registration via `tarn.passkeys.register()` from a password-authenticated session — the fallback recovery path. Note: the stale-credential repair currently requires the SDK to know the username (so the password KEK can be derived). If the user only logged in via passkey (no prior password login on this client), call `tarn.login(username, password)` first to prime the username; otherwise the SDK falls back to throwing `StalePasskeyError` with a clear message.
+
+**Synced passkeys (the dominant case).** Apple iCloud Keychain and Google Password Manager share the same credential and PRF secret across all of a user's devices. A single re-tap on one device emits a wrapping that any of the user's other devices can derive themselves on next use — they never need to re-tap. For users who have registered multiple distinct credentials (e.g., iPhone Face ID *and* a YubiKey), each credential's staleness is independent.
 
 ---
 
@@ -425,8 +466,16 @@ await tarn.authenticateWithPasskey({ deviceLabel: 'Brian\'s iPhone' });
 
 ```js
 // Rotate credentials (routine username/password change). Existing data stays decryptable.
-// Pass the account key to extend the recovery factor to the new generation.
-await tarn.account.changeCredentials('new@example.com', 'new-password', { phrase });
+// Pass the account key to extend the recovery factor to the new generation. If the account
+// has any registered passkeys, also pass `passkeyTapHandler` — the SDK calls it once per
+// credential to drive the re-tap that re-wraps the new generation under each passkey's
+// PRF KEK. Without the handler, accounts with passkeys throw (see "What happens when you
+// change your password" in the Passkeys section above for the full model).
+await tarn.account.changeCredentials('new@example.com', 'new-password', {
+  phrase,
+  passkeyTapHandler: async ({ credentialId, deviceLabel }) =>
+    await app.confirmPasskeyTap(deviceLabel ?? credentialId),
+});
 
 // Permanently delete. Tombstones credentials, clears server-side state, wipes local session.
 await tarn.account.delete();

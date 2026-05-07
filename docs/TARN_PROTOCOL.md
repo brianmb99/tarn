@@ -376,9 +376,30 @@ CREATE TABLE passkey_credentials (
 - `POST /api/v1/auth/passkey/register-options` — JWT-authed (logged-in user). Returns `{ options, prf_salt }`. Server stores the registration challenge in `webauthn_challenges` (60 s TTL, single-use).
 - `POST /api/v1/auth/passkey/register` — JWT-authed. Body: `{ credential, prf_salt, new_envelope, device_label? }`. Server verifies the WebAuthn registration response, stores the credential row, atomically replaces the envelope, republishes to Arweave. Returns `{ credential_id, device_label, created_at }`.
 - `POST /api/v1/auth/passkey/authentication-options` — public. Returns `{ options, allow_credentials: [{ credential_id, prf_salt }, ...], rp_id }`. Server stores the authentication challenge in `webauthn_challenges` (60 s TTL).
-- `POST /api/v1/auth/passkey/authenticate` — public. Body: `{ credential, previous_sid?, device_label? }`. Server verifies the assertion against the stored public key, increments sign_count, mints a session JWT. Returns the same payload shape as `/auth/verify` (`{ jwt, expiresIn, data_lookup_key, wrapped_data_key, account_key_stored, credential_id }`).
+- `POST /api/v1/auth/passkey/authenticate` — public. Body: `{ credential, previous_sid?, device_label? }`. Server verifies the assertion against the stored public key, increments sign_count, mints a session JWT. Returns `{ jwt, expiresIn, data_lookup_key, wrapped_data_key, account_key_stored, credential_id, stale_credential }`. The JWT carries `via_passkey: true` and `passkey_cred_id: <credential_id>` claims so the refresh-credential endpoint can verify the caller is repairing the same credential they just signed in with.
+- `POST /api/v1/auth/passkey/refresh-credential` — JWT-authed (passkey-side JWT only — `via_passkey: true` plus a matching `passkey_cred_id`). Body: `{ credential_id, new_envelope }`. Repairs a stale credential (see "Stale credentials and re-tap" below). The credential_id in the body MUST match the JWT's `passkey_cred_id`. The new envelope MUST include a `passkey_prf` wrapping for this credential at the latest gen — the server rejects envelopes that would re-establish the stale state. No step-up token is required: the passkey assertion that produced the JWT is the moral equivalent of a fresh re-authentication.
 - `GET /api/v1/account/passkeys` — JWT-authed. Returns `{ passkeys: [{ credential_id, device_label, created_at, last_used_at }, ...] }`. Public keys and PRF salts are NOT exposed (those are auth-internal).
 - `DELETE /api/v1/account/passkeys/:credential_id` — JWT + step-up token. Body: `{ new_envelope }`. Strips the credential row and the matching wrappings, republishes to Arweave. Step-up reuses the existing `account_key_fetch` scope (the security posture is identical to the account-key toggles).
+
+#### Stale credentials and re-tap (Phase 6.1)
+
+A passkey credential is considered **stale** when the credential row exists in `passkey_credentials` but the LATEST gen of the account's envelope contains no `passkey_prf` wrapping for that credential_id. The model is intentionally derived from envelope shape alone — no side table, no schema change — so a `wrapped_data_key` republish from any source automatically updates the stale flag the next time the credential authenticates.
+
+Staleness arises when an envelope-mutating operation creates a new gen and the SDK does not have the credential's PRF output to wrap the new gen DEK with. The canonical case is `changeCredentials`: the user is re-typing their password, the SDK has no opportunity to read the PRF output from any registered passkey, so the new gen ships without passkey wrappings. Phase 6.1 closes the gap by:
+
+1. **Re-tap during `changeCredentials`.** When the account has registered passkeys, the SDK `changeCredentials` flow refuses to proceed without a `passkeyTapHandler` callback (silently producing stale credentials would be a worse UX failure). The handler is invoked once per registered credential; the user taps each authenticator they want to keep usable. The SDK fetches `/auth/passkey/authentication-options` for each credential, drives `navigator.credentials.get()` with the PRF extension, derives the wrapping key, and adds a `passkey_prf` wrapping to the new gen. Credentials whose tap is skipped or fails (authenticator unavailable, user dismissed) ship a new gen without their wrapping — they become stale.
+2. **Server-side stale detection on auth.** `/auth/passkey/authenticate` parses the live envelope after verifying the assertion, checks whether the latest gen has a `passkey_prf` wrapping for this `credential_id`, and sets `stale_credential: true` in the response when it does not. Authentication still succeeds (JWT minted, older gens unwrap normally) — the flag is purely informational so the SDK can transparently surface the repair.
+3. **Stale-credential refresh.** When the SDK sees `stale_credential: true`, it can repair the credential inline. The flow:
+   - Unwrap pre-stale gens via the passkey PRF KEK as usual.
+   - Invoke a caller-supplied `stalePasskeyHandler` callback that prompts the user for their password.
+   - Re-derive the password KEK from `(username, password, app_id)`, unwrap the latest gen via the password factor, re-wrap it under the passkey PRF KEK.
+   - Build a refreshed envelope and POST to `/api/v1/auth/passkey/refresh-credential` with `{ credential_id, new_envelope }`.
+
+   When no handler is supplied, the SDK throws `StalePasskeyError` instead — the app catches it and prompts re-registration via `tarn.passkeys.register()` from a password-authenticated session as the fallback recovery path.
+
+**OS-synced passkeys.** For the dominant case — Apple iCloud Keychain and Google Password Manager — all of a user's devices share the same credential_id and PRF secret. So a single re-tap on one device emits a wrapping that any of the user's other devices can derive themselves on next use. Real-world cross-device PRF stability is an empirical property of the platform sync layer, not something Tarn can guarantee from the wire spec; this assumption is documented for v1, with a path to per-device fallback (re-register) if a sync mismatch ever surfaces in practice.
+
+**Multiple distinct credentials.** When a user has multiple credentials that don't share PRF secrets (e.g., iPhone Face ID plus a YubiKey, registered as separate credentials), they can only re-wrap credentials whose authenticator is physically present at change time. Per-credential staleness is independent — re-tapping one doesn't affect the other. Each stale credential has its own per-credential repair flow on next use.
 
 #### RP-ID and origin handling
 
@@ -739,14 +760,25 @@ CLIENT (authenticated with old credentials, holds DEK chain DEK[1..N]):
      wrappings byte-for-byte (AES-KW is deterministic, so re-wrapping under
      the same recovery_KEK would be a no-op anyway). When the caller supplies
      `phrase`, derive recovery_KEK and add a recovery wrapping to gen N+1 too.
-  4. new_wrapped_data_key = v1 envelope with chain entries:
+  4. Phase 6.1 — passkey re-tap. When the account has registered passkeys,
+     prompt the user to re-tap each authenticator (caller-supplied
+     `passkeyTapHandler`). For each successful tap, derive the PRF wrapping
+     key and add a passkey_prf wrapping for that credential_id to gen N+1.
+     Credentials skipped at change-time or whose authenticator is absent
+     ship without a new-gen wrapping → marked "stale" by the server on next
+     authenticate. Apps with registered passkeys MUST supply the handler
+     (the SDK refuses to silently produce stale credentials).
+  5. new_wrapped_data_key = v1 envelope with chain entries:
        [ { gen: i, wrappings: [
              { factor: 'password',        wrapped: AES-KW(DEK[i], new_credential_encryption_key) },
              // recovery wrapping per existing gen, plus optional gen N+1 if phrase supplied
              { factor: 'recovery_phrase', wrapped: <preserved or fresh> },
+             // passkey wrappings: preserved verbatim per existing gen,
+             // plus per-credential wrappings on gen N+1 for re-tapped credentials
+             { factor: 'passkey_prf', credential_id: ..., wrapped: ... }, ...
          ]}
          for i in 1..N+1 ]
-  5. Future writes use Gen=N+1.
+  6. Future writes use Gen=N+1.
 
 CLIENT -> API:
   PUT /api/v1/auth [JWT from old credentials]
@@ -754,7 +786,9 @@ CLIENT -> API:
           new_share_pub, new_share_lookup_key }
 
 data_lookup_key unchanged. Existing data untouched. Old gens stay readable;
-new writes go to the new gen.
+new writes go to the new gen. Skipped passkeys become stale on the new gen
+and surface a refresh path on next authenticate (see Passkey factor §
+"Stale credentials and re-tap").
 ```
 
 ### 7a. Account recovery (via account key)

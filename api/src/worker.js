@@ -26,6 +26,7 @@ import {
   handlePasskeyRegister,
   handlePasskeyAuthOptions,
   handlePasskeyAuthenticate,
+  handlePasskeyRefreshCredential,
   handleListPasskeys,
   handleDeletePasskey,
 } from './routes/passkeys.js';
@@ -147,6 +148,9 @@ export default {
       }
       if (path === '/api/v1/auth/passkey/authenticate' && method === 'POST') {
         return await handlePasskeyAuthenticate(request, env, ctx, cors);
+      }
+      if (path === '/api/v1/auth/passkey/refresh-credential' && method === 'POST') {
+        return await handlePasskeyRefreshCredential(request, env, ctx, cors);
       }
       if (path === '/api/v1/account/passkeys' && method === 'GET') {
         return await handleListPasskeys(request, env, ctx, cors);

@@ -23,7 +23,11 @@ export type PasskeyInfo = {
 export interface IPasskeysClient {
   passkeysSupported(): Promise<boolean>;
   registerPasskey(opts?: { deviceLabel?: string }): Promise<{ credentialId: string; deviceLabel: string | null }>;
-  authenticateWithPasskey(opts?: { deviceLabel?: string; credentialId?: string }): Promise<{ dataLookupKey: string }>;
+  authenticateWithPasskey(opts?: {
+    deviceLabel?: string;
+    credentialId?: string;
+    stalePasskeyHandler?: () => Promise<string | null>;
+  }): Promise<{ dataLookupKey: string }>;
   listPasskeys(): Promise<PasskeyInfo[]>;
   removePasskey(opts: { credentialId: string; password: string }): Promise<void>;
 }
