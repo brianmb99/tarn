@@ -871,6 +871,338 @@ await test('Cleanup invite-leg accounts', async () => {
   await inviteRedeemer.deleteAccount();
 });
 
+// ============ 9f. RECOVERY (Phases 3-6) =================================
+//
+// Smoke coverage for Model B account-key storage, toggle, rotation,
+// recoverAccount({ rotatePhrase: true }), and the WebAuthn-PRF passkey
+// factor. All flows happen end-to-end against the live API; each test
+// registers fresh accounts (random usernames) so reruns + concurrent
+// runs don't collide. Edge cases live in tests/test-account-key.mjs and
+// tests/test-passkeys.mjs — this section just ensures the happy path
+// flows still work post-deploy.
+
+// Tiny inline helper so each fresh account gets permissive rules from
+// the bookish app JWT — same pattern §8 / §9c / §9e use, factored once.
+async function setRulesForAccount(dlk, opts = {}) {
+  const limit = opts.maxEntries ?? 30;
+  const bytes = opts.maxBytes ?? 102400;
+  const pkcs8 = new Uint8Array(APP_KEY.length / 2);
+  for (let i = 0; i < APP_KEY.length; i += 2) pkcs8[i / 2] = parseInt(APP_KEY.substr(i, 2), 16);
+  const privateKey = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const cRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: APP_ID }),
+  });
+  const { nonce } = await cRes.json();
+  const nonceBytes = new Uint8Array(nonce.length / 2);
+  for (let i = 0; i < nonce.length; i += 2) nonceBytes[i / 2] = parseInt(nonce.substr(i, 2), 16);
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, nonceBytes);
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  const vRes = await fetch(`${API_BASE}/api/v1/auth/verify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: APP_ID, nonce, signature: sigB64 }),
+  });
+  const { jwt } = await vRes.json();
+  const r = await fetch(`${API_BASE}/api/v1/accounts/${dlk}/rules`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
+    body: JSON.stringify({ rules: [{ type: 'max_entries', limit, app: APP_ID }, { type: 'max_bytes', limit: bytes }] }),
+  });
+  if (r.status !== 200) throw new Error(`set rules failed: ${r.status}`);
+}
+
+function freshUsername(tag) {
+  return `deploy-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
+}
+
+// ============ 9f. ACCOUNT KEY: VIEW (Model B, Phase 3) ==================
+
+console.log('\n=== 9f. Account-key view (Model B) ===');
+
+let modelBClient;
+let modelBUsername;
+let modelBPassword;
+let modelBPhrase;
+
+await test('register({ storeAccountKey: true }) surfaces the phrase + sets account_key_stored', async () => {
+  modelBClient = new TarnClient(API_BASE, APP_ID);
+  modelBUsername = freshUsername('mb');
+  modelBPassword = 'pw-mb-' + Date.now();
+  const reg = await modelBClient.register(modelBUsername, modelBPassword, {
+    recoveryAcknowledged: true,
+    storeAccountKey: true,
+  });
+  modelBPhrase = reg.accountKey;
+  assert(typeof modelBPhrase === 'string' && modelBPhrase.split(' ').length === 24,
+    `expected a 24-word phrase, got ${modelBPhrase?.split(' ').length} words`);
+  assert(modelBClient.isAccountKeyStored() === true, 'account_key_stored should be true after Model B register');
+  await setRulesForAccount(modelBClient.dataLookupKey);
+});
+
+await test('viewAccountKey({ password }) round-trips the same phrase that register issued', async () => {
+  const out = await modelBClient.viewAccountKey({ password: modelBPassword });
+  assert(out.accountKey === modelBPhrase,
+    `view() must round-trip the original phrase`);
+});
+
+// ============ 9g. ACCOUNT KEY: TOGGLE (Phase 4) =========================
+
+console.log('\n=== 9g. Account-key toggle (enable/disable) ===');
+
+await test('disableKeyStorage flips Model B → A; view() then errors no_account_key_stored', async () => {
+  const out = await modelBClient.disableKeyStorage({ password: modelBPassword });
+  assert(out.stored === false, 'disable returns stored: false');
+  assert(modelBClient.isAccountKeyStored() === false, 'cached flag flipped to false');
+  let threw = null;
+  try {
+    await modelBClient.viewAccountKey({ password: modelBPassword });
+  } catch (err) { threw = err; }
+  assert(threw && /no_account_key_stored/.test(threw.message),
+    `expected no_account_key_stored, got: ${threw?.message}`);
+});
+
+await test('enableKeyStorage with the saved phrase restores Model B; view() round-trips', async () => {
+  const out = await modelBClient.enableKeyStorage({
+    password: modelBPassword,
+    accountKey: modelBPhrase,
+  });
+  assert(out.stored === true, 'enable returns stored: true');
+  assert(modelBClient.isAccountKeyStored() === true, 'cached flag flipped back to true');
+  const view = await modelBClient.viewAccountKey({ password: modelBPassword });
+  assert(view.accountKey === modelBPhrase, 'view() round-trips after re-enable');
+});
+
+await test('Cleanup §9f/§9g account', async () => {
+  await modelBClient.deleteAccount();
+});
+
+// ============ 9h. ACCOUNT KEY: ROTATION (Phase 4) =======================
+
+console.log('\n=== 9h. Account-key rotation ===');
+
+await test('rotateAccountKey: NEW phrase recovers + reads pre-rotation data; OLD phrase is rejected', async () => {
+  // Register a fresh account, write a probe entry, rotate, then verify
+  // (a) OLD phrase no longer recovers, (b) NEW phrase recovers, (c) the
+  // entry is still readable post-recovery (DEK chain preserved across
+  // rotation).
+  const client = new TarnClient(API_BASE, APP_ID);
+  const username = freshUsername('rot');
+  const password = 'pw-rot-' + Date.now();
+  const reg = await client.register(username, password, { recoveryAcknowledged: true });
+  const oldPhrase = reg.accountKey;
+  await setRulesForAccount(client.dataLookupKey);
+
+  // Write a probe entry pre-rotation.
+  const probeMarker = 'rot-probe-' + Date.now();
+  await client.createEntry('entry', { marker: probeMarker, ts: Date.now() });
+
+  // Rotate.
+  const rot = await client.rotateAccountKey({ password });
+  assert(typeof rot.accountKey === 'string' && rot.accountKey.split(' ').length === 24,
+    'rotation returns a new 24-word phrase');
+  assert(rot.accountKey !== oldPhrase, 'new phrase differs from old');
+
+  // OLD phrase must now be rejected.
+  let threw = null;
+  try {
+    const stale = new TarnClient(API_BASE, APP_ID);
+    await stale.recoverAccount({
+      phrase: oldPhrase,
+      newUsername: freshUsername('rot-stale'),
+      newPassword: 'pw-stale-' + Date.now(),
+    });
+  } catch (err) { threw = err; }
+  assert(threw && /no account found|challenge failed/i.test(threw.message),
+    `OLD phrase must be rejected post-rotation; got: ${threw?.message}`);
+
+  // NEW phrase must recover, and the probe entry must still be readable.
+  const recovered = new TarnClient(API_BASE, APP_ID);
+  await recovered.recoverAccount({
+    phrase: rot.accountKey,
+    newUsername: freshUsername('rot-rec'),
+    newPassword: 'pw-rec-' + Date.now(),
+  });
+  assert(recovered.isLoggedIn(), 'recovered client is logged in via new phrase');
+  const entries = await recovered.getEntries('entry');
+  assert(entries.some(e => e.data?.marker === probeMarker),
+    'pre-rotation entry must still be readable after recovery');
+
+  await recovered.deleteAccount();
+});
+
+// ============ 9i. recoverAccount({ rotatePhrase: true }) ================
+
+console.log('\n=== 9i. recoverAccount({ rotatePhrase: true }) ===');
+
+await test('recoverAccount({ rotatePhrase: true }): NEW phrase replaces OLD; data still readable', async () => {
+  const client = new TarnClient(API_BASE, APP_ID);
+  const username = freshUsername('rp');
+  const password = 'pw-rp-' + Date.now();
+  const reg = await client.register(username, password, { recoveryAcknowledged: true });
+  const oldPhrase = reg.accountKey;
+  await setRulesForAccount(client.dataLookupKey);
+
+  const probeMarker = 'rp-probe-' + Date.now();
+  await client.createEntry('entry', { marker: probeMarker, ts: Date.now() });
+
+  // Recover-with-rotation.
+  const rec1 = new TarnClient(API_BASE, APP_ID);
+  const result = await rec1.recoverAccount({
+    phrase: oldPhrase,
+    newUsername: freshUsername('rp-1'),
+    newPassword: 'pw-rp1-' + Date.now(),
+    rotatePhrase: true,
+  });
+  assert(typeof result.accountKey === 'string' && result.accountKey.split(' ').length === 24,
+    'rotatePhrase: true returns a new 24-word phrase');
+  assert(result.accountKey !== oldPhrase, 'new phrase differs from old');
+
+  // OLD phrase no longer recovers.
+  let threw = null;
+  try {
+    const c2 = new TarnClient(API_BASE, APP_ID);
+    await c2.recoverAccount({
+      phrase: oldPhrase,
+      newUsername: freshUsername('rp-stale'),
+      newPassword: 'pw-stale-' + Date.now(),
+    });
+  } catch (err) { threw = err; }
+  assert(threw && /no account found|challenge failed/i.test(threw.message),
+    `OLD phrase must be rejected post-rotation; got: ${threw?.message}`);
+
+  // NEW phrase still recovers and data still reads.
+  const rec2 = new TarnClient(API_BASE, APP_ID);
+  await rec2.recoverAccount({
+    phrase: result.accountKey,
+    newUsername: freshUsername('rp-2'),
+    newPassword: 'pw-rp2-' + Date.now(),
+  });
+  const entries = await rec2.getEntries('entry');
+  assert(entries.some(e => e.data?.marker === probeMarker),
+    'pre-rotation entry must still be readable after recovery via new phrase');
+
+  await rec2.deleteAccount();
+});
+
+// ============ 9j. PASSKEYS (register / authenticate / list / remove) ====
+//
+// Uses the virtual WebAuthn authenticator from
+// tests/helpers/virtual-authenticator.mjs to drive the full ceremony
+// against the live API. We install the env right before this section
+// and restore it immediately after — earlier sections in this file
+// don't tolerate a globally-patched fetch (Origin injection is harmless
+// against the deployed API but the install also wires up
+// navigator.credentials, which we don't want in scope long-term).
+//
+// The `Origin: http://localhost:3000` header the shim injects is in
+// the deployed API's CORS + passkey-origin allowlist (see
+// api/src/routes/passkeys.js → ORIGIN_TO_RP_ID and worker.js →
+// ALLOWED_ORIGINS), so the same shim works against api.tarn.dev as
+// against http://localhost:8787.
+
+console.log('\n=== 9j. Passkey lifecycle (register / authenticate / list / remove) ===');
+
+const { VirtualAuthenticator, installPasskeyTestEnv } = await import('./helpers/virtual-authenticator.mjs');
+const passkeyEnv = installPasskeyTestEnv({ origin: 'http://localhost:3000', rpId: 'localhost' });
+
+let pkClient;
+let pkUsername;
+let pkPassword;
+let pkPhrase;
+let pkAuth;
+let pkCredId;
+
+await test('register fresh account, then enroll a passkey via virtual authenticator', async () => {
+  pkClient = new TarnClient(API_BASE, APP_ID);
+  pkUsername = freshUsername('pk');
+  pkPassword = 'pw-pk-' + Date.now();
+  const reg = await pkClient.register(pkUsername, pkPassword, { recoveryAcknowledged: true });
+  pkPhrase = reg.accountKey;
+  await setRulesForAccount(pkClient.dataLookupKey);
+
+  pkAuth = new VirtualAuthenticator();
+  passkeyEnv.stageRegistration(pkAuth);
+  const result = await pkClient.registerPasskey({ deviceLabel: 'smoke-passkey' });
+  pkCredId = result.credentialId;
+  assert(pkCredId && pkCredId === pkAuth.credentialIdB64Url,
+    'registerPasskey returned the staged credentialId');
+  assert(result.deviceLabel === 'smoke-passkey', 'deviceLabel persisted');
+});
+
+await test('listPasskeys() shows the new credential with stale: false', async () => {
+  const list = await pkClient.listPasskeys();
+  assert(Array.isArray(list) && list.length === 1, `expected 1 passkey, got ${list.length}`);
+  assert(list[0].credentialId === pkCredId, 'credentialId matches');
+  assert(list[0].stale === false, `expected stale: false on a freshly-registered credential, got ${list[0].stale}`);
+  assert(!('publicKey' in list[0]) && !('prfSalt' in list[0]),
+    'listPasskeys must not leak public_key / prf_salt');
+});
+
+await test('authenticateWithPasskey() on a fresh client mints a session that can read+write', async () => {
+  const fresh = new TarnClient(API_BASE, APP_ID);
+  passkeyEnv.pinNextAuth(pkAuth.credentialIdB64Url);
+  const r = await fresh.authenticateWithPasskey();
+  passkeyEnv.clearNextAuth();
+  assert(r.dataLookupKey === pkClient.dataLookupKey, 'passkey auth resolved to the registered account');
+
+  // Write + read via the passkey-authenticated session.
+  const marker = 'pk-write-' + Date.now();
+  await fresh.createEntry('entry', { marker, ts: Date.now() });
+  const entries = await fresh.getEntries('entry');
+  assert(entries.some(e => e.data?.marker === marker),
+    'passkey-authenticated session can read its own writes');
+});
+
+await test('removePasskey({ credentialId, password }) removes it from list', async () => {
+  await pkClient.removePasskey({ credentialId: pkCredId, password: pkPassword });
+  const list = await pkClient.listPasskeys();
+  assert(list.length === 0, `expected 0 passkeys after remove, got ${list.length}`);
+});
+
+// ============ 9k. CHANGECREDENTIALS WITH PASSKEY RE-TAP (Phase 6.1) =====
+
+console.log('\n=== 9k. changeCredentials with passkey re-tap ===');
+
+await test('changeCredentials({ passkeyTapHandler }) preserves passkey auth across rotation', async () => {
+  // Register a fresh passkey; rotate credentials with auto-tap; verify
+  // the passkey still authenticates and reads post-rotation data.
+  const auth = new VirtualAuthenticator();
+  passkeyEnv.stageRegistration(auth);
+  const r = await pkClient.registerPasskey({ deviceLabel: 'retap-passkey' });
+  const credId = r.credentialId;
+
+  const newPassword = 'pw-pk-changed-' + Date.now();
+  let handlerCalls = 0;
+  await pkClient.changeCredentials(pkUsername, newPassword, {
+    phrase: pkPhrase,
+    passkeyTapHandler: async (cred) => {
+      handlerCalls += 1;
+      assert(cred.credentialId === credId, 'tap handler called with the registered credentialId');
+      return true; // auto-tap
+    },
+  });
+  assert(handlerCalls === 1, `expected exactly 1 re-tap, got ${handlerCalls}`);
+
+  // Write a post-rotation entry under the new password.
+  const marker = 'post-rotate-' + Date.now();
+  await pkClient.createEntry('entry', { marker, ts: Date.now() });
+
+  // Authenticate with the passkey on a fresh client; verify it reads the new entry.
+  const fresh = new TarnClient(API_BASE, APP_ID);
+  passkeyEnv.pinNextAuth(auth.credentialIdB64Url);
+  const session = await fresh.authenticateWithPasskey();
+  passkeyEnv.clearNextAuth();
+  assert(session.dataLookupKey === pkClient.dataLookupKey, 'passkey resolves to same account post-rotation');
+  const entries = await fresh.getEntries('entry');
+  assert(entries.some(e => e.data?.marker === marker),
+    'passkey-authenticated session reads post-rotation data (re-tap rewrapped gen-2)');
+});
+
+await test('Cleanup §9j/§9k account; restore passkey shim', async () => {
+  await pkClient.deleteAccount();
+  passkeyEnv.restore();
+});
+
 // ============ 10. CLEANUP ============
 
 console.log('\n=== 10. Cleanup ===');
