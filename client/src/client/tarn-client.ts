@@ -240,7 +240,7 @@ export class TarnClient<S extends AnySchema> {
   async authenticateWithPasskey(opts: {
     deviceLabel?: string;
     credentialId?: string;
-    stalePasskeyHandler?: () => Promise<string | null>;
+    stalePasskeyHandler?: () => Promise<{ username: string; password: string } | null>;
   } = {}): Promise<unknown> {
     const result = await this.#underlying.authenticateWithPasskey(opts);
     await this.#persistSession();

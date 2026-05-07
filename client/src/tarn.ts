@@ -196,8 +196,9 @@ export class StalePasskeyError extends Error {
     super(
       args.message ??
         `Passkey ${args.credentialId.slice(0, 8)}… has no wrapping for the current generation. ` +
-          'Repair it by re-authenticating with a stalePasskeyHandler that supplies the password, ' +
-          'or by re-registering the passkey from a password-authenticated session.',
+          "Repair it by re-authenticating with a stalePasskeyHandler that returns both the " +
+          "account's username and password, or by re-registering the passkey from a " +
+          'password-authenticated session.',
     );
     this.name = 'StalePasskeyError';
     this.credentialId = args.credentialId;
@@ -2053,13 +2054,24 @@ export class TarnClient {
     /**
      * Phase 6.1 — handler invoked when the server flags the just-used
      * credential as stale (no `passkey_prf` wrapping on the latest gen).
-     * The handler should prompt the user for their password and resolve
-     * with it; resolving with null aborts the repair and surfaces a
+     * The handler should prompt the user for BOTH the account's username
+     * and password and resolve with `{ username, password }`. The SDK
+     * derives the master_key from `(username, password, app_id)`, unwraps
+     * the latest gen via the password factor, re-wraps it under this
+     * passkey's PRF KEK, and submits the rebuilt envelope.
+     *
+     * Resolving with `null` aborts the repair and surfaces a
      * `StalePasskeyError` instead. If no handler is supplied and a stale
      * credential is detected, this method throws `StalePasskeyError`
      * directly so the app can surface a re-registration UI.
+     *
+     * Both fields are required because passkey-only sessions (where the
+     * user has only ever tapped, never typed a username) do not have a
+     * cached username on the client. Asking the handler for both makes
+     * the repair work unconditionally — apps prompt for both the same way
+     * they would for a normal username+password login.
      */
-    stalePasskeyHandler?: () => Promise<string | null>;
+    stalePasskeyHandler?: () => Promise<{ username: string; password: string } | null>;
   } = {}): Promise<{ dataLookupKey: string }> {
     if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
@@ -2178,18 +2190,26 @@ export class TarnClient {
       if (typeof opts.stalePasskeyHandler !== 'function') {
         throw new StalePasskeyError({ credentialId: credential_id });
       }
-      const password = await opts.stalePasskeyHandler();
-      if (typeof password !== 'string' || password.length === 0) {
+      const handlerResult = await opts.stalePasskeyHandler();
+      if (
+        !handlerResult ||
+        typeof handlerResult !== 'object' ||
+        typeof (handlerResult as any).username !== 'string' ||
+        typeof (handlerResult as any).password !== 'string' ||
+        (handlerResult as any).username.length === 0 ||
+        (handlerResult as any).password.length === 0
+      ) {
         throw new StalePasskeyError({
           credentialId: credential_id,
           message:
             `Passkey ${credential_id.slice(0, 8)}… is stale and the stalePasskeyHandler ` +
-            'returned no password — re-register the passkey to repair.',
+            'must return { username, password }; re-register the passkey to repair.',
         });
       }
       await this.#repairStaleCredential({
         credentialId: credential_id,
-        password,
+        username: handlerResult.username,
+        password: handlerResult.password,
         passkeyKEK,
         wrappedDataKey: wrapped_data_key,
       });
@@ -2249,37 +2269,29 @@ export class TarnClient {
   }
 
   /**
-   * Phase 6.1 — repair a stale credential by:
-   *   1. Looking up the username via /auth/passkey/whoami (server replies
-   *      with the credential blob the SDK already has — we already have
-   *      the dataLookupKey from the auth response, but we need a
-   *      username-side credential_lookup_key to finish the password
-   *      challenge). Fall back to deriving from the in-memory username if
-   *      the caller previously called `login()` on the same client.
-   *   2. Deriving password keys from the supplied password.
-   *   3. Unwrapping the LATEST gen via the password factor.
-   *   4. Wrapping it under the passkey's PRF KEK.
-   *   5. Submitting the rebuilt envelope to the refresh-credential endpoint.
+   * Phase 6.2 — repair a stale credential by:
+   *   1. Deriving password keys from the handler-supplied (username,
+   *      password) — Tarn never stores plaintext usernames, so the SDK
+   *      needs the user to retype both. Passkey-only sessions don't have
+   *      a username cached, so we accept it from the handler rather than
+   *      relying on `#username`.
+   *   2. Unwrapping the LATEST gen via the password factor.
+   *   3. Wrapping it under the passkey's PRF KEK.
+   *   4. Submitting the rebuilt envelope to the refresh-credential endpoint.
    *
-   * After step 5 the credential is no longer stale; the local
+   * After step 4 the credential is no longer stale; the local
    * `#dekByGen` snapshot is updated in place to include the (now-repaired)
    * latest gen.
    *
-   * Note: the SDK does not look up the username at the server (Tarn never
-   * stores plaintext usernames). The handler-supplied password alone is
-   * enough — credential_lookup_key derives from (username, password,
-   * appId), and the user would have only set the password they're
-   * supplying now if it goes with the username on this account. So we
-   * try the in-memory `#username` (set when the client previously logged
-   * in via password); if absent, the repair fails with a clear message
-   * directing the app to use re-registration instead. This is acceptable
-   * because the typical app flow stores the username in a way that can
-   * be plumbed back through (re-render the login form), and the
-   * less-typical "log in via passkey only, then change password on a
-   * different device" pattern is rare enough to leave to re-registration.
+   * If `#username` was already cached (the client previously did a
+   * password login on this same instance), it must match the handler's
+   * username — otherwise the supplied password is for the wrong account
+   * and the unwrap will fail anyway. We accept whatever the handler
+   * returns; the password unwrap is the truth check.
    */
   async #repairStaleCredential(args: {
     credentialId: string;
+    username: string;
     password: string;
     passkeyKEK: CryptoKey;
     wrappedDataKey: string;
@@ -2303,25 +2315,7 @@ export class TarnClient {
         message: 'stale-credential repair: latest gen has no password wrapping',
       });
     }
-
-    // We need the username to derive the password KEK. The simplest
-    // path: the app re-uses a TarnClient that was previously
-    // password-logged-in (username cached). If the client started via
-    // authenticateWithPasskey alone, we can't derive the password KEK
-    // here — surface a clear error. In practice the stale-handler is
-    // typically invoked on the same client where the user is filling in
-    // a password form, and apps can call `tarn.login()` first to
-    // establish the username. A future endpoint could let the server
-    // supply the username back to the client; deferred to a follow-up.
-    if (!this.#username) {
-      throw new StalePasskeyError({
-        credentialId: args.credentialId,
-        message:
-          'stale-credential repair requires a username — call tarn.login() first or ' +
-          're-register the passkey via tarn.passkeys.register() from a password session.',
-      });
-    }
-    const reKeys = await deriveAllKeys(this.#username, args.password, this.#appId);
+    const reKeys = await deriveAllKeys(args.username, args.password, this.#appId);
 
     // Unwrap the latest gen via the password factor, then wrap it under
     // the passkey KEK.
@@ -2409,6 +2403,7 @@ export class TarnClient {
     deviceLabel: string | null;
     createdAt: number;
     lastUsedAt: number | null;
+    stale: boolean;
   }>> {
     await this.#requireAuth();
     const res = await this.#fetch('/api/v1/account/passkeys', { method: 'GET', auth: true });
@@ -2421,6 +2416,7 @@ export class TarnClient {
       deviceLabel: r.device_label ?? null,
       createdAt: r.created_at,
       lastUsedAt: r.last_used_at ?? null,
+      stale: r.stale === true,
     }));
   }
 

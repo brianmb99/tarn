@@ -396,7 +396,11 @@ if (await tarn.passkeys.isSupported()) {
 
   // List registered passkeys (Settings UI).
   const all = await tarn.passkeys.list();
-  // [{ credentialId, deviceLabel, createdAt, lastUsedAt }, ...]
+  // [{ credentialId, deviceLabel, createdAt, lastUsedAt, stale }, ...]
+  // `stale: true` means the credential has no wrapping at the latest gen
+  // — typically because changeCredentials ran without a re-tap. Surface
+  // a "Refresh" affordance on stale entries (see "What happens when you
+  // change your password" below for the repair flow).
 
   // Remove a passkey. Step-up gated — caller passes the freshly-typed password.
   await tarn.passkeys.remove({
@@ -410,9 +414,14 @@ if (await tarn.passkeys.isSupported()) {
 // work normally.
 await tarn.authenticateWithPasskey({
   deviceLabel: 'Brian\'s iPhone',
-  // Optional: handler for the stale-credential path (see "What happens
-  // when you change your password" below).
-  stalePasskeyHandler: async () => prompt('Confirm your password to repair this passkey'),
+  // Optional: handler for the stale-credential path. The handler MUST
+  // return both username and password — passkey-only sessions don't
+  // have either cached on the client. See "What happens when you change
+  // your password" below for the repair flow.
+  stalePasskeyHandler: async () => ({
+    username: await app.promptForUsername(),
+    password: await app.promptForPassword(),
+  }),
 });
 ```
 
@@ -447,16 +456,23 @@ Stale credentials are repaired transparently on next authenticate-with-passkey:
 
 ```js
 // On the next login with a stale passkey, supply a handler that
-// returns the password. The SDK derives the password KEK locally,
-// unwraps the latest gen via password, re-wraps it under the
-// passkey, and submits the repaired envelope. After this round-trip
-// the credential is no longer stale.
+// returns BOTH the username and the password. The SDK derives the
+// password KEK locally, unwraps the latest gen via password, re-wraps
+// it under the passkey, and submits the repaired envelope. After this
+// round-trip the credential is no longer stale.
 await tarn.authenticateWithPasskey({
-  stalePasskeyHandler: async () => app.promptForPassword(),
+  stalePasskeyHandler: async () => ({
+    username: await app.promptForUsername(),
+    password: await app.promptForPassword(),
+  }),
 });
 ```
 
-If `stalePasskeyHandler` is omitted and the credential is stale, the SDK throws `StalePasskeyError` (exported from the package) so the app can prompt re-registration via `tarn.passkeys.register()` from a password-authenticated session — the fallback recovery path. Note: the stale-credential repair currently requires the SDK to know the username (so the password KEK can be derived). If the user only logged in via passkey (no prior password login on this client), call `tarn.login(username, password)` first to prime the username; otherwise the SDK falls back to throwing `StalePasskeyError` with a clear message.
+The handler returns both fields because passkey-only sessions don't have either cached on the client (the user has only ever tapped — never typed). Apps prompt for both, which is the same shape as a normal username+password login form. For Bookish-style apps where the username IS the user's email, this is a familiar pattern. If the handler returns `null`, the SDK aborts the repair and throws `StalePasskeyError`; if the returned object is missing either field, the SDK throws with a clear "must return { username, password }" message.
+
+If `stalePasskeyHandler` is omitted and the credential is stale, the SDK throws `StalePasskeyError` (exported from the package) so the app can prompt re-registration via `tarn.passkeys.register()` from a password-authenticated session — the fallback recovery path.
+
+The Settings UI can also surface staleness proactively: every entry returned by `tarn.passkeys.list()` carries a `stale` boolean. Render a "Refresh" button next to stale entries so users can repair them before they hit a stale credential at login time.
 
 **Synced passkeys (the dominant case).** Apple iCloud Keychain and Google Password Manager share the same credential and PRF secret across all of a user's devices. A single re-tap on one device emits a wrapping that any of the user's other devices can derive themselves on next use — they never need to re-tap. For users who have registered multiple distinct credentials (e.g., iPhone Face ID *and* a YubiKey), each credential's staleness is independent.
 

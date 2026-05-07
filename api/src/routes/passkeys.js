@@ -76,6 +76,34 @@ function generateChallengeBytes() {
   return bytes;
 }
 
+/**
+ * Phase 6.2 — given a parsed envelope object and a credential_id, return
+ * true if the credential has NO `passkey_prf` wrapping at the LATEST gen.
+ * Returns false when a wrapping is present, when the envelope is
+ * unparseable (best-effort: surface as "not stale" so the SDK still gets
+ * a session and discovers the real error itself), or when no dek_chain
+ * is present.
+ *
+ * Used both by /auth/passkey/authenticate (per-credential, on the
+ * credential the user just signed in with) and by /account/passkeys
+ * (per-credential, across the full registered list).
+ */
+function isCredentialStale(envelopeObj, credentialId) {
+  try {
+    if (!envelopeObj || !Array.isArray(envelopeObj.dek_chain) || envelopeObj.dek_chain.length === 0) {
+      return false;
+    }
+    const latest = envelopeObj.dek_chain[envelopeObj.dek_chain.length - 1];
+    const wraps = Array.isArray(latest?.wrappings) ? latest.wrappings : [];
+    const hit = wraps.some(
+      w => w?.factor === 'passkey_prf' && w?.credential_id === credentialId,
+    );
+    return !hit;
+  } catch {
+    return false;
+  }
+}
+
 function bytesToBase64Url(bytes) {
   let bin = '';
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
@@ -612,14 +640,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
   let staleCredential = false;
   try {
     const env_ = JSON.parse(account.wrapped_data_key);
-    if (env_ && Array.isArray(env_.dek_chain) && env_.dek_chain.length > 0) {
-      const latest = env_.dek_chain[env_.dek_chain.length - 1];
-      const wraps = Array.isArray(latest?.wrappings) ? latest.wrappings : [];
-      const hit = wraps.some(
-        w => w?.factor === 'passkey_prf' && w?.credential_id === credRow.credential_id,
-      );
-      staleCredential = !hit;
-    }
+    staleCredential = isCredentialStale(env_, credRow.credential_id);
   } catch {
     // Envelope parse failure — treat as not stale; the SDK will hit a
     // different error code-path on its own unwrap attempt.
@@ -678,11 +699,33 @@ export async function handleListPasskeys(request, env, ctx, cors) {
       ORDER BY created_at ASC`
   ).bind(auth.data_lookup_key).all();
 
+  // Phase 6.2 — surface per-credential stale state. Pull the live
+  // envelope once, parse once, then mark each credential row as stale or
+  // fresh by checking whether its (passkey_prf, credential_id) wrapping
+  // exists at the latest gen. Apps surface this as a "Refresh
+  // recommended" indicator so users can repair credentials proactively
+  // (instead of discovering staleness only after bouncing off it at
+  // login).
+  const accountRow = await env.DB.prepare(
+    'SELECT wrapped_data_key FROM accounts WHERE data_lookup_key = ?1'
+  ).bind(auth.data_lookup_key).first();
+  let envelopeObj = null;
+  if (accountRow?.wrapped_data_key) {
+    try {
+      envelopeObj = JSON.parse(accountRow.wrapped_data_key);
+    } catch {
+      // Treat all credentials as not stale on parse failure — the SDK
+      // will hit a more useful error path on its own unwrap attempt.
+      envelopeObj = null;
+    }
+  }
+
   const passkeys = (rows.results || []).map(r => ({
     credential_id: r.credential_id,
     device_label: r.device_label,
     created_at: r.created_at,
     last_used_at: r.last_used_at,
+    stale: envelopeObj ? isCredentialStale(envelopeObj, r.credential_id) : false,
   }));
   return jsonResponse({ passkeys }, 200, cors);
 }

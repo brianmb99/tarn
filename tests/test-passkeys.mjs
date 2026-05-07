@@ -169,6 +169,44 @@ await test('listPasskeys() returns the registered credential without leaking pub
   assert(typeof p.createdAt === 'number', 'createdAt is a number');
   assert(!('publicKey' in p) && !('public_key' in p), 'public key NOT in response');
   assert(!('prfSalt' in p) && !('prf_salt' in p), 'PRF salt NOT in response');
+  // Phase 6.2 — `stale` is surfaced. Freshly-registered credentials
+  // always have a wrapping at the latest gen, so this must be false.
+  assert(p.stale === false, `expected stale: false on a fresh credential, got ${p.stale}`);
+});
+
+await test('listPasskeys() round-trip: register → skip-retap → stale:true → repair → stale:false (Phase 6.2)', async () => {
+  // Verifies the full Settings-UX lifecycle of the stale flag.
+  const a = await registerAccount();
+  const { auth } = await registerPasskeyOn(a.client, { deviceLabel: 'stale-roundtrip' });
+
+  // Right after registration: stale must be false.
+  let list = await a.client.listPasskeys();
+  assert(list.length === 1, 'one passkey registered');
+  assert(list[0].stale === false, 'fresh credential: stale must be false');
+
+  // changeCredentials with a handler that skips re-tap — produces stale.
+  const newPw = 'changed-' + Date.now();
+  await a.client.changeCredentials(a.username, newPw, {
+    phrase: a.reg.accountKey,
+    passkeyTapHandler: async () => false,
+  });
+
+  list = await a.client.listPasskeys();
+  assert(list.length === 1, 'still one passkey');
+  assert(list[0].stale === true, `after skipped re-tap: stale must be true, got ${list[0].stale}`);
+
+  // Drive a passkey-only login + repair via stalePasskeyHandler.
+  const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  env.pinNextAuth(auth.credentialIdB64Url);
+  await c2.authenticateWithPasskey({
+    stalePasskeyHandler: async () => ({ username: a.username, password: newPw }),
+  });
+  env.clearNextAuth();
+
+  // After repair: stale must be false again.
+  list = await a.client.listPasskeys();
+  assert(list.length === 1, 'still one passkey');
+  assert(list[0].stale === false, `after repair: stale must be false, got ${list[0].stale}`);
 });
 
 section('Remove passkey');
@@ -332,12 +370,14 @@ await test('changeCredentials WITH re-tap re-wraps the new gen so the passkey ca
   assert(r.dataLookupKey === a.client.dataLookupKey, 'passkey still authenticates the same account');
 });
 
-await test('changeCredentials with handler returning false leaves credential stale; refresh repairs it', async () => {
+await test('changeCredentials with handler returning false leaves credential stale; refresh repairs it (passkey-only client, Phase 6.2)', async () => {
   // The user dismisses the tap → credential becomes stale on the new gen.
   // A subsequent authenticateWithPasskey returns stale_credential:true.
-  // With a stalePasskeyHandler that supplies the password, the SDK
-  // transparently re-wraps the latest gen and the credential is no
-  // longer stale.
+  // With a stalePasskeyHandler that supplies (username, password), the
+  // SDK transparently re-wraps the latest gen — even on a fresh
+  // passkey-only client that has no #username cached. This is the Phase
+  // 6.2 contract that supersedes the Phase 6.1 "must call login() first"
+  // limitation.
   const a = await registerAccount();
   const { auth } = await registerPasskeyOn(a.client, { deviceLabel: 'stale-test' });
 
@@ -356,26 +396,17 @@ await test('changeCredentials with handler returning false leaves credential sta
   const gen2Pk = afterChange.dek_chain.find(e => e.gen === 2)?.wrappings.find(w => w.factor === 'passkey_prf');
   assert(!gen2Pk, 'gen-2 should have no passkey wrapping (user skipped re-tap)');
 
-  // Login with the passkey + stale handler → should succeed and re-wrap.
-  // Use a NEW client (passkey-only path), then call login() first to
-  // populate username so the stale handler can do the password-side unwrap.
-  const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c.login(a.username, newPw); // primes username + dlk + dekByGen
-  // Now log out from the password side and exercise the passkey path
-  // — but we need a fresh client. Re-design: log in with passkey first,
-  // then call refresh-credential through the stale handler. Because
-  // #username is null on a passkey-only session, the repair throws
-  // (documented limitation). Instead drive the flow on a client that
-  // already has #username populated (the post-changeCredentials
-  // `a.client` itself, which still holds the post-change credentials).
-  // Re-validate the contract: stale handler is invoked, repair runs
-  // through, gen 2 re-gains its passkey wrapping.
+  // Drive the repair through a FRESH passkey-only client — no prior
+  // login() to seed #username. Phase 6.2: the handler returns both
+  // username + password and the SDK can repair anyway.
   const c2 = new TarnClient(API_BASE, DEFAULT_APP_ID);
-  await c2.login(a.username, newPw);
   let stalePromptCount = 0;
   env.pinNextAuth(auth.credentialIdB64Url);
   const r = await c2.authenticateWithPasskey({
-    stalePasskeyHandler: async () => { stalePromptCount += 1; return newPw; },
+    stalePasskeyHandler: async () => {
+      stalePromptCount += 1;
+      return { username: a.username, password: newPw };
+    },
   });
   env.clearNextAuth();
   assert(r.dataLookupKey === a.client.dataLookupKey, 'passkey authenticates with refresh path');

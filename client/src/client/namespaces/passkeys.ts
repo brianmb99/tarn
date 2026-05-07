@@ -18,6 +18,17 @@ export type PasskeyInfo = {
   deviceLabel: string | null;
   createdAt: number;
   lastUsedAt: number | null;
+  /**
+   * Phase 6.2 — true when this credential has no `passkey_prf` wrapping
+   * at the latest gen of the account's envelope. Stale credentials still
+   * authenticate (older gens unwrap normally) but cannot read post-stale
+   * writes until repaired via `tarn.authenticateWithPasskey({
+   * stalePasskeyHandler })` or by re-registering the credential.
+   *
+   * Surface this in Settings so users can see "Refresh recommended" next
+   * to stale entries before they hit a stale credential at login time.
+   */
+  stale: boolean;
 };
 
 export interface IPasskeysClient {
@@ -26,7 +37,7 @@ export interface IPasskeysClient {
   authenticateWithPasskey(opts?: {
     deviceLabel?: string;
     credentialId?: string;
-    stalePasskeyHandler?: () => Promise<string | null>;
+    stalePasskeyHandler?: () => Promise<{ username: string; password: string } | null>;
   }): Promise<{ dataLookupKey: string }>;
   listPasskeys(): Promise<PasskeyInfo[]>;
   removePasskey(opts: { credentialId: string; password: string }): Promise<void>;
@@ -67,6 +78,13 @@ export class PasskeysNamespace {
    * List the passkeys registered against this account. Each entry is one
    * device the user has enrolled. `lastUsedAt` is null for credentials
    * that have never authenticated since registration.
+   *
+   * Each entry also carries a `stale` flag (Phase 6.2) — true when the
+   * credential has no `passkey_prf` wrapping at the latest gen of the
+   * envelope (typically because changeCredentials ran without a re-tap).
+   * Stale entries still authenticate but can't read post-stale writes
+   * until the user repairs the wrap. Surface the flag in Settings so
+   * users see a "Refresh" affordance before they hit it at login time.
    */
   async list(): Promise<PasskeyInfo[]> {
     return this.#client.listPasskeys();

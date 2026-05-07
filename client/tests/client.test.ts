@@ -153,6 +153,7 @@ class StubUnderlying implements IUnderlyingClient {
     deviceLabel: string | null;
     createdAt: number;
     lastUsedAt: number | null;
+    stale: boolean;
   }> = [];
   removePasskeyCalls = 0;
   async passkeysSupported() { return this.passkeysSupportedResult; }

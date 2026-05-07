@@ -811,12 +811,290 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
       ]);
       const c = new TC2('https://api.tarn.dev', APP);
       const r = await c.authenticateWithPasskey({
-        stalePasskeyHandler: async () => { handlerCalls += 1; return 'should-not-be-called'; },
+        stalePasskeyHandler: async () => {
+          handlerCalls += 1;
+          return { username: 'should-not-be-called', password: 'should-not-be-called' };
+        },
       });
       assert.equal(handlerCalls, 0, 'stalePasskeyHandler should NOT be called when not stale');
       assert.equal(r.dataLookupKey, 'd'.repeat(64));
     } finally {
       restore();
     }
+  });
+
+  // Phase 6.2 — handler signature is `() => { username, password } | null`.
+  // Verify a handler that returns the legacy string shape (Phase 6.1) is
+  // rejected with a clear error, and that a handler that returns an
+  // incomplete object is also rejected.
+  it('rejects a Phase-6.1-style string handler return value (passkey-only client, no #username cached)', async () => {
+    const credentialId = 'cred-legacy';
+    const prfSecret = new Uint8Array(32).fill(0x99);
+    const { kwKey } = await derivePasskeyWrappingKey(prfSecret);
+    const dek = await generateRandomDataKey();
+    const wrappedPasskeyG1 = bytesToBase64(new Uint8Array(
+      await crypto.subtle.wrapKey('raw', dek.gcmKey, kwKey, 'AES-KW'),
+    ));
+    const wrappedPasswordG1 = bytesToBase64(new Uint8Array(40).fill(0x11));
+    const wrappedPasswordG2 = bytesToBase64(new Uint8Array(40).fill(0x22));
+    const salt = generateRecoverySalt();
+    const envelope = JSON.stringify({
+      v: 1, kdf: 'argon2id',
+      kdf_params: { m_kib: 19456, t: 2, p: 1 },
+      recovery: {
+        kdf: 'argon2id',
+        kdf_params: { m_kib: 19456, t: 2, p: 1 },
+        salt: bytesToBase64(salt),
+      },
+      dek_chain: [
+        {
+          gen: 1,
+          wrappings: [
+            { factor: 'password', wrapped: wrappedPasswordG1 },
+            { factor: 'passkey_prf', wrapped: wrappedPasskeyG1, credential_id: credentialId },
+          ],
+        },
+        {
+          gen: 2,
+          wrappings: [
+            { factor: 'password', wrapped: wrappedPasswordG2 },
+          ],
+        },
+      ],
+    });
+
+    const restore = installPrfStub({ credentialId, prfSecret });
+    try {
+      mockFetch([
+        { status: 200, body: JSON.stringify({
+          options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
+          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
+          rp_id: 'localhost',
+        }) },
+        { status: 200, body: JSON.stringify({
+          jwt: fakeJwt('passkey-legacy'),
+          data_lookup_key: 'd'.repeat(64),
+          wrapped_data_key: envelope,
+          account_key_stored: false,
+          credential_id: credentialId,
+          stale_credential: true,
+        }) },
+      ]);
+      const c = new TC2('https://api.tarn.dev', APP);
+      let threw = null;
+      try {
+        // Legacy Phase-6.1 handler returning a bare string — must throw.
+        await c.authenticateWithPasskey({
+          // @ts-expect-error — intentional misuse of the handler shape
+          stalePasskeyHandler: async () => 'just-a-password',
+        });
+      } catch (err) { threw = err; }
+      assert.ok(threw instanceof StalePasskeyError, `expected StalePasskeyError, got ${threw && threw.name}`);
+      assert.match(threw.message, /username, password/);
+    } finally {
+      restore();
+    }
+  });
+
+  it('repairs a stale credential on a passkey-only client when handler returns { username, password }', async () => {
+    // The point of Phase 6.2: even with NO #username cached on the client
+    // (passkey-only session, user never typed a username), the SDK can
+    // repair via the (username, password) returned by the handler. We
+    // verify the SDK reaches the refresh-credential endpoint with a
+    // properly-rebuilt envelope.
+    const credentialId = 'cred-repair';
+    const username = 'user@example.com';
+    const password = 'correct-pw-2026';
+
+    // Build a stale envelope with a real password wrapping that the
+    // SDK can ACTUALLY unwrap when given the right (username, password).
+    // The crypto must be self-consistent so the unwrap chain works
+    // end-to-end through #repairStaleCredential.
+    const { deriveAllKeys } = await import('../../client/src/crypto.js');
+    const reKeys = await deriveAllKeys(username, password, APP);
+    const prfSecret = new Uint8Array(32).fill(0x42);
+    const { kwKey: passkeyKEK } = await derivePasskeyWrappingKey(prfSecret);
+
+    const dekG1 = await generateRandomDataKey();
+    const dekG2 = await generateRandomDataKey();
+    const wrapBase64 = async (gcmKey, kwKEK) =>
+      bytesToBase64(new Uint8Array(await crypto.subtle.wrapKey('raw', gcmKey, kwKEK, 'AES-KW')));
+    const passwordG1 = await wrapBase64(dekG1.gcmKey, reKeys.credentialEncryptionKey.kwKey);
+    const passwordG2 = await wrapBase64(dekG2.gcmKey, reKeys.credentialEncryptionKey.kwKey);
+    const passkeyG1 = await wrapBase64(dekG1.gcmKey, passkeyKEK);
+    // gen 2 has NO passkey wrapping — that's the staleness we're repairing.
+
+    const salt = generateRecoverySalt();
+    const recoverySalt = bytesToBase64(salt);
+    const recoveryWrap = bytesToBase64(new Uint8Array(40).fill(0xee));
+    const envelope = JSON.stringify({
+      v: 1, kdf: 'argon2id',
+      kdf_params: { m_kib: 19456, t: 2, p: 1 },
+      recovery: {
+        kdf: 'argon2id',
+        kdf_params: { m_kib: 19456, t: 2, p: 1 },
+        salt: recoverySalt,
+      },
+      dek_chain: [
+        {
+          gen: 1,
+          wrappings: [
+            { factor: 'password', wrapped: passwordG1 },
+            { factor: 'recovery_phrase', wrapped: recoveryWrap },
+            { factor: 'passkey_prf', wrapped: passkeyG1, credential_id: credentialId },
+          ],
+        },
+        {
+          gen: 2,
+          wrappings: [
+            { factor: 'password', wrapped: passwordG2 },
+            { factor: 'recovery_phrase', wrapped: recoveryWrap },
+          ],
+        },
+      ],
+    });
+
+    const restore = installPrfStub({ credentialId, prfSecret });
+    let handlerCalls = 0;
+    try {
+      mockFetch([
+        // /auth/passkey/authentication-options
+        { status: 200, body: JSON.stringify({
+          options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
+          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
+          rp_id: 'localhost',
+        }) },
+        // /auth/passkey/authenticate — stale_credential: true
+        { status: 200, body: JSON.stringify({
+          jwt: fakeJwt('passkey-repair'),
+          data_lookup_key: 'd'.repeat(64),
+          wrapped_data_key: envelope,
+          account_key_stored: false,
+          credential_id: credentialId,
+          stale_credential: true,
+        }) },
+        // /auth/passkey/refresh-credential — accepts the rebuilt envelope
+        { status: 200, body: JSON.stringify({ refreshed: true, credential_id: credentialId }) },
+      ]);
+      const c = new TC2('https://api.tarn.dev', APP);
+      // Sanity: passkey-only client has no cached username before authenticate.
+      const r = await c.authenticateWithPasskey({
+        stalePasskeyHandler: async () => {
+          handlerCalls += 1;
+          return { username, password };
+        },
+      });
+      assert.equal(handlerCalls, 1, 'handler called exactly once');
+      assert.equal(r.dataLookupKey, 'd'.repeat(64));
+      // The third fetch call must be /auth/passkey/refresh-credential
+      // with a properly-shaped body that includes a passkey_prf wrapping
+      // for the credential at the latest gen.
+      const refreshCall = fetchCalls[2];
+      assert.match(refreshCall.url, /\/auth\/passkey\/refresh-credential$/);
+      const body = JSON.parse(refreshCall.body);
+      assert.equal(body.credential_id, credentialId);
+      const refreshed = JSON.parse(body.new_envelope);
+      const gen2Pk = refreshed.dek_chain[1].wrappings.find(
+        w => w.factor === 'passkey_prf' && w.credential_id === credentialId,
+      );
+      assert.ok(gen2Pk, 'rebuilt envelope must include a gen-2 passkey_prf wrapping');
+    } finally {
+      restore();
+    }
+  });
+
+  it('handler returning null still throws StalePasskeyError after being consulted', async () => {
+    // Re-confirms behavior: null = abort the repair, surface the error.
+    // (Previously asserted in the prior test but worth pinning explicitly
+    // under the new signature.)
+    const credentialId = 'cred-nul';
+    const prfSecret = new Uint8Array(32).fill(0xaa);
+    const { kwKey } = await derivePasskeyWrappingKey(prfSecret);
+    const dek = await generateRandomDataKey();
+    const passkeyG1 = bytesToBase64(new Uint8Array(
+      await crypto.subtle.wrapKey('raw', dek.gcmKey, kwKey, 'AES-KW'),
+    ));
+    const passwordG1 = bytesToBase64(new Uint8Array(40).fill(0x11));
+    const passwordG2 = bytesToBase64(new Uint8Array(40).fill(0x22));
+    const salt = generateRecoverySalt();
+    const envelope = JSON.stringify({
+      v: 1, kdf: 'argon2id',
+      kdf_params: { m_kib: 19456, t: 2, p: 1 },
+      recovery: {
+        kdf: 'argon2id',
+        kdf_params: { m_kib: 19456, t: 2, p: 1 },
+        salt: bytesToBase64(salt),
+      },
+      dek_chain: [
+        { gen: 1, wrappings: [{ factor: 'password', wrapped: passwordG1 }, { factor: 'passkey_prf', wrapped: passkeyG1, credential_id: credentialId }] },
+        { gen: 2, wrappings: [{ factor: 'password', wrapped: passwordG2 }] },
+      ],
+    });
+
+    const restore = installPrfStub({ credentialId, prfSecret });
+    let handlerCalls = 0;
+    try {
+      mockFetch([
+        { status: 200, body: JSON.stringify({
+          options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
+          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
+          rp_id: 'localhost',
+        }) },
+        { status: 200, body: JSON.stringify({
+          jwt: fakeJwt('passkey-null'),
+          data_lookup_key: 'd'.repeat(64),
+          wrapped_data_key: envelope,
+          account_key_stored: false,
+          credential_id: credentialId,
+          stale_credential: true,
+        }) },
+      ]);
+      const c = new TC2('https://api.tarn.dev', APP);
+      let threw = null;
+      try {
+        await c.authenticateWithPasskey({
+          stalePasskeyHandler: async () => { handlerCalls += 1; return null; },
+        });
+      } catch (err) { threw = err; }
+      assert.equal(handlerCalls, 1, 'handler called exactly once before abort');
+      assert.ok(threw instanceof StalePasskeyError, `expected StalePasskeyError, got ${threw && threw.name}`);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// =============================================================
+// Phase 6.2 — `stale: boolean` in PasskeyInfo on listPasskeys.
+// =============================================================
+
+describe('Phase 6.2 — listPasskeys() surfaces per-credential stale state', () => {
+  afterEach(restoreFetch);
+
+  it('maps server-provided `stale` flag through to PasskeyInfo unchanged', async () => {
+    const { client } = await registerClient();
+
+    // Three rows: one fresh, one stale, one with the field omitted (treat as fresh).
+    mockFetch([
+      { status: 200, body: JSON.stringify({
+        passkeys: [
+          { credential_id: 'cred-fresh', device_label: 'Phone',  created_at: 1, last_used_at: null, stale: false },
+          { credential_id: 'cred-stale', device_label: 'Laptop', created_at: 2, last_used_at: 999,  stale: true  },
+          { credential_id: 'cred-default', device_label: null,   created_at: 3, last_used_at: null /* stale absent */ },
+        ],
+      }) },
+    ]);
+    const list = await client.listPasskeys();
+    assert.equal(list.length, 3);
+    assert.equal(list[0].stale, false);
+    assert.equal(list[1].stale, true);
+    // Default to false when server omits the field (defensive — older
+    // server build, very unlikely in practice).
+    assert.equal(list[2].stale, false);
+    // Other fields preserved.
+    assert.equal(list[0].credentialId, 'cred-fresh');
+    assert.equal(list[0].deviceLabel, 'Phone');
+    assert.equal(list[1].credentialId, 'cred-stale');
+    assert.equal(list[1].lastUsedAt, 999);
   });
 });
