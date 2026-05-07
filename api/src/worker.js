@@ -126,9 +126,10 @@ export default {
       if (path === '/api/v1/account/account-key' && method === 'DELETE') {
         return await handleDeleteAccountKey(request, env, ctx, cors);
       }
-      // Phase 4: rotate the account key. JWT only — the friction is on
-      // the client side (user must have generated and confirmed a new
-      // phrase before this is reachable).
+      // Phase 4 / 4.1: rotate the account key. JWT + step-up token
+      // (symmetric with view/enable/disable on /account/account-key);
+      // step-up requirement was added in 4.1 to close the session-hijack
+      // gap that JWT-only rotation left open.
       if (path === '/api/v1/account/rotate-account-key' && method === 'POST') {
         return await handleRotateAccountKey(request, env, ctx, cors);
       }

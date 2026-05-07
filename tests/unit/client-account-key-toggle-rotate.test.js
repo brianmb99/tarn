@@ -232,7 +232,11 @@ describe('TarnClient.rotateAccountKey', () => {
     const { client, accountKey: oldKey } = await registerModelB();
     restoreFetch();
     mockFetch([
-      // POST /account/rotate-account-key — JWT only, no challenge/step-up
+      // /auth/challenge for step-up (Phase 4.1 — rotate now requires step-up)
+      { status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      // /auth/step-up
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok-rotate', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
+      // POST /account/rotate-account-key
       { status: 200, body: JSON.stringify({ rotated: true }) },
     ]);
     const out = await client.rotateAccountKey({ password: 'pw-2026' });
@@ -240,10 +244,17 @@ describe('TarnClient.rotateAccountKey', () => {
     assert.notEqual(out.accountKey, oldKey, 'rotation must produce a different key');
     assert.equal(out.accountKey.split(' ').length, 24);
 
+    // Step-up must be invoked before rotate (Phase 4.1).
+    const stepUpCall = fetchCalls.find(c => c.url.endsWith('/auth/step-up'));
+    assert.ok(stepUpCall, 'must call /auth/step-up before rotating');
+    const stepUpBody = JSON.parse(stepUpCall.body);
+    assert.equal(stepUpBody.scope, 'account_key_fetch', 'step-up must use account_key_fetch scope');
+
     const rotateCall = fetchCalls.find(c => c.url.endsWith('/account/rotate-account-key'));
     assert.ok(rotateCall, 'must call /account/rotate-account-key');
     assert.equal(rotateCall.method, 'POST');
     assert.match(rotateCall.headers['Authorization'], /^Bearer /);
+    assert.equal(rotateCall.headers['X-Step-Up-Token'], 'tok-rotate', 'rotate must carry the step-up token');
     const rotateBody = JSON.parse(rotateCall.body);
     assert.ok(rotateBody.new_envelope, 'must include new_envelope');
     assert.match(rotateBody.new_recovery_lookup_key, /^[a-f0-9]{64}$/);
@@ -268,6 +279,10 @@ describe('TarnClient.rotateAccountKey', () => {
 
     restoreFetch();
     mockFetch([
+      // step-up challenge + token
+      { status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok-rotate-A', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
+      // rotate POST
       { status: 200, body: JSON.stringify({ rotated: true }) },
     ]);
     const out = await client.rotateAccountKey({ password: 'pw-modelA' });
@@ -275,12 +290,13 @@ describe('TarnClient.rotateAccountKey', () => {
     const rotateCall = fetchCalls.find(c => c.url.endsWith('/account/rotate-account-key'));
     const rotateBody = JSON.parse(rotateCall.body);
     assert.equal(rotateBody.new_wrapped_account_key, null, 'Model A rotation must NOT carry a wrap');
+    assert.equal(rotateCall.headers['X-Step-Up-Token'], 'tok-rotate-A', 'Model A rotation also requires step-up');
   });
 
   it('rejects on wrong password without touching the API', async () => {
     const { client } = await registerModelB();
     restoreFetch();
-    mockFetch([]); // no fetches expected
+    mockFetch([]); // no fetches expected — local credential mismatch tripwire fires first
     await assert.rejects(
       () => client.rotateAccountKey({ password: 'wrong-pw' }),
       /wrong password/,
@@ -292,6 +308,9 @@ describe('TarnClient.rotateAccountKey', () => {
     const { client } = await registerModelB();
     restoreFetch();
     mockFetch([
+      // step-up succeeds; conflict surfaces from the rotate POST itself
+      { status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
       { status: 409, body: JSON.stringify({ error: 'new_recovery_lookup_key already in use' }) },
     ]);
     await assert.rejects(
@@ -306,6 +325,9 @@ describe('TarnClient.rotateAccountKey', () => {
     const { client, accountKey: oldKey } = await registerModelB();
     restoreFetch();
     mockFetch([
+      // step-up + rotate
+      { status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
       { status: 200, body: JSON.stringify({ rotated: true }) },
     ]);
     const { accountKey: newKey } = await client.rotateAccountKey({ password: 'pw-2026' });

@@ -456,6 +456,10 @@ await test('rotation conflict: 409 when new_recovery_lookup_key collides', async
   const vU = randomUsername();
   const vPw = 'pw-victim-' + Date.now();
   await victim.register(vU, vPw, { recoveryAcknowledged: true });
+  // Phase 4.1: rotate now requires a step-up token in addition to the JWT.
+  // Mint a fresh one for the victim so the conflict check (which runs after
+  // step-up validation but before envelope validation) actually executes.
+  const stepUpToken = await mintStepUpToken(victim, vU, vPw);
   // Build a minimal-looking but invalid payload — the lookup-key conflict
   // check runs before envelope validation in the API, so we need to pass
   // schema checks (envelope: any non-empty string; recovery_public_key:
@@ -464,6 +468,7 @@ await test('rotation conflict: 409 when new_recovery_lookup_key collides', async
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${victim._testJwt()}`,
+      'X-Step-Up-Token': stepUpToken,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -476,6 +481,104 @@ await test('rotation conflict: 409 when new_recovery_lookup_key collides', async
     }),
   });
   assert(r.status === 409, `expected 409 on lookup conflict, got ${r.status}`);
+});
+
+// Phase 4.1 — step-up requirement on rotate-account-key. Mirrors the
+// existing PUT/DELETE step-up tests above. The SDK's rotate() handles step-up
+// transparently; these tests probe the wire-level posture.
+
+await test('POST /account/rotate-account-key without step-up token → 401', async () => {
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  const u = randomUsername();
+  const pw = 'pw-rotate-nostep-' + Date.now();
+  await client.register(u, pw, { recoveryAcknowledged: true });
+  const r = await fetch(`${API_BASE}/api/v1/account/rotate-account-key`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${client._testJwt()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      new_envelope: '{"v":1,"x":"stub"}',
+      new_recovery_lookup_key: 'a'.repeat(64),
+      new_recovery_public_key: await pullRecoveryPublicKey(client.dataLookupKey),
+      new_wrapped_account_key: null,
+    }),
+  });
+  assert(r.status === 401, `expected 401 without step-up, got ${r.status}`);
+});
+
+await test('POST /account/rotate-account-key without JWT → 401', async () => {
+  const r = await fetch(`${API_BASE}/api/v1/account/rotate-account-key`, {
+    method: 'POST',
+    headers: {
+      'X-Step-Up-Token': 'whatever',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      new_envelope: '{"v":1,"x":"stub"}',
+      new_recovery_lookup_key: 'a'.repeat(64),
+      new_recovery_public_key: 'stub',
+      new_wrapped_account_key: null,
+    }),
+  });
+  assert(r.status === 401, `expected 401 without JWT, got ${r.status}`);
+});
+
+await test('POST /account/rotate-account-key with consumed step-up token → 401', async () => {
+  // Mint a token, consume it via a successful GET /account/account-key,
+  // then try to reuse it on rotate. Single-use enforcement → 401.
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  const u = randomUsername();
+  const pw = 'pw-rotate-consumed-' + Date.now();
+  await client.register(u, pw, { recoveryAcknowledged: true });
+  const token = await mintStepUpToken(client, u, pw);
+
+  // Consume it on the GET endpoint first.
+  const r1 = await fetch(`${API_BASE}/api/v1/account/account-key`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${client._testJwt()}`,
+      'X-Step-Up-Token': token,
+    },
+  });
+  assert(r1.status === 200, `precondition: GET succeeds, got ${r1.status}`);
+
+  // Reuse must 401.
+  const r2 = await fetch(`${API_BASE}/api/v1/account/rotate-account-key`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${client._testJwt()}`,
+      'X-Step-Up-Token': token,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      new_envelope: '{"v":1,"x":"stub"}',
+      new_recovery_lookup_key: 'a'.repeat(64),
+      new_recovery_public_key: await pullRecoveryPublicKey(client.dataLookupKey),
+      new_wrapped_account_key: null,
+    }),
+  });
+  assert(r2.status === 401, `consumed step-up token must 401 on rotate, got ${r2.status}`);
+});
+
+await test('rotateAccountKey() with wrong password fails authentication', async () => {
+  // Mirrors the wrong-password test for viewAccountKey above. With Phase 4.1
+  // step-up the SDK has TWO password tripwires: a local credential mismatch
+  // check (fires first on wrong-pw) and the server-side step-up signature
+  // check. Either failure mode is acceptable — both prove the password
+  // didn't match.
+  const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
+  const u = randomUsername();
+  const pw = 'pw-rotate-wrong-' + Date.now();
+  await client.register(u, pw, { recoveryAcknowledged: true });
+  let threw = null;
+  try {
+    await client.rotateAccountKey({ password: 'wrong-' + pw });
+  } catch (err) { threw = err; }
+  assert(threw, 'expected rotateAccountKey to throw on wrong password');
+  assert(/wrong password|step-up|challenge|Unknown/i.test(threw.message),
+    `expected auth failure, got: ${threw.message}`);
 });
 
 // ============ Phase 4 — recoverAccount({ rotatePhrase: true }) ============
@@ -562,6 +665,38 @@ async function countAuditRows(dlk) {
   ).toString();
   const parsed = JSON.parse(out);
   return parsed[0]?.results?.[0]?.n ?? 0;
+}
+
+/**
+ * Drive the wire-level step-up flow against the real API and return a fresh
+ * token. Mirrors what the SDK's #performStepUp does — used by the integration
+ * tests that POST to rotate-account-key directly (bypassing the SDK) so they
+ * can attach a valid token without rebuilding the SDK helper.
+ */
+async function mintStepUpToken(client, username, password) {
+  const { deriveAllKeys, signChallenge } = await import('../client/src/crypto.js');
+  const keys = await deriveAllKeys(username, password, DEFAULT_APP_ID);
+  const challengeRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ credential_lookup_key: keys.credentialLookupKey }),
+  });
+  const challengeJson = await challengeRes.json();
+  const sig = await signChallenge(keys.signingKeyPair.privateKey, challengeJson.nonce);
+  const stepUpRes = await fetch(`${API_BASE}/api/v1/auth/step-up`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      credential_lookup_key: keys.credentialLookupKey,
+      nonce: challengeJson.nonce,
+      signature: sig,
+      scope: 'account_key_fetch',
+    }),
+  });
+  if (stepUpRes.status !== 200) {
+    throw new Error(`mintStepUpToken: step-up failed ${stepUpRes.status}`);
+  }
+  return (await stepUpRes.json()).step_up_token;
 }
 
 async function pullRecoveryPublicKey(dlk) {

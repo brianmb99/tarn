@@ -291,7 +291,7 @@ Errors: `401` for missing/invalid JWT or step-up token, `403` for app-role JWTs.
 
 Atomically swaps the recovery factor on an account. The client has generated a fresh account key, derived all dependent values, re-wrapped every gen of the DEK chain under {existing password KEK (unchanged — the password did not rotate), NEW recovery KEK}, and submits the bundle here.
 
-**Auth: JWT only — no step-up.** The friction is client-side: the user must have generated and confirmed a new phrase before this endpoint is reachable. Adding a step-up gate here would just push it onto the toggle endpoints' auth machinery for no additional security gain — the rotation itself proves possession of the password (the new envelope decrypts only under the password KEK derived from the same password the JWT proves possession of).
+**Auth: JWT + step-up token (`X-Step-Up-Token`, `account_key_fetch` scope).** Symmetric with the view/enable/disable endpoints. Phase 4 originally shipped this endpoint as JWT-only, on the reasoning that "client-side friction is enough — the user just generated a new phrase". Phase 4.1 closes that gap: client-side friction does nothing against a session-hijack attacker who calls the endpoint directly, and a stolen JWT alone was sufficient to overwrite the recovery factor with attacker-controlled values and permanently brick the user's saved account key. Step-up raises the bar from "any session theft" to "session theft + password phish".
 
 Request body:
 
@@ -320,7 +320,7 @@ Errors:
 - `400` for invalid envelope / lookup key / public key / wrap shape.
 - `400` if `new_recovery_lookup_key === credential_lookup_key` (the two identifier spaces must stay disjoint, mirroring the register / changeCredentials invariant).
 - `409` if `new_recovery_lookup_key` collides with another account's recovery lookup key (astronomically unlikely with 256-bit HMAC output, but propagated cleanly so the SDK can surface a retry).
-- `401` for missing/invalid JWT, `403` for app-role JWTs.
+- `401` for missing/invalid JWT or step-up token (single-use, 60s TTL — the SDK mints a fresh one for every rotate call), `403` for app-role JWTs.
 
 **Effect on `recoverAccount`.** Post-rotation, the OLD account key no longer authenticates `recoverAccount` (the OLD `recovery_lookup_key` no longer maps to any account row, so `/auth/challenge` returns 404). The NEW key works as expected. Pre-rotation data remains decryptable under either the password OR the new recovery factor (the DEK chain itself is unchanged; only the wrappings rotated).
 
@@ -330,7 +330,7 @@ Errors:
 
 When `false` (default), `recoverAccount` behaves exactly as documented in §7a: the phrase stays the same after recovery; the result has no `accountKey` field. Existing apps see no behavior change.
 
-The implementation reuses the rotation primitive directly — no new endpoint. If the inline rotation fails after a successful recovery, `recoverAccount` throws a partial-success error pointing at `tarn.accountKey.rotate()` for retry; the user is logged in under the new credentials and the OLD account key still works.
+The implementation reuses the rotation primitive directly — no new endpoint. The SDK pipes the freshly-set `newPassword` through the rotate primitive's step-up dance, so the additional Phase 4.1 step-up requirement on the rotate endpoint is transparent to the caller. If the inline rotation fails after a successful recovery, `recoverAccount` throws a partial-success error pointing at `tarn.accountKey.rotate()` for retry; the user is logged in under the new credentials and the OLD account key still works.
 
 ### Passkey factor (Phase 6)
 
@@ -920,7 +920,7 @@ DELETE /api/v1/account/account-key
 
 POST /api/v1/account/rotate-account-key
   Body: { new_envelope, new_recovery_lookup_key, new_recovery_public_key, new_wrapped_account_key }
-  Auth: JWT
+  Auth: JWT + X-Step-Up-Token (account_key_fetch scope) — Phase 4.1
   Returns: { rotated: true }
   Errors: 400 (invalid bundle), 409 (recovery_lookup_key collision), 401, 403
 ```

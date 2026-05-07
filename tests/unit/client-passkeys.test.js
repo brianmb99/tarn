@@ -406,6 +406,9 @@ describe('Envelope round-trip across credential mutations', () => {
     const fakeWrapped = bytesToBase64(new Uint8Array(40).fill(0x77));
 
     mockFetch([
+      // Phase 4.1 — rotateAccountKey now runs step-up before the POST.
+      { status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
       // rotate-account-key POST
       { status: 200, body: JSON.stringify({ rotated: true }) },
     ]);
@@ -418,7 +421,8 @@ describe('Envelope round-trip across credential mutations', () => {
     const rotated = await client.rotateAccountKey({ password: 'pw-2026' });
     assert.ok(rotated.accountKey);
     assert.equal(rotated.accountKey.split(/\s+/).length, 24);
-    const rotateBody = JSON.parse(fetchCalls[0].body);
+    const rotateCall = fetchCalls.find(c => c.url.endsWith('/account/rotate-account-key'));
+    const rotateBody = JSON.parse(rotateCall.body);
     const newEnvelope = parseWrappedDataKey(rotateBody.new_envelope);
     // No passkey wrappings expected (none were cached).
     const passkeys = newEnvelope.dekChain[0].wrappings.filter(w => w.factor === FACTOR_PASSKEY_PRF);

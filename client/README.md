@@ -338,6 +338,8 @@ Notes:
 - Pre-rotation data remains decryptable — the DEK chain itself is unchanged; only the wrappings rotated.
 - Apps can also pass `rotatePhrase: true` to `tarn.recoverAccount()` to bundle a rotation into a forgot-password flow (see below).
 
+Like `viewAccountKey` / `enableKeyStorage` / `disableKeyStorage`, `rotate` runs a step-up dance against `/auth/step-up` before submitting the rotation — the rotate endpoint requires both a session JWT and a fresh step-up token (Phase 4.1, mirrors the other privileged account-key endpoints). The SDK handles step-up internally; the caller still just passes `{ password }`.
+
 Failure modes:
 
 - **Wrong password** — local credential mismatch tripwire. Error message contains `"wrong password"`.

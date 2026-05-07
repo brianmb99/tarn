@@ -1712,10 +1712,12 @@ export class TarnClient {
    * salt + OLD KEK remains on Arweave forever (immutable history) but is
    * unwrappable without the OLD phrase, which is now defunct.
    *
-   * The caller must have a live session and supply the current password
-   * (needed to verify we still hold the existing DEK chain via the local
-   * #dekByGen — no server round-trip for the password proof, since
-   * rotation is JWT-only at the API).
+   * The caller must have a live session and supply the current password.
+   * The password drives both the local credential-mismatch tripwire AND
+   * the step-up dance against /api/v1/auth/step-up — Phase 4.1 added a
+   * step-up requirement to the rotate endpoint so a stolen JWT alone is
+   * not sufficient to overwrite the recovery factor (symmetric with
+   * view/enable/disable).
    *
    * Flow:
    *   1. Generate a new account key.
@@ -1726,9 +1728,10 @@ export class TarnClient {
    *      KEK}.
    *   4. If Model B (isStored() === true): compute new wrapped_account_key
    *      under DEK_gen1.
-   *   5. POST /account/rotate-account-key with the bundle.
-   *   6. Update the cached recovery-factor metadata + #recoveryLookupKey.
-   *   7. Return the new account key string. The SDK does NOT retain it.
+   *   5. Run step-up to mint a single-use token bound to the same password.
+   *   6. POST /account/rotate-account-key with the bundle + step-up token.
+   *   7. Update the cached recovery-factor metadata + #recoveryLookupKey.
+   *   8. Return the new account key string. The SDK does NOT retain it.
    *
    * @returns `{ accountKey: string }` on success — the new phrase. The
    *   app surfaces it to the user (downloadable kit, printable page, etc.)
@@ -1813,26 +1816,43 @@ export class TarnClient {
       newWrappedAccountKey = await wrapAccountKey(dekGen1.gcmKey, newPhrase);
     }
 
-    // 5. Submit. The API performs an atomic UPDATE across all four fields.
-    const res = await this.#fetch('/api/v1/account/rotate-account-key', {
+    // 5. Step-up: mint a single-use token bound to the same password. We
+    //    run this AFTER the wrong-password tripwire above so the user gets
+    //    a clean "wrong password" error rather than "step-up auth failed"
+    //    on the most common operator mistake. Step-up itself re-derives the
+    //    credential keys from the same password, so a credential mismatch
+    //    here would surface as a 401 from /auth/challenge — but we already
+    //    short-circuited that case.
+    const stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
+
+    // 6. Submit. The API performs an atomic UPDATE across all four fields.
+    //    JWT and the step-up token both required (Phase 4.1).
+    const res = await this.#fetchRaw('/api/v1/account/rotate-account-key', {
       method: 'POST',
-      auth: true,
-      body: {
+      headers: {
+        'Authorization': `Bearer ${this.#jwt}`,
+        'X-Step-Up-Token': stepUpToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
         new_envelope: newWrappedDataKey,
         new_recovery_lookup_key: newRecoveryLookupKey,
         new_recovery_public_key: newRecoveryPublicKey,
         new_wrapped_account_key: newWrappedAccountKey,
-      },
+      }),
     });
+    const text = await res.text();
+    let json: any = null;
+    try { json = JSON.parse(text); } catch {}
     if (res.status === 409) {
       // Salt + entropy collision yielding the same recovery_lookup_key as
       // another account is astronomically unlikely (HMAC over 32 random
       // bytes → 256-bit space), but propagate the conflict cleanly so the
       // app can prompt a retry.
-      throw new Error(`rotateAccountKey(): conflict: ${res.json?.error || 'recovery_lookup_key in use'}`);
+      throw new Error(`rotateAccountKey(): conflict: ${json?.error || 'recovery_lookup_key in use'}`);
     }
     if (res.status !== 200) {
-      throw new Error(`rotateAccountKey(): rotation failed: ${res.json?.error || res.status}`);
+      throw new Error(`rotateAccountKey(): rotation failed: ${json?.error || res.status}`);
     }
 
     // 6. Update cached recovery-factor metadata so a subsequent

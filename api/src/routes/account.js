@@ -6,11 +6,16 @@
 // POST   /api/v1/account/rotate-account-key     — Phase 4, rotate the account key
 //
 // Common shape:
-//   - GET  / PUT / DELETE require BOTH a session JWT (Authorization: Bearer)
+//   - All four endpoints require BOTH a session JWT (Authorization: Bearer)
 //     AND a single-use step-up token (X-Step-Up-Token header). Either missing → 401.
-//   - POST rotate-account-key requires the JWT only. The friction is
-//     client-side (the user must have generated and confirmed a new phrase);
-//     the SDK orchestrates the full re-wrap and submits atomically.
+//   - Phase 4.1: rotate-account-key was originally JWT-only (the rationale was
+//     that client-side friction — the user just generated a new phrase — was
+//     enough). That reasoning is incomplete: client-side friction does nothing
+//     against a session-hijack attacker who calls the endpoint directly. A
+//     stolen JWT was sufficient to permanently destroy the user's recovery
+//     factor. Step-up brings rotate symmetric with view/enable/disable and
+//     raises the bar from "any session theft" to "session theft + password
+//     phish".
 //
 // All write endpoints publish a fresh credential blob to Arweave after the
 // D1 commit (best-effort in waitUntil) so the "Tarn infra is rebuildable
@@ -319,9 +324,11 @@ export async function handleDeleteAccountKey(request, env, ctx, cors) {
 // values (recovery_lookup_key, recovery_public_key, recovery_KEK), and
 // re-wrapped every gen of the DEK chain. We just commit the bundle.
 //
-// Auth posture: JWT only — no step-up. The friction here is client-side
-// (the user must have generated and confirmed a new phrase before this is
-// reachable). Matching the plan's reasoning at RECOVERY_PLAN.md §4.4.
+// Auth posture (Phase 4.1): JWT + step-up token, symmetric with the
+// view/enable/disable endpoints. Closes the session-hijack gap that the
+// JWT-only posture left open — without step-up, a stolen JWT was enough
+// to overwrite the recovery factor with attacker-controlled values and
+// permanently brick the user's saved account key.
 //
 // Atomicity: D1 batch updates wrapped_data_key, recovery_lookup_key,
 // recovery_public_key, and wrapped_account_key together. Either all four
@@ -335,6 +342,18 @@ export async function handleRotateAccountKey(request, env, ctx, cors) {
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') {
     return errorResponse('Only user accounts can rotate the account key', 403, cors);
+  }
+
+  const stepUpToken = request.headers.get('X-Step-Up-Token');
+  if (!stepUpToken) {
+    return errorResponse('Step-up token required', 401, cors);
+  }
+  const consumed = await consumeStepUpToken(env, stepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH);
+  if (!consumed) {
+    return errorResponse('Invalid or expired step-up token', 401, cors);
+  }
+  if (consumed.data_lookup_key !== auth.data_lookup_key) {
+    return errorResponse('Step-up token does not match session', 401, cors);
   }
 
   let body;
