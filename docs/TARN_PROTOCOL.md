@@ -512,6 +512,33 @@ All blobs on Arweave carry these tags:
 For credential blobs: `Lk` = `credential_lookup_key`.
 For data blobs: `Lk` = `data_lookup_key`.
 
+Credential blobs additionally carry a secondary lookup tag when the
+account has a recovery factor:
+
+| Tag  | Meaning                                                                                 |
+|------|-----------------------------------------------------------------------------------------|
+| RLk  | Secondary lookup key, equal to `recovery_lookup_key`. Credential blobs only.            |
+
+`RLk` is present on credential-blob writes from 2026-05 onwards. It
+allows gateway-direct discovery of the account record from
+`(account_key, app_id)` alone, without knowing the password — the user's
+account key derives `recovery_lookup_key` (HMAC, no salt) but cannot
+derive `credential_lookup_key` (which depends on the password). Dual-
+tagging makes the credential blob discoverable by either lookup key.
+This unblocks the standalone-recovery package (`@tarn/recover`) and is
+otherwise invisible to apps. Account-deletion tombstones carry `RLk`
+under the same conditions, so a recovery client sees "account deleted"
+rather than silently empty.
+
+**Migration:** existing accounts written before this change have
+credential blobs tagged only with `Lk`. They are not directly
+discoverable by `RLk` until they next undergo a credential-blob
+republish (any of: changeCredentials, rotateAccountKey, account-key
+Model A↔B toggle, passkey add/remove). For environments with existing
+accounts that need standalone recovery, a one-time backfill query by
+`Lk` followed by re-tagging by `RLk` would be required — but for
+Bookish (no users yet) this is moot.
+
 Additional tags for versioning and key rotation (data blobs only):
 
 | Tag  | Meaning                                                       |
@@ -572,6 +599,8 @@ No value here is secret. Storing unencrypted enables:
 - Single API call for registration (no second client round-trip)
 - Full API self-healing from Arweave (all account fields recoverable)
 - No asymmetric crypto complexity for negligible privacy gain
+
+The credential blob is dual-tagged on Arweave with `Lk = credential_lookup_key` and `RLk = recovery_lookup_key` (when the account has a recovery factor — i.e. all 2026-05+ accounts). Either tag finds the same blob via gateway-direct GraphQL; see "Arweave Tag Scheme" above for the rationale.
 
 ---
 
