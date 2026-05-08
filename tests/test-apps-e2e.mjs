@@ -480,6 +480,79 @@ if (appReady) {
     });
     assert(res.status === 400, `Expected 400, got ${res.status}: ${res.text}`);
   });
+
+  console.log('\n=== App-reg Arweave mirror (Phase A) ===');
+
+  // After PUT /apps/:app_id/invite-template succeeds, the worker fires a
+  // fresh Type=app-reg DataItem in ctx.waitUntil. Verify by querying the
+  // local D1 entries table for the cached row that the upsertWriteThrough
+  // call inserts synchronously inside that waitUntil. (Turbo upload is
+  // skipped via TARN_SKIP_TURBO=true in api/.dev.vars.)
+  async function queryAppRegEntries(appId) {
+    const { execSync } = await import('child_process');
+    const sql = `SELECT txid FROM entries WHERE app='tarn' AND type='app-reg' AND lookup_key='${appId}'`;
+    const out = execSync(
+      `npx wrangler d1 execute tarn-api --local --command "${sql}" --json`,
+      { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 15000 }
+    ).toString('utf8');
+    // wrangler --json wraps results in an array; pick the first result block.
+    let parsed;
+    try { parsed = JSON.parse(out); } catch { return []; }
+    const rows = Array.isArray(parsed) && parsed[0]?.results ? parsed[0].results : [];
+    return rows;
+  }
+
+  await test('PUT invite-template publishes a Type=app-reg blob to D1 cache', async () => {
+    const before = await queryAppRegEntries(APP_ID);
+
+    const tpl = `https://example.test/inv/${Date.now()}/{token_id}`;
+    const res = await fetchJSON(`/api/v1/apps/${APP_ID}/invite-template`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ invite_url_template: tpl }),
+    });
+    assert(res.status === 200, `Expected 200, got ${res.status}: ${res.text}`);
+
+    // ctx.waitUntil runs after the response in wrangler dev; give it a beat.
+    // upsertWriteThrough is the synchronous prefix inside the waitUntil, so a
+    // small wait is sufficient (no Turbo round trip — TARN_SKIP_TURBO=true).
+    let after = before;
+    for (let i = 0; i < 20 && after.length === before.length; i++) {
+      await sleep(150);
+      after = await queryAppRegEntries(APP_ID);
+    }
+    assert(after.length > before.length,
+      `expected a new app-reg entry row; before=${before.length} after=${after.length}`);
+  });
+
+  await test('Two invite-template updates produce two distinct app-reg blobs', async () => {
+    const start = await queryAppRegEntries(APP_ID);
+
+    const tplA = `https://example.test/A-${Date.now()}/{token_id}`;
+    const tplB = `https://example.test/B-${Date.now()}/{token_id}`;
+
+    const a = await fetchJSON(`/api/v1/apps/${APP_ID}/invite-template`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ invite_url_template: tplA }),
+    });
+    assert(a.status === 200, `A failed: ${a.status} ${a.text}`);
+
+    const b = await fetchJSON(`/api/v1/apps/${APP_ID}/invite-template`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${appJwt}` },
+      body: JSON.stringify({ invite_url_template: tplB }),
+    });
+    assert(b.status === 200, `B failed: ${b.status} ${b.text}`);
+
+    let final = start;
+    for (let i = 0; i < 25 && final.length < start.length + 2; i++) {
+      await sleep(200);
+      final = await queryAppRegEntries(APP_ID);
+    }
+    assert(final.length >= start.length + 2,
+      `expected at least 2 new app-reg rows; start=${start.length} final=${final.length}`);
+  });
 }
 
 // ============ SUMMARY ============
