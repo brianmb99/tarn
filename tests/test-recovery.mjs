@@ -267,6 +267,21 @@ async function readRecoveryLookupKey(dataLookupKey) {
   return JSON.parse(out)[0]?.results?.[0] ?? null;
 }
 
+// Read the newest live (non-tombstoned) credential entry for a given
+// credential_lookup_key. Used by the rotation test to identify the txid
+// that the recovery client would treat as the live record, without
+// assuming the rotation also rotated `Lk` (which it does not — see the
+// "OLD RLk" assertion in the rotateAccountKey test).
+async function readNewestCredEntry(credentialLookupKey) {
+  const { execSync } = await import('child_process');
+  const sql = `SELECT txid, lookup_key, tags_json FROM entries WHERE app='tarn' AND type='cred' AND lookup_key='${credentialLookupKey}' AND is_tombstone=0 ORDER BY cached_at DESC LIMIT 1`;
+  const out = execSync(
+    `npx wrangler d1 execute tarn-api --local --json --command "${sql}"`,
+    { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000 },
+  ).toString();
+  return JSON.parse(out)[0]?.results?.[0] ?? null;
+}
+
 await test('register: credential blob is dual-tagged with Lk + RLk', async () => {
   const client = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const username = randomUsername();
@@ -346,14 +361,22 @@ await test('rotateAccountKey: NEW RLk discovers the rotated blob, OLD RLk does n
     throw new Error('NEW RLk should resolve to the post-rotation credential blob');
   }
 
-  // OLD RLk: there is one historical row tagged with it (the original register
-  // blob, written before rotation). That's expected — Arweave is append-only.
-  // The CRITICAL property is that no row tagged with the OLD RLk also carries
-  // the CURRENT credential_lookup_key — i.e. an attacker / observer with the
-  // old phrase finds only stale data, never the live credential.
+  // OLD RLk: a historical row remains tagged with it (the original register
+  // blob, written before rotation) — Arweave is append-only and the entries
+  // cache mirrors that. Note: rotateAccountKey does NOT change
+  // credential_lookup_key (only the recovery factor rotates), so the old
+  // blob and the new blob share the same `Lk`. The discoverability invariant
+  // we care about is therefore: looking up by OLD RLk must NOT return the
+  // post-rotation txid. Both the old and the new blob carry the same `Lk`,
+  // but only the new blob carries the new RLk; the recovery client sorts
+  // by cached_at / block height to pick the live one.
   const oldMatches = await queryEntriesByRLk(oldRlk);
-  if (oldMatches.some(m => m.lookup_key === afterRow.credential_lookup_key)) {
-    throw new Error('OLD RLk must NOT resolve to the post-rotation credential blob');
+  // Find the newest row for the current credential_lookup_key. That row's
+  // RLk must be the new one, not the old.
+  const newestForClk = await readNewestCredEntry(afterRow.credential_lookup_key);
+  if (!newestForClk?.txid) throw new Error('expected at least one credential entry for current clk');
+  if (oldMatches.some(m => m.txid === newestForClk.txid)) {
+    throw new Error('OLD RLk must NOT resolve to the post-rotation (latest) credential blob');
   }
 });
 
