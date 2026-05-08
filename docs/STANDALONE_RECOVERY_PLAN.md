@@ -62,18 +62,24 @@ We'd recommend Bookish promote this from stretch to v1 — it's the difference b
 
 ## Proposed API shape
 
+The reader accepts **either** factor — username + password, OR account key. Both factors independently locate the credential blob on Arweave (post-RLk dual-tag fix) and independently unwrap the DEK chain. Apps surface whichever inputs the user has on hand.
+
 ```js
 import { recover } from '@tarn/recover';
 
 const reader = await recover({
-  username,                    // string
-  accountKey,                  // 24-word phrase
   appId: 'bookish',            // app whose data we're reading
   schema: bookishSchema,       // app's defineSchema() output
   arweaveGateways: [           // ordered fallback list
     'https://arweave.net',
     'https://g8way.io',
   ],
+
+  // Provide ONE of the following auth blocks:
+  credentials: { type: 'password', username, password },
+  // OR:
+  credentials: { type: 'accountKey', accountKey },
+
   onProgress: (stage, info) => {
     // stage: 'deriving' | 'locating-account' | 'fetching-envelope'
     //      | 'walking-log' | 'decrypting' | 'done'
@@ -250,7 +256,7 @@ The six questions from the original proposal phase have been answered. Captured 
 
 1. **Share-log + connection data — IN v1.** Confirmed.
 2. **`username` not `email` in the API.** Confirmed.
-3. **Whether username is cryptographically required** — to be answered in Phase 1 audit. UX takes it either way.
+3. **Whether username is cryptographically required** — answered by the Phase 1 audit: NO for the account-key path (account key alone is sufficient), YES for the password path (`master_key = Argon2id(password, SHA-256(normalizedUsername))` requires both). The reader takes whichever inputs the user has — either `(username, password)` or `accountKey` alone. See API shape above.
 4. **`@tarn/recover` as a separate npm package.** Confirmed.
 5. **Phase 9 (publish reference HTML to Arweave) in v1 scope.** Confirmed; Bookish accepts the 1-2 days of publish-script work to ship `forever.html` on Arweave alongside the bare reference.
 6. **Timeline at 3-5 weeks is fine.** Bookish has no hard deadline; better to ship the right thing.
@@ -261,6 +267,7 @@ Phase 6 (forward-compat decoder framework + fixture suite) builds the structural
 
 - **Legacy KDF (PBKDF2) account** — recovery succeeds; correct decoder picked from account record.
 - **Current KDF (Argon2id) account** — recovery succeeds.
+- **Both auth paths** — every test scenario above must pass with BOTH `credentials: { type: 'password', username, password }` AND `credentials: { type: 'accountKey', accountKey }`. Same outcome via independent crypto chains.
 - **Account that has been through `changeCredentials`** (multiple DEK gens) — all gens unwrap correctly; entries from every gen appear.
 - **Account that has been through `rotateAccountKey`** — current account key recovers; old account key fails loudly (not silently with empty results).
 - **Model A account** (no `wrapped_account_key` on server) — recovery succeeds via the user-supplied account key. (Server-side storage of the key is irrelevant to the recovery path; this just confirms both modes recover identically given the key as input.)

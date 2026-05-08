@@ -519,16 +519,11 @@ account has a recovery factor:
 |------|-----------------------------------------------------------------------------------------|
 | RLk  | Secondary lookup key, equal to `recovery_lookup_key`. Credential blobs only.            |
 
-`RLk` is present on credential-blob writes from 2026-05 onwards. It
-allows gateway-direct discovery of the account record from
-`(account_key, app_id)` alone, without knowing the password — the user's
-account key derives `recovery_lookup_key` (HMAC, no salt) but cannot
-derive `credential_lookup_key` (which depends on the password). Dual-
-tagging makes the credential blob discoverable by either lookup key.
-This unblocks the standalone-recovery package (`@tarn/recover`) and is
-otherwise invisible to apps. Account-deletion tombstones carry `RLk`
-under the same conditions, so a recovery client sees "account deleted"
-rather than silently empty.
+**Design principle: each authentication factor must independently locate the credential blob on Arweave.** The protocol has always supported recovery via either factor (password or account key) for unwrapping the DEK chain — both factors' wrapping keys are present in the envelope. But the original Arweave tag scheme only published `Lk = credential_lookup_key`, which the password derives. The account-key factor's lookup key (`recovery_lookup_key`) was discoverable only via D1 lookups through the live API. That made the account-key factor server-mediated-only on the read side, not Arweave-direct.
+
+`RLk` (added 2026-05 onwards) closes this index gap: every credential-blob write now publishes both lookup keys as Arweave tags, so the same blob is discoverable via either factor's GraphQL query. Both factors are now equally usable for Arweave-direct standalone recovery — which is what the design always intended; the original tag scheme was just incomplete in this respect.
+
+Account-deletion tombstones carry `RLk` under the same conditions, so a recovery client sees "account deleted" rather than silently empty.
 
 **Migration:** existing accounts written before this change have
 credential blobs tagged only with `Lk`. They are not directly
