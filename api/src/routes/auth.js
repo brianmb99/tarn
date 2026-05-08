@@ -50,13 +50,35 @@ function buildCredentialBlob(
   return JSON.stringify(blob);
 }
 
-function buildCredentialTags(credentialLookupKey) {
-  return [
+/**
+ * Build the Arweave tag set for a credential mapping blob.
+ *
+ * Emits the primary `Lk` (credential_lookup_key) plus, when supplied, a
+ * secondary `RLk` (recovery_lookup_key). The RLk tag was added 2026-05 to
+ * unblock the standalone-recovery package (`@tarn/recover`): a user who
+ * has only their account key (24-word phrase) can derive
+ * `recovery_lookup_key` directly (HMAC, no salt) but cannot derive
+ * `credential_lookup_key` (which depends on the password). Dual-tagging
+ * makes the credential blob discoverable by gateway-direct GraphQL from
+ * `(account_key, app_id)` alone.
+ *
+ * Existing accounts written before this change have credential blobs
+ * tagged only with `Lk`. They become RLk-discoverable on their next
+ * credential-blob republish (any of: changeCredentials, rotateAccountKey,
+ * Model A↔B toggle, passkey add/remove). No backfill is in scope; for
+ * Bookish (no users yet) the gap is moot.
+ */
+export function buildCredentialTags(credentialLookupKey, recoveryLookupKey) {
+  const tags = [
     { name: 'App', value: 'tarn' },
     { name: 'Type', value: 'cred' },
     { name: 'Lk', value: credentialLookupKey },
-    { name: 'V', value: PROTOCOL_VERSION },
   ];
+  if (recoveryLookupKey) {
+    tags.push({ name: 'RLk', value: recoveryLookupKey });
+  }
+  tags.push({ name: 'V', value: PROTOCOL_VERSION });
+  return tags;
 }
 
 /**
@@ -75,7 +97,7 @@ function persistCredentialBlob(
     sharePub, shareDiscoverable, shareLookupKey,
     wrappedAccountKey,
   );
-  const tags = buildCredentialTags(credentialLookupKey);
+  const tags = buildCredentialTags(credentialLookupKey, recoveryLookupKey);
 
   ctx.waitUntil((async () => {
     try {
@@ -783,9 +805,11 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
   if (!auth) return errorResponse('Unauthorized', 401, cors);
   if (auth.role !== 'user') return errorResponse('Only user accounts can be deleted', 403, cors);
 
-  // Find current account
+  // Find current account. Read recovery_lookup_key as well so the tombstone
+  // can carry the RLk tag — keeping the deletion record discoverable via the
+  // same gateway-direct path that finds the live credential blob.
   const account = await env.DB.prepare(
-    'SELECT credential_lookup_key FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT credential_lookup_key, recovery_lookup_key FROM accounts WHERE data_lookup_key = ?1'
   ).bind(auth.data_lookup_key).first();
   if (!account) {
     return errorResponse('Account not found', 404, cors);
@@ -806,7 +830,11 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
     console.warn('[tarn-api] handleDeleteAccount: deleteAllSessionsForAccount failed:', err.message);
   }
 
-  // Write tombstone to Arweave (non-blocking)
+  // Write tombstone to Arweave (non-blocking).
+  // Mirror the dual-tag scheme used on live credential blobs: include `RLk`
+  // alongside `Lk` when the account had a recovery factor, so a recovery
+  // client querying by recovery_lookup_key can discover the tombstone and
+  // surface "this account was deleted" rather than silently returning empty.
   if (credEntry?.txid) {
     const tombstoneTags = [
       { name: 'App', value: 'tarn' },
@@ -814,8 +842,11 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
       { name: 'Op', value: 'tombstone' },
       { name: 'Ref', value: credEntry.txid },
       { name: 'Lk', value: account.credential_lookup_key },
-      { name: 'V', value: PROTOCOL_VERSION },
     ];
+    if (account.recovery_lookup_key) {
+      tombstoneTags.push({ name: 'RLk', value: account.recovery_lookup_key });
+    }
+    tombstoneTags.push({ name: 'V', value: PROTOCOL_VERSION });
 
     ctx.waitUntil((async () => {
       try {

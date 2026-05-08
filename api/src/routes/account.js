@@ -25,11 +25,10 @@
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
-import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH } from './auth.js';
+import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH, buildCredentialTags } from './auth.js';
 import { importPublicKey, isValidHex64 } from '../crypto.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
-import { PROTOCOL_VERSION } from '../constants.js';
 
 async function hashIp(ip) {
   if (!ip) return null;
@@ -105,12 +104,9 @@ function persistCredentialBlobFromRow(ctx, env, row) {
   if (row.share_lookup_key) blob.share_lookup_key = row.share_lookup_key;
   if (row.wrapped_account_key) blob.wrapped_account_key = row.wrapped_account_key;
 
-  const tags = [
-    { name: 'App', value: 'tarn' },
-    { name: 'Type', value: 'cred' },
-    { name: 'Lk', value: row.credential_lookup_key },
-    { name: 'V', value: PROTOCOL_VERSION },
-  ];
+  // Dual-tag with Lk (credential_lookup_key) + RLk (recovery_lookup_key when
+  // present) — see buildCredentialTags in auth.js for rationale.
+  const tags = buildCredentialTags(row.credential_lookup_key, row.recovery_lookup_key);
 
   ctx.waitUntil((async () => {
     try {
