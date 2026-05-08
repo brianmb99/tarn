@@ -477,6 +477,55 @@ Tarn operator registers: { app_id, public_key }
 Stored in D1 and on Arweave: Type: 'app-reg', Lk: app_id
 ```
 
+#### Type=app-reg blob format
+
+The `apps` D1 table is mirrored to Arweave so the operator can reconstruct
+it from gateway-only state. Each app produces (at minimum) one Arweave
+blob at registration time, plus one fresh blob per `invite_url_template`
+update.
+
+**Tags:**
+
+| Tag    | Value                  |
+|--------|------------------------|
+| `App`  | `tarn`                 |
+| `Type` | `app-reg`              |
+| `Lk`   | `<app_id>`             |
+| `V`    | `<PROTOCOL_VERSION>`   |
+
+`(App=tarn, Type=app-reg)` enumerates every registered app; adding `Lk`
+selects a single app's history. Latest blob per `app_id` wins on rebuild.
+
+**Body (JSON, UTF-8):**
+
+```json
+{
+  "v": 1,
+  "app_id": "<string>",
+  "public_key": "<base64 SPKI of ECDSA P-256>",
+  "invite_url_template": "<string>" | null,
+  "created_at": <unix-ms>
+}
+```
+
+`v` is the body schema version; bump on incompatible change.
+`created_at` is set once at registration and reused across update blobs
+so successive template edits do not rewrite history.
+
+**Write sites:**
+
+1. `tools/generate-app-key.mjs` and `tools/register-app-from-key.mjs`
+   sign + publish via Turbo before printing the D1 seed SQL. Arweave-first
+   ordering guarantees that any apps row inserted via the printed SQL
+   already has a matching Arweave blob.
+2. `PUT /api/v1/apps/:app_id/invite-template` (worker) publishes a fresh
+   blob via `ctx.waitUntil` after the D1 UPDATE succeeds. The blob
+   carries the existing `created_at` and the updated template.
+
+**Update / tombstone semantics:** there are no `Type=app-reg` tombstones
+in v1 — app de-registration is future work. If needed, mirror the
+existing `Op=tombstone, Ref=<txid>` pattern used for credential blobs.
+
 ### App authentication
 
 Same challenge-response protocol as users:
@@ -863,7 +912,19 @@ data_lookup_key unchanged. All pre-recovery data is decryptable under the new cr
 
 ### 8. D1 Recovery
 
-All tables fully rebuildable from Arweave. Entries self-heal on cache miss. Accounts rebuilt from `Type=cred` blobs. Apps rebuilt from `Type=app-reg` blobs.
+The recoverable substrate of D1 is rebuildable from Arweave: entries
+self-heal on cache miss, accounts rebuild from `Type=cred` blobs, apps
+rebuild from `Type=app-reg` blobs (see [App registration](#app-registration)
+above for the wire format), per-account write rules rebuild from
+`Type=app-config` blobs, and shared connection / log material rebuilds
+from `App=tarn-share` blobs. Transient and operator-only state
+(sessions, nonces, step-up tokens, rate-limit counters, audit logs) is
+intentionally D1-only and treated as acceptable loss; users re-authenticate.
+
+The operational rebuild tool that walks Arweave and reconstructs D1 is
+tracked in `docs/ARWEAVE_RECOVERABILITY_FIX_PLAN.md` (Phase C). Until
+that lands, "rebuildable" is a property of the data layout (the bytes
+and their tags are on Arweave) rather than a single push-button procedure.
 
 ### 9. Delete account
 
