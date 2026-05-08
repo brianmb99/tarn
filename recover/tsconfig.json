@@ -25,7 +25,12 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
 
-    "allowImportingTsExtensions": false
+    "allowImportingTsExtensions": false,
+
+    // Tests use Node-only modules (http, assert, Buffer). Add the
+    // type definitions explicitly. Source files don't import these
+    // so this doesn't leak Node types into the browser-deliverable bundle.
+    "types": ["node"]
   },
   "include": [
     "src/**/*.ts",

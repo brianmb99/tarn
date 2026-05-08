@@ -141,9 +141,9 @@ describe('findCredentialBlob', () => {
     try {
       const result = await findCredentialBlob(makeClient(gw), { recoveryLookupKey: RLK });
       assert.ok(result);
-      assert.equal(result.txid, txid);
-      assert.deepEqual(result.body, JSON.parse(body));
-      assert.equal(result.tagMap['RLk'], RLK);
+      assert.equal(result!.txid, txid);
+      assert.deepEqual(result!.body, JSON.parse(body));
+      assert.equal(result!.tagMap['RLk'], RLK);
       // Verify the actual request shape — sort=HEIGHT_DESC, first=1.
       const req = gw.graphqlRequests[0];
       assert.equal(req?.first, 1);
@@ -169,7 +169,7 @@ describe('findCredentialBlob', () => {
     try {
       const result = await findCredentialBlob(makeClient(gw), { credentialLookupKey: CLK });
       assert.ok(result);
-      assert.equal(result.txid, txid);
+      assert.equal(result!.txid, txid);
     } finally {
       await gw.close();
     }
@@ -216,8 +216,8 @@ describe('findAppBlob', () => {
     try {
       const result = await findAppBlob(makeClient(gw), { appId: 'bookish' });
       assert.ok(result);
-      assert.equal(result.txid, txid);
-      assert.deepEqual(result.body, JSON.parse(body));
+      assert.equal(result!.txid, txid);
+      assert.deepEqual(result!.body, JSON.parse(body));
     } finally {
       await gw.close();
     }
@@ -262,7 +262,7 @@ describe('findContentBlobs', () => {
     const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
       if (req.method === 'POST' && req.url === '/graphql') {
         let raw = '';
-        req.on('data', (c: Buffer) => (raw += c.toString()));
+        req.on('data', (c: unknown) => (raw += String(c)));
         req.on('end', () => {
           res.statusCode = 200;
           res.setHeader('content-type', 'application/json');
