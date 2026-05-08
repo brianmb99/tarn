@@ -1,0 +1,38 @@
+{
+  "name": "@tarn/recover",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/esm/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js"
+    },
+    "./gateway": {
+      "types": "./dist/types/gateway/index.d.ts",
+      "import": "./dist/esm/gateway/index.js"
+    }
+  },
+  "files": [
+    "dist/esm/",
+    "dist/types/",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "typecheck": "tsc --noEmit",
+    "clean": "node -e \"import('node:fs/promises').then(fs => fs.rm('dist', {recursive:true,force:true}))\"",
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.27.7",
+    "glob": "^11.1.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
