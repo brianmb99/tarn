@@ -24,7 +24,7 @@
 // matching real authenticator behavior.
 
 import { TarnClient } from '../client/src/tarn.js';
-import { seedTestApp, DEFAULT_APP_ID, randomUsername } from './helpers.mjs';
+import { seedTestApp, DEFAULT_APP_ID, randomUsername, sleep } from './helpers.mjs';
 import { VirtualAuthenticator, installPasskeyTestEnv } from './helpers/virtual-authenticator.mjs';
 
 const API_BASE = process.argv[2] || 'http://localhost:8787';
@@ -695,6 +695,88 @@ await test('sign_count regression rejected', async () => {
   env.clearNextAuth();
   assert(threw, 'expected sign_count regression to throw');
   assert(/counter|verification|401/i.test(threw.message), `expected counter rejection, got: ${threw.message}`);
+});
+
+// ============ PHASE B — Arweave passkey-reg blob writes ============
+//
+// docs/ARWEAVE_RECOVERABILITY_FIX_PLAN.md §B. Each passkey register/remove
+// must emit a `Type=passkey-reg` blob to Arweave so a Phase-C rebuild can
+// reconstruct `passkey_credentials` rows from Arweave alone. The
+// upload runs in ctx.waitUntil; the D1 cache write-through (via
+// upsertWriteThrough on the entries table) is the synchronous side
+// effect we can observe locally.
+
+section('Phase B — Arweave passkey-reg blob writes');
+
+await test('register publishes a Type=passkey-reg blob (D1 entries cache populated)', async () => {
+  const a = await registerAccount();
+  const { auth, result } = await registerPasskeyOn(a.client, { deviceLabel: 'phase-b-register' });
+
+  // Give the waitUntil callback a moment to run upsertWriteThrough.
+  await sleep(500);
+
+  const rows = await d1Query(
+    `SELECT txid, type, lookup_key, is_tombstone, tags_json FROM entries WHERE type = 'passkey-reg' AND lookup_key = '${a.client.dataLookupKey}' AND is_tombstone = 0`,
+  );
+  assert(rows.length === 1, `expected 1 live passkey-reg row, got ${rows.length}`);
+  const row = rows[0];
+  assert(row.lookup_key === a.client.dataLookupKey, 'Lk tag = data_lookup_key');
+  // CredId is in tags_json — confirm it matches the registered credential.
+  const tags = JSON.parse(row.tags_json);
+  const credIdTag = tags.find(t => t.name === 'CredId');
+  assert(credIdTag, 'CredId tag is present');
+  assert(
+    credIdTag.value === auth.credentialIdB64Url,
+    `CredId tag should be the registered credential_id (got ${credIdTag.value})`,
+  );
+  assert(
+    credIdTag.value === result.credentialId,
+    'CredId matches the value returned to the SDK',
+  );
+  // App + Type discoverability for rebuild scans.
+  assert(tags.find(t => t.name === 'App')?.value === 'tarn', 'App=tarn');
+  assert(tags.find(t => t.name === 'Type')?.value === 'passkey-reg', 'Type=passkey-reg');
+});
+
+await test('remove publishes a Type=passkey-reg tombstone (CredId-by-tag scheme)', async () => {
+  const a = await registerAccount();
+  const { auth } = await registerPasskeyOn(a.client, { deviceLabel: 'phase-b-remove' });
+
+  await sleep(300);
+  // Sanity precondition: the live blob is present.
+  const before = await d1Query(
+    `SELECT COUNT(*) AS n FROM entries WHERE type = 'passkey-reg' AND lookup_key = '${a.client.dataLookupKey}' AND is_tombstone = 0`,
+  );
+  assert(before[0].n === 1, `precondition: 1 live passkey-reg row before remove, got ${before[0].n}`);
+
+  await a.client.removePasskey({ credentialId: auth.credentialIdB64Url, password: a.password });
+
+  await sleep(500);
+
+  // Tombstone is a Type=passkey-reg row with is_tombstone=1, scoped to this DLK + CredId.
+  const tombs = await d1Query(
+    `SELECT txid, is_tombstone, tags_json FROM entries WHERE type = 'passkey-reg' AND lookup_key = '${a.client.dataLookupKey}' AND is_tombstone = 1`,
+  );
+  assert(tombs.length === 1, `expected 1 passkey-reg tombstone row, got ${tombs.length}`);
+  const ttags = JSON.parse(tombs[0].tags_json);
+  assert(ttags.find(t => t.name === 'Op')?.value === 'tombstone', 'tombstone carries Op=tombstone');
+  assert(
+    ttags.find(t => t.name === 'CredId')?.value === auth.credentialIdB64Url,
+    'tombstone CredId matches the removed credential_id (CredId-by-tag scheme — no tombstone_ref)',
+  );
+  // The tombstone deliberately does NOT reference the original txid.
+  assert(
+    !ttags.find(t => t.name === 'Ref'),
+    'tombstone must not carry a Ref tag (CredId-by-tag scheme, not txid-ref)',
+  );
+
+  // The live blob is still in the cache (it's the historical record;
+  // rebuild logic excludes by checking for any tombstone with a
+  // matching CredId — not by deleting the live row).
+  const live = await d1Query(
+    `SELECT COUNT(*) AS n FROM entries WHERE type = 'passkey-reg' AND lookup_key = '${a.client.dataLookupKey}' AND is_tombstone = 0`,
+  );
+  assert(live[0].n === 1, 'live row remains in cache; tombstone is the discriminator on rebuild');
 });
 
 // ============ DONE ============
