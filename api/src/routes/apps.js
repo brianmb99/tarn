@@ -7,6 +7,7 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { upsertWriteThrough } from '../cache.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
+import { buildAppRegTags, buildAppRegBody } from '../app-reg.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
 
@@ -147,14 +148,50 @@ export async function handleSetInviteTemplate(appId, request, env, ctx, cors) {
     }
   }
 
-  const exists = await env.DB.prepare('SELECT 1 FROM apps WHERE app_id = ?1').bind(appId).first();
-  if (!exists) {
+  const existing = await env.DB.prepare(
+    'SELECT public_key, created_at FROM apps WHERE app_id = ?1'
+  ).bind(appId).first();
+  if (!existing) {
     return errorResponse('App not found', 404, cors);
   }
 
   await env.DB.prepare(
     'UPDATE apps SET invite_url_template = ?1 WHERE app_id = ?2'
   ).bind(template ?? null, appId).run();
+
+  // Mirror the updated app row to Arweave as a fresh Type=app-reg blob
+  // (latest blob wins on rebuild — see ARWEAVE_RECOVERABILITY_FIX_PLAN.md
+  // Phase A). The blob carries the original `created_at` so successive
+  // updates don't rewrite history; only `invite_url_template` changes.
+  // Best-effort, non-blocking — the same pattern handleSetRules uses.
+  ctx.waitUntil((async () => {
+    try {
+      const signingKey = env.APP_SIGNING_KEY;
+      if (!signingKey) {
+        console.warn('[tarn-api] APP_SIGNING_KEY not set — skipping app-reg upload');
+        return;
+      }
+      const tags = buildAppRegTags(appId);
+      const body = buildAppRegBody({
+        app_id: appId,
+        public_key: existing.public_key,
+        invite_url_template: template ?? null,
+        created_at: existing.created_at,
+      });
+      const blobBytes = new TextEncoder().encode(body);
+      const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
+      await upsertWriteThrough(env.DB, txid, tags, blobBytes);
+      console.log(`[tarn-api] App-reg cached (invite-template update): ${appId} ${txid}`);
+      const turbo = await uploadSignedDataItem(signedDataItem);
+      if (turbo.ok) {
+        console.log(`[tarn-api] App-reg uploaded to Turbo: ${appId} ${txid}`);
+      } else {
+        console.warn(`[tarn-api] App-reg Turbo upload failed: ${turbo.status} ${turbo.body}`);
+      }
+    } catch (err) {
+      console.error('[tarn-api] App-reg upload error:', err.message);
+    }
+  })());
 
   return jsonResponse({ ok: true, invite_url_template: template ?? null }, 200, cors);
 }
