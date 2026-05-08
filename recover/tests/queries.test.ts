@@ -259,10 +259,10 @@ describe('findContentBlobs', () => {
   it('caches body fetches per BlobRecord', async () => {
     const DLK = 'd'.repeat(64);
     let bodyFetchCount = 0;
-    const server = http.createServer((req, res) => {
+    const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
       if (req.method === 'POST' && req.url === '/graphql') {
         let raw = '';
-        req.on('data', (c) => (raw += c.toString()));
+        req.on('data', (c: Buffer) => (raw += c.toString()));
         req.on('end', () => {
           res.statusCode = 200;
           res.setHeader('content-type', 'application/json');
