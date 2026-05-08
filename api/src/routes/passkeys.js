@@ -39,6 +39,7 @@ import { signJWT } from '../auth.js';
 import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH, buildCredentialTags } from './auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
+import { persistPasskeyRegBlob, persistPasskeyRegTombstone } from './passkey-reg.js';
 import {
   pruneStaleSessions,
   createOrReuseSession,
@@ -452,10 +453,25 @@ export async function handlePasskeyRegister(request, env, ctx, cors) {
   writePasskeyAudit(ctx, env, request, auth.data_lookup_key, 'passkey_register');
   persistCredentialBlobFromRowWithEnvelope(ctx, env, updated);
 
+  // Phase B (Arweave-recoverability) — mirror the new credential row to
+  // Arweave as a `Type=passkey-reg` blob. D1-first ordering (the row was
+  // inserted above); the upload runs in ctx.waitUntil. See
+  // `routes/passkey-reg.js` header for the full wire format and the
+  // ordering / tombstone-scheme rationale.
+  const createdAt = Date.now();
+  persistPasskeyRegBlob(ctx, env, {
+    dataLookupKey: auth.data_lookup_key,
+    credentialId,
+    publicKey: publicKeyB64,
+    prfSalt: prf_salt,
+    deviceLabel: device_label || null,
+    createdAt,
+  });
+
   return jsonResponse({
     credential_id: credentialId,
     device_label: device_label || null,
-    created_at: Date.now(),
+    created_at: createdAt,
   }, 201, cors);
 }
 
@@ -912,6 +928,13 @@ export async function handleDeletePasskey(request, env, ctx, credentialId, cors)
 
   writePasskeyAudit(ctx, env, request, auth.data_lookup_key, 'passkey_remove');
   persistCredentialBlobFromRowWithEnvelope(ctx, env, updated);
+
+  // Phase B (Arweave-recoverability) — publish a tombstone for the
+  // passkey-reg blob so a Phase-C rebuild excludes this credential. We
+  // tombstone by `CredId`-tag rather than `tombstone_ref=<txid>` to
+  // avoid threading the original txid through the schema; see the
+  // `routes/passkey-reg.js` header for rationale.
+  persistPasskeyRegTombstone(ctx, env, auth.data_lookup_key, credentialId);
 
   return jsonResponse({ removed: true, credential_id: credentialId }, 200, cors);
 }
