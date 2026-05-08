@@ -783,7 +783,7 @@ Tarn is the sole write path for any data associated with a (`data_lookup_key`, `
 - **Arweave GraphQL is consulted only on cold bootstrap:** a first read for a tuple Tarn has never processed. After bootstrap, the marker short-circuits all subsequent queries.
 - **`block_timestamp` / confirmation status** is set at write time (NULL = pending) and no longer updates once the marker is set. Clients that need Arweave confirmation status can check Turbo directly for a given txid.
 
-**Rebuild from Arweave:** All tables fully rebuildable from Arweave blob scans. After rebuild, `cache_meta` markers are cleared so the next read for each tuple re-bootstraps from the restored `entries` rows.
+**Rebuild from Arweave:** Recoverable tables (apps, accounts, passkey_credentials, accounts.rules_json, share_inbox, share_log, entries) rebuildable from Arweave blob scans. The operational rebuild tool is `tools/rebuild-from-arweave.mjs` — see [Operational rebuild from Arweave](#operational-rebuild-from-arweave) below. After rebuild, `cache_meta` markers are cleared so the next read for each tuple re-bootstraps from the restored `entries` rows.
 
 ---
 
@@ -980,7 +980,51 @@ The recoverable substrate of D1 is rebuildable from Arweave:
 
 Transient and operator-only state (sessions, nonces, step-up tokens, WebAuthn challenges, rate-limit counters, idempotency cache, audit logs) is intentionally D1-only and treated as acceptable loss on rebuild; users re-authenticate.
 
-The operational rebuild tool (Phase C, `tools/rebuild-from-arweave.mjs`) walks Arweave and reconstructs D1 in dependency order. Until that lands, "rebuildable" is a property of the data layout (the bytes and their tags are on Arweave) rather than a single push-button procedure. See `docs/ARWEAVE_RECOVERABILITY_FIX_PLAN.md` for the cross-phase plan.
+The operational rebuild tool is **`tools/rebuild-from-arweave.mjs`** — see [Operational rebuild from Arweave](#operational-rebuild-from-arweave) for usage, dependency order, idempotency, and acceptable losses. Phase C of the cross-phase recoverability fix is now landed; "rebuildable from Arweave" is a runnable procedure, not just a layout property. See `docs/ARWEAVE_RECOVERABILITY_FIX_PLAN.md` for the historical phase context.
+
+### 8a. Operational rebuild from Arweave
+
+**Tool: `tools/rebuild-from-arweave.mjs` (Phase C, 2026-05).**
+
+A standalone Node.js script that walks Arweave via GraphQL and reconstructs every recoverable D1 table for `tarn-api`. Operator-runnable, idempotent, dry-run by default.
+
+**Invocation:**
+
+```
+node tools/rebuild-from-arweave.mjs \
+  --d1-binding tarn-api \
+  --arweave-gateway https://arweave.net \
+  --confirm                          # without --confirm: dry-run only
+```
+
+Optional: `--app=<id>` (scope steps 4-6 to one app), `--gateways="A,B"` (multi-gateway body-fetch fallback), `--skip=apps,accounts,...`, `--prefetch-content`, `--remote` (default `--local`), `--max-pages=N` (pagination cap), `--quiet`, `--help`.
+
+**Dependency order (each step depends on the prior step's output):**
+
+1. **`apps`** — `App=tarn, Type=app-reg, Lk=<app_id>`. Latest blob per `app_id` wins.
+2. **`accounts`** — `App=tarn, Type=cred, Lk=<credential_lookup_key>`. Tombstone-aware (`Op=tombstone, Ref=<txid>`); credential rotation is handled by grouping on `data_lookup_key` (from blob body) and selecting the latest non-tombstoned blob. `recovery_lookup_key` is read from the `RLk` tag (post 2026-05) with body fallback.
+3. **`passkey_credentials`** — `App=tarn, Type=passkey-reg, Lk=<dlk>, CredId=<id>`. Group by `CredId`; any group containing an `Op=tombstone` blob is excluded entirely.
+4. **`accounts.rules_json`** — `App=<app_id>, Type=app-config, Lk=<dlk>`, scoped to apps recovered in step 1. Latest blob's `rules` array is `JSON.stringify`-ed into `accounts.rules_json`.
+5. **`share_inbox`** — `App=tarn-share, Type=connection-{request,accept}-v1, To=<tag>`. Many writers per tag; one row per txid.
+6. **`share_log`** — `App=tarn-share, Type=share-log-v1, To=<tag>`. UNIQUE on `(app_id, log_tag, blob_type)`; in-memory dedup keeps the latest if duplicates appear.
+7. **`entries` cache (lazy, default off).** Use the existing single-tuple cold-bootstrap (`refreshCache` in `api/src/cache.js`) on first read. `--prefetch-content` reserved for future exhaustive walk.
+
+**Idempotency.** Every D1 write is `INSERT ... ON CONFLICT(<pk>) DO UPDATE SET ...` (or `ON CONFLICT(...) DO NOTHING` for already-keyed share rows). Re-running the tool with the same flags is safe; partial state from a previous failed run is healed in place.
+
+**Dry-run vs `--confirm`.** Without `--confirm`, the tool walks Arweave, parses bodies, and prints what would be rebuilt — no `wrangler d1 execute` writes occur. `--confirm` enables real D1 writes via batched SQL files (one batch per phase, chunked at 50 rows per file for share blobs to keep wrangler argv friendly).
+
+**Failure handling.** Any phase failure (GraphQL HTTP error, body-fetch exhaustion of every gateway, parse error rate above thresholds) prints the error, prints the partial summary, and exits non-zero. Re-running with the same flags resumes cleanly thanks to idempotency.
+
+**Acceptable losses (NOT rebuilt).** Per the audit (`docs/ARWEAVE_RECOVERABILITY_AUDIT.md`):
+
+- `cache_meta` bootstrap markers — cleared; first read re-bootstraps lazily.
+- `sessions`, `step_up_tokens`, `webauthn_challenges`, `auth_nonces` — transient by design; users re-authenticate.
+- `pending_txs`, `idempotency_keys`, `write_rate_limits`, `account_key_fetch_log`, KV state — operator-side or transient; not load-bearing for user-facing recoverability.
+- `passkey_credentials.sign_count` (defaults to 0 on rebuild — see [Passkey factor (Phase 6) — Arweave mirror](#passkey-factor-phase-6) for why this is benign).
+- `passkey_credentials.last_used_at` (UX scaffold; resets to NULL).
+- `share_log.data_lookup_key` (sender attribution — operator metadata, not in any Arweave tag; rebuilt as the empty string `''` sentinel).
+
+**Property-test recommendation.** Operationalising the rebuild claim requires running `tests/test-rebuild-from-arweave.mjs` against a real Arweave gateway with real registrations: register a fresh app, register N users + K passkeys, snapshot D1, wipe D1, run the rebuild tool, diff. The script is scaffolded as operator-driven (writes to Arweave, wipes local D1) and requires `--i-accept-destructive-wipe`. Until run, "Tarn is rebuildable from Arweave" is verified in unit + mock-CLI tests but not yet against live bytes.
 
 ### 9. Delete account
 
