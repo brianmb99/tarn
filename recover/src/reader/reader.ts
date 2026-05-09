@@ -80,6 +80,14 @@ export interface ReaderInit {
    * derivable from the recovery factor).
    */
   shareKeyPair?: { privateKey: Uint8Array; publicKey: Uint8Array };
+  /**
+   * Optional ECDSA P-256 signing public key (base64 SPKI) for the
+   * recovered user. Used to verify outgoing share-log entries signed by
+   * the user themselves — sourced from the credential blob's `public_key`
+   * field by the `recover()` orchestrator. When omitted, outgoing entries
+   * are surfaced with `verified: false`.
+   */
+  ownSigningPubBase64?: string;
 }
 
 /**
@@ -138,6 +146,7 @@ export class Reader {
         dataLookupKey: init.dataLookupKey,
         dekChain: init.dekChain,
         shareKeyPair: init.shareKeyPair,
+        ...(init.ownSigningPubBase64 ? { ownSigningPubBase64: init.ownSigningPubBase64 } : {}),
       });
     }
   }

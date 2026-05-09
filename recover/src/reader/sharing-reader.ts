@@ -172,6 +172,13 @@ export interface SharingReaderInit {
   dekChain: UnwrappedDekChain;
   /** The recovered user's X25519 share key (private + public, raw bytes). */
   shareKeyPair: { privateKey: Uint8Array; publicKey: Uint8Array };
+  /**
+   * The recovered user's ECDSA P-256 signing public key, base64-encoded SPKI.
+   * Optional — when omitted, outgoing share-log entries are surfaced without
+   * signature verification (`verified: false`). Supplied by the `recover()`
+   * orchestrator from the credential blob's `public_key` field.
+   */
+  ownSigningPubBase64?: string;
 }
 
 /**
@@ -186,6 +193,7 @@ export class SharingReader {
   readonly #dekChain: UnwrappedDekChain;
   readonly #sharePriv: Uint8Array;
   readonly #sharePub: Uint8Array;
+  readonly #ownSigningPubBase64: string | undefined;
 
   /** Promise cache for the connections record. Single in-flight request. */
   #connectionsPromise: Promise<Connection[]> | undefined;
@@ -215,6 +223,7 @@ export class SharingReader {
     this.#dekChain = init.dekChain;
     this.#sharePriv = init.shareKeyPair.privateKey;
     this.#sharePub = init.shareKeyPair.publicKey;
+    this.#ownSigningPubBase64 = init.ownSigningPubBase64;
   }
 
   // ============ Connections ============
@@ -329,6 +338,16 @@ export class SharingReader {
     //   - "outgoing" reads OUR outbound log.
     const tagSeed = direction === 'incoming' ? pair.inboundTagSeed : pair.outboundTagSeed;
     const decryptKey = direction === 'incoming' ? pair.inboundKey : pair.outboundKey;
+    // Pick the right signing pub for verification:
+    //   - "incoming" entries were signed by the PEER → verify against
+    //     `connection.signing_pub`.
+    //   - "outgoing" entries were signed by US → verify against the user's
+    //     own `public_key` from the credential blob (passed in at
+    //     construction). When unavailable, entries are surfaced with
+    //     verified=false rather than blocking the read.
+    const verifyPub = direction === 'incoming'
+      ? connection.signing_pub
+      : this.#ownSigningPubBase64;
 
     // Find the highest published seq via O(log N) probes against the gateway.
     const probe = async (seq: number): Promise<boolean> => {
@@ -347,7 +366,7 @@ export class SharingReader {
     const fetched = new Map<number, FetchedEntry | null>();
     let snapshotSeq = -1;
     for (let seq = highestSeq; seq >= 0; seq--) {
-      const entry = await this.#fetchEntry(seq, tagSeed, decryptKey, connection);
+      const entry = await this.#fetchEntry(seq, tagSeed, decryptKey, verifyPub, connection);
       fetched.set(seq, entry);
       if (entry?.operation && (entry.operation as { type?: string }).type === OP_SNAPSHOT) {
         snapshotSeq = seq;
@@ -361,7 +380,7 @@ export class SharingReader {
     // re-bootstrapping the rotated peer.)
     const startSeq = snapshotSeq >= 0 ? snapshotSeq : 0;
     for (let seq = startSeq; seq <= highestSeq; seq++) {
-      const cached = fetched.has(seq) ? fetched.get(seq) : await this.#fetchEntry(seq, tagSeed, decryptKey, connection);
+      const cached = fetched.has(seq) ? fetched.get(seq) : await this.#fetchEntry(seq, tagSeed, decryptKey, verifyPub, connection);
       if (!cached) continue;
       const event = makeEvent(cached, connection, direction);
       yield event;
@@ -377,6 +396,7 @@ export class SharingReader {
     seq: number,
     tagSeed: Uint8Array,
     decryptKey: CryptoKey,
+    verifyPub: string | undefined,
     connection: Connection,
   ): Promise<FetchedEntry | null> {
     const tag = await deriveLogTag(tagSeed, seq);
@@ -400,7 +420,9 @@ export class SharingReader {
       );
       return null;
     }
-    const verified = await verifyOperationSignature(operation, connection.signing_pub);
+    const verified = verifyPub
+      ? await verifyOperationSignature(operation, verifyPub)
+      : false;
     return { txid: blob.txid, operation, verified };
   }
 

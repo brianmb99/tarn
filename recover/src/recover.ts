@@ -159,12 +159,20 @@ export async function recover(opts: RecoverOptions): Promise<Reader> {
   }
   const dataLookupKey = body['data_lookup_key'];
   const wrappedDataKey = body['wrapped_data_key'];
+  // `public_key` (base64 SPKI P-256) is the user's signing pub. Used by the
+  // sharing reader to verify outgoing share-log entries (which the user
+  // themselves signed). Optional in older credential blobs — when absent,
+  // the SharingReader surfaces outgoing entries with `verified: false`.
+  const publicKey = body['public_key'];
   if (typeof dataLookupKey !== 'string' || dataLookupKey.length === 0) {
     throw new Error(`recover: credential blob ${credBlob.txid} missing data_lookup_key`);
   }
   if (typeof wrappedDataKey !== 'string' || wrappedDataKey.length === 0) {
     throw new Error(`recover: credential blob ${credBlob.txid} missing wrapped_data_key`);
   }
+  const ownSigningPubBase64 = typeof publicKey === 'string' && publicKey.length > 0
+    ? publicKey
+    : undefined;
 
   // === 5. Derive the factor's KEK + unwrap the DEK chain ===
   const parsed = parseEnvelope(wrappedDataKey);
@@ -226,6 +234,7 @@ export async function recover(opts: RecoverOptions): Promise<Reader> {
     account,
     ...(onProgress ? { onProgress } : {}),
     ...(shareKeyPair ? { shareKeyPair } : {}),
+    ...(ownSigningPubBase64 ? { ownSigningPubBase64 } : {}),
   });
 
   emit('done', { totalGens: dekChain.dekByGen.size, currentGen: dekChain.currentGen });
