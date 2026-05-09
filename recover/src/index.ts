@@ -1,53 +1,61 @@
 /**
  * `@tarn/recover` — standalone, server-free recovery for Tarn-backed accounts.
  *
- * Phase 3 status: this entry point now re-exports both the gateway-direct
- * read primitives (Phase 2) and the crypto / unwrap pipeline (Phase 3).
- * The `recover()` orchestrator and the schema-aware reader land in later
- * phases (see `docs/STANDALONE_RECOVERY_PLAN.md`).
+ * Public surface (Phase 4):
  *
- * Phase 2 surface — gateway-direct read primitives:
+ *   import { recover } from '@tarn/recover';
  *
- *   import { makeMultiGatewayClient, findCredentialBlob } from '@tarn/recover';
- *
- *   const client = makeMultiGatewayClient([
- *     'https://arweave.net',
- *     'https://g8way.io',
- *   ]);
- *
- *   const blob = await findCredentialBlob(client, {
- *     recoveryLookupKey: '<64-hex>',
+ *   const reader = await recover({
+ *     appId: 'bookish',
+ *     schema: bookishSchema,
+ *     arweaveGateways: ['https://arweave.net', 'https://g8way.io'],
+ *     credentials: { type: 'password', username, password },
+ *     // OR: credentials: { type: 'accountKey', accountKey },
+ *     onProgress: (stage, info) => { ... },
  *   });
  *
- * Phase 3 surface — KDFs + envelope unwrap (browser-side decrypt path):
+ *   for await (const book of reader.entries('books')) {
+ *     render(book);
+ *   }
  *
- *   import {
- *     parseEnvelope,
- *     deriveRecoveryKEK,
- *     unwrapDekChain,
- *     decryptWithCEK,
- *   } from '@tarn/recover';
+ * What's covered:
+ *   - Both credential factors (`password` / `accountKey`) end-to-end.
+ *   - Multi-gateway fallback for every Arweave fetch (Phase 2).
+ *   - Multi-gen DEK chain unwrap (Phase 3) — accounts that have rotated
+ *     credentials decrypt content from every generation correctly.
+ *   - Tombstone application + Eid + Prev-chain resolution, ported from
+ *     the server-side resolver (`api/src/cache.js` `resolveEntries`).
+ *   - Schema-version marker (`_schemaVersion`) on entries written under
+ *     a schema version older than the caller's.
  *
- *   const parsed = parseEnvelope(envelopeJson);
- *   const kek = await deriveRecoveryKEK({
- *     accountKey: '<24 words>',
- *     recoverySalt: parsed.recovery.salt,
- *     kdfParams: parsed.recovery.kdfParams,
- *   });
- *   const { dekByGen, currentGen } = await unwrapDekChain({
- *     envelope: envelopeJson,
- *     kek,
- *     factor: 'recovery_phrase',
- *   });
- *   // dekByGen.get(currentGen) is the latest DEK; pass to decryptWithCEK
- *   // alongside an Arweave-fetched per-content-CEK blob.
+ * Not in this phase (see `docs/STANDALONE_RECOVERY_PLAN.md` for the
+ * full roadmap):
+ *   - Sharing / connections / share-log iteration (Phase 5).
+ *   - Forward-compat fixture suite (Phase 6).
+ *   - Reference HTML in `examples/` (Phase 7).
+ *   - README + forward-compat contract (Phase 8).
+ *   - Arweave-publish of the example HTML (Phase 9).
  */
 
+// === Public entry point + reader surface ===
+
+export { recover } from './recover.js';
+export type { RecoverOptions, RecoverCredentials } from './recover.js';
+export {
+  Reader,
+  type DecryptedEntry,
+  type ReaderInit,
+  type ReaderSchema,
+  type ReaderAccount,
+} from './reader/index.js';
+export type { OnProgress, RecoverStage, RecoverProgress } from './progress.js';
+
+// === Re-exports from earlier phases ===
+//
+// These remain accessible so callers that need lower-level primitives
+// (e.g., bespoke reader logic, fixture-vault tooling) don't have to
+// reach into deep paths.
+
 export * from './gateway/index.js';
-
-// Borrowed crypto primitives — pure WebCrypto + hash-wasm + @scure/bip39.
-// See `src/crypto/index.ts` for the cross-validation contract.
 export * from './crypto/index.js';
-
-// Phase 3 unwrap pipeline — derive-KEK + unwrap-envelope.
 export * from './decrypt/index.js';

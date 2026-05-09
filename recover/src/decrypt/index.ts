@@ -39,3 +39,8 @@ export {
   type ParsedWrappedDataKey,
   type UnwrappedDekChain,
 } from './unwrap-envelope.js';
+
+export {
+  deriveCredentialLookupKey,
+  deriveRecoveryLookupKey,
+} from './derive-lookup-keys.js';
