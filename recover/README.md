@@ -6,13 +6,13 @@
 
 ## Status
 
-Phases 2–5 of the
+Phases 2–6 of the
 [Standalone Recovery Plan](../docs/STANDALONE_RECOVERY_PLAN.md) are
 landed. The package is **usable end-to-end** for owned-collection content
-plus the user's social graph (connections + per-pair share-log).
-Forward-compatibility fixtures (Phase 6), the reference HTML (Phase 7),
-the full forward-compat contract (Phase 8), and Arweave-publish (Phase 9)
-remain.
+plus the user's social graph (connections + per-pair share-log), and the
+forward-compatibility decoder framework + fixture vault are in place. The
+reference HTML (Phase 7), full README polish (Phase 8), and
+Arweave-publish (Phase 9) remain.
 
 ## What ships through Phase 5
 
@@ -59,6 +59,36 @@ itself rotates `share_priv` — pre-rotation share-log entries become
 unreadable to anyone who only has the account key. See
 `src/crypto/share-key.ts` for the full explanation.
 
+## Forward-compatibility contract
+
+This package's reason to exist is the constitutional commitment that **a
+user's data, once written and confirmed-on-Arweave, must remain
+decryptable by `@tarn/recover@vN` for any future `N`** — given only the
+account key (or username + password) and a working Arweave gateway.
+
+The full contract is in
+[`docs/STANDALONE_RECOVERY_PLAN.md`](../docs/STANDALONE_RECOVERY_PLAN.md)
+"Forward-compatibility contract" section. The structural enforcement
+lives in this package:
+
+- **Envelope decoders are version-dispatched.** `src/crypto/envelope/`
+  contains one module per envelope wire version (`v1.ts` today).
+  `index.ts` reads the `v` field and routes to the right decoder.
+  Adding `v2` is purely additive — drop a `v2.ts` and register it; old
+  versions are never removed or modified.
+- **Fixture vault.** `fixtures/envelope-vN/` holds frozen synthetic
+  envelopes for every supported version. They are immutable artifacts;
+  the only allowed change is adding new files. See
+  [`fixtures/README.md`](fixtures/README.md) for the rules.
+- **CI enforcement.** `tests/forward-compat.test.ts` runs every fixture
+  through the full pipeline on every release. `tests/fixture-vault.test.ts`
+  hashes the vault and fails if any tracked file is missing, modified,
+  or unlisted.
+
+Scope: the contract covers **owned content only.** Share-log and HPKE
+shapes are best-effort and explicitly NOT under contract — see the plan
+doc §1 (revised 2026-05-08) for the rationale.
+
 ## Layout
 
 ```
@@ -67,12 +97,19 @@ recover/
 │   ├── index.ts                # public entry — recover() + re-exports
 │   ├── recover.ts              # orchestrator
 │   ├── crypto/                 # KDF + envelope (borrowed from client/src/crypto.ts)
+│   │   └── envelope/           # version-dispatched decoder modules (v1.ts + index)
 │   ├── decrypt/                # factor-KEK + DEK-chain unwrap
 │   ├── gateway/                # multi-gateway client + tag-filtered queries
 │   ├── reader/                 # schema-aware Reader + SharingReader
 │   └── sharing/                # share-log / HPKE primitives (borrowed)
+├── fixtures/                   # forward-compat fixture vault (immutable)
+│   ├── README.md               # vault rules / contract enforcement
+│   ├── manifest.json           # SHA-256 manifest, source of truth for meta-test
+│   └── envelope-v1/            # frozen v1 fixtures (never deleted/modified)
 ├── tests/                      # *.test.ts unit + integration tests
-└── scripts/                    # build + test runners (mirror tarn-client)
+│                                #   ├── forward-compat.test.ts (fixture suite)
+│                                #   └── fixture-vault.test.ts  (manifest meta-test)
+└── scripts/                    # build + test runners + fixture generator
 ```
 
 ## Development

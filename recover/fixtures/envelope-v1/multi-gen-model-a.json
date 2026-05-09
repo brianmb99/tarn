@@ -1,0 +1,30 @@
+{
+  "name": "envelope-v1 multi-gen Model A (3 gens)",
+  "description": "Account that has been through changeCredentials twice — three DEK generations, every gen wrapped under both factors. Content is encrypted under gen-1 (oldest gen still reachable).",
+  "version": 1,
+  "model": "A",
+  "inputs": {
+    "username": "phase6-fixture@example.com",
+    "password": "phase6-fixture-pw-DO-NOT-REUSE",
+    "appId": "tarn-recover-fixture-app",
+    "accountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+  },
+  "wrappedDataKey": "{\"v\":1,\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"recovery\":{\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"salt\":\"NzYkHm+s5YmUbS8w8jGn+A==\"},\"dek_chain\":[{\"gen\":1,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"mkLG2u7anzelzvN4U8I+F/2cT2OX85ryzUUdZtZCbzBTuOwuRF0fvQ==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"J6LNIE3/kMGp8dqUCjUYkr4NzkWySMtPCKUMH6ktQ9FRV0VxrJM+RQ==\"}]},{\"gen\":2,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"Zh4e+wL+JJh91QdSbbJY8Ao66e28DLN5u5FFL/q4nYko5tTCU63Oog==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"pVosxvZrJuBmO3AzYPwpJldQzMEz9sO6TZoqKKY078DXupond6Yd/Q==\"}]},{\"gen\":3,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"oD/ZFeRYoFI3ecwLUkIZBLanNfxpdd+qEJDDVsVsiQKBXzKv75sf1w==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"OpdRidHWfAsdVsDMlcgsVuMW39o42sQ10NKERA1J7F2saJoLWv9kZg==\"}]}]}",
+  "expected": {
+    "currentGen": 3,
+    "totalGens": 3,
+    "dekRawByGen": {
+      "1": "4aff3e1f467a9c06be194aff2530939a2828d551b91f539c40f9ddca06f5d328",
+      "2": "e6688f9c1f1b5c1047e8e081904b35ec1a0616a9912d62f4a59221a5a9624c27",
+      "3": "bc84e142b9239de01be6595d4aacbf16e41c43351a2df8540ab257e6f05809b2"
+    },
+    "contentBlob": {
+      "hex": "5441524e0297491d237474915271048c9592a6a56ba5e992442f957a0fd52c9423b725b4ecaf1b695e54ce72c8b5f035d4ec6babad18754d0a6232ce37831af917b3c81ba57d3965c1d344ab0c8f54b11474860282443760b792a89846e70ac4e16a1e88d6819f88965397951326e6dd4b148088dc3009d7ce883e9cb792b8900de8e1a73271da8f31499391acbfd000511caa7ebd9b41618273d369a1ff216800084d19c8560870b9d83842",
+      "plaintext": {
+        "item": "fixture-multi-gen-A",
+        "n": 3,
+        "note": "simulates an account through 2 changeCredentials runs"
+      }
+    }
+  }
+}
