@@ -50,6 +50,8 @@ import {
   FACTOR_PASSWORD,
   FACTOR_RECOVERY_PHRASE,
 } from './crypto/constants.js';
+import { deriveMasterKey } from './crypto/kdf.js';
+import { deriveSharingKeyPair } from './crypto/share-key.js';
 import { Reader, type ReaderAccount, type ReaderSchema } from './reader/reader.js';
 import type { OnProgress } from './progress.js';
 
@@ -157,24 +159,48 @@ export async function recover(opts: RecoverOptions): Promise<Reader> {
   }
   const dataLookupKey = body['data_lookup_key'];
   const wrappedDataKey = body['wrapped_data_key'];
+  // `public_key` (base64 SPKI P-256) is the user's signing pub. Used by the
+  // sharing reader to verify outgoing share-log entries (which the user
+  // themselves signed). Optional in older credential blobs — when absent,
+  // the SharingReader surfaces outgoing entries with `verified: false`.
+  const publicKey = body['public_key'];
   if (typeof dataLookupKey !== 'string' || dataLookupKey.length === 0) {
     throw new Error(`recover: credential blob ${credBlob.txid} missing data_lookup_key`);
   }
   if (typeof wrappedDataKey !== 'string' || wrappedDataKey.length === 0) {
     throw new Error(`recover: credential blob ${credBlob.txid} missing wrapped_data_key`);
   }
+  const ownSigningPubBase64 = typeof publicKey === 'string' && publicKey.length > 0
+    ? publicKey
+    : undefined;
 
   // === 5. Derive the factor's KEK + unwrap the DEK chain ===
   const parsed = parseEnvelope(wrappedDataKey);
 
   let kek: CryptoKey;
   let factor: typeof FACTOR_PASSWORD | typeof FACTOR_RECOVERY_PHRASE;
+  // Phase 5: when the password factor is in play we also derive the
+  // X25519 share keypair so the Reader can light up `connections()` and
+  // `shareLog()`. The account-key path leaves this undefined — see
+  // `crypto/share-key.ts` for the architectural reason.
+  let shareKeyPair: { privateKey: Uint8Array; publicKey: Uint8Array } | undefined;
   if (opts.credentials.type === 'password') {
-    kek = await derivePasswordKEK({
-      username: opts.credentials.username,
-      password: opts.credentials.password,
-      appId: opts.appId,
-    });
+    // Compute master_key once; both the password KEK and the share keypair
+    // need it, and it's the slow Argon2id step.
+    const masterKey = await deriveMasterKey(
+      opts.credentials.username,
+      opts.credentials.password,
+    );
+    const [passwordKek, sharing] = await Promise.all([
+      derivePasswordKEK({
+        username: opts.credentials.username,
+        password: opts.credentials.password,
+        appId: opts.appId,
+      }),
+      deriveSharingKeyPair(masterKey, opts.appId),
+    ]);
+    kek = passwordKek;
+    shareKeyPair = sharing;
     factor = FACTOR_PASSWORD;
   } else {
     kek = await deriveRecoveryKEK({
@@ -207,6 +233,8 @@ export async function recover(opts: RecoverOptions): Promise<Reader> {
     dekChain,
     account,
     ...(onProgress ? { onProgress } : {}),
+    ...(shareKeyPair ? { shareKeyPair } : {}),
+    ...(ownSigningPubBase64 ? { ownSigningPubBase64 } : {}),
   });
 
   emit('done', { totalGens: dekChain.dekByGen.size, currentGen: dekChain.currentGen });

@@ -1,7 +1,7 @@
 /**
  * `@tarn/recover` — standalone, server-free recovery for Tarn-backed accounts.
  *
- * Public surface (Phase 4):
+ * Public surface (through Phase 5):
  *
  *   import { recover } from '@tarn/recover';
  *
@@ -18,6 +18,12 @@
  *     render(book);
  *   }
  *
+ *   const peers = await reader.connections();
+ *   for await (const event of reader.shareLog({ direction: 'incoming' })) {
+ *     // typed event union: add | update | rotate | remove | snapshot |
+ *     // rotate_identity, with `connection`, `seq`, `verified` metadata
+ *   }
+ *
  * What's covered:
  *   - Both credential factors (`password` / `accountKey`) end-to-end.
  *   - Multi-gateway fallback for every Arweave fetch (Phase 2).
@@ -27,10 +33,14 @@
  *     the server-side resolver (`api/src/cache.js` `resolveEntries`).
  *   - Schema-version marker (`_schemaVersion`) on entries written under
  *     a schema version older than the caller's.
+ *   - Connections + per-pair share-log replay (Phase 5). Note:
+ *     **only the password factor lights up the sharing surface** — the
+ *     account-key path cannot derive the X25519 share keypair (see
+ *     `crypto/share-key.ts`). On the account-key factor `connections()`
+ *     returns `[]` and the share-log iterators yield nothing.
  *
  * Not in this phase (see `docs/STANDALONE_RECOVERY_PLAN.md` for the
  * full roadmap):
- *   - Sharing / connections / share-log iteration (Phase 5).
  *   - Forward-compat fixture suite (Phase 6).
  *   - Reference HTML in `examples/` (Phase 7).
  *   - README + forward-compat contract (Phase 8).
@@ -47,6 +57,14 @@ export {
   type ReaderInit,
   type ReaderSchema,
   type ReaderAccount,
+  // Phase 5 sharing surface
+  SharingReader,
+  replayConnection,
+  type SharingReaderInit,
+  type Connection,
+  type ShareLogEvent,
+  type ShareLogEntryBase,
+  type ShareLogDirection,
 } from './reader/index.js';
 export type { OnProgress, RecoverStage, RecoverProgress } from './progress.js';
 
@@ -59,3 +77,4 @@ export type { OnProgress, RecoverStage, RecoverProgress } from './progress.js';
 export * from './gateway/index.js';
 export * from './crypto/index.js';
 export * from './decrypt/index.js';
+export * from './sharing/index.js';

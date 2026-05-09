@@ -10,3 +10,12 @@ export { Reader } from './reader.js';
 export type { ReaderInit, ReaderSchema, ReaderAccount } from './reader.js';
 export { resolveContentBlobs } from './resolve.js';
 export { attachSchemaVersionMarker, type DecryptedEntry } from './decode.js';
+export {
+  SharingReader,
+  replayConnection,
+  type SharingReaderInit,
+  type Connection,
+  type ShareLogEvent,
+  type ShareLogEntryBase,
+  type ShareLogDirection,
+} from './sharing-reader.js';
