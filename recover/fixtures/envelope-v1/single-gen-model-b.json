@@ -9,16 +9,16 @@
     "appId": "tarn-recover-fixture-app",
     "accountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
   },
-  "wrappedDataKey": "{\"v\":1,\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"recovery\":{\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"salt\":\"RKfDPpLkkwk7s2GAph6kHQ==\"},\"dek_chain\":[{\"gen\":1,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"S2m5d3XpLvXT6xoOeIPXn0EEF0K2wVm8aS/5v+uO40zjaVOnPZPRlg==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"yJRPGambTRefa3U+TLrwG8/RKtjFFeCJ8zESzXucZH9BG2RuF/QVfg==\"}]}]}",
-  "wrappedAccountKey": "L68r6KEI0D+pxS1DeLJiNJ6B4ga1WoAl8fcu29HEXVuntuowiQITbG5TkpdWPR6fDbLMnO+BVM7QjLNXHLtpq7OgeDUqYROJAqlldhM/N6lvw9rD0kinVjXlp9yd055fW//a0lJjQjh358bTsJo7sKK0DPRA3IwyDHZyd9gEQjr3esxIMCiMNW1s3TuvbNLmulf6DOfkWzQfTF470xYPy2EsEwFC27X4G0bjiMewunbLRs6h9c3dHafOfn6BASsBA5eKFf0K3AKWHpFGwCC8z82NmiYHKow=",
+  "wrappedDataKey": "{\"v\":1,\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"recovery\":{\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"salt\":\"IBb2q2YvBUiG69LrD1ryvQ==\"},\"dek_chain\":[{\"gen\":1,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"+8ET57zqMD1sD/M6pVC1tXa8VW5o+eQZW4fSw2wkr4e8ARXb0tMuoA==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"HaJLdRj4CQSR7dFwi4x1IkR1eWVSpq9yz831+/UIc3agcnmkwLxU1Q==\"}]}]}",
+  "wrappedAccountKey": "PQU6T31QsHq0r25lvJnV+vhEHJnc65/c7lFmCDl5MUnfIbRMRQwS4vEfPqKEjtr2KJxzRTOKgTRsgBNntw5qh8hm/7/5oRkm8avzZEPz3BZGJHM3+FcshHe1tA2LDzCSr3IaYojzR83NkmGkNmPEgn7f1DQVtGLtMI9dYqTQfo5P64scedtsPi6voFIEVVjMUheRwKWXJE7XeJqW9E1ZpRF+gCvnc/rGPr3WYcXZPoh8t6z1i8RJ+rPsRTtqXlNjzLKvvNwQnBf1IZdiMX2SqpLf7jqz8k0=",
   "expected": {
     "currentGen": 1,
     "totalGens": 1,
     "dekRawByGen": {
-      "1": "d7b26b486d456771e36d7aa6db26a0e0d946b1636267a49d6a3c2ea61b0f81c1"
+      "1": "cde7232abdbe8ea1e1fca1639367e6b90879388c27d2fb63fa1281e2670794a6"
     },
     "contentBlob": {
-      "hex": "5441524e02e0b77f93f11b6deb26a3e294248125f38081fe676eda18329c718a042e4b1ee962cd61d9bbe24e742755078307d770fdc17bfbe0acf1b31e9c122dd3759125b67b1d2b0ee8a9acb3e6560af46d66d2d179b8e5831ba889379865f2c56ac59fc2bf3fe7e81d49fc43d9f561a9f94f0dbc5ab58b35d7e109ce5c5efb5ac8fab882ad2e4280a69e1779e143adf6477344f5fa39db6f1833",
+      "hex": "5441524e0245d3d7e1953647220993c21e7f8e473a12981500e97b6b3ed25ce44c26a4d19ff964953a7a3ee305198bff5ae807b64ec6c8a25a41702a36c09d806701af4c2849b056ccf80c049144b91bc6ab0d298c2ef55163fd9022acad79a578b47c590d1afbb4350e4ea7a268504aa6be7d60058866f83cdb1bac1d587a3d9b47bdbf4d001dcf14588e1ac487afe9d4dbd792e62a035a9d11a2",
       "plaintext": {
         "item": "fixture-single-gen-B",
         "n": 2,

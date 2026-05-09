@@ -4,22 +4,22 @@
   "fixtures": [
     {
       "path": "envelope-v1/multi-gen-model-a.json",
-      "sha256": "6082b6f9bf239f605db70c66be60bcb3427dc3b3e5d7e35abca57c0d1c02f415",
+      "sha256": "dc185c18d8b57fb66b19752b9613e39e16f278772b7dc6645534ffae39ec9028",
       "sizeBytes": 2464
     },
     {
       "path": "envelope-v1/multi-gen-model-b.json",
-      "sha256": "2989bc50e9377fa0feb98f31259793c0faaac2ca7c766a6ed386e290a27d1555",
+      "sha256": "5686385f516272ef1117f1b29439b6866c610fa39f07d6dc20a19306f72df742",
       "sizeBytes": 2528
     },
     {
       "path": "envelope-v1/single-gen-model-a.json",
-      "sha256": "302b214c1d82895533eb2be71c08256f753c70b4f47d334a1a62619328519eed",
+      "sha256": "8d0ea2288065d5a6c2f469f7c1bdd6b61c13a75025dfbfd9f9f474bfbe28f085",
       "sizeBytes": 1678
     },
     {
       "path": "envelope-v1/single-gen-model-b.json",
-      "sha256": "94f756f5ac774678cad95926a40a4c49de1cea3906489ef3f0fb7b8fe20cd29b",
+      "sha256": "c077c36f9a525ed0192491bceb941d9e2f47bbbeee986f8eb037ba3dd12d274c",
       "sizeBytes": 2318
     }
   ]

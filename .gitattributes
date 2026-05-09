@@ -7,3 +7,11 @@
 *.jpeg binary
 *.gif  binary
 *.ico  binary
+
+# Forward-compat fixture vault — byte-identity across platforms is the whole
+# point. The meta-test (recover/tests/fixture-vault.test.ts) verifies SHA-256
+# of every file against a manifest. Without `-text`, Git's core.autocrlf=true
+# on Windows checkouts would expand LF → CRLF, breaking the byte-identity
+# guarantee.
+recover/fixtures/**/*.json -text
+recover/fixtures/manifest.json -text
