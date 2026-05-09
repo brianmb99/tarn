@@ -1,0 +1,30 @@
+{
+  "name": "envelope-v1 single-gen Model B",
+  "description": "Account that opted into server-side account-key storage (Model B): same envelope shape as A plus a wrapped_account_key ciphertext under the gen-1 DEK (AAD: tarn-wrapped-account-key-v1).",
+  "version": 1,
+  "model": "B",
+  "inputs": {
+    "username": "phase6-fixture@example.com",
+    "password": "phase6-fixture-pw-DO-NOT-REUSE",
+    "appId": "tarn-recover-fixture-app",
+    "accountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+  },
+  "wrappedDataKey": "{\"v\":1,\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"recovery\":{\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"salt\":\"RKfDPpLkkwk7s2GAph6kHQ==\"},\"dek_chain\":[{\"gen\":1,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"S2m5d3XpLvXT6xoOeIPXn0EEF0K2wVm8aS/5v+uO40zjaVOnPZPRlg==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"yJRPGambTRefa3U+TLrwG8/RKtjFFeCJ8zESzXucZH9BG2RuF/QVfg==\"}]}]}",
+  "wrappedAccountKey": "L68r6KEI0D+pxS1DeLJiNJ6B4ga1WoAl8fcu29HEXVuntuowiQITbG5TkpdWPR6fDbLMnO+BVM7QjLNXHLtpq7OgeDUqYROJAqlldhM/N6lvw9rD0kinVjXlp9yd055fW//a0lJjQjh358bTsJo7sKK0DPRA3IwyDHZyd9gEQjr3esxIMCiMNW1s3TuvbNLmulf6DOfkWzQfTF470xYPy2EsEwFC27X4G0bjiMewunbLRs6h9c3dHafOfn6BASsBA5eKFf0K3AKWHpFGwCC8z82NmiYHKow=",
+  "expected": {
+    "currentGen": 1,
+    "totalGens": 1,
+    "dekRawByGen": {
+      "1": "d7b26b486d456771e36d7aa6db26a0e0d946b1636267a49d6a3c2ea61b0f81c1"
+    },
+    "contentBlob": {
+      "hex": "5441524e02e0b77f93f11b6deb26a3e294248125f38081fe676eda18329c718a042e4b1ee962cd61d9bbe24e742755078307d770fdc17bfbe0acf1b31e9c122dd3759125b67b1d2b0ee8a9acb3e6560af46d66d2d179b8e5831ba889379865f2c56ac59fc2bf3fe7e81d49fc43d9f561a9f94f0dbc5ab58b35d7e109ce5c5efb5ac8fab882ad2e4280a69e1779e143adf6477344f5fa39db6f1833",
+      "plaintext": {
+        "item": "fixture-single-gen-B",
+        "n": 2,
+        "note": "Model B retains wrapped_account_key"
+      }
+    },
+    "unwrappedAccountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+  }
+}

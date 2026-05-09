@@ -1,0 +1,28 @@
+{
+  "name": "envelope-v1 single-gen Model A",
+  "description": "Account just registered: one DEK gen, password + recovery_phrase wrappings, no wrapped_account_key on the credential blob (Model A).",
+  "version": 1,
+  "model": "A",
+  "inputs": {
+    "username": "phase6-fixture@example.com",
+    "password": "phase6-fixture-pw-DO-NOT-REUSE",
+    "appId": "tarn-recover-fixture-app",
+    "accountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+  },
+  "wrappedDataKey": "{\"v\":1,\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"recovery\":{\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"salt\":\"ix/YPtQnffPqHYtl+RRmKg==\"},\"dek_chain\":[{\"gen\":1,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"J3wVVuWIYtruivcQoG/jiCa4FhPLZG7kHhRsZX60zeuDDxpoUqcIUg==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"HcaCQe7oiRQaImlOqcANQhK8c/3sM4EO9c5uup5Cba0c8RGkJoBXHQ==\"}]}]}",
+  "expected": {
+    "currentGen": 1,
+    "totalGens": 1,
+    "dekRawByGen": {
+      "1": "bd322a236876227e137e073b392707a0bedaaff9062c0b7e883afd46406fffa0"
+    },
+    "contentBlob": {
+      "hex": "5441524e0295ec30656055c716aebadce4b213afd5d86de8881efcc7c954d98f8beb3a6a362f622c3ebfdf154946f366f031b45da5267ff8a1510cc265837f07da127e19ca172c5dfb9035f45788e9f0f827f59d478bbedf2549e10aef927b0c126ac9f0fc2e17f5c7917e07b18e3d7c0690697d979809af636d054ff12f2158a6bec889a2fcdbf5bb",
+      "plaintext": {
+        "item": "fixture-single-gen-A",
+        "n": 1,
+        "note": "frozen 2026-05-08"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "comment": "Hash manifest for the @tarn/recover fixture vault. Fixtures are immutable: this manifest grows monotonically. The meta-test (recover/tests/fixture-vault.test.ts) fails if any tracked file is missing, modified, or if a new file is present that is not in the manifest. To add fixtures: run scripts/generate-fixtures.mjs (which appends), commit the new files plus the regenerated manifest.",
+  "generatedBy": "generate-fixtures.mjs",
+  "fixtures": [
+    {
+      "path": "envelope-v1/multi-gen-model-a.json",
+      "sha256": "6082b6f9bf239f605db70c66be60bcb3427dc3b3e5d7e35abca57c0d1c02f415",
+      "sizeBytes": 2464
+    },
+    {
+      "path": "envelope-v1/multi-gen-model-b.json",
+      "sha256": "2989bc50e9377fa0feb98f31259793c0faaac2ca7c766a6ed386e290a27d1555",
+      "sizeBytes": 2528
+    },
+    {
+      "path": "envelope-v1/single-gen-model-a.json",
+      "sha256": "302b214c1d82895533eb2be71c08256f753c70b4f47d334a1a62619328519eed",
+      "sizeBytes": 1678
+    },
+    {
+      "path": "envelope-v1/single-gen-model-b.json",
+      "sha256": "94f756f5ac774678cad95926a40a4c49de1cea3906489ef3f0fb7b8fe20cd29b",
+      "sizeBytes": 2318
+    }
+  ]
+}

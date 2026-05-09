@@ -1,0 +1,31 @@
+{
+  "name": "envelope-v1 multi-gen Model B (2 gens)",
+  "description": "Account with two DEK gens AND server-side account-key storage. Exercises the full multi-gen + wrapped_account_key combination.",
+  "version": 1,
+  "model": "B",
+  "inputs": {
+    "username": "phase6-fixture@example.com",
+    "password": "phase6-fixture-pw-DO-NOT-REUSE",
+    "appId": "tarn-recover-fixture-app",
+    "accountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+  },
+  "wrappedDataKey": "{\"v\":1,\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"recovery\":{\"kdf\":\"argon2id\",\"kdf_params\":{\"m_kib\":65536,\"t\":3,\"p\":1},\"salt\":\"nT1BbkSwqEY+wZT1IEci1g==\"},\"dek_chain\":[{\"gen\":1,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"5dR7O9s47dreG+7ju/zNx9MRsJR9Cl3qBTJ4pPrFRIneVzOPjC1ivQ==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"qtSH0LEsQMO7w1Hm+TQZf+SMm1QHWbxf9vC1sDaUshqu8+1zOtQ84Q==\"}]},{\"gen\":2,\"wrappings\":[{\"factor\":\"password\",\"wrapped\":\"lpoqI/UxpsWHDD3bXLRidJoWSltVW8ugVUIWU8sUV9/Sb69XtFsCeA==\"},{\"factor\":\"recovery_phrase\",\"wrapped\":\"eRcN5d/AdSjzSqsXt09alAUfOKzpGT9x4FO+5lMt7UqroVeEWNBhkA==\"}]}]}",
+  "wrappedAccountKey": "kUzMVVMKqVNQNv+4mKMFeeHHTgjcGEwZLqHGmkP7gFAw711uWyGqcAtzc+AX9ROT2DGQ85AsJxzA37UK+/ypxzAzXDpZ9yK+sPP20QPBtz0x5/tOH212xe++k6JO+6c/j4HNH38nS3v+0e1HYrljJsHJfKMdTBIrnq3ZKRRtLvN5q4XfbaCxn8ivP61hoRVk7skFmAYPI9D+SuAMdyQyCY+pVuxzm+VqDZeQNOpG6A2XObw+C5wMv9BtzNqpzhA99Nmgp+iHCXDFTxhKjoVhVISTEHhxrz4=",
+  "expected": {
+    "currentGen": 2,
+    "totalGens": 2,
+    "dekRawByGen": {
+      "1": "20fb751b763c7c8cdf5e1b21308865f2f66f9ecd6973c4d2c32d11169960843f",
+      "2": "0953a3a746300511ed9c2425296167e7849bfd3d6c5b7633e6fcd0eb8c0e78e0"
+    },
+    "contentBlob": {
+      "hex": "5441524e02306605df730cebd85ddc7dcc1cd01354ff45ce804b7abe9dad020f323027b63870eb65e8e0533a1e9afa02d50a1178d153f6e9aaa6d6a6a7374aa778ec70ca95350c4be863da0e1cfc81643e58c6bcd4f6a486f4a65fa014d5c450e1b2a1490d0cfb3ebb7a91a8c7b4938e23ce8515529c9bd608db6aeb2a4240805471c0088cd459bdf4ff",
+      "plaintext": {
+        "item": "fixture-multi-gen-B",
+        "n": 4,
+        "note": "Model B + multi-gen"
+      }
+    },
+    "unwrappedAccountKey": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+  }
+}
