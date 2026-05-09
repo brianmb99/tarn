@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recover your data — Tarn</title>
+  <meta name="description" content="Standalone, server-free recovery for Tarn-backed accounts. Decrypts entirely in your browser using your own credentials.">
+  <style>__INLINE_CSS__</style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Recover your data</h1>
+      <p class="lede">
+        This page reads your data directly from Arweave and decrypts it
+        in your browser. Tarn's servers are not contacted at any point.
+        Nothing you type leaves this tab.
+      </p>
+    </header>
+
+    <details class="explainer">
+      <summary>What is this page?</summary>
+      <p>
+        Tarn-backed apps store your data, encrypted, on Arweave — a
+        permanent storage network. The keys that decrypt your data are
+        derived from your credentials. This page exercises that property
+        directly: given your account key (or username + password), it
+        downloads your encrypted data from a public Arweave gateway and
+        decrypts it locally.
+      </p>
+      <p>
+        You can use this page even if the app you used is offline, even
+        if Tarn's servers are down, even if the company is gone. As long
+        as Arweave is online and you remember your credentials (or kept
+        your account key), your data is recoverable.
+      </p>
+      <p>
+        This page is open-source and reproducible. If you have the page
+        file saved locally, you don't even need this site to be online.
+      </p>
+    </details>
+
+    <section class="card">
+      <h2>1. Which app's data?</h2>
+      <p class="hint">
+        The <code>appId</code> is the identifier the app used when you
+        registered. Apps that ship a themed copy of this page pin it
+        automatically.
+      </p>
+      <label for="appId">App ID</label>
+      <input id="appId" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. bookish">
+
+      <h3>Schema</h3>
+      <p class="hint">
+        Paste the app's schema JSON below. The app developer publishes
+        this — it tells the recovery tool which collections you have and
+        how to interpret each record's fields.
+      </p>
+      <textarea id="schema" rows="6" autocomplete="off" spellcheck="false" placeholder='{"appId":"bookish","version":1,"collections":{"books":{"primaryKey":"id","fields":{"id":"string","title":"string"}}}}'></textarea>
+    </section>
+
+    <section class="card">
+      <h2>2. How do you want to sign in?</h2>
+      <div class="auth-tabs" role="tablist">
+        <button type="button" role="tab" id="tab-key" class="active" aria-selected="true">I have my account key</button>
+        <button type="button" role="tab" id="tab-pwd" aria-selected="false">I remember my username + password</button>
+      </div>
+
+      <div id="panel-key" class="auth-panel">
+        <p class="hint">
+          Your <strong>account key</strong> is the 24-word phrase you
+          saved when the app first asked you to back up your account. It
+          is the durable, password-independent way to recover. Paste it
+          below — words separated by single spaces.
+        </p>
+        <label for="accountKey">Account key (24 words)</label>
+        <textarea id="accountKey" rows="3" autocomplete="off" spellcheck="false"></textarea>
+      </div>
+
+      <div id="panel-pwd" class="auth-panel hidden">
+        <p class="hint">
+          Use your username and the password you remember. (Tarn doesn't
+          have a password reset — if you've forgotten the password and
+          don't have your account key, the data is unrecoverable. That's
+          the cost of zero-knowledge encryption.)
+        </p>
+        <label for="username">Username</label>
+        <input id="username" type="text" autocomplete="off" spellcheck="false">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="off">
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. Arweave gateways</h2>
+      <p class="hint">
+        Arweave is a network of independent gateways. We try them in
+        order; if one is down, we move to the next. The defaults are
+        fine. Override only if you know a specific gateway is healthier
+        right now.
+      </p>
+      <label for="gateways">Gateways (one per line)</label>
+      <textarea id="gateways" rows="3" autocomplete="off" spellcheck="false">https://arweave.net
+https://g8way.io</textarea>
+    </section>
+
+    <section class="card">
+      <button id="recover" class="primary" type="button">Recover my data</button>
+      <div id="status" class="status" aria-live="polite"></div>
+    </section>
+
+    <section id="results" class="card hidden">
+      <h2>Your data</h2>
+      <p class="hint">
+        Decrypted entirely in your browser. The download buttons save
+        files to your device — nothing is uploaded.
+      </p>
+      <div id="results-body"></div>
+    </section>
+
+    <footer>
+      <p>
+        Your data was decrypted entirely in your browser, using your own
+        credentials. Tarn's servers were not contacted at any point. The
+        encrypted bytes came directly from a public Arweave gateway.
+      </p>
+      <p>
+        This page is a reference implementation from
+        <a href="https://github.com/brianmb99/tarn">@tarn/recover</a>.
+        Apps may ship their own themed copy as their canonical
+        recovery URL.
+      </p>
+    </footer>
+  </main>
+
+  <script type="module">__INLINE_JS__</script>
+</body>
+</html>

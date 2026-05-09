@@ -6,13 +6,15 @@
 
 ## Status
 
-Phases 2–6 of the
+Phases 2–7 of the
 [Standalone Recovery Plan](../docs/STANDALONE_RECOVERY_PLAN.md) are
 landed. The package is **usable end-to-end** for owned-collection content
-plus the user's social graph (connections + per-pair share-log), and the
-forward-compatibility decoder framework + fixture vault are in place. The
-reference HTML (Phase 7), full README polish (Phase 8), and
-Arweave-publish (Phase 9) remain.
+plus the user's social graph (connections + per-pair share-log), the
+forward-compatibility decoder framework + fixture vault are in place,
+and the reference standalone HTML page is shipped (see
+[`examples/forever/`](examples/forever/README.md), built artifact at
+`dist/forever.html`). Full README polish (Phase 8) and the
+Arweave-publish workflow (Phase 9) remain.
 
 ## What ships through Phase 5
 
@@ -102,15 +104,34 @@ recover/
 │   ├── gateway/                # multi-gateway client + tag-filtered queries
 │   ├── reader/                 # schema-aware Reader + SharingReader
 │   └── sharing/                # share-log / HPKE primitives (borrowed)
+├── examples/
+│   └── forever/                # reference standalone HTML page (Phase 7)
+│       ├── README.md           # hosting / theming / scope notes
+│       ├── page.html           # template with __INLINE_CSS__ / __INLINE_JS__
+│       ├── page.css            # styles
+│       └── page.ts             # owned-content-only recovery UI
 ├── fixtures/                   # forward-compat fixture vault (immutable)
 │   ├── README.md               # vault rules / contract enforcement
 │   ├── manifest.json           # SHA-256 manifest, source of truth for meta-test
 │   └── envelope-v1/            # frozen v1 fixtures (never deleted/modified)
 ├── tests/                      # *.test.ts unit + integration tests
 │                                #   ├── forward-compat.test.ts (fixture suite)
-│                                #   └── fixture-vault.test.ts  (manifest meta-test)
+│                                #   ├── fixture-vault.test.ts  (manifest meta-test)
+│                                #   └── forever-page.test.ts   (Phase 7 build + scope)
 └── scripts/                    # build + test runners + fixture generator
+                                 #   ├── build.mjs            (SDK build)
+                                 #   └── build-forever.mjs    (page build)
 ```
+
+## Reference standalone page
+
+The `examples/forever/` directory ships a self-contained HTML page that
+exercises the SDK end-to-end in a browser — the artifact of the
+permanent owned-content promise. Build it with `npm run build:forever`
+(or `npm run build` to build the SDK and the page together); the
+output lands at `dist/forever.html`. See
+[`examples/forever/README.md`](examples/forever/README.md) for the full
+treatment (hosting, theming, scope guard, reproducibility).
 
 ## Development
 
