@@ -5,7 +5,10 @@
  *   - a `MultiGatewayClient` (Phase 2),
  *   - an unwrapped DEK chain (Phase 3),
  *   - a caller-supplied schema (`defineSchema()` output),
- *   - the app id, data lookup key, and account metadata.
+ *   - the app id, data lookup key, and account metadata,
+ *   - optionally, the user's X25519 sharing keypair (Phase 5 — the
+ *     `password` factor derives this from `master_key`; the `accountKey`
+ *     factor cannot, see `crypto/share-key.ts` for why).
  *
  * Surface:
  *   - `reader.collections`              — names declared in the schema.
@@ -13,9 +16,9 @@
  *   - `reader.tombstoneCount`           — populated after each `entries()` walk.
  *   - `reader.entries(name)`            — async iterator of typed entries.
  *   - `reader.allEntries(name)`         — buffered batch helper.
- *
- * Phase 4 covers OWNED content only. Sharing / connections / share-log
- * iteration is Phase 5; calling `reader.connections()` etc. throws.
+ *   - `reader.connections()`            — accepted-connections list (Phase 5).
+ *   - `reader.shareLog({ direction })`  — async iterator of share-log events.
+ *   - `reader.allShareLog({ direction })` — buffered batch helper.
  *
  * The reader caches tombstone counts per collection — every fresh walk
  * overwrites the count so `tombstoneCount` always reflects the most
@@ -31,6 +34,12 @@ import { decryptWithCEK } from '../crypto/aes.js';
 import type { UnwrappedDekChain } from '../crypto/envelope.js';
 import { resolveContentBlobs } from './resolve.js';
 import { attachSchemaVersionMarker, type DecryptedEntry } from './decode.js';
+import {
+  SharingReader,
+  type Connection,
+  type ShareLogDirection,
+  type ShareLogEvent,
+} from './sharing-reader.js';
 
 /**
  * Caller-side schema shape consumed by the Reader. We intentionally don't
@@ -61,6 +70,16 @@ export interface ReaderInit {
   dekChain: UnwrappedDekChain;
   account: ReaderAccount;
   onProgress?: RecoverOnProgress;
+  /**
+   * Optional X25519 sharing keypair (32 raw bytes each). Populated by the
+   * `recover()` orchestrator when the password factor is used (the keypair
+   * is derived from `master_key`); omitted on the account-key path. When
+   * absent, `connections()` returns `[]` and `shareLog(...)` yields nothing
+   * — see `recover/src/crypto/share-key.ts` for the architectural reason
+   * (the share keypair is rotated whenever credentials change and is not
+   * derivable from the recovery factor).
+   */
+  shareKeyPair?: { privateKey: Uint8Array; publicKey: Uint8Array };
 }
 
 /**
@@ -87,6 +106,12 @@ export class Reader {
   readonly #dataLookupKey: string;
   readonly #dekChain: UnwrappedDekChain;
   readonly #onProgress: RecoverOnProgress | undefined;
+  /**
+   * Composed sharing reader; only populated when the caller supplied a
+   * share keypair. When undefined, `connections()` returns `[]` and the
+   * share-log iterators yield nothing.
+   */
+  readonly #sharing: SharingReader | undefined;
 
   constructor(init: ReaderInit) {
     if (!init.schema || !init.schema.collections) {
@@ -106,6 +131,15 @@ export class Reader {
     this.#onProgress = init.onProgress;
     this.account = init.account;
     this.collections = Object.keys(init.schema.collections);
+    if (init.shareKeyPair) {
+      this.#sharing = new SharingReader({
+        appId: init.appId,
+        client: init.client,
+        dataLookupKey: init.dataLookupKey,
+        dekChain: init.dekChain,
+        shareKeyPair: init.shareKeyPair,
+      });
+    }
   }
 
   /**
@@ -168,6 +202,47 @@ export class Reader {
     return out;
   }
 
+  // ============ Sharing surface (Phase 5) ============
+
+  /**
+   * Return the user's accepted connections (peers + their stable identifiers).
+   * Returns `[]` when the caller authenticated via the account-key factor —
+   * see `recover/src/crypto/share-key.ts` for why the share keypair isn't
+   * derivable on that path.
+   */
+  async connections(): Promise<Connection[]> {
+    if (!this.#sharing) return [];
+    return this.#sharing.connections();
+  }
+
+  /**
+   * Async iterator over share-log events for the requested direction.
+   * `direction: 'incoming'` reads peers' outbound logs (events the user
+   * received); `direction: 'outgoing'` reads the user's outbound logs
+   * (events the user emitted). Yields nothing when the share keypair is
+   * unavailable (account-key factor).
+   *
+   * Each event carries `connection` (peer identity), `seq`, `direction`,
+   * `txid`, and `verified` (false means the event's ECDSA signature did
+   * not validate against the connection's `signing_pub` — apps generally
+   * treat unverified events as forgeries).
+   */
+  shareLog(opts: { direction: ShareLogDirection }): AsyncIterable<ShareLogEvent> {
+    if (!this.#sharing) {
+      return emptyAsyncIterable<ShareLogEvent>();
+    }
+    return this.#sharing.shareLog(opts);
+  }
+
+  /**
+   * Buffered batch helper: drain {@link shareLog} into a flat array. Returns
+   * `[]` when the share keypair is unavailable.
+   */
+  async allShareLog(opts: { direction: ShareLogDirection }): Promise<ShareLogEvent[]> {
+    if (!this.#sharing) return [];
+    return this.#sharing.allShareLog(opts);
+  }
+
   // ============ Internal helpers ============
 
   #assertCollection(name: string): void {
@@ -213,4 +288,13 @@ export class Reader {
       // onProgress callbacks are diagnostic — never let one break the read.
     }
   }
+}
+
+/** Empty async iterable — returned when the share keypair is unavailable. */
+function emptyAsyncIterable<T>(): AsyncIterable<T> {
+  return {
+    [Symbol.asyncIterator]: async function* () {
+      // intentionally empty
+    },
+  };
 }

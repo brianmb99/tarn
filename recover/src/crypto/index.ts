@@ -20,3 +20,4 @@ export * from './kdf.js';
 export * from './aes.js';
 export * from './envelope.js';
 export * from './bip39.js';
+export * from './share-key.js';
