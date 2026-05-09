@@ -14,16 +14,28 @@ This isn't a feature request — it's the load-bearing piece that makes Tarn's p
 
 ## Decisions on open scope questions
 
-### 1. Share-log and connection data — IN scope for v1
+### 1. Share-log and connection data — IN the SDK; OUT of the forever-page promise
 
-The user's social graph (connections, share-log entries, redeemed invites) is real data living on Arweave under the same architectural promise as the user's owned content. Excluding it would create the awkward state where "permanent recovery" returns books but not the friends the user shared with. Bookish's `forever.html` doesn't strictly need the connection data today, but other Tarn apps almost certainly will, and rebuilding that surface later means breaking the package's API.
+**Revised 2026-05-08, after the Phase 5 work surfaced an architectural fact and a positioning question.**
+
+The earlier framing here was "social data in v1 because excluding it punts a worse migration story." That conflated two questions that should have been separated:
+
+1. **What can the SDK read?** Whatever the protocol exposes. Useful surface for live-context apps.
+2. **What does the permanent forever-page promise commit us to?** The user's owned data. Period.
+
+The right answer:
+
+- **The SDK (`@tarn/recover`) supports both surfaces.** Phase 5 ships connections + share-log readers. Live-context apps (Settings → Export, developer tools, etc.) can call them.
+- **The forever-page artifact (Phase 7's reference HTML, and Bookish's `forever.html`) surfaces only owned content.** The permanent promise is scoped to the durable kit-saving use case.
+- **Forward-compatibility contract is scoped to owned content.** Envelope-format-vN must decrypt with @tarn/recover@vM forever — for owned content. Share-log + HPKE protocol decoders are best-effort and may be revised in future versions; they are NOT under the contract.
+
+This separation also falls out naturally from the math: the `accountKey` factor (the durable BIP39 phrase you save once) cannot derive the X25519 sharing keypair, so connections/share-log are mathematically inaccessible from that factor anyway. Only the `(username, password)` factor can read social data, and that's a "you still have your live credentials" recovery posture, not a "permanent durable kit" recovery posture.
 
 V1 of `@tarn/recover` returns:
-- All collection entries the user owns.
-- The user's connection records (peers + their handshake material as decrypted by the user's keys).
-- The user's incoming and outgoing share-log entries (subject to the same per-pair key derivations the live SDK uses).
+- **Always:** all collection entries the user owns.
+- **Only via password+username factor (and best-effort, not under forward-compat contract):** connections + share-log.
 
-This adds maybe 30-40% to the implementation effort, but the alternative (ship v1 without it, add it in v2) creates a worse migration story than just doing it once.
+The forever-page reference HTML in `tarn/examples/` (Phase 7) renders only owned content. Apps theming it (`forever.html` in Bookish) inherit that scope.
 
 ### 2. Username (not email) is the input field
 
@@ -219,9 +231,13 @@ Verify against test fixtures: a known account-key + envelope produces the known 
 
 **Goal:** the structural commitment to the contract. Fixture vault, decoder dispatch by envelope version, CI matrix.
 
+**Scoped to owned content only.** Per the revised decision in §1 above, the forward-compat contract covers the envelope formats and content-blob formats needed for owned-content recovery. Share-log and HPKE-inbox shapes are best-effort and explicitly NOT under the contract — no fixtures required for them in Phase 6.
+
 ### Phase 7 — Reference HTML in `tarn/examples/`
 
 **Goal:** an app-agnostic standalone exporter HTML page that uses `@tarn/recover`. Themed by Bookish to become `forever.html`.
+
+**Surfaces only owned-content APIs** — `recover()`, `reader.entries()`, `reader.allEntries()`. Does NOT surface `reader.connections()` or `reader.shareLog()`. The forever page is the artifact of the permanent promise; its scope matches that promise. Other apps that want to use the SDK's social capabilities do so from a live-context UI, not from a permanent-kit page.
 
 ### Phase 8 — Documentation, README, forward-compat contract
 
