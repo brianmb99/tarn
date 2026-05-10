@@ -1,6 +1,6 @@
 # Standalone recovery package — implementation plan
 
-> **Status:** Approved direction. Scope converged with Bookish 2026-05-08; ready for phased implementation. This document is the working implementation guide for `@tarn/recover` — analogous to [RECOVERY_PLAN.md](RECOVERY_PLAN.md) for the recovery v2 work.
+> **Status:** ✅ Implementation complete (2026-05-09). All phases (1-9) shipped to dev. `@tarn/recover` is functionally done; the operator publishes the forever page to Arweave when ready (Phase 9 deliverable: `recover/scripts/publish-forever.mjs`, dry-run by default). This document remains the canonical reference for the package's design and forward-compatibility contract.
 >
 > **Source materials:**
 > - Bookish's original ask: [STANDALONE_RECOVERY_PACKAGE.md](https://github.com/brianmb99/bookish/blob/dev/docs/tarn-requests/STANDALONE_RECOVERY_PACKAGE.md)
@@ -183,7 +183,7 @@ Sub-export of `tarn-client` was the alternative. We considered it; rejected beca
 
 Modeled on the RECOVERY_PLAN.md phasing that worked well for the recovery v2 work.
 
-### Phase 1 — Audit existing read path; carve out reusable pieces
+### Phase 1 — Audit existing read path; carve out reusable pieces ✅ done
 
 **Goal:** identify exactly what the live SDK does to read user data, and figure out what's reusable for an Arweave-direct reader vs what needs to be net-new.
 
@@ -196,7 +196,7 @@ Likely findings (to verify):
 
 Output: a list of "borrow these modules" + "new code for these layers" + a directory structure for `@tarn/recover`.
 
-### Phase 2 — Gateway-direct read primitives
+### Phase 2 — Gateway-direct read primitives ✅ done
 
 **Goal:** a minimal Arweave-gateway client with the tag queries needed to find:
 - An account record by `recovery_lookup_key`
@@ -213,39 +213,43 @@ Multi-gateway fallback. GraphQL for queries (matching what arweave.net exposes),
 
 Stale-data semantics aren't a real concern on Arweave once a TX is confirmed — but a slow-to-index gateway might return "not found" for a recently-confirmed TX. Treating that the same as a connection failure (try next) handles the case cleanly.
 
-### Phase 3 — KDF + envelope unwrapping in browser
+### Phase 3 — KDF + envelope unwrapping in browser ✅ done
 
 **Goal:** decoder-side crypto working in a browser context. WASM Argon2 (probably `hash-wasm`), PBKDF2 via WebCrypto, AES-GCM via WebCrypto, AES-KW via shim.
 
 Verify against test fixtures: a known account-key + envelope produces the known DEK chain.
 
-### Phase 4 — Schema-aware reader
+### Phase 4 — Schema-aware reader ✅ done
 
 **Goal:** given DEK chain + schema + Arweave-direct fetch, yield typed plaintext entries via async iterator. Tombstone application. Schema-version tagging.
 
-### Phase 5 — Connection + share-log support
+### Phase 5 — Connection + share-log support ✅ done (in SDK; not surfaced on forever page)
 
 **Goal:** the social-graph data, with appropriate per-pair key derivations.
 
-### Phase 6 — Forward-compat decoder framework + fixture suite
+### Phase 6 — Forward-compat decoder framework + fixture suite ✅ done
 
 **Goal:** the structural commitment to the contract. Fixture vault, decoder dispatch by envelope version, CI matrix.
 
 **Scoped to owned content only.** Per the revised decision in §1 above, the forward-compat contract covers the envelope formats and content-blob formats needed for owned-content recovery. Share-log and HPKE-inbox shapes are best-effort and explicitly NOT under the contract — no fixtures required for them in Phase 6.
 
-### Phase 7 — Reference HTML in `tarn/examples/`
+### Phase 7 — Reference HTML in `tarn/examples/` ✅ done (`recover/examples/forever/`)
 
 **Goal:** an app-agnostic standalone exporter HTML page that uses `@tarn/recover`. Themed by Bookish to become `forever.html`.
 
 **Surfaces only owned-content APIs** — `recover()`, `reader.entries()`, `reader.allEntries()`. Does NOT surface `reader.connections()` or `reader.shareLog()`. The forever page is the artifact of the permanent promise; its scope matches that promise. Other apps that want to use the SDK's social capabilities do so from a live-context UI, not from a permanent-kit page.
 
-### Phase 8 — Documentation, README, forward-compat contract
+### Phase 8 — Documentation, README, forward-compat contract ✅ done
 
 **Goal:** the package's README is the place the contract lives. Public docs covering API, contract, gateway-fallback model, edge cases (rotated keys, multi-app accounts, deleted entries, Model B caveat).
 
-### Phase 9 — Publish to Arweave
+### Phase 9 — Publish to Arweave ✅ done (tool ships; operator runs the publish)
 
 **Goal:** the example HTML page itself published to Arweave. Bookish takes the same route for their themed `forever.html`.
+
+**Tool:** `recover/scripts/publish-forever.mjs`. Dry-run by default (`--confirm` for real publish). Tags include `App=tarn-recover`, `Type=forever-page`, `Version`, `Sha256`. A companion `Type=forever-page-pointer` blob is published on each successful publish so users / apps can discover the latest published txid via Arweave-native query without needing a Tarn-side endpoint.
+
+**Status:** the tool is shipped and tested in dry-run mode; the actual production Arweave publish is the operator's call (real cost). See `recover/examples/forever/README.md` "Arweave publish workflow" for the operator procedure.
 
 ## Timeline
 
