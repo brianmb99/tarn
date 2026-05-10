@@ -948,9 +948,20 @@ theming, scope-guard, and reproducibility notes.
 The page surfaces only owned-content APIs (`recover()`,
 `reader.entries`, `reader.allEntries`). It does **not** surface
 `connections()` or `shareLog()` — that scope matches the
-forward-compatibility contract. Phase 9 of the standalone-recovery plan
-publishes this page to Arweave so the artifact of the permanent promise
-is itself permanent.
+forward-compatibility contract.
+
+### Publishing the page to Arweave
+
+The artifact of the permanent owned-content promise is itself
+permanent: the operator publishes the built `dist/forever.html` to
+Arweave with `recover/scripts/publish-forever.mjs`. Dry-run is the
+default; pass `--confirm` to publish for real. Each publish writes the
+page (`Type=forever-page`) plus a tiny `Type=forever-page-pointer`
+blob whose body is the just-published page txid — the Arweave-native
+"latest" discovery layer. See
+[`examples/forever/README.md` §"Arweave publish workflow"](examples/forever/README.md#arweave-publish-workflow)
+for the full flow (build, dry-run, confirm, tag scheme, idempotency,
+discovery query, sharing the txid with users).
 
 ---
 
