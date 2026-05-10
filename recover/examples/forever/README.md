@@ -71,11 +71,11 @@ fine — every dependency is already inlined.
 
 ## Arweave publish workflow
 
-The reference page is published to Arweave by the operator using
-`recover/scripts/publish-forever.mjs`. The script is the last step in
-the durability story: once the artifact lives on Arweave too, the
-recovery path keeps working even if `tarn.dev`, `getbookish.app`, and
-every other piece of Tarn-operated infrastructure is gone.
+> **Who this is for:** **app authors publishing their themed forever page.** Bookish runs the publish script for `bookish/public/forever.html`; future Tarn apps run it for their themed copies. The end-user's saved recovery kit references their app's themed-page txid — not this generic reference page.
+>
+> Publishing this *unthemed reference* page is **optional** and mostly symbolic. End users wouldn't actually use it (it requires manually entering `appId` and pasting in a schema JSON — not realistic recovery UX). Treat the reference page as the source app developers fork. The publish tool is shipped so app authors can reuse the same workflow on their themed copy.
+
+The publish script (`recover/scripts/publish-forever.mjs`) is the last step in the durability story for an app's themed page: once the themed forever page lives on Arweave too, the recovery path keeps working even if `tarn.dev`, the app's own domain, and every other piece of operator-controlled infrastructure is gone.
 
 ### Build, then dry-run
 

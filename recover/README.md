@@ -950,18 +950,13 @@ The page surfaces only owned-content APIs (`recover()`,
 `connections()` or `shareLog()` — that scope matches the
 forward-compatibility contract.
 
-### Publishing the page to Arweave
+### Publishing the page to Arweave (app-author workflow)
 
-The artifact of the permanent owned-content promise is itself
-permanent: the operator publishes the built `dist/forever.html` to
-Arweave with `recover/scripts/publish-forever.mjs`. Dry-run is the
-default; pass `--confirm` to publish for real. Each publish writes the
-page (`Type=forever-page`) plus a tiny `Type=forever-page-pointer`
-blob whose body is the just-published page txid — the Arweave-native
-"latest" discovery layer. See
-[`examples/forever/README.md` §"Arweave publish workflow"](examples/forever/README.md#arweave-publish-workflow)
-for the full flow (build, dry-run, confirm, tag scheme, idempotency,
-discovery query, sharing the txid with users).
+The publish tool exists for **app authors who want their themed forever page on Arweave**. Bookish themes this reference page to become `bookish/public/forever.html`, then publishes that themed copy with `recover/scripts/publish-forever.mjs`. The user's saved recovery kit references the app's themed-page txid.
+
+Publishing the **unthemed reference page** is optional and mostly symbolic — end users wouldn't actually use it (it asks them to enter `appId` and paste a schema JSON, which isn't realistic recovery UX). The reference page's audience is app developers as a starting point.
+
+Tool details: `dist/forever.html` is built deterministically (same input bytes → same output). The publish script is dry-run by default; `--confirm` enables real publish. Each publish writes the page (`Type=forever-page`) plus a tiny `Type=forever-page-pointer` blob whose body is the just-published page txid — Arweave-native "latest" discovery without needing a Tarn-side endpoint. See [`examples/forever/README.md` §"Arweave publish workflow"](examples/forever/README.md#arweave-publish-workflow) for the full flow (build, dry-run, confirm, tag scheme, idempotency, discovery query, sharing the txid with users).
 
 ---
 
