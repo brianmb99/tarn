@@ -1898,18 +1898,33 @@ export class TarnClient {
    *   - Platform without an authenticator (`isUserVerifyingPlatformAuthenticatorAvailable`
    *     returns false — typical on a desktop without Touch ID, Windows
    *     Hello, or a security key)
-   *   - Browsers without PRF extension support
    *
-   * PRF detection is the load-bearing one. The cleanest reliable check
-   * (per WebAuthn WG guidance, mid-2026) is to call the static
-   * `getClientCapabilities()` method when present (Chrome 132+, Safari
-   * 18+ both expose it); if absent, fall back to checking
-   * `PublicKeyCredential.prototype.getClientExtensionResults` exists,
-   * which signals at minimum that `extensions` is a known field.
+   * **PRF advertisement is intentionally NOT a hard requirement.** The
+   * cleanest signal would be `PublicKeyCredential.getClientCapabilities()`
+   * returning `{ prf: true }`, but that advertisement is browser-level
+   * while PRF support is per-authenticator — Chrome on Windows reports
+   * `prf: false` even when PRF actually works for synced passkeys (e.g.
+   * Google Password Manager — verified empirically 2026-05-07). Demanding
+   * a positive PRF advertisement excludes the very common Chrome/Windows
+   * configuration entirely, even though passkeys work fine there.
    *
-   * Apps call this before surfacing any passkey UX. If false, fall back
-   * to password-only — the SDK does NOT register a passkey on a device
-   * without PRF (the wrap would be unrecoverable on the next login).
+   * So this returns true whenever the basic shapes are present, leaving
+   * the actual PRF determination to register/authenticate time. If the
+   * chosen authenticator turns out not to support PRF, `registerPasskey`
+   * throws with a clear error — apps should surface that failure rather
+   * than hiding the option pre-emptively.
+   *
+   * Apps that want a stricter "definitely will work" signal can layer
+   * their own probe on top — but they should accept that no synchronous
+   * probe is fully reliable; the only true test is attempting the
+   * ceremony.
+   *
+   * Returns false on:
+   *   - No `navigator.credentials` (Node, ancient browsers)
+   *   - No `PublicKeyCredential` global
+   *   - `isUserVerifyingPlatformAuthenticatorAvailable()` returns false
+   *     (no platform authenticator — Touch ID, Face ID, Windows Hello,
+   *     etc.; we don't surface roaming-only flows in v1)
    */
   async passkeysSupported(): Promise<boolean> {
     if (typeof navigator === 'undefined' || !navigator.credentials) return false;
@@ -1922,22 +1937,12 @@ export class TarnClient {
         const ok = await G.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
         if (!ok) return false;
       }
-      // PRF capability check. The standard exposes
-      // `getClientCapabilities()` returning { prf: true } on supporting
-      // browsers. Older builds gate on whether the extension shape is
-      // recognized in `getClientExtensionResults` — coarse but the only
-      // signal pre-getClientCapabilities.
-      if (typeof G.PublicKeyCredential.getClientCapabilities === 'function') {
-        const caps = await G.PublicKeyCredential.getClientCapabilities();
-        return !!(caps && caps.prf === true);
-      }
-      // Fallback: browsers that don't expose getClientCapabilities and
-      // don't recognize PRF will silently drop the extension and return
-      // an empty results map — there's no reliable a-priori signal short
-      // of attempting a registration. Return false to be safe; apps that
-      // want to opportunistically try can call `register()` directly and
-      // catch the failure.
-      return false;
+      // Intentionally do NOT gate on getClientCapabilities().prf — see
+      // the JSDoc above. PRF advertisement is unreliable across the
+      // browser × authenticator matrix (notably Chrome/Windows reports
+      // false even when PRF works for synced passkeys). Truth comes at
+      // register-time.
+      return true;
     } catch {
       return false;
     }

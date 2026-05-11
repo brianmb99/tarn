@@ -51,11 +51,23 @@ export class PasskeysNamespace {
   }
 
   /**
-   * Feature-detect WebAuthn + PRF support on the current device.
-   * Apps render passkey UX only when this returns true. Returns false in
-   * environments without `navigator.credentials`, without a platform
-   * authenticator, or without browser-level PRF extension support
-   * (Firefox <141, older Safari/Chrome).
+   * Feature-detect WebAuthn + likely PRF support on the current device.
+   *
+   * Returns true when the basic WebAuthn shapes are present (navigator.
+   * credentials, PublicKeyCredential, a platform authenticator like Touch
+   * ID / Face ID / Windows Hello). Apps render passkey UX based on this.
+   *
+   * Does NOT gate on a positive PRF advertisement from
+   * `getClientCapabilities()` — that advertisement is browser-level while
+   * PRF support is per-authenticator. Chrome on Windows reports
+   * `prf: false` but PRF actually works there for synced passkeys (Google
+   * Password Manager). The actual PRF determination happens at register
+   * time; if PRF turns out to be unavailable, `register()` throws with a
+   * useful error.
+   *
+   * Returns false in environments without `navigator.credentials` (Node,
+   * very old browsers), without `PublicKeyCredential`, or where
+   * `isUserVerifyingPlatformAuthenticatorAvailable()` returns false.
    */
   async isSupported(): Promise<boolean> {
     return this.#client.passkeysSupported();

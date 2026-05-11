@@ -144,7 +144,12 @@ describe('PRF detection', () => {
     }
   });
 
-  it('passkeysSupported() returns false when getClientCapabilities reports prf:false', async () => {
+  it('passkeysSupported() returns true even when getClientCapabilities reports prf:false (Chrome/Windows quirk)', async () => {
+    // Chrome on Windows reports prf:false from getClientCapabilities even
+    // when PRF actually works for synced passkeys (Google Password Manager).
+    // The advertisement is browser-level; PRF support is per-authenticator.
+    // We don't gate on it — verified 2026-05-07 (PRF consistency test passed
+    // on Chrome/Windows + Android via Google Password Manager).
     const originalNav = globalThis.navigator;
     const originalPK = globalThis.PublicKeyCredential;
     try {
@@ -155,7 +160,30 @@ describe('PRF detection', () => {
       };
       const client = new TarnClient('https://api.tarn.dev', APP);
       const supported = await client.passkeysSupported();
-      assert.equal(supported, false);
+      assert.equal(supported, true);
+    } finally {
+      globalThis.navigator = originalNav;
+      globalThis.PublicKeyCredential = originalPK;
+    }
+  });
+
+  it('passkeysSupported() returns true when getClientCapabilities is absent (older browsers)', async () => {
+    // Browsers without getClientCapabilities (older Chrome, older Safari,
+    // anything not on the WebAuthn 2024+ spec) get the benefit of the doubt
+    // — basic platform authenticator + PublicKeyCredential is enough to
+    // surface passkey UX. If PRF turns out to be unavailable at register
+    // time, registerPasskey throws with a useful error.
+    const originalNav = globalThis.navigator;
+    const originalPK = globalThis.PublicKeyCredential;
+    try {
+      globalThis.navigator = { credentials: {} };
+      globalThis.PublicKeyCredential = {
+        isUserVerifyingPlatformAuthenticatorAvailable: async () => true,
+        // no getClientCapabilities
+      };
+      const client = new TarnClient('https://api.tarn.dev', APP);
+      const supported = await client.passkeysSupported();
+      assert.equal(supported, true);
     } finally {
       globalThis.navigator = originalNav;
       globalThis.PublicKeyCredential = originalPK;
