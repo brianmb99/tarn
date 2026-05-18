@@ -364,6 +364,14 @@ export async function deriveRecoverySigningKeyPair(
  * Derive credential encryption key material from master_key for a specific app.
  * Returns both an AES-GCM key (for data encryption) and an AES-KW key (for key wrapping).
  * Both are derived from the same raw bytes — same key, different WebCrypto usages.
+ *
+ * Both handles are `extractable: true`. The kwKey is exported as raw bytes
+ * during serializeSession (issue #25) so #rebuildEnvelopeWithExtraPasskey and
+ * #rebuildEnvelopeWithoutPasskey can re-wrap DEKs under the password factor
+ * on a resumed-session client. Extractability is threat-model neutral here:
+ * the session blob holding the exported bytes is itself encrypted under the
+ * origin-bound IndexedDB wrapping key, and the DEKs persisted alongside are
+ * strictly more sensitive than the CEK (which only wraps DEKs).
  */
 export async function deriveCredentialEncryptionKey(
   masterKey: Uint8Array,

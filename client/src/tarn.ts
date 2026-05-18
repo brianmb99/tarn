@@ -5594,6 +5594,20 @@ export class TarnClient {
     }
     dekByGen.sort((a, b) => a.gen - b.gen);
 
+    // Issue #25: persist #credentialEncryptionKey alongside the DEK chain so
+    // #rebuildEnvelopeWithExtraPasskey / #rebuildEnvelopeWithoutPasskey (the
+    // passkey add / remove paths) work on a resumed-session client. The kwKey
+    // is exported as raw 32 bytes (extractable: true at derivation) and
+    // re-imported as AES-KW on resume. Threat-model neutral: the session blob
+    // is already encrypted under the origin-bound IndexedDB wrapping key, and
+    // the DEKs persisted next to it are strictly more sensitive than the CEK
+    // (which only wraps DEKs).
+    let credentialEncryptionKeyB64: string | null = null;
+    if (this.#credentialEncryptionKey) {
+      const cekRaw = await crypto.subtle.exportKey('raw', this.#credentialEncryptionKey.kwKey);
+      credentialEncryptionKeyB64 = bytesToBase64(new Uint8Array(cekRaw));
+    }
+
     let recoveryFactorMeta = null;
     if (this.#recoveryFactorMeta) {
       const m = this.#recoveryFactorMeta;
@@ -5629,6 +5643,12 @@ export class TarnClient {
       sharingPrivateKey: bytesToBase64(this.#sharingKeyPair!.privateKey),
       sharingPublicKey: bytesToBase64(this.#sharingKeyPair!.publicKey),
       recoveryFactorMeta,
+      // Issue #25: read by resumeSession to rehydrate #credentialEncryptionKey
+      // so passkey register/remove flows succeed post-page-reload. Omitted (null)
+      // only for the brief window where a logged-in client somehow has no CEK
+      // (e.g., passkey-only authenticated session before the removePasskey
+      // password-prompt fallback runs); resumeSession tolerates null.
+      credentialEncryptionKey: credentialEncryptionKeyB64,
       jwt: this.#jwt,
       sid: this.#sid,
       // Phase 3: persist the Model B indicator so resumed sessions know
@@ -5759,11 +5779,33 @@ export class TarnClient {
         };
       }
 
+      // Issue #25: rehydrate #credentialEncryptionKey. The passkey add / remove
+      // paths (#rebuildEnvelopeWithExtraPasskey / #rebuildEnvelopeWithoutPasskey)
+      // re-wrap each gen's DEK under this key. Pre-fix v3 blobs lack the field;
+      // back-compat is null, in which case removePasskey's password-prompt
+      // fallback re-derives it and registerPasskey throws a "missing client
+      // state" error that the app surfaces as "sign in again."
+      // We materialize all three DataKeyHandles fields (gcmKey, kwKey, rawBytes)
+      // to mirror deriveCredentialEncryptionKey's output even though only kwKey
+      // is read post-rehydrate today — keeps the type honest.
+      let credentialEncryptionKey: DataKeyHandles | null = null;
+      if (typeof payload.credentialEncryptionKey === 'string') {
+        try {
+          const cekRaw = base64ToBytes(payload.credentialEncryptionKey);
+          const [gcmKey, kwKey] = await Promise.all([
+            crypto.subtle.importKey('raw', bs(cekRaw), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']),
+            crypto.subtle.importKey('raw', bs(cekRaw), 'AES-KW', true, ['wrapKey', 'unwrapKey']),
+          ]);
+          credentialEncryptionKey = { gcmKey, kwKey, rawBytes: cekRaw };
+        } catch {
+          return null;
+        }
+      }
+
       const client = new TarnClient(apiBase, appId);
       // Mirror the field-set pattern at the end of login() — populate the
       // private slots directly so the resumed client behaves identically to
-      // one that just logged in. credentialEncryptionKey is intentionally
-      // not persisted (no code path reads it post-login).
+      // one that just logged in.
       client.#jwt = payload.jwt || null;
       client.#sid = typeof payload.sid === 'string' ? payload.sid : null;
       client.#dataLookupKey = payload.dataLookupKey;
@@ -5777,6 +5819,7 @@ export class TarnClient {
         publicKey: base64ToBytes(payload.sharingPublicKey),
       };
       client.#recoveryFactorMeta = recoveryFactorMeta;
+      client.#credentialEncryptionKey = credentialEncryptionKey;
       // Phase 3: rehydrate the Model B indicator. Pre-Phase-3 blobs lack
       // the field; coerce undefined → null so isStored() reads correctly.
       client.#accountKeyStored =
