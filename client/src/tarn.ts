@@ -114,6 +114,7 @@ import {
   OP_SNAPSHOT,
   OP_ROTATE_IDENTITY,
 } from './share-log.js';
+import { repairPrfExtensionBuffers } from './passkeys/prf.js';
 
 // Local type aliases used throughout the class.
 import type {
@@ -1371,6 +1372,13 @@ export class TarnClient {
     // it to /authenticate. For environments where this matters, a future
     // /auth/passkey/prf-only options endpoint could mint a non-auth
     // challenge specifically for re-wrapping ceremonies.
+    //
+    // Repair the PRF extension buffers before handing the options to
+    // the browser. The server sends `extensions.prf.evalByCredential[*]
+    // .first` as `Uint8Array` but @simplewebauthn/server doesn't
+    // serialize it, so it arrives as `{"0":n,"1":n,...}` on the wire;
+    // the browser then rejects it. See client/src/passkeys/prf.ts.
+    repairPrfExtensionBuffers(pkOptions?.extensions);
     const { startAuthentication } = await import('@simplewebauthn/browser');
     const credential = await startAuthentication({ optionsJSON: pkOptions });
     const prfResults = (credential as any)?.clientExtensionResults?.prf?.results?.first;
@@ -2002,6 +2010,13 @@ export class TarnClient {
     // 2. Convert the JSON-friendly option payload back to BufferSource
     //    fields and call navigator.credentials.create. Use the helper
     //    from @simplewebauthn/browser for the round trip.
+    //
+    //    Repair `extensions.prf.eval.first` first. @simplewebauthn
+    //    does not transform buffer values inside extensions on either
+    //    side, so the server's Uint8Array salt arrives here as
+    //    `{"0":n,...}` and the browser will reject it. See
+    //    client/src/passkeys/prf.ts for the full story.
+    repairPrfExtensionBuffers(pkOptions?.extensions);
     const { startRegistration } = await import('@simplewebauthn/browser');
     const credential = await startRegistration({ optionsJSON: pkOptions });
 
@@ -2114,7 +2129,12 @@ export class TarnClient {
       throw new Error('authenticateWithPasskey(): server did not return options');
     }
 
-    // 2. Get the assertion + PRF output.
+    // 2. Get the assertion + PRF output. Repair the PRF eval buffers
+    //    first — @simplewebauthn passes extension buffer values
+    //    through untouched on both sides, so the server's Uint8Array
+    //    salts arrive as `{"0":n,...}` objects that the browser will
+    //    reject. See client/src/passkeys/prf.ts.
+    repairPrfExtensionBuffers(pkOptions?.extensions);
     const { startAuthentication } = await import('@simplewebauthn/browser');
     const credential = await startAuthentication({ optionsJSON: pkOptions });
     const prfResults = (credential as any)?.clientExtensionResults?.prf?.results?.first;
