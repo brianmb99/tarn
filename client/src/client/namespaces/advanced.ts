@@ -46,6 +46,43 @@ export class AdvancedEntries<C extends IAdvancedClient> {
     return this.#client.createEntry(type, payload, extraTags);
   }
 
+  /**
+   * Schema-less bulk create. Writes 1-25 entries in a single batch. Counts as
+   * 1 rate-limit hit regardless of batch size (vs N hits for N single calls).
+   * Returns `[{ txid, shareKey }]` in input order.
+   *
+   * Schema-less by design — partial-failure validation semantics across a
+   * batch don't have a clean answer, so the typed `client.<collection>.create`
+   * path stays single-item. Callers wanting per-item validation should call
+   * the collection's `validate(item)` upstream before batching, or use the
+   * typed surface per item (at the cost of 1 rate-limit hit per item).
+   *
+   * Throws on empty input or `items.length > 25`. Idempotent: a retry on the
+   * same input produces the same list of txids (server-side de-dupe via one
+   * idempotency key per batch).
+   *
+   * Note: `extraTags` is forwarded for forward-compat with the interface
+   * signature; the bundled underlying client currently ignores it on batch
+   * writes (single-item `create` honors it). If you need extra tags per
+   * batched item today, use single-item `create` until the underlying
+   * surface adds support.
+   */
+  async batchCreate(
+    type: string,
+    items: Array<Record<string, unknown>>,
+    extraTags: Tag[] = [],
+  ): Promise<Array<{ txid: string; shareKey: string | null }>> {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error('advanced.entries.batchCreate: items must be a non-empty array');
+    }
+    if (items.length > 25) {
+      throw new Error(
+        `advanced.entries.batchCreate: items max 25 per batch (got ${items.length})`,
+      );
+    }
+    return this.#client.batchCreate(type, items, extraTags);
+  }
+
   /** Schema-less update. */
   async update(
     priorTxid: string,

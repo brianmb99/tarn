@@ -278,6 +278,29 @@ class StubUnderlying implements IUnderlyingClient {
     this.shareKeyByTxid.set(txid, shareKey);
     return { txid, shareKey };
   }
+  // Records the most recent batchCreate args so tests can assert
+  // forwarding fidelity without re-stubbing the method.
+  batchCreateCalls: Array<{ type: string; items: Array<Record<string, unknown>>; extraTags: Tag[] }> = [];
+  async batchCreate(
+    type: string,
+    items: Array<Record<string, unknown>>,
+    extraTags: Tag[] = [],
+  ) {
+    this.batchCreateCalls.push({ type, items: items.slice(), extraTags: extraTags.slice() });
+    const out: Array<{ txid: string; shareKey: string | null }> = [];
+    for (const item of items) {
+      const txid = this.#nextTxid();
+      const shareKey = this.#nextShareKey();
+      this.entries.push({
+        txid,
+        data: { ...item },
+        tags: [{ name: 'Type', value: type }, ...extraTags],
+      });
+      this.shareKeyByTxid.set(txid, shareKey);
+      out.push({ txid, shareKey });
+    }
+    return out;
+  }
   async updateEntry(priorTxid: string, type: string, plaintext: Record<string, unknown>, extraTags: Tag[] = []) {
     this.entries = this.entries.filter((e) => e.txid !== priorTxid);
     const txid = this.#nextTxid();
@@ -908,6 +931,61 @@ describe('TarnClient.advanced', () => {
     const blob = await tarn.advanced.entries.fetchBlob('tx1');
     assert.ok(blob);
     assert.equal(blob[0], 42);
+  });
+
+  it('advanced.entries.batchCreate is exposed on the namespace', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    assert.equal(typeof tarn.advanced.entries.batchCreate, 'function');
+  });
+
+  it('advanced.entries.batchCreate forwards (type, items, extraTags) to underlying client', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    const items = [{ a: 1 }, { a: 2 }, { a: 3 }];
+    const extraTags: Tag[] = [{ name: 'Custom', value: 'X' }];
+    const out = await tarn.advanced.entries.batchCreate('bookish-custom', items, extraTags);
+    assert.equal(stub.batchCreateCalls.length, 1);
+    assert.equal(stub.batchCreateCalls[0]!.type, 'bookish-custom');
+    assert.deepEqual(stub.batchCreateCalls[0]!.items, items);
+    assert.deepEqual(stub.batchCreateCalls[0]!.extraTags, extraTags);
+    assert.equal(out.length, 3);
+    assert.deepEqual(out.map((r) => r.txid), ['mock-tx-1', 'mock-tx-2', 'mock-tx-3']);
+    assert.deepEqual(out.map((r) => r.shareKey), ['mock-sk-1', 'mock-sk-2', 'mock-sk-3']);
+  });
+
+  it('advanced.entries.batchCreate preserves input order in the returned array', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    const items = [{ marker: 'first' }, { marker: 'second' }, { marker: 'third' }];
+    const out = await tarn.advanced.entries.batchCreate('order-test', items);
+    // Verify result order matches input order (not e.g. alphabetic on txid).
+    const dataOrder = out.map((r) => {
+      const entry = stub.entries.find((e) => e.txid === r.txid)!;
+      return entry.data['marker'];
+    });
+    assert.deepEqual(dataOrder, ['first', 'second', 'third']);
+  });
+
+  it('advanced.entries.batchCreate throws on empty input', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    await assert.rejects(
+      () => tarn.advanced.entries.batchCreate('t', []),
+      /non-empty/i,
+    );
+    assert.equal(stub.batchCreateCalls.length, 0, 'underlying not called on bad input');
+  });
+
+  it('advanced.entries.batchCreate throws on 26+ items', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    const items = Array.from({ length: 26 }, (_, i) => ({ i }));
+    await assert.rejects(
+      () => tarn.advanced.entries.batchCreate('t', items),
+      /max 25/i,
+    );
+    assert.equal(stub.batchCreateCalls.length, 0, 'underlying not called on bad input');
   });
 
   it('advanced.shareLog.read returns the connection state map', async () => {

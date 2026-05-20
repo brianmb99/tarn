@@ -535,6 +535,29 @@ await tarn.advanced.shareLog.share(connection, contentId, txid, shareKey);
 await tarn.advanced.shareLog.unshare(connection, contentId);
 ```
 
+### Bulk writes (`advanced.entries.batchCreate`)
+
+Bulk-write up to 25 entries in a single request. Counts as **1 rate-limit hit** regardless of batch size — vs N hits for N single-item `create` calls. Built for migration scripts, seeders, and integration tests that need to land many records under the 100 writes/hour/account limit; not a general substitute for typed `collection.create`.
+
+```js
+// Migration: write 18 records from an exported library into a fresh account.
+// One rate-limit hit, ~one round-trip — vs 18 hits + 18 round-trips otherwise.
+const records = [
+  { bookId: 'b-001', title: 'The Idiot',          status: 'reading' },
+  { bookId: 'b-002', title: 'Mountains of My Life', status: 'finished' },
+  // ...up to 25 per batch
+];
+const results = await tarn.advanced.entries.batchCreate('book', records);
+// results: [{ txid, shareKey }, ...] — same order as input.
+
+// Larger imports: chunk client-side and pace at one batch per ~36s to stay
+// under 100 writes/hour. Each batch is one hit.
+```
+
+**Schema-less by design.** Per-item validation across a batch has no clean partial-failure story — if item 3 of 25 fails validation, does the whole batch fail or do the rest commit? Until that's resolved, batch lives on `advanced.entries` and the typed `collection.create` stays single-item. If you want schema-aware validation, call your collection's `validate()` per item upstream, then batch.
+
+**Throws on `items.length === 0` or `items.length > 25`.** Idempotent — a retry on the same input produces the same list of txids (one idempotency key per batch).
+
 If you find yourself reaching for `advanced.*` for something the typed surface should cover, that's a signal to file an issue.
 
 ---

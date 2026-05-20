@@ -230,6 +230,62 @@ await test('Entry available on Turbo gateway', async () => {
   // Pass regardless — the D1 cache test above proves the write worked
 });
 
+// ============ 5a. BATCH WRITE (Section 5.5 / issue #23) ============
+//
+// Covers the wire path that tarn.advanced.entries.batchCreate forwards to:
+// a 5-item bulk write should land all 5 entries on the deployed API in one
+// request (1 rate-limit hit instead of 5) and a subsequent getEntries() must
+// surface every one of them. The schema-first wrapper is unit-tested under
+// tests/unit/ — this leg confirms the underlying client + API contract.
+
+console.log('\n=== 5a. Batch Write + Read (issue #23) ===');
+
+await test('batchCreate writes 5 entries atomically, getEntries returns all 5', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+  // Unique type so we don't collide with the single-write test above when
+  // counting back through getEntries.
+  const batchType = `batch-${Date.now()}`;
+  const markers = Array.from({ length: 5 }, (_, i) => `batch-marker-${i}-${Date.now()}`);
+  const items = markers.map((marker, i) => ({ marker, idx: i, title: `Batch ${i}` }));
+
+  const out = await tarn.batchCreate(batchType, items);
+  assert(Array.isArray(out), 'batchCreate returned non-array');
+  assert(out.length === 5, `expected 5 results, got ${out.length}`);
+  for (const r of out) {
+    assert(typeof r.txid === 'string' && r.txid.length > 0, `bad txid: ${r.txid}`);
+    assert('shareKey' in r, 'each result must include shareKey (may be null)');
+  }
+  console.log(`    Batch txids: ${out.map((r) => r.txid.slice(0, 12)).join(', ')}`);
+
+  await sleep(500); // Brief wait for write-through to D1 cache.
+  const entries = await tarn.getEntries(batchType);
+  assert(entries.length >= 5, `expected ≥5 entries on read-back, got ${entries.length}`);
+  const seen = new Set(entries.map((e) => e.data?.marker));
+  for (const marker of markers) {
+    assert(seen.has(marker), `marker ${marker} missing from read-back`);
+  }
+});
+
+await test('batchCreate rejects empty input', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+  let caught = null;
+  try { await tarn.batchCreate('batch-empty', []); } catch (e) { caught = e; }
+  assert(caught, 'empty batch must throw');
+  assert(/non-empty/i.test(caught.message), `unexpected error: ${caught.message}`);
+});
+
+await test('batchCreate rejects 26+ items', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+  const items = Array.from({ length: 26 }, (_, i) => ({ i }));
+  let caught = null;
+  try { await tarn.batchCreate('batch-toobig', items); } catch (e) { caught = e; }
+  assert(caught, '26-item batch must throw');
+  assert(/max 25/i.test(caught.message), `unexpected error: ${caught.message}`);
+});
+
 // ============ 5b. SESSION PERSISTENCE (Section 7, issue #19) ============
 
 console.log('\n=== 5b. Session Persistence ===');

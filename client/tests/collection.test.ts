@@ -70,6 +70,29 @@ class MockTarnClient implements ITarnClient {
     return { txid, shareKey };
   }
 
+  // Collection<T> doesn't consume batchCreate (the typed surface is single-
+  // item by design — see issue #23). Implemented here only to satisfy the
+  // ITarnClient interface; tests don't exercise it.
+  async batchCreate(
+    type: string,
+    items: Array<Record<string, unknown>>,
+    extraTags: Tag[] = [],
+  ): Promise<Array<{ txid: string; shareKey: string | null }>> {
+    const out: Array<{ txid: string; shareKey: string | null }> = [];
+    for (const item of items) {
+      const txid = this.#nextTxid();
+      const shareKey = this.#nextShareKey();
+      this.entries.push({
+        txid,
+        data: { ...item },
+        tags: [{ name: 'Type', value: type }, ...extraTags],
+      });
+      this.shareKeysByTxid.set(txid, shareKey);
+      out.push({ txid, shareKey });
+    }
+    return out;
+  }
+
   async updateEntry(
     priorTxid: string,
     type: string,

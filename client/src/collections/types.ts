@@ -46,6 +46,20 @@ export interface ITarnClient {
     extraTags?: Tag[],
   ): Promise<{ txid: string; shareKey: string | null }>;
 
+  /**
+   * Bulk-create up to 25 entries in a single batched write. Counts as 1
+   * rate-limit hit regardless of batch size. Returns `[{ txid, shareKey }]`
+   * in input order. Throws on empty input or `items.length > 25`.
+   *
+   * Idempotency: one key per batch — a retry on the same input produces the
+   * same list of txids (server-side de-dupe).
+   */
+  batchCreate(
+    type: string,
+    items: Array<Record<string, unknown>>,
+    extraTags?: Tag[],
+  ): Promise<Array<{ txid: string; shareKey: string | null }>>;
+
   updateEntry(
     priorTxid: string,
     type: string,
