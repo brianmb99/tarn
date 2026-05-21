@@ -421,6 +421,92 @@ describe('Collection.update', () => {
     assert.equal(mock.updateCalls[0]!.priorTxid, 'mock-tx-1');
     assert.equal(mock.updateCalls[1]!.priorTxid, 'mock-tx-2');
   });
+
+  // ---- { unset } option (issue #26) ----
+
+  it('unset clears an optional field — key absent on returned record and on get()', async () => {
+    // Seed an optional field via update so we know it was actually present.
+    await books.update('b1', { rating: 5 });
+    assert.equal((await books.get('b1'))!.rating, 5);
+
+    const returned = await books.update('b1', {}, { unset: ['rating'] });
+
+    // 1. Returned record: the key must be truly absent, not undefined / null.
+    assert.ok(!Object.prototype.hasOwnProperty.call(returned, 'rating'),
+      `expected 'rating' to be absent from returned record; got ${JSON.stringify(returned)}`);
+
+    // 2. Last persisted entry: the key must be truly absent on the wire.
+    const lastUpdate = mock.updateCalls.at(-1)!;
+    assert.ok(!Object.prototype.hasOwnProperty.call(lastUpdate.plaintext, 'rating'),
+      `expected 'rating' to be absent from persisted plaintext; got ${JSON.stringify(lastUpdate.plaintext)}`);
+
+    // 3. Round-trip via get(): the key must remain absent on read-back.
+    const readBack = await books.get('b1');
+    assert.ok(readBack);
+    assert.ok(!Object.prototype.hasOwnProperty.call(readBack, 'rating'),
+      `expected 'rating' to be absent on get(); got ${JSON.stringify(readBack)}`);
+  });
+
+  it('unset of a field that was never present is a no-op (no error)', async () => {
+    // 'rating' was never set on b1 in the beforeEach seed.
+    const returned = await books.update('b1', {}, { unset: ['rating'] });
+    assert.ok(!Object.prototype.hasOwnProperty.call(returned, 'rating'));
+    // All other fields are still there.
+    assert.equal(returned.bookId, 'b1');
+    assert.equal(returned.title, 'Foo');
+    assert.equal(returned.author, 'AuthorA');
+    assert.equal(returned.isPrivate, false);
+  });
+
+  it('unset of a required field throws the existing required-field validation error', async () => {
+    await assert.rejects(
+      () => books.update('b1', {}, { unset: ['title'] }),
+      /required field 'title'/,
+    );
+  });
+
+  it('when the same field is in both patch and unset, unset wins (delete-after-merge)', async () => {
+    // 'rating' is optional, so we can exercise the precedence cleanly.
+    const returned = await books.update('b1', { rating: 5 }, { unset: ['rating'] });
+    assert.ok(!Object.prototype.hasOwnProperty.call(returned, 'rating'),
+      `expected unset to win over patch; got ${JSON.stringify(returned)}`);
+
+    // And the persisted entry agrees.
+    const lastUpdate = mock.updateCalls.at(-1)!;
+    assert.ok(!Object.prototype.hasOwnProperty.call(lastUpdate.plaintext, 'rating'));
+  });
+
+  it('empty unset: [] behaves identically to omitting the option', async () => {
+    await books.update('b1', { rating: 5 });
+    const before = mock.updateCalls.length;
+
+    const returned = await books.update('b1', { author: 'AuthorB' }, { unset: [] });
+
+    // rating is still there, author updated, exactly one new entry chain step.
+    assert.equal(returned.rating, 5);
+    assert.equal(returned.author, 'AuthorB');
+    assert.equal(mock.updateCalls.length, before + 1);
+  });
+
+  it('unset with multiple fields clears all of them in a single write', async () => {
+    // Set author and rating both first; then clear both in one update.
+    await books.update('b1', { rating: 5 });
+    const before = mock.updateCalls.length;
+
+    const returned = await books.update('b1', {}, { unset: ['author', 'rating'] });
+
+    // Exactly one new chain entry — not two.
+    assert.equal(mock.updateCalls.length, before + 1);
+
+    // Both fields gone on the returned record.
+    assert.ok(!Object.prototype.hasOwnProperty.call(returned, 'author'));
+    assert.ok(!Object.prototype.hasOwnProperty.call(returned, 'rating'));
+
+    // And on the persisted entry.
+    const lastUpdate = mock.updateCalls.at(-1)!;
+    assert.ok(!Object.prototype.hasOwnProperty.call(lastUpdate.plaintext, 'author'));
+    assert.ok(!Object.prototype.hasOwnProperty.call(lastUpdate.plaintext, 'rating'));
+  });
 });
 
 // ============ Collection.delete ============

@@ -70,8 +70,24 @@ export class Collection<TRecord extends Record<string, unknown>> {
    * Partial update of an existing record. Reads the current record, merges
    * the patch, re-validates, writes a new entry chained via `Prev` and
    * sharing the same Eid. Apps pass only changed fields.
+   *
+   * Pass `opts.unset` to clear specific fields on the existing record.
+   * Fields listed in `unset` are deleted from the merged record *after*
+   * the patch is applied, so if the same key appears in both `patch`
+   * and `unset` the unset wins. Unsetting a field that wasn't present
+   * is a no-op. Unsetting a required field throws the standard
+   * "required field missing" validation error from the re-validate step
+   * (no new error class).
+   *
+   * The `keyof TRecord & string` constraint on the unset list lets
+   * callers spell the field names with normal autocomplete, without
+   * `as any` casts.
    */
-  async update(primaryKey: string, patch: Partial<TRecord>): Promise<TRecord> {
+  async update(
+    primaryKey: string,
+    patch: Partial<TRecord>,
+    opts?: { unset?: Array<keyof TRecord & string> },
+  ): Promise<TRecord> {
     const validatedPatch = validateRecordForUpdate(this.#name, this.#def, patch);
     const { entry, current } = await this.#findCurrent(primaryKey);
 
@@ -80,7 +96,13 @@ export class Collection<TRecord extends Record<string, unknown>> {
     // strictly necessary (the patch is already validated) but it catches
     // the unusual case where the prior record on Arweave is malformed for
     // the current schema version.
-    const merged = { ...current, ...validatedPatch };
+    const merged: Record<string, unknown> = { ...current, ...validatedPatch };
+    const unsetList = opts?.unset ?? [];
+    for (const key of unsetList) {
+      // Delete after merge so a key appearing in both `patch` and `unset`
+      // ends up cleared. Deleting an absent key is a no-op (standard JS).
+      delete merged[key];
+    }
     const revalidated = validateRecordForCreate(this.#name, this.#def, merged);
 
     const eid = await deriveEid(this.#appId, this.#name, primaryKey);

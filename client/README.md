@@ -160,6 +160,20 @@ Records are addressed by **primary key**, never by Arweave txid. The SDK maps pr
 
 `update()` is **partial-merge**. Pass only what's changing; the SDK reads the current record from Arweave, merges, re-validates as a full record, and writes a chained entry. Full-replace is `update(id, { ...current, ...patch })` if you ever want it.
 
+**Clearing fields.** To remove a field from an existing record, pass its name via the `unset` option:
+
+```js
+// Clear `dateRead` while also updating the title — both happen in one write.
+await tarn.books.update('b1', { title: 'A New Title' }, { unset: ['dateRead'] });
+```
+
+The listed keys are deleted from the merged record *after* the patch, then the result is re-validated. Notes:
+
+- Unsetting a field that wasn't present is a no-op.
+- If the same field is in both `patch` and `unset`, the unset wins (delete-after-merge).
+- Unsetting a required field throws the standard "required field missing" validation error — required fields can't be cleared.
+- Reading the record back via `get()` returns a record where the cleared key is truly absent (not `null` or `undefined`).
+
 ### Sharing (when `shareable: true`)
 
 ```js
