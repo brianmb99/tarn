@@ -40,6 +40,7 @@ function makeFakeClient() {
     async updateEntry() { return { txid: 'unused', shareKey: null }; },
     async deleteEntry() { return { txid: 'unused' }; },
     async getEntries() { return []; },
+    async getEntryByEid() { return null; },
     async getShareKey() { return null; },
     async fetchBlob() { return null; },
     async decryptSharedBlob() { return {}; },

@@ -159,6 +159,144 @@ export function resolveEntries(rows) {
   return deduped;
 }
 
+/**
+ * Resolve the delta of live state since a (cached_at, txid) cursor.
+ *
+ * Filters rows by `(cached_at, txid) > (sinceCachedAt, sinceTxid)`, groups
+ * the result by Eid, runs resolution per Eid group, and emits semantic
+ * events for each Eid that has any rows in the window:
+ *   - Eid has a live row after resolution → { eid, txid, tags, ..., blob }
+ *   - Eid has only tombstone(s) / superseded rows → { eid, deleted: true }
+ *
+ * Page-bounded by `limit`. Returns `nextCursor` = (max(cached_at), max(txid))
+ * over the *input* rows (not the events), so the next poll picks up where
+ * this one stopped regardless of how the events were grouped. When the
+ * window is exhausted without hitting the limit, `nextCursor` is the
+ * highest cursor seen and `hasMore` is false; the client just keeps that
+ * cursor for the next poll.
+ *
+ * The wire-level tombstone abstraction stays server-side — clients never
+ * see a "tombstone row", just a `deleted: true` event on the Eid. Same
+ * way `update` doesn't expose Prev-chain mechanics to callers.
+ */
+export async function getDeltaEntries(db, app, type, dataLookupKey, since, { limit = 25 } = {}) {
+  const sinceCachedAt = since?.cachedAt ?? 0;
+  const sinceTxid = since?.txid ?? '';
+
+  // Pull the next page of input rows by composite cursor. Include blob_data —
+  // we inline blobs for live events so a single delta call covers metadata
+  // and bytes for new entries (the same trade-off as the ?eid= fast path).
+  const all = await db.prepare(
+    `SELECT txid, app, type, wallet_addr, lookup_key, eid, prev_txid,
+            is_tombstone, tombstone_ref, block_timestamp, tags_json, cached_at, blob_data
+     FROM entries
+     WHERE app = ?1 AND type = ?2 AND lookup_key = ?3
+       AND (cached_at > ?4 OR (cached_at = ?4 AND txid > ?5))
+     ORDER BY cached_at ASC, txid ASC
+     LIMIT ?6`
+  ).bind(app, type, dataLookupKey, sinceCachedAt, sinceTxid, limit).all();
+
+  const rows = all.results || [];
+  if (rows.length === 0) {
+    return {
+      events: [],
+      nextCursor: since ?? { cachedAt: 0, txid: '' },
+      hasMore: false,
+    };
+  }
+
+  // Group input rows by Eid so we can resolve per-Eid in the window. Rows
+  // without an Eid tag (legacy or unscoped writes) fall through as their
+  // own "group of one" — same shape, never collapsed across rows.
+  const byEid = new Map();
+  const orphans = [];
+  for (const r of rows) {
+    if (r.eid) {
+      if (!byEid.has(r.eid)) byEid.set(r.eid, []);
+      byEid.get(r.eid).push(r);
+    } else {
+      orphans.push(r);
+    }
+  }
+
+  // For each Eid group, run resolution against *all* rows in the group
+  // observed within this window. If anything live emerges → emit an entry
+  // event for the resolved head. If nothing live emerges (tombstone or
+  // everything superseded inside the window) → emit a deleted event.
+  //
+  // Caveat: a tombstone in this window targeting an entry written in a
+  // PRIOR window will only show up here as the tombstone row alone. The
+  // resolver sees a single is_tombstone row, yields nothing, and we emit
+  // `deleted: true`. That's exactly what the client needs — they have the
+  // prior entry locally and need to know it's gone.
+  const events = [];
+  for (const [eid, group] of byEid) {
+    const live = resolveEntries(group);
+    if (live.length > 0) {
+      const head = live[0];
+      events.push({
+        eid,
+        txid: head.txid,
+        tags_json: head.tags_json,
+        confirmed: head.block_timestamp != null,
+        cached_at: head.cached_at,
+        blob_data: head.blob_data,
+        is_tombstone: head.is_tombstone,
+      });
+    } else {
+      // Either the group is a single tombstone row, or the resolver
+      // collapsed everything (e.g., create + tombstone in same window).
+      events.push({ eid, deleted: true });
+    }
+  }
+
+  // Orphans (no Eid) pass through individually as live events. Don't try
+  // to resolve them — without an Eid there's no group to resolve over.
+  for (const r of orphans) {
+    if (r.is_tombstone) continue; // tombstones need an Eid to be meaningful
+    events.push({
+      eid: null,
+      txid: r.txid,
+      tags_json: r.tags_json,
+      confirmed: r.block_timestamp != null,
+      cached_at: r.cached_at,
+      blob_data: r.blob_data,
+    });
+  }
+
+  // Cursor advances past the last *input* row, not the last event. Critical:
+  // grouping by Eid can collapse N rows to 1 event, but we still need to
+  // skip past all N rows on the next call.
+  const lastRow = rows[rows.length - 1];
+  return {
+    events,
+    nextCursor: { cachedAt: lastRow.cached_at, txid: lastRow.txid },
+    hasMore: rows.length === limit,
+  };
+}
+
+/**
+ * Resolve the single live entry for a (app, type, dlk, eid) tuple, including
+ * blob bytes. Returns null if no live entry exists.
+ *
+ * Used by the list endpoint's Eid-filter fast path (delete/update/get on the
+ * Collection surface). Including blob_data here is safe because Eid is unique
+ * per (app, collection, primaryKey) and resolveEntries collapses any
+ * Prev-chain down to one head — at most one row's worth of bytes ever lands
+ * in the response.
+ */
+export async function getResolvedEntryByEid(db, app, type, dataLookupKey, eid) {
+  const all = await db.prepare(
+    `SELECT txid, app, type, wallet_addr, lookup_key, eid, prev_txid,
+            is_tombstone, tombstone_ref, block_timestamp, tags_json, cached_at, blob_data
+     FROM entries WHERE app = ?1 AND type = ?2 AND lookup_key = ?3 AND eid = ?4`
+  ).bind(app, type, dataLookupKey, eid).all();
+
+  const rows = all.results || [];
+  const live = resolveEntries(rows);
+  return live[0] || null;
+}
+
 // ============ SINGLE ENTRY ============
 
 export async function getEntryByTxid(db, txid) {

@@ -866,6 +866,21 @@ GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}
 No auth required. IP rate-limited.
 Returns resolved entries (tombstones applied, Prev-chains resolved).
 Client downloads + decrypts blobs from Arweave gateways.
+
+Optional &eid={eid} filter — returns at most one live entry (the resolved
+head for that Eid). Blob bytes are inlined as base64 in the entry's `data`
+field; no follow-up per-txid fetch needed. The SDK uses this for any
+single-record lookup (delete / update / get / share-state) so it doesn't
+sweep the whole collection to find one record's txid.
+
+Optional &since={cursor} filter — delta-sync mode. Returns events that
+have occurred since the cursor, indexed by Eid:
+  - Created / updated: { eid, txid, tags, data: <base64 blob> }
+  - Deleted:           { eid, deleted: true }
+Blobs are inlined for live events (page-bounded at 25 entries). The
+response's pagination.cursor is the opaque cursor to pass on the next
+poll. The protocol-level tombstone row never appears on the wire — the
+server resolves it into a semantic deletion event.
 ```
 
 ### 5. Update data
@@ -1148,9 +1163,13 @@ POST /api/v1/entries/batch
   Max 100 entries per batch. Counts as 1 rate-limit hit.
   Rules evaluated once for the entire batch (max_entries checks count + batchSize).
 
-GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}
+GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}[&eid={eid}|&since={cursor}]
   Auth: none (IP rate-limited)
-  Returns: { entries: [{ txid, tags }], total }
+  Returns: { entries: [...], pagination: { cursor?, hasMore? } }
+  Default: metadata-only list of resolved live entries.
+  With &eid=: returns at most one resolved entry with blob inlined as `data`.
+  With &since=: delta events ({ eid, txid, tags, data } | { eid, deleted: true }),
+                blob inlined, page-bounded (25), pagination.cursor advances.
 
 PUT /api/v1/entries/{prior_txid}
   Auth: JWT

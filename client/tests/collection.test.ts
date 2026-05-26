@@ -127,6 +127,18 @@ class MockTarnClient implements ITarnClient {
     return this.entries.filter((e) => e.tags.some((t) => t.name === 'Type' && t.value === type));
   }
 
+  // Narrowed Eid lookup. Tracked separately so tests can assert call shape and
+  // confirm callers stopped using getEntries for single-record lookups.
+  getEntryByEidCalls: Array<{ type: string; eid: string }> = [];
+  async getEntryByEid(type: string, eid: string): Promise<DecryptedEntry | null> {
+    this.getEntryByEidCalls.push({ type, eid });
+    const match = this.entries.find((e) =>
+      e.tags.some((t) => t.name === 'Type' && t.value === type) &&
+      e.tags.some((t) => t.name === 'Eid' && t.value === eid),
+    );
+    return match ?? null;
+  }
+
   // ---- Blob / shareKey helpers ----
 
   async getShareKey(txid: string): Promise<string | null> {
@@ -535,11 +547,13 @@ describe('Collection.delete', () => {
     assert.equal(eidTag.value, expectedEid);
   });
 
-  it('throws TarnCollectionError when the record does not exist', async () => {
-    await assert.rejects(
-      () => books.delete('does-not-exist'),
-      TarnCollectionError,
-    );
+  it('is idempotent: missing record returns silently with no delete call', async () => {
+    // delete() used to throw TarnCollectionError on a missing primaryKey.
+    // After the Eid-lookup refactor it became idempotent — REST DELETE
+    // semantics, and the previous behavior turned retry loops into death
+    // loops when a record was already gone.
+    await books.delete('does-not-exist'); // must not throw
+    assert.equal(mock.deleteCalls.length, 0, 'no delete call should be issued for a missing record');
   });
 });
 

@@ -75,6 +75,16 @@ export interface ITarnClient {
 
   getEntries(type: string): Promise<DecryptedEntry[]>;
 
+  /**
+   * Resolve the single live entry for a (type, eid) pair. Eid is deterministic
+   * from (appId, collection, primaryKey) so the SDK can compute it locally and
+   * issue a narrow lookup instead of fetching every entry in the collection
+   * just to find one. The API filters at the SQL layer and inlines the blob,
+   * so this is one round trip end-to-end. Returns null if no live entry
+   * exists for that Eid (already tombstoned, or never written).
+   */
+  getEntryByEid(type: string, eid: string): Promise<DecryptedEntry | null>;
+
   // ---- Blob / shareKey helpers ----
 
   /** Resolve the shareKey for a txid (cache + fallback unwrap). Null on miss. */

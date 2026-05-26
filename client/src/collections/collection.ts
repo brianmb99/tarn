@@ -8,13 +8,11 @@
  *   - SchemaV tagging so future migrations can dispatch by version
  *   - primaryKey-keyed addressing — apps never see txids
  *
- * Read path note: each `get` / `list` issues one `getEntries(collectionName)`
- * call to the underlying client, which already returns one decrypted entry
- * per live record (the API's resolver collapses Prev chains and tombstones
- * server-side). This makes `get(pk)` an O(N) client-side filter today; it
- * is fast enough for the record counts we expect, and a per-collection
- * in-memory cache is a straightforward optimization to add in a later
- * step if it becomes worth the bookkeeping.
+ * Read path: single-record operations (`get`, `update`, `delete`, `share`,
+ * `shareWithAll`) compute the Eid locally from the primaryKey and issue a
+ * narrow `getEntryByEid` lookup — one round trip, one decrypted blob,
+ * regardless of how many other records exist in the collection. `list()`
+ * is the only path that legitimately fans out across every entry.
  */
 
 import type { CollectionDef, CollectionRecord } from '../schema/index.js';
@@ -111,20 +109,24 @@ export class Collection<TRecord extends Record<string, unknown>> {
   }
 
   /**
-   * Tombstone the record. Idempotent at the protocol layer; calling delete
-   * on an already-deleted record throws TarnCollectionError because the
-   * underlying entry is no longer in the live set.
+   * Tombstone the record. Idempotent — calling delete on a primaryKey that
+   * has no live entry (already tombstoned, or never written) returns
+   * successfully without contacting the protocol layer. This matches REST
+   * DELETE semantics and prevents retry loops from latching into permanent
+   * errors when the work has already been done.
    */
   async delete(primaryKey: string): Promise<void> {
-    const { entry } = await this.#findCurrent(primaryKey);
     const eid = await deriveEid(this.#appId, this.#name, primaryKey);
+    const entry = await this.#client.getEntryByEid(this.#name, eid);
+    if (!entry) return;
     await this.#client.deleteEntry(entry.txid, this.#name, this.#protocolTags(eid));
   }
 
   /** Return the live record for this primaryKey, or null if absent. */
   async get(primaryKey: string): Promise<TRecord | null> {
-    const all = await this.list();
-    return all.find((r) => this.#primaryKeyOf(r) === primaryKey) ?? null;
+    const eid = await deriveEid(this.#appId, this.#name, primaryKey);
+    const entry = await this.#client.getEntryByEid(this.#name, eid);
+    return entry ? (entry.data as TRecord) : null;
   }
 
   /** Return all live records in this collection. Returns [] if none. */
@@ -291,16 +293,14 @@ export class Collection<TRecord extends Record<string, unknown>> {
 
   /** Locate the live txid + decoded record for a primaryKey, or throw. */
   async #findCurrent(primaryKey: string): Promise<{ entry: DecryptedEntry; current: TRecord }> {
-    const entries = await this.#client.getEntries(this.#name);
-    for (const e of entries) {
-      const candidate = e.data as TRecord;
-      if (this.#primaryKeyOf(candidate) === primaryKey) {
-        return { entry: e, current: candidate };
-      }
+    const eid = await deriveEid(this.#appId, this.#name, primaryKey);
+    const entry = await this.#client.getEntryByEid(this.#name, eid);
+    if (!entry) {
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': no record with primaryKey '${primaryKey}'`,
+      );
     }
-    throw new TarnCollectionError(
-      `Collection '${this.#name}': no record with primaryKey '${primaryKey}'`,
-    );
+    return { entry, current: entry.data as TRecord };
   }
 
   #extractPrimaryKey(record: Record<string, unknown>): string {

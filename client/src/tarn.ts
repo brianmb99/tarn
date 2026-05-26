@@ -56,6 +56,8 @@ import {
   getOrCreateWrappingKey,
   clearWrappingKey,
 } from './session-persistence.js';
+import { getCachedBlob, setCachedBlob } from './blob-cache.js';
+import { getCursor, setCursor } from './sync-cursor.js';
 import {
   deriveInboxTag,
   recentInboxWindows,
@@ -2709,6 +2711,11 @@ export class TarnClient {
     }
 
     this.#cacheShareKey(json.id, shareKey);
+    // Pre-populate the blob cache: we already have the ciphertext we just
+    // wrote, so a same-device read of this entry needs zero blob fetches.
+    if (this.#dataLookupKey) {
+      await setCachedBlob(this.#appId, this.#dataLookupKey, json.id, encrypted);
+    }
     return { txid: json.id, shareKey };
   }
 
@@ -2734,6 +2741,7 @@ export class TarnClient {
     // response.
     const entries = [];
     const shareKeys = [];
+    const encryptedBytes: Uint8Array[] = [];
     for (const item of items) {
       const { encrypted, tags: cryptoTags, shareKey } = await this.#encryptForWrite(item);
       const tags = [
@@ -2747,6 +2755,7 @@ export class TarnClient {
       const data = btoa(String.fromCharCode(...encrypted));
       entries.push({ data, tags });
       shareKeys.push(shareKey);
+      encryptedBytes.push(encrypted);
     }
 
     // Batch idempotency: one key for the whole batch. Server stores the full
@@ -2766,6 +2775,10 @@ export class TarnClient {
       const txid = returned[i].txid;
       const shareKey = shareKeys[i] ?? null;
       this.#cacheShareKey(txid, shareKey);
+      const bytes = encryptedBytes[i];
+      if (bytes && this.#dataLookupKey) {
+        await setCachedBlob(this.#appId, this.#dataLookupKey, txid, bytes);
+      }
       out.push({ txid, shareKey });
     }
     return out;
@@ -2850,6 +2863,135 @@ export class TarnClient {
   }
 
   /**
+   * Delta-sync read: returns the events that have happened since the last
+   * call (or since the beginning, on first call). The SDK maintains the
+   * cursor internally — persisted in IndexedDB per (appId, dlk, type), so
+   * subsequent calls across page reloads pick up exactly where the previous
+   * one stopped.
+   *
+   * Return shape:
+   *   - `entries`: full decrypted records that were created or updated since
+   *     the cursor, indexed by Eid. The caller upserts these into local
+   *     state, keyed by Eid (not txid) — Eid is stable across updates.
+   *   - `deleted`: Eids whose live entry was tombstoned since the cursor.
+   *     The caller removes these from local state by Eid.
+   *
+   * Pagination is handled internally: the SDK loops until `hasMore: false`
+   * and returns the aggregated delta in one call. Catch-up after a long
+   * inactivity may take several round trips but the caller doesn't see them.
+   *
+   * Tombstones do NOT cross the wire as protocol-level rows — the server
+   * resolves them and emits `{ eid, deleted: true }` events. Updates show
+   * up as the latest version only (Prev-chain hidden), same way the typed
+   * Collection<T> surface presents them.
+   */
+  async getEntriesSince(type: string): Promise<{
+    entries: Array<{ eid: string | null; txid: string; data: any; tags: any[] }>;
+    deleted: string[];
+  }> {
+    await this.#requireAuth();
+    if (!this.#dataLookupKey) {
+      throw new Error('getEntriesSince(): not logged in');
+    }
+
+    const aggregatedEntries: Array<{ eid: string | null; txid: string; data: any; tags: any[] }> = [];
+    const aggregatedDeleted: string[] = [];
+
+    let cursor = (await getCursor(this.#appId, this.#dataLookupKey, type)) ?? '0:';
+
+    // Loop until we drain the delta. Each iteration is bounded by the
+    // server's page cap (~25 events). Typical case: 1 page with 0 events
+    // (warm poll, nothing changed). Catch-up after a long pause may take
+    // several pages but converges deterministically because the cursor
+    // advances past every input row.
+    for (let safety = 0; safety < 200; safety++) {
+      const url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&since=${encodeURIComponent(cursor)}`;
+      const res = await this.#fetch(url);
+      if (res.status !== 200) {
+        throw new Error(`getEntriesSince failed: ${res.json?.error || res.status}`);
+      }
+
+      const wireEntries = res.json.entries || [];
+      for (const evt of wireEntries) {
+        if (evt.deleted) {
+          if (evt.eid) aggregatedDeleted.push(evt.eid);
+          continue;
+        }
+        if (!evt.data) {
+          // Server should only send data:null for delete events; defensive skip.
+          continue;
+        }
+        const blobBytes = base64ToBytes(evt.data);
+        // Same as the ?eid= path: write the inline blob to the cache so a
+        // subsequent #fetchBlob(txid) hits IDB instead of going back over
+        // the network. The bytes we already have are the bytes the caller
+        // would need.
+        await setCachedBlob(this.#appId, this.#dataLookupKey, evt.txid, blobBytes);
+        const data = await this.#decryptBlob(blobBytes, evt.tags);
+        aggregatedEntries.push({
+          eid: evt.eid ?? null,
+          txid: evt.txid,
+          data,
+          tags: evt.tags,
+        });
+      }
+
+      cursor = res.json.pagination?.cursor ?? cursor;
+      if (!res.json.pagination?.hasMore) break;
+    }
+
+    // Persist the final cursor so the next call resumes from here. We do
+    // this after the whole loop succeeds — if a mid-loop request fails, we
+    // re-sync the same window next time, which is safe (idempotent: applying
+    // the same events twice produces the same state by Eid).
+    await setCursor(this.#appId, this.#dataLookupKey, type, cursor);
+
+    return { entries: aggregatedEntries, deleted: aggregatedDeleted };
+  }
+
+  /**
+   * Resolve the single live entry for a (type, eid) pair in one round trip.
+   *
+   * Eid is deterministic from (appId, collection, primaryKey), so callers
+   * can compute it on-device and issue a narrow lookup — collapsing the
+   * N+1 fan-out that the old "fetch all + filter" path produced for any
+   * single-record operation (delete / update / get / share-state lookups).
+   *
+   * The API returns the resolved head (Prev-chain + tombstone collapsing
+   * already applied server-side) with blob bytes inline, so this method
+   * fetches and decrypts in a single network round trip. Returns null
+   * if no live entry exists for that Eid.
+   */
+  async getEntryByEid(type: string, eid: string): Promise<any> {
+    await this.#requireAuth();
+
+    const url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&eid=${encodeURIComponent(eid)}`;
+    const res = await this.#fetch(url);
+    if (res.status !== 200) {
+      throw new Error(`Get entry by eid failed: ${res.json?.error || res.status}`);
+    }
+
+    const entries = res.json.entries || [];
+    if (entries.length === 0) return null;
+    const entry = entries[0];
+
+    // Tombstones come back with data: null. A tombstone means no live entry —
+    // surface that as null to the caller, consistent with "Eid has no live row."
+    if (!entry.data) return null;
+
+    const blobBytes = base64ToBytes(entry.data);
+    // Populate the blob cache so a subsequent #fetchBlob(txid) on this
+    // record hits IDB instead of the network. Txids are content-addressed
+    // (Arweave) — bytes never change — so caching the inline blob alongside
+    // the fan-out fetch path is correct without any invalidation logic.
+    if (this.#dataLookupKey) {
+      await setCachedBlob(this.#appId, this.#dataLookupKey, entry.txid, blobBytes);
+    }
+    const data = await this.#decryptBlob(blobBytes, entry.tags);
+    return { txid: entry.txid, data, tags: entry.tags };
+  }
+
+  /**
    * Update an existing entry.
    * @param {string} priorTxid
    * @param {string} type - Entry type
@@ -2889,6 +3031,9 @@ export class TarnClient {
     // Each update generates a fresh shareKey (CEK is per-content); cache it
     // so a subsequent share() call resolves without an unwrap round trip.
     this.#cacheShareKey(json.id, shareKey);
+    if (this.#dataLookupKey) {
+      await setCachedBlob(this.#appId, this.#dataLookupKey, json.id, encrypted);
+    }
     return { txid: json.id, shareKey };
   }
 
@@ -5508,16 +5653,11 @@ export class TarnClient {
    * content_id. Returns `{ txid, data }` or null if no entry exists yet.
    *
    * The connections + pending records use type='tarn-share-state' with
-   * Eid=<content_id>. Resolution dedupes by Eid + Prev chain so we get the
-   * single live version.
+   * Eid=<content_id>, so the contentId IS the Eid tag value. One narrow
+   * API lookup — no fan-out across the type.
    */
   async #findShareStateEntry(contentId: string): Promise<any> {
-    const entries = await this.getEntries('tarn-share-state');
-    for (const e of entries) {
-      const eid = e.tags?.find((t: any) => t.name === 'Eid')?.value;
-      if (eid === contentId) return e;
-    }
-    return null;
+    return await this.getEntryByEid('tarn-share-state', contentId);
   }
 
   async #writeShareStateEntry(contentId: string, state: any, newRecord: any): Promise<any> {
@@ -6172,6 +6312,16 @@ export class TarnClient {
   }
 
   async #fetchBlob(txid: string): Promise<Uint8Array | null> {
+    // Cache check first. Txids are Arweave content hashes — blob bytes are
+    // immutable forever — so a cache hit needs no validation. This collapses
+    // warm-list reads from N network round trips to zero, which is the
+    // primary lever against the 300/hr IP rate-limit budget for users with
+    // non-trivial collection sizes.
+    if (this.#dataLookupKey) {
+      const cached = await getCachedBlob(this.#appId, this.#dataLookupKey, txid);
+      if (cached) return cached;
+    }
+
     // Single source of truth: Tarn's per-entry endpoint. Tarn serves
     // blob_data from D1 (populated via write-through on writes, lazy-loaded
     // from a public Arweave gateway on cold-bootstrap reads), so it covers
@@ -6189,7 +6339,13 @@ export class TarnClient {
         const text = await res.text();
         try {
           const json = JSON.parse(text);
-          if (json?.data) return base64ToBytes(json.data);
+          if (json?.data) {
+            const bytes = base64ToBytes(json.data);
+            if (this.#dataLookupKey) {
+              await setCachedBlob(this.#appId, this.#dataLookupKey, txid, bytes);
+            }
+            return bytes;
+          }
         } catch {}
       }
     } catch {}

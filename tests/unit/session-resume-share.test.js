@@ -125,13 +125,20 @@ describe('Gap D — share-key cold-path recovery after session resume', () => {
     // ============ Phase 3: cold-path getShareKey on the fresh client ============
     // The resumed client's #shareKeyCache is empty by construction. Calling
     // getShareKey must hit #recoverShareKey, which:
-    //   1. fetches GET /api/v1/entries/{txid}
+    //   1. fetches the blob (from IndexedDB blob cache, or network on miss)
     //   2. slices the wrapped CEK from the blob
     //   3. AES-KW-unwraps with the resumed DEK
     //   4. base64url-encodes the raw CEK bytes
     // The result must equal the shareKey we captured pre-reload.
+    //
+    // Same-process resume hits the ciphertext blob cache (the IDB shim is
+    // process-global, and createEntry pre-populated it under this dlk),
+    // so no network fetch is needed. That's the intended optimization —
+    // the substantive test below is that the DEK-unwrap recovery produces
+    // the same shareKey.
     pushFetch([
-      // GET /api/v1/entries/{txid}: the blob fetch
+      // GET /api/v1/entries/{txid}: still queued in case the cache misses
+      // for any reason (e.g., if test ordering ever leaves IDB pristine).
       {
         status: 200,
         body: JSON.stringify({
@@ -148,13 +155,6 @@ describe('Gap D — share-key cold-path recovery after session resume', () => {
       originalShareKey,
       'cold-path-recovered shareKey must equal the original',
     );
-
-    // Verify we actually used the cold path — there should have been a GET
-    // for the blob during the recovery call.
-    const blobFetchCall = fetchCalls.find(c =>
-      c.url.endsWith(`/api/v1/entries/${txid}`) && c.method === 'GET'
-    );
-    assert.ok(blobFetchCall, 'cold path should have fetched the blob via GET /api/v1/entries/{txid}');
   });
 
   it('cold path returns null for an unknown txid (non-existent blob)', async () => {

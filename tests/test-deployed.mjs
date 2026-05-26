@@ -286,7 +286,171 @@ await test('batchCreate rejects 26+ items', async () => {
   assert(/max 25/i.test(caught.message), `unexpected error: ${caught.message}`);
 });
 
-// ============ 5b. SESSION PERSISTENCE (Section 7, issue #19) ============
+// ============ 5b. EID-NARROWED READ PATH ============
+//
+// Verifies the API's ?eid= filter and the SDK's getEntryByEid wrapper. This
+// is the read path that delete / update / get / share-state lookups all use
+// now — before the change they swept the entire collection and decrypted
+// every blob just to find one record's txid. Regressions here would
+// reintroduce the 300/hr rate-limit issue for any user with non-trivial
+// collection sizes.
+
+console.log('\n=== 5b. Eid-narrowed read path ===');
+
+await test('?eid= filter returns at most one live entry with inline blob', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+
+  // Write an entry tagged with a unique Eid so we can target it precisely.
+  const eidType = `eid-probe-${Date.now()}`;
+  const eid = `eid-${crypto.randomUUID()}`;
+  const { txid } = await tarn.createEntry(
+    eidType,
+    { marker: 'eid-roundtrip', t: Date.now() },
+    [{ name: 'Eid', value: eid }],
+  );
+  assert(txid, 'createEntry must return a txid');
+
+  await sleep(500); // write-through to D1
+
+  // Raw API call to prove the filter works at the SQL layer.
+  const res = await fetch(
+    `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${eidType}&key=${testDlk}&eid=${encodeURIComponent(eid)}`,
+  );
+  const json = await res.json();
+  assert(res.status === 200, `?eid= filter returned ${res.status}`);
+  assert(Array.isArray(json.entries), 'response missing entries array');
+  assert(json.entries.length === 1, `expected exactly 1 entry, got ${json.entries.length}`);
+  assert(json.entries[0].txid === txid, 'returned entry txid mismatch');
+  assert(json.entries[0].eid === eid, 'returned eid mismatch');
+  assert(typeof json.entries[0].data === 'string' && json.entries[0].data.length > 0,
+    'Eid-filtered response must inline the encrypted blob');
+});
+
+await test('getEntryByEid decrypts and returns the single matching record', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+
+  const eidType = `eid-sdk-${Date.now()}`;
+  const eid = `eid-${crypto.randomUUID()}`;
+  const payload = { marker: 'sdk-eid-roundtrip', t: Date.now() };
+  await tarn.createEntry(eidType, payload, [{ name: 'Eid', value: eid }]);
+
+  await sleep(500);
+
+  const got = await tarn.getEntryByEid(eidType, eid);
+  assert(got, 'getEntryByEid returned null for a record that exists');
+  assert(got.data?.marker === payload.marker && got.data?.t === payload.t,
+    `decrypted payload mismatch: got ${JSON.stringify(got.data)}`);
+
+  const miss = await tarn.getEntryByEid(eidType, 'eid-not-real');
+  assert(miss === null, 'getEntryByEid must return null for an unknown Eid');
+});
+
+// ============ 5b2. DELTA-SYNC READ PATH ============
+//
+// Verifies the API's ?since= cursor filter and the SDK's getEntriesSince
+// wrapper. Polling clients use this to learn about cross-device changes
+// without re-pulling the full live set — and deletions surface as
+// semantic { eid, deleted: true } events, not raw tombstone rows.
+
+console.log('\n=== 5b2. Delta-sync read path ===');
+
+await test('?since= returns events with inline blobs and an advancing cursor', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+
+  // Establish a unique type so prior runs don't bleed in.
+  const deltaType = `delta-probe-${Date.now()}`;
+  const eid = `eid-${crypto.randomUUID()}`;
+  await tarn.createEntry(
+    deltaType,
+    { marker: 'delta-first', t: Date.now() },
+    [{ name: 'Eid', value: eid }],
+  );
+  await sleep(500);
+
+  // First sync from the beginning.
+  const url1 = `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${deltaType}&key=${testDlk}&since=${encodeURIComponent('0:')}`;
+  const res1 = await fetch(url1);
+  const json1 = await res1.json();
+  assert(res1.status === 200, `delta first sync returned ${res1.status}`);
+  assert(Array.isArray(json1.entries), 'response missing entries array');
+  assert(json1.entries.length >= 1, `expected ≥1 entry, got ${json1.entries.length}`);
+  const matchedEntry = json1.entries.find((e) => e.eid === eid);
+  assert(matchedEntry, 'just-written entry should appear in delta');
+  assert(typeof matchedEntry.data === 'string' && matchedEntry.data.length > 0,
+    'delta event must inline the blob');
+  assert(typeof json1.pagination?.cursor === 'string', 'response must carry a cursor');
+
+  // Second sync with the cursor: should see zero new events (nothing changed).
+  const cursor = json1.pagination.cursor;
+  const url2 = `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${deltaType}&key=${testDlk}&since=${encodeURIComponent(cursor)}`;
+  const res2 = await fetch(url2);
+  const json2 = await res2.json();
+  assert(res2.status === 200, `delta warm sync returned ${res2.status}`);
+  assert(json2.entries.length === 0, `warm sync should see zero events, got ${json2.entries.length}`);
+});
+
+await test('deletion surfaces as { eid, deleted: true } — no tombstone leakage', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+
+  const deltaType = `delta-del-${Date.now()}`;
+  const eid = `eid-${crypto.randomUUID()}`;
+  const { txid } = await tarn.createEntry(
+    deltaType,
+    { marker: 'will-be-deleted', t: Date.now() },
+    [{ name: 'Eid', value: eid }],
+  );
+  await sleep(500);
+
+  // Capture the cursor at the "just after the create" mark.
+  const baseUrl = `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${deltaType}&key=${testDlk}`;
+  const after1 = await fetch(`${baseUrl}&since=${encodeURIComponent('0:')}`).then((r) => r.json());
+  const cursorAfterCreate = after1.pagination.cursor;
+  // Confirm we see the live entry at this point.
+  assert(after1.entries.some((e) => e.eid === eid && !e.deleted),
+    'create event should appear as a live entry, not deleted');
+
+  // Now tombstone it via the SDK (note: deleteEntry is the low-level API
+  // path; this exercises the same protocol-level tombstone behavior the
+  // typed Collection.delete uses).
+  await tarn.deleteEntry(txid, deltaType, [{ name: 'Eid', value: eid }]);
+  await sleep(500);
+
+  // Polling with the post-create cursor should now surface the deletion as
+  // a semantic event — never as a tombstone row.
+  const after2 = await fetch(`${baseUrl}&since=${encodeURIComponent(cursorAfterCreate)}`).then((r) => r.json());
+  const deletion = after2.entries.find((e) => e.eid === eid && e.deleted === true);
+  assert(deletion, 'tombstone must surface as { eid, deleted: true } event');
+  assert(!('txid' in deletion) || !deletion.data,
+    'deletion event should not carry blob data');
+  // Belt: no event in the response should mention "tombstone" — that
+  // vocabulary stays server-side.
+  for (const evt of after2.entries) {
+    assert(!('tombstone' in evt), 'wire-level tombstone field must not appear in delta events');
+  }
+});
+
+await test('getEntriesSince persists cursor across calls', async () => {
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+
+  const deltaType = `delta-sdk-${Date.now()}`;
+  await tarn.createEntry(deltaType, { id: 'a' }, [{ name: 'Eid', value: `eid-a-${crypto.randomUUID()}` }]);
+  await sleep(500);
+
+  const first = await tarn.getEntriesSince(deltaType);
+  assert(first.entries.length >= 1, `first sync should see ≥1 entry, got ${first.entries.length}`);
+
+  // Warm sync — cursor was persisted, so nothing new.
+  const second = await tarn.getEntriesSince(deltaType);
+  assert(second.entries.length === 0, `warm sync should see 0 entries, got ${second.entries.length}`);
+  assert(second.deleted.length === 0, `warm sync should see 0 deletions`);
+});
+
+// ============ 5c. SESSION PERSISTENCE (Section 7, issue #19) ============
 
 console.log('\n=== 5b. Session Persistence ===');
 

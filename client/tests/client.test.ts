@@ -320,6 +320,12 @@ class StubUnderlying implements IUnderlyingClient {
   async getEntries(type: string): Promise<DecryptedEntry[]> {
     return this.entries.filter((e) => e.tags.some((t) => t.name === 'Type' && t.value === type));
   }
+  async getEntryByEid(type: string, eid: string): Promise<DecryptedEntry | null> {
+    return this.entries.find((e) =>
+      e.tags.some((t) => t.name === 'Type' && t.value === type) &&
+      e.tags.some((t) => t.name === 'Eid' && t.value === eid),
+    ) ?? null;
+  }
   async getShareKey(txid: string): Promise<string | null> {
     return this.shareKeyByTxid.get(txid) ?? null;
   }
