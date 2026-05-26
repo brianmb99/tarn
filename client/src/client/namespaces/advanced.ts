@@ -98,6 +98,24 @@ export class AdvancedEntries<C extends IAdvancedClient> {
     return this.#client.deleteEntry(targetTxid, type, extraTags);
   }
 
+  /**
+   * Schema-less delta-sync. The typed wrapper is `tarn.<collection>.getEntriesSince()`,
+   * which decodes records into the collection's TS type and emits Eids
+   * alongside; this escape hatch returns the raw shape so apps without
+   * a schema-typed surface (or wanting the txid / tag stream directly)
+   * can drive their own sync loop.
+   *
+   * Cursor is shared with the typed surface — persisted per `(appId, dlk, type)`,
+   * so mixing typed and advanced calls for the same `type` is safe but
+   * usually unnecessary.
+   */
+  async getEntriesSince(type: string): Promise<{
+    entries: Array<{ eid: string | null; txid: string; data: Record<string, unknown>; tags: Tag[] }>;
+    deleted: string[];
+  }> {
+    return this.#client.getEntriesSince(type);
+  }
+
   /** Fetch encrypted blob bytes for any txid via Tarn (lazy-loads from gateway on miss). */
   async fetchBlob(txid: string): Promise<Uint8Array | null> {
     return this.#client.fetchBlob(txid);

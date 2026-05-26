@@ -85,6 +85,19 @@ export interface ITarnClient {
    */
   getEntryByEid(type: string, eid: string): Promise<DecryptedEntry | null>;
 
+  /**
+   * Delta-sync read: events that have happened since the cursor persisted
+   * for this (appId, dlk, type) scope. Returns at most one event per Eid
+   * per call (dedup is handled internally across server pages). Live
+   * events carry the decoded record + tags; deleted events carry only
+   * the Eid. Cursor is managed by the SDK — first call returns the full
+   * history, subsequent calls return only what changed.
+   */
+  getEntriesSince(type: string): Promise<{
+    entries: Array<{ eid: string | null; txid: string; data: Record<string, unknown>; tags: Tag[] }>;
+    deleted: string[];
+  }>;
+
   // ---- Blob / shareKey helpers ----
 
   /** Resolve the shareKey for a txid (cache + fallback unwrap). Null on miss. */

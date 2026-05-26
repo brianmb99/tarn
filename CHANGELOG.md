@@ -11,6 +11,24 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com). The
 
 ### Fixed
 
+- **SDK:** `getEntriesSince` is now reachable from the public typed
+  client. The original commit added the method to the bundled legacy
+  underlying class but didn't bridge it through the `TarnClient`
+  wrapper, so apps that consume the SDK via the typed surface
+  (`TarnClient.create(...)` → `tarn.<collection>` / `tarn.advanced`)
+  couldn't call it.
+
+  The method is now exposed in two places:
+    - `tarn.<collection>.getEntriesSince()` — typed, returns
+      `{ entries: Array<{ record, eid }>, deleted: string[] }`. Each
+      entry carries its Eid alongside the typed record so callers
+      can index local state by Eid (matching the `deleted` shape) or
+      by primary key with Eid as the bridge.
+    - `tarn.advanced.entries.getEntriesSince(type)` — escape hatch,
+      returns the raw shape (untyped `data`, with txid + tags).
+
+  Same cursor underlies both — persisted per `(appId, dlk, type)`.
+
 - **SDK:** `getEntriesSince` now deduplicates events by Eid across server
   pages (last event wins). Without this, an Eid whose multiple rows
   straddled a 25-row page cut could surface as both a live event and a

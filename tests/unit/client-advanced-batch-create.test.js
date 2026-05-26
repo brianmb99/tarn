@@ -41,6 +41,7 @@ function makeFakeClient() {
     async deleteEntry() { return { txid: 'unused' }; },
     async getEntries() { return []; },
     async getEntryByEid() { return null; },
+    async getEntriesSince() { return { entries: [], deleted: [] }; },
     async getShareKey() { return null; },
     async fetchBlob() { return null; },
     async decryptSharedBlob() { return {}; },

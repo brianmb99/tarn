@@ -326,6 +326,12 @@ class StubUnderlying implements IUnderlyingClient {
       e.tags.some((t) => t.name === 'Eid' && t.value === eid),
     ) ?? null;
   }
+  async getEntriesSince(_type: string): Promise<{
+    entries: Array<{ eid: string | null; txid: string; data: Record<string, unknown>; tags: Tag[] }>;
+    deleted: string[];
+  }> {
+    return { entries: [], deleted: [] };
+  }
   async getShareKey(txid: string): Promise<string | null> {
     return this.shareKeyByTxid.get(txid) ?? null;
   }
@@ -943,6 +949,15 @@ describe('TarnClient.advanced', () => {
     const stub = new StubUnderlying();
     const tarn = await makeClient(stub);
     assert.equal(typeof tarn.advanced.entries.batchCreate, 'function');
+  });
+
+  it('advanced.entries.getEntriesSince is exposed on the namespace', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    assert.equal(typeof tarn.advanced.entries.getEntriesSince, 'function');
+    // Smoke: calling it routes through the stub, returns the empty-default shape.
+    const result = await tarn.advanced.entries.getEntriesSince('any-type');
+    assert.deepEqual(result, { entries: [], deleted: [] });
   });
 
   it('advanced.entries.batchCreate forwards (type, items, extraTags) to underlying client', async () => {

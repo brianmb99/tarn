@@ -139,6 +139,22 @@ class MockTarnClient implements ITarnClient {
     return match ?? null;
   }
 
+  // Delta-sync stub. Tests inject scenarios by setting `getEntriesSinceResponse`
+  // before calling Collection.getEntriesSince(); the mock returns whatever is
+  // pre-staged. Calls are tracked for shape assertions.
+  getEntriesSinceCalls: string[] = [];
+  getEntriesSinceResponse: {
+    entries: Array<{ eid: string | null; txid: string; data: Record<string, unknown>; tags: Tag[] }>;
+    deleted: string[];
+  } = { entries: [], deleted: [] };
+  async getEntriesSince(type: string): Promise<{
+    entries: Array<{ eid: string | null; txid: string; data: Record<string, unknown>; tags: Tag[] }>;
+    deleted: string[];
+  }> {
+    this.getEntriesSinceCalls.push(type);
+    return this.getEntriesSinceResponse;
+  }
+
   // ---- Blob / shareKey helpers ----
 
   async getShareKey(txid: string): Promise<string | null> {
@@ -609,6 +625,78 @@ describe('Collection.get / list', () => {
     const all = await books.list();
     assert.equal(all.length, 1);
     assert.equal(all[0]!.bookId, 'b2');
+  });
+});
+
+// ============ Collection.getEntriesSince + eidFor ============
+
+describe('Collection.getEntriesSince', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(() => {
+    mock = new MockTarnClient();
+    books = makeBooks(mock);
+  });
+
+  it('forwards to the underlying client with this collection name', async () => {
+    await books.getEntriesSince();
+    assert.deepEqual(mock.getEntriesSinceCalls, ['books']);
+  });
+
+  it('returns typed { record, eid } pairs alongside deleted Eids', async () => {
+    mock.getEntriesSinceResponse = {
+      entries: [
+        {
+          eid: 'eid-b1',
+          txid: 'tx-1',
+          data: { bookId: 'b1', title: 'Alpha', isPrivate: false },
+          tags: [],
+        },
+        {
+          eid: 'eid-b2',
+          txid: 'tx-2',
+          data: { bookId: 'b2', title: 'Beta', isPrivate: true },
+          tags: [],
+        },
+      ],
+      deleted: ['eid-gone'],
+    };
+
+    const { entries, deleted } = await books.getEntriesSince();
+    assert.equal(entries.length, 2);
+    assert.equal(entries[0]!.record.title, 'Alpha');
+    assert.equal(entries[0]!.eid, 'eid-b1');
+    assert.equal(entries[1]!.record.title, 'Beta');
+    assert.deepEqual(deleted, ['eid-gone']);
+  });
+
+  it('drops orphan events (no Eid) — typed Collection always writes with Eid', async () => {
+    mock.getEntriesSinceResponse = {
+      entries: [
+        { eid: null, txid: 'tx-orphan', data: { bookId: 'lost' }, tags: [] },
+        { eid: 'eid-real', txid: 'tx-1', data: { bookId: 'b1', title: 'kept', isPrivate: false }, tags: [] },
+      ],
+      deleted: [],
+    };
+
+    const { entries } = await books.getEntriesSince();
+    assert.equal(entries.length, 1, 'orphan event should be dropped');
+    assert.equal(entries[0]!.eid, 'eid-real');
+  });
+});
+
+describe('Collection.eidFor', () => {
+  it('returns the same Eid that create() attaches to the entry', async () => {
+    const mock = new MockTarnClient();
+    const books = makeBooks(mock);
+
+    await books.create({ bookId: 'b1', title: 'X', isPrivate: false });
+    const eidFromCreate = mock.createCalls[0]!.extraTags.find((t) => t.name === 'Eid')!.value;
+
+    const eidFromHelper = await books.eidFor('b1');
+    assert.equal(eidFromHelper, eidFromCreate,
+      'Collection.eidFor must match the Eid the protocol layer stamps on writes');
   });
 });
 

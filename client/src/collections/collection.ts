@@ -129,6 +129,66 @@ export class Collection<TRecord extends Record<string, unknown>> {
     return entry ? (entry.data as TRecord) : null;
   }
 
+  /**
+   * Delta-sync read: returns the events that have happened in this
+   * collection since the last `getEntriesSince()` call. First call returns
+   * the full live state; subsequent calls return only what changed.
+   *
+   * Each entry comes with its Eid alongside the typed record so the caller
+   * can index local state by Eid (matching the `deleted` shape) — or by
+   * primary key, with Eid as the bridge. Eid is deterministic from
+   * `(appId, collectionName, primaryKey)`; use `collection.eidFor(pk)` if
+   * you need to compute it for a record you already have locally.
+   *
+   * The SDK guarantees at most one event per Eid per call (dedup across
+   * server pages, latest event wins). A `create → delete → recreate`
+   * sequence within one window surfaces as a single live event with the
+   * recreated data — the transient deletion is invisible. Apply `entries`
+   * and `deleted` in either order; the result is identical.
+   *
+   * Cursor is persisted in IndexedDB per `(appId, dlk, collectionName)`.
+   * A cleared cursor (private mode, fresh device, cleared site data)
+   * naturally triggers a full re-sync on the next call.
+   */
+  async getEntriesSince(): Promise<{
+    entries: Array<{ record: TRecord; eid: string }>;
+    deleted: string[];
+  }> {
+    const raw = await this.#client.getEntriesSince(this.#name);
+    const entries: Array<{ record: TRecord; eid: string }> = [];
+    for (const e of raw.entries) {
+      if (!e.eid) {
+        // Orphan event (no Eid tag — legacy or malformed write). Typed
+        // Collection drops these: every well-formed Collection write
+        // carries an Eid (set in #protocolTags), so an orphan is by
+        // construction not a record this Collection produced.
+        console.warn(
+          `[TarnClient] Collection '${this.#name}': dropping orphan delta event for txid ${e.txid}`,
+        );
+        continue;
+      }
+      try {
+        entries.push({ record: e.data as TRecord, eid: e.eid });
+      } catch (err) {
+        console.warn(
+          `[TarnClient] Collection '${this.#name}': skipping malformed delta entry ${e.txid}: `,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    return { entries, deleted: raw.deleted };
+  }
+
+  /**
+   * Derive the Eid for a primaryKey under this collection. Cheap, pure
+   * function of `(appId, collectionName, primaryKey)` — no network. Useful
+   * for callers that index their local store by primaryKey and need to
+   * map an Eid (from `getEntriesSince`) back to a primaryKey.
+   */
+  async eidFor(primaryKey: string): Promise<string> {
+    return await deriveEid(this.#appId, this.#name, primaryKey);
+  }
+
   /** Return all live records in this collection. Returns [] if none. */
   async list(_opts: ListOpts = {}): Promise<TRecord[]> {
     const entries = await this.#client.getEntries(this.#name);
