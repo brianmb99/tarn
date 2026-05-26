@@ -134,11 +134,15 @@ await test('App sets free-tier rules for new user', async () => {
   assert(vRes.status === 200, `Verify failed: ${vRes.status}`);
   const { jwt } = await vRes.json();
 
-  // Set rules
+  // Set rules. limit must cover all writes across sections 5, 5a, 5b, 5b2
+  // on the same account: 1 (section 5 single create + idempotent retry
+  // which dedupes) + 5 (5a batchCreate) + 2 (5b eid writes) + 3 (5b2 delta
+  // writes) = 11. Use 20 for headroom — matches the pattern other deep
+  // sections (handshake/share-log/etc.) use when they set rules themselves.
   const rulesRes = await fetch(`${API_BASE}/api/v1/accounts/${testDlk}/rules`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
-    body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 5, app: APP_ID }, { type: 'max_bytes', limit: 102400 }] }),
+    body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 20, app: APP_ID }, { type: 'max_bytes', limit: 102400 }] }),
   });
   assert(rulesRes.status === 200, `Set rules failed: ${rulesRes.status}`);
 });
@@ -594,10 +598,9 @@ await test('Two test users register + complete a mutual handshake against the de
   // Note: we don't need to set rules for the connections + pending records
   // because Bookish's standard rules (max_entries with no entry_type filter,
   // max_bytes) apply per-app. The test creates only a few share-state
-  // entries — well under the limit. If max_entries were lower than ~5 the
-  // test would fail; the smoke-test rule set is `max_entries: 5, app:
-  // bookish` and we use 2 entries per user (connections + pending), so we have
-  // headroom.
+  // entries — well under the limit. The smoke-test rule set is
+  // `max_entries: 20, app: bookish` (see Section 3) and we use 2 entries
+  // per user (connections + pending), so we have plenty of headroom.
   handshakeAliceUsername = `deploy-handshake-a-${Date.now()}@test.com`;
   handshakeBobUsername = `deploy-handshake-b-${Date.now()}@test.com`;
   const password = 'handshake-test-' + Date.now();
