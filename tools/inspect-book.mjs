@@ -70,6 +70,8 @@ const bookIdFilter = arg('--book-id');
 const statusFields = (arg('--status-fields', 'status,completed,isComplete,completedAt') || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const showAll = flag('--all');
+const fullDump = flag('--full');
+const keysOnly = flag('--keys-only');
 
 if (!email || !password) {
   console.error('Missing credentials. Set TARN_EMAIL + TARN_PASSWORD env vars or pass --email + --password.');
@@ -152,6 +154,21 @@ function tag(tags, name) {
   return tags.find((t) => t.name === name)?.value ?? null;
 }
 
+// Fetch the per-entry metadata directly from the API so we can show
+// cachedAt alongside each version — it's not surfaced by the SDK's
+// getEntriesSince() output today, but the single-entry endpoint
+// returns it.
+async function fetchEntryMetadata(txid) {
+  try {
+    const res = await fetch(`${apiBase}/api/v1/entries/${txid}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return { cachedAt: json.cachedAt, confirmed: json.confirmed };
+  } catch {
+    return null;
+  }
+}
+
 for (const event of matched) {
   const rec = event.data ?? {};
   const title = rec[titleField] ?? '(no title)';
@@ -162,15 +179,32 @@ for (const event of matched) {
   console.log(`PrimaryKey: ${primaryKeyField}=${bookId}`);
   console.log();
 
+  const meta = await fetchEntryMetadata(event.txid);
+
   console.log('--- Live (server-resolved head) ---');
   console.log(`  txid:       ${event.txid}`);
+  if (meta?.cachedAt != null) {
+    const dt = new Date(meta.cachedAt).toISOString();
+    console.log(`  cachedAt:   ${meta.cachedAt}  (${dt})`);
+  }
   console.log(`  Eid (tag):  ${formatEid(event.eid)}`);
   console.log(`  Prev (tag): ${tag(event.tags, 'Prev') ?? '(none)'}`);
   console.log(`  SchemaV:    ${tag(event.tags, 'SchemaV') ?? '(none)'}`);
   console.log(`  Gateway:    https://arweave.net/${event.txid}`);
   console.log(`  Tags:       ${formatTags(event.tags)}`);
 
-  if (statusFields.length > 0) {
+  if (keysOnly) {
+    console.log(`  Decoded record keys (no values shown — use --full for values):`);
+    const keys = Object.keys(rec).sort();
+    for (const k of keys) {
+      const t = typeof rec[k];
+      console.log(`    ${k}  (${t})`);
+    }
+  } else if (fullDump) {
+    console.log(`  Full decoded record:`);
+    const json = JSON.stringify(rec, null, 2);
+    for (const line of json.split('\n')) console.log(`    ${line}`);
+  } else if (statusFields.length > 0) {
     console.log(`  Status fields on decoded record:`);
     for (const field of statusFields) {
       const value = rec[field];
