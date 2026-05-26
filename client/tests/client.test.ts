@@ -280,21 +280,27 @@ class StubUnderlying implements IUnderlyingClient {
   }
   // Records the most recent batchCreate args so tests can assert
   // forwarding fidelity without re-stubbing the method.
-  batchCreateCalls: Array<{ type: string; items: Array<Record<string, unknown>>; extraTags: Tag[] }> = [];
+  batchCreateCalls: Array<{ type: string; items: Array<Record<string, unknown>>; extraTagsPerItem: Tag[][] }> = [];
   async batchCreate(
     type: string,
     items: Array<Record<string, unknown>>,
-    extraTags: Tag[] = [],
+    extraTagsPerItem: Tag[][] = [],
   ) {
-    this.batchCreateCalls.push({ type, items: items.slice(), extraTags: extraTags.slice() });
+    this.batchCreateCalls.push({
+      type,
+      items: items.slice(),
+      extraTagsPerItem: extraTagsPerItem.map((t) => t.slice()),
+    });
     const out: Array<{ txid: string; shareKey: string | null }> = [];
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!;
+      const perItem = extraTagsPerItem[i] ?? [];
       const txid = this.#nextTxid();
       const shareKey = this.#nextShareKey();
       this.entries.push({
         txid,
         data: { ...item },
-        tags: [{ name: 'Type', value: type }, ...extraTags],
+        tags: [{ name: 'Type', value: type }, ...perItem],
       });
       this.shareKeyByTxid.set(txid, shareKey);
       out.push({ txid, shareKey });
@@ -960,19 +966,58 @@ describe('TarnClient.advanced', () => {
     assert.deepEqual(result, { entries: [], deleted: [] });
   });
 
-  it('advanced.entries.batchCreate forwards (type, items, extraTags) to underlying client', async () => {
+  it('advanced.entries.batchCreate forwards (type, items, extraTags) to underlying as per-item tags', async () => {
     const stub = new StubUnderlying();
     const tarn = await makeClient(stub);
+    // Use a schema-less type so no Eid auto-stamping happens — keeps the
+    // assertion focused on the batch-level extraTags → per-item forwarding.
     const items = [{ a: 1 }, { a: 2 }, { a: 3 }];
     const extraTags: Tag[] = [{ name: 'Custom', value: 'X' }];
     const out = await tarn.advanced.entries.batchCreate('bookish-custom', items, extraTags);
     assert.equal(stub.batchCreateCalls.length, 1);
     assert.equal(stub.batchCreateCalls[0]!.type, 'bookish-custom');
     assert.deepEqual(stub.batchCreateCalls[0]!.items, items);
-    assert.deepEqual(stub.batchCreateCalls[0]!.extraTags, extraTags);
+    // Legacy batch-level extraTags applied to every item.
+    assert.deepEqual(stub.batchCreateCalls[0]!.extraTagsPerItem, [extraTags, extraTags, extraTags]);
     assert.equal(out.length, 3);
     assert.deepEqual(out.map((r) => r.txid), ['mock-tx-1', 'mock-tx-2', 'mock-tx-3']);
     assert.deepEqual(out.map((r) => r.shareKey), ['mock-sk-1', 'mock-sk-2', 'mock-sk-3']);
+  });
+
+  it('advanced.entries.batchCreate auto-stamps Eid + SchemaV when type matches a defined collection', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    const items = [
+      { bookId: 'b1', title: 'A', isPrivate: false },
+      { bookId: 'b2', title: 'B', isPrivate: false },
+    ];
+    await tarn.advanced.entries.batchCreate('books', items);
+    assert.equal(stub.batchCreateCalls.length, 1);
+    const tagsPerItem = stub.batchCreateCalls[0]!.extraTagsPerItem;
+    assert.equal(tagsPerItem.length, 2);
+    // Each item must carry an Eid tag (auto-stamped from primaryKey)
+    // and a SchemaV tag (from the collection's schema version).
+    for (const tags of tagsPerItem) {
+      assert.ok(tags.find((t) => t.name === 'Eid')?.value, 'Eid tag must be stamped');
+      assert.ok(tags.find((t) => t.name === 'SchemaV')?.value, 'SchemaV tag must be stamped');
+    }
+    // The Eids must differ — they're derived per primaryKey.
+    const eid1 = tagsPerItem[0]!.find((t) => t.name === 'Eid')!.value;
+    const eid2 = tagsPerItem[1]!.find((t) => t.name === 'Eid')!.value;
+    assert.notEqual(eid1, eid2, 'Eids must differ per primaryKey');
+  });
+
+  it('advanced.entries.batchCreate throws when a typed-collection item is missing primaryKey', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    // 'books' has primaryKey: 'bookId' — second item is missing it.
+    const items = [{ bookId: 'b1', title: 'A', isPrivate: false }, { title: 'no-pk' }];
+    await assert.rejects(
+      () => tarn.advanced.entries.batchCreate('books', items),
+      /missing a usable primaryKey/,
+    );
+    // Nothing got forwarded — the throw happens before the wire call.
+    assert.equal(stub.batchCreateCalls.length, 0);
   });
 
   it('advanced.entries.batchCreate preserves input order in the returned array', async () => {

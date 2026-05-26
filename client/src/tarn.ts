@@ -2721,12 +2721,22 @@ export class TarnClient {
 
   /**
    * Bulk import multiple entries in one request.
-   * Counts as 1 rate-limit hit regardless of batch size. Max 100 entries per batch.
+   * Counts as 1 rate-limit hit regardless of batch size. Max 25 entries per batch.
+   *
+   * `extraTagsPerItem` (optional) lets callers stamp per-item tags — most
+   * importantly the protocol's Eid + SchemaV tags. When omitted, all items
+   * write without per-item tags (legacy behavior, which produces "orphan"
+   * entries that aren't visible to the delta-sync surface — see #protocolTags
+   * and Collection<T>.batchCreate for the typed path that always supplies
+   * per-item Eid).
+   *
    * @param {string} type - Entry type for all entries
    * @param {Array<Object>} items - Array of JSON-serializable payloads
-   * @returns {Promise<Array<{txid: string}>>}
+   * @param {Tag[][]} [extraTagsPerItem] - Optional per-item tag arrays. If
+   *   provided, length must equal items.length.
+   * @returns {Promise<Array<{txid: string, shareKey: string|null}>>}
    */
-  async batchCreate(type: string, items: any[]): Promise<any> {
+  async batchCreate(type: string, items: any[], extraTagsPerItem?: Tag[][]): Promise<any> {
     await this.#requireAuth();
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -2735,6 +2745,11 @@ export class TarnClient {
     if (items.length > 25) {
       throw new Error('items max 25 per batch');
     }
+    if (extraTagsPerItem !== undefined && extraTagsPerItem.length !== items.length) {
+      throw new Error(
+        `extraTagsPerItem.length (${extraTagsPerItem.length}) must equal items.length (${items.length})`,
+      );
+    }
 
     // Encrypt each item and build the batch payload. Capture per-item shareKeys
     // in the same order so we can pair them with the server-issued txids on
@@ -2742,14 +2757,17 @@ export class TarnClient {
     const entries = [];
     const shareKeys = [];
     const encryptedBytes: Uint8Array[] = [];
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       const { encrypted, tags: cryptoTags, shareKey } = await this.#encryptForWrite(item);
+      const perItemTags = extraTagsPerItem?.[i] ?? [];
       const tags = [
         { name: 'App', value: this.#appId },
         { name: 'Type', value: type },
         { name: 'Lk', value: this.#dataLookupKey },
         ...cryptoTags,
         { name: 'V', value: '0.4.0' },
+        ...perItemTags,
       ];
       // Base64-encode the encrypted bytes for JSON transport
       const data = btoa(String.fromCharCode(...encrypted));
@@ -2960,24 +2978,30 @@ export class TarnClient {
     // the same events twice produces the same state by Eid).
     await setCursor(this.#appId, this.#dataLookupKey, type, cursor);
 
-    // Dedup pass: last event per Eid wins. Orphans (eid: null) keep all
-    // their events — they're not deduplicatable without an identifier.
-    const latestByEid = new Map<string, LiveEvent | DeleteEvent>();
-    const orphans: LiveEvent[] = [];
-    for (const e of arrivalOrder) {
-      if (e.kind === 'live' && e.eid === null) {
-        orphans.push(e);
-      } else {
-        latestByEid.set(e.eid as string, e);
-      }
+    // Dedup pass: walk arrival order, keep one entry per dedup key with
+    // LAST-OCCURRENCE POSITION preserved. Non-null Eids dedup on the Eid
+    // string; orphans (eid: null) each get a unique Symbol key so they
+    // never collide (they're not deduplicable without an identifier here —
+    // the typed Collection layer derives Eid from primaryKey and runs its
+    // own dedup pass, which depends on this layer preserving arrival order
+    // including orphans interleaved at their actual position).
+    //
+    // Key choice: delete-then-set on existing keys, so the latest occurrence
+    // takes the latest insertion slot. JS Map iteration is in insertion
+    // order, so this gives us arrival-ordered output with the LATEST data
+    // and the LATEST position for each deduplicated Eid.
+    const dedupInOrder = new Map<string | symbol, LiveEvent | DeleteEvent>();
+    for (let i = 0; i < arrivalOrder.length; i++) {
+      const e = arrivalOrder[i]!;
+      const key: string | symbol =
+        (e.kind === 'live' && e.eid === null) ? Symbol(`orphan-${i}`) : (e.eid as string);
+      if (dedupInOrder.has(key)) dedupInOrder.delete(key);
+      dedupInOrder.set(key, e);
     }
 
     const entries: Array<{ eid: string | null; txid: string; data: any; tags: any[] }> = [];
     const deleted: string[] = [];
-    for (const e of orphans) {
-      entries.push({ eid: e.eid, txid: e.txid, data: e.data, tags: e.tags });
-    }
-    for (const e of latestByEid.values()) {
+    for (const e of dedupInOrder.values()) {
       if (e.kind === 'delete') {
         deleted.push(e.eid);
       } else {

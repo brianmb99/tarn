@@ -51,13 +51,19 @@ export interface ITarnClient {
    * rate-limit hit regardless of batch size. Returns `[{ txid, shareKey }]`
    * in input order. Throws on empty input or `items.length > 25`.
    *
+   * `extraTagsPerItem` (optional) stamps per-item tags onto each entry —
+   * used by the typed Collection<T>.batchCreate path to carry Eid + SchemaV
+   * per record. Without it (or with the legacy `extraTags` shape some
+   * callers use), batch entries land as orphans on the wire — invisible
+   * to the delta-sync surface.
+   *
    * Idempotency: one key per batch — a retry on the same input produces the
    * same list of txids (server-side de-dupe).
    */
   batchCreate(
     type: string,
     items: Array<Record<string, unknown>>,
-    extraTags?: Tag[],
+    extraTagsPerItem?: Tag[][],
   ): Promise<Array<{ txid: string; shareKey: string | null }>>;
 
   updateEntry(

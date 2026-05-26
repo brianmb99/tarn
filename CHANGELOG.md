@@ -9,7 +9,42 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com). The
 
 ## [Unreleased]
 
+### Invariant
+
+- **Protocol:** Every data-bearing write to a defined collection MUST carry
+  an `Eid` tag. The SDK now upholds this through every public write path
+  (typed Collection, advanced escape hatch); the wire protocol and the
+  delta-sync surface assume it. "Orphan" entries (rows without an Eid
+  tag for a defined collection) are not a valid steady state — the SDK
+  no longer produces them.
+
+  Apps with pre-existing orphan data (e.g., entries written via
+  `advanced.entries.batchCreate` before this fix, or by SDK versions
+  prior to Eid support) won't see those entries through
+  `tarn.<collection>.getEntriesSince()`. They still render via the
+  lenient `tarn.<collection>.list()` path. To repair: re-upload affected
+  entries through the post-fix typed path (`Collection.create` /
+  `Collection.batchCreate`), or write a one-off migration that calls
+  `tarn.advanced.entries.update(orphan.txid, type, record, [])` per
+  orphan — the advanced surface now auto-stamps Eid when `type` matches
+  a defined collection, so a same-data update chains a properly-Eid'd
+  version via Prev and the resolver picks it as head.
+
 ### Fixed
+
+- **SDK:** Orphan-creation through `advanced.entries.*`. Before this
+  change, `advanced.entries.{create, update, batchCreate}` accepted a
+  `type` string and never auto-stamped Eid + SchemaV — so writes to
+  defined collections through the escape hatch silently produced
+  orphans. Now: when `type` matches a defined collection, the advanced
+  surface derives Eid from the record's primaryKey and stamps Eid +
+  SchemaV (in addition to any caller-supplied `extraTags`). Throws if
+  the record is missing its primaryKey under that type. Schema-less
+  types (e.g., `tarn-share-state`, app-internal) are unchanged — the
+  caller still manages tags. `delete` is unchanged because it has no
+  payload to derive from; callers writing tombstones for a defined
+  collection through the escape hatch must supply Eid themselves or
+  use `Collection<T>.delete(primaryKey)`.
 
 - **SDK:** `getEntriesSince` is now reachable from the public typed
   client. The original commit added the method to the bundled legacy
@@ -37,6 +72,17 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com). The
   Eid per `getEntriesSince()` call**.
 
 ### Added
+
+- **SDK:** `tarn.<collection>.batchCreate(items)` — typed bulk create.
+  Validates every item against the schema, derives Eid per item, stamps
+  Eid + SchemaV on every wire-level entry. One rate-limit hit for up to
+  25 items. The typed entry point for bulk writes; apps doing imports
+  should prefer this over `tarn.advanced.entries.batchCreate`.
+
+- **SDK:** Per-item `extraTags` support in the underlying `batchCreate`.
+  The legacy `extraTags: Tag[]` shape on `advanced.entries.batchCreate`
+  still works (applied to every item); the new internal contract is
+  `extraTagsPerItem: Tag[][]` for per-item Eid + SchemaV stamping.
 
 - **SDK / API:** Eid-narrowed single-record read path.
   - New API filter `GET /api/v1/entries?…&eid=<eid>` returns at most one live

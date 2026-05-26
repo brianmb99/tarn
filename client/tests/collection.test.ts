@@ -70,22 +70,30 @@ class MockTarnClient implements ITarnClient {
     return { txid, shareKey };
   }
 
-  // Collection<T> doesn't consume batchCreate (the typed surface is single-
-  // item by design — see issue #23). Implemented here only to satisfy the
-  // ITarnClient interface; tests don't exercise it.
+  // Tracked for assertions: Collection<T>.batchCreate exercises this path.
+  // Captures (type, items, extraTagsPerItem) so tests can verify the per-item
+  // Eid + SchemaV stamping.
+  batchCreateCalls: Array<{
+    type: string;
+    items: Array<Record<string, unknown>>;
+    extraTagsPerItem: Tag[][];
+  }> = [];
   async batchCreate(
     type: string,
     items: Array<Record<string, unknown>>,
-    extraTags: Tag[] = [],
+    extraTagsPerItem: Tag[][] = [],
   ): Promise<Array<{ txid: string; shareKey: string | null }>> {
+    this.batchCreateCalls.push({ type, items, extraTagsPerItem });
     const out: Array<{ txid: string; shareKey: string | null }> = [];
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!;
+      const perItem = extraTagsPerItem[i] ?? [];
       const txid = this.#nextTxid();
       const shareKey = this.#nextShareKey();
       this.entries.push({
         txid,
         data: { ...item },
-        tags: [{ name: 'Type', value: type }, ...extraTags],
+        tags: [{ name: 'Type', value: type }, ...perItem],
       });
       this.shareKeysByTxid.set(txid, shareKey);
       out.push({ txid, shareKey });
@@ -625,6 +633,76 @@ describe('Collection.get / list', () => {
     const all = await books.list();
     assert.equal(all.length, 1);
     assert.equal(all[0]!.bookId, 'b2');
+  });
+});
+
+// ============ Collection.batchCreate ============
+
+describe('Collection.batchCreate', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(() => {
+    mock = new MockTarnClient();
+    books = makeBooks(mock);
+  });
+
+  it('throws on empty input without calling the underlying client', async () => {
+    await assert.rejects(() => books.batchCreate([]), TarnCollectionError);
+    assert.equal(mock.batchCreateCalls.length, 0);
+  });
+
+  it('throws on > 25 items', async () => {
+    const items = Array.from({ length: 26 }, (_, i) => ({
+      bookId: `b${i}`,
+      title: `T${i}`,
+      isPrivate: false,
+    }));
+    await assert.rejects(() => books.batchCreate(items), TarnCollectionError);
+    assert.equal(mock.batchCreateCalls.length, 0);
+  });
+
+  it('stamps Eid + SchemaV per item, derived from each primaryKey', async () => {
+    const items: BookRecord[] = [
+      { bookId: 'b1', title: 'Alpha', isPrivate: false },
+      { bookId: 'b2', title: 'Beta', isPrivate: true },
+    ];
+    await books.batchCreate(items);
+
+    assert.equal(mock.batchCreateCalls.length, 1);
+    const call = mock.batchCreateCalls[0]!;
+    assert.equal(call.type, 'books');
+    assert.equal(call.extraTagsPerItem.length, 2);
+
+    // Eids derived from each primaryKey — must match Collection.eidFor.
+    const expectedEid1 = await books.eidFor('b1');
+    const expectedEid2 = await books.eidFor('b2');
+    assert.equal(call.extraTagsPerItem[0]!.find((t) => t.name === 'Eid')!.value, expectedEid1);
+    assert.equal(call.extraTagsPerItem[1]!.find((t) => t.name === 'Eid')!.value, expectedEid2);
+
+    // SchemaV stamped on every item.
+    for (const tags of call.extraTagsPerItem) {
+      assert.ok(tags.find((t) => t.name === 'SchemaV')?.value, 'SchemaV must be stamped');
+    }
+  });
+
+  it('validates each record before sending to the underlying client', async () => {
+    // Missing required `bookId` should fail validation.
+    await assert.rejects(
+      () => books.batchCreate([{ title: 'no-id', isPrivate: false } as unknown as BookRecord]),
+    );
+    assert.equal(mock.batchCreateCalls.length, 0, 'no wire call on validation failure');
+  });
+
+  it('returns the validated records in input order', async () => {
+    const items: BookRecord[] = [
+      { bookId: 'b1', title: 'A', isPrivate: false },
+      { bookId: 'b2', title: 'B', isPrivate: false },
+      { bookId: 'b3', title: 'C', isPrivate: false },
+    ];
+    const out = await books.batchCreate(items);
+    assert.equal(out.length, 3);
+    assert.deepEqual(out.map((r) => r.bookId), ['b1', 'b2', 'b3']);
   });
 });
 

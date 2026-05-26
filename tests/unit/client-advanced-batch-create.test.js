@@ -25,8 +25,12 @@ function makeFakeClient() {
   let shareKeyCounter = 0;
   const client = {
     calls,
-    async batchCreate(type, items, extraTags) {
-      calls.push({ type, items: items.slice(), extraTags: extraTags === undefined ? undefined : extraTags.slice() });
+    async batchCreate(type, items, extraTagsPerItem) {
+      calls.push({
+        type,
+        items: items.slice(),
+        extraTagsPerItem: extraTagsPerItem === undefined ? undefined : extraTagsPerItem.map((t) => t.slice()),
+      });
       return items.map(() => ({
         txid: `tx-${++txidCounter}`,
         shareKey: `sk-${++shareKeyCounter}`,
@@ -94,6 +98,8 @@ describe('AdvancedEntries.batchCreate', () => {
   });
 
   it('forwards (type, items, extraTags) verbatim to the underlying client', async () => {
+    // No schemaInfo → no auto-Eid stamping. The batch-level extraTags
+    // are applied to every item via the underlying's per-item tag param.
     const fake = makeFakeClient();
     const advanced = new AdvancedEntries(fake);
     const items = [{ a: 1 }, { a: 2 }];
@@ -102,15 +108,15 @@ describe('AdvancedEntries.batchCreate', () => {
     assert.equal(fake.calls.length, 1);
     assert.equal(fake.calls[0].type, 'books');
     assert.deepEqual(fake.calls[0].items, items);
-    assert.deepEqual(fake.calls[0].extraTags, extraTags);
+    assert.deepEqual(fake.calls[0].extraTagsPerItem, [extraTags, extraTags]);
   });
 
-  it('defaults extraTags to [] when omitted', async () => {
+  it('defaults extraTags to per-item [] when omitted', async () => {
     const fake = makeFakeClient();
     const advanced = new AdvancedEntries(fake);
     await advanced.batchCreate('books', [{ a: 1 }]);
     assert.equal(fake.calls.length, 1);
-    assert.deepEqual(fake.calls[0].extraTags, []);
+    assert.deepEqual(fake.calls[0].extraTagsPerItem, [[]]);
   });
 
   it('returns the underlying result preserving input order', async () => {

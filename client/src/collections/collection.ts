@@ -65,6 +65,47 @@ export class Collection<TRecord extends Record<string, unknown>> {
   }
 
   /**
+   * Bulk-create up to 25 records in one request. Each record is validated
+   * against the schema, gets its own Eid (derived from its primaryKey), and
+   * gets the collection's SchemaV tag. Counts as 1 rate-limit hit regardless
+   * of batch size (vs N hits for N single `create()` calls).
+   *
+   * This is the typed entry point for bulk writes — Eid is always stamped
+   * per item, so batched records are NOT orphans on the wire and surface
+   * normally through `getEntriesSince`. Apps doing bulk imports should
+   * prefer this over `advanced.entries.batchCreate` (which only auto-stamps
+   * Eid when the `type` string happens to match a defined collection).
+   *
+   * Returns the validated records in input order, mirroring single-item
+   * `create()` which returns the validated record. Throws on empty input
+   * or `items.length > 25`. Validation failures throw before the wire
+   * request — partial-success semantics across a batch don't apply.
+   */
+  async batchCreate(items: TRecord[]): Promise<TRecord[]> {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': batchCreate requires a non-empty array`,
+      );
+    }
+    if (items.length > 25) {
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': batchCreate max 25 items per batch (got ${items.length})`,
+      );
+    }
+    const validated: TRecord[] = [];
+    const extraTagsPerItem: Tag[][] = [];
+    for (const r of items) {
+      const v = validateRecordForCreate(this.#name, this.#def, r) as TRecord;
+      const pk = this.#extractPrimaryKey(v as Record<string, unknown>);
+      const eid = await deriveEid(this.#appId, this.#name, pk);
+      validated.push(v);
+      extraTagsPerItem.push(this.#protocolTags(eid));
+    }
+    await this.#client.batchCreate(this.#name, validated as Array<Record<string, unknown>>, extraTagsPerItem);
+    return validated;
+  }
+
+  /**
    * Partial update of an existing record. Reads the current record, merges
    * the patch, re-validates, writes a new entry chained via `Prev` and
    * sharing the same Eid. Apps pass only changed fields.

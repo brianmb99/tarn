@@ -12,60 +12,111 @@
  */
 
 import type { ITarnClient, Tag } from '../../collections/index.js';
+import { deriveEid } from '../../collections/eid.js';
 
 export interface IAdvancedClient extends ITarnClient {
   // ITarnClient already covers entry CRUD + blob + shareKey + sharing primitives.
   // Add any further escape-hatch methods here as needs arise.
 }
 
+/**
+ * Schema info passed down from TarnClient.create so the advanced surface
+ * can transparently stamp Eid + SchemaV tags when callers write to a `type`
+ * that corresponds to a defined collection. The escape-hatch semantics stay
+ * intact for unknown types — those writes still go through with whatever
+ * tags the caller supplies (no auto-stamping).
+ *
+ * Invariant the SDK now upholds: every data-bearing write to a defined
+ * collection carries an Eid tag, regardless of whether it went through
+ * the typed Collection<T> surface or the advanced escape hatch. The wire
+ * protocol can rely on it; the delta-sync surface can rely on it.
+ */
+export interface AdvancedSchemaInfo {
+  /** Map from collection name (the `type` arg) to its primaryKey field. */
+  primaryKeyByType: ReadonlyMap<string, string>;
+  /** Top-level schema version — used as the SchemaV tag value. */
+  schemaVersion: number;
+  /** App id, used to derive Eids. */
+  appId: string;
+}
+
 export class AdvancedNamespace<C extends IAdvancedClient = IAdvancedClient> {
   readonly entries: AdvancedEntries<C>;
   readonly shareLog: AdvancedShareLog<C>;
 
-  constructor(client: C) {
-    this.entries = new AdvancedEntries(client);
+  constructor(client: C, schemaInfo?: AdvancedSchemaInfo) {
+    this.entries = new AdvancedEntries(client, schemaInfo);
     this.shareLog = new AdvancedShareLog(client);
   }
 }
 
 export class AdvancedEntries<C extends IAdvancedClient> {
   readonly #client: C;
-  constructor(client: C) {
+  readonly #schemaInfo: AdvancedSchemaInfo | null;
+  constructor(client: C, schemaInfo?: AdvancedSchemaInfo) {
     this.#client = client;
+    this.#schemaInfo = schemaInfo ?? null;
   }
 
   /**
-   * Schema-less entry create. Returns the freshly-issued shareKey so the
-   * caller can publish through the share-log directly.
+   * If `type` corresponds to a defined collection, derive the Eid + SchemaV
+   * tags from the payload's primaryKey field and return them. Otherwise
+   * returns an empty array (schema-less type — caller manages tags).
+   *
+   * Throws when the type IS defined but the payload's primaryKey value is
+   * missing or non-string. The escape hatch will not silently produce
+   * an orphan in a typed collection.
+   */
+  async #protocolTagsFor(type: string, payload: Record<string, unknown>): Promise<Tag[]> {
+    if (!this.#schemaInfo) return [];
+    const primaryKeyField = this.#schemaInfo.primaryKeyByType.get(type);
+    if (primaryKeyField === undefined) return [];
+    const pkValue = payload[primaryKeyField];
+    if (typeof pkValue !== 'string' || pkValue.length === 0) {
+      throw new Error(
+        `advanced.entries: type '${type}' is a defined collection but the payload ` +
+        `is missing a usable primaryKey at field '${primaryKeyField}' (expected non-empty string)`,
+      );
+    }
+    const eid = await deriveEid(this.#schemaInfo.appId, type, pkValue);
+    return [
+      { name: 'Eid', value: eid },
+      { name: 'SchemaV', value: String(this.#schemaInfo.schemaVersion) },
+    ];
+  }
+
+  /**
+   * Schema-less entry create. When `type` matches a defined collection, the
+   * Eid + SchemaV tags are auto-stamped from the payload's primaryKey;
+   * caller-supplied tags are preserved and prepended.
    */
   async create(
     type: string,
     payload: Record<string, unknown>,
     extraTags: Tag[] = [],
   ): Promise<{ txid: string; shareKey: string | null }> {
-    return this.#client.createEntry(type, payload, extraTags);
+    const auto = await this.#protocolTagsFor(type, payload);
+    return this.#client.createEntry(type, payload, [...extraTags, ...auto]);
   }
 
   /**
-   * Schema-less bulk create. Writes 1-25 entries in a single batch. Counts as
-   * 1 rate-limit hit regardless of batch size (vs N hits for N single calls).
-   * Returns `[{ txid, shareKey }]` in input order.
+   * Bulk create up to 25 entries in one request. Counts as 1 rate-limit hit
+   * regardless of batch size (vs N hits for N single calls). Returns
+   * `[{ txid, shareKey }]` in input order.
    *
-   * Schema-less by design — partial-failure validation semantics across a
-   * batch don't have a clean answer, so the typed `client.<collection>.create`
-   * path stays single-item. Callers wanting per-item validation should call
-   * the collection's `validate(item)` upstream before batching, or use the
-   * typed surface per item (at the cost of 1 rate-limit hit per item).
+   * When `type` matches a defined collection, the SDK auto-stamps Eid +
+   * SchemaV per item from each item's primaryKey field — so batched
+   * entries are NOT orphans on the wire. This pairs with the protocol
+   * invariant that every write to a defined collection carries an Eid.
+   * Throws if any item is missing its primaryKey for a defined type.
    *
-   * Throws on empty input or `items.length > 25`. Idempotent: a retry on the
-   * same input produces the same list of txids (server-side de-dupe via one
-   * idempotency key per batch).
+   * Throws on empty input or `items.length > 25`. Idempotent: a retry on
+   * the same input produces the same list of txids (server-side de-dupe
+   * via one idempotency key per batch).
    *
-   * Note: `extraTags` is forwarded for forward-compat with the interface
-   * signature; the bundled underlying client currently ignores it on batch
-   * writes (single-item `create` honors it). If you need extra tags per
-   * batched item today, use single-item `create` until the underlying
-   * surface adds support.
+   * The legacy `extraTags` arg is still accepted at the batch level —
+   * any caller-supplied tags are applied to every item. Per-item Eid +
+   * SchemaV (auto-stamped for defined types) are merged on top.
    */
   async batchCreate(
     type: string,
@@ -80,20 +131,37 @@ export class AdvancedEntries<C extends IAdvancedClient> {
         `advanced.entries.batchCreate: items max 25 per batch (got ${items.length})`,
       );
     }
-    return this.#client.batchCreate(type, items, extraTags);
+    // Build per-item tags: legacy batch-level extraTags + auto-stamped Eid + SchemaV.
+    const perItem: Tag[][] = [];
+    for (const item of items) {
+      const auto = await this.#protocolTagsFor(type, item);
+      perItem.push([...extraTags, ...auto]);
+    }
+    return this.#client.batchCreate(type, items, perItem);
   }
 
-  /** Schema-less update. */
+  /**
+   * Schema-less update. When `type` matches a defined collection, the
+   * Eid + SchemaV tags are auto-stamped from the payload's primaryKey.
+   */
   async update(
     priorTxid: string,
     type: string,
     payload: Record<string, unknown>,
     extraTags: Tag[] = [],
   ): Promise<{ txid: string; shareKey: string | null }> {
-    return this.#client.updateEntry(priorTxid, type, payload, extraTags);
+    const auto = await this.#protocolTagsFor(type, payload);
+    return this.#client.updateEntry(priorTxid, type, payload, [...extraTags, ...auto]);
   }
 
-  /** Schema-less delete (tombstone). */
+  /**
+   * Schema-less delete (tombstone). No auto-stamping here because delete
+   * doesn't carry a payload to derive a primaryKey from. Callers writing
+   * tombstones for a defined collection through this escape hatch must
+   * supply the Eid via `extraTags` themselves — or, more commonly, use
+   * the typed `Collection<T>.delete(primaryKey)` path which derives Eid
+   * automatically.
+   */
   async delete(targetTxid: string, type: string, extraTags: Tag[] = []): Promise<{ txid: string }> {
     return this.#client.deleteEntry(targetTxid, type, extraTags);
   }
