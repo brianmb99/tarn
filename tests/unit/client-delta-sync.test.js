@@ -263,6 +263,102 @@ describe('getEntriesSince — deletion events', () => {
   });
 });
 
+describe('getEntriesSince — last-event-per-Eid semantics', () => {
+  afterEach(restoreFetch);
+
+  it('cross-page same-Eid: late delete wins over earlier live event', async () => {
+    // Setup: write one entry so we have a real ciphertext / tags pair to
+    // replay through the delta endpoint. The Eid will appear on page 1 as
+    // a live event and then on page 2 as a delete event — simulating an
+    // Eid whose rows happen to straddle the server's 25-row page cut.
+    const { client, captured } = await setUp({
+      collectionType: 'books',
+      payloads: [{ id: 'b1', title: 'eventually-deleted' }],
+    });
+    const splitEid = captured[0].eid;
+
+    mockFetch([
+      // Page 1: live event for splitEid + hasMore: true.
+      {
+        status: 200,
+        body: JSON.stringify({
+          entries: [{
+            eid: splitEid,
+            txid: captured[0].txid,
+            tags: captured[0].tags,
+            data: bytesToBase64(captured[0].body),
+          }],
+          pagination: { cursor: `100:${captured[0].txid}`, hasMore: true },
+        }),
+      },
+      // Page 2: delete event for the same Eid.
+      {
+        status: 200,
+        body: JSON.stringify({
+          entries: [{ eid: splitEid, deleted: true }],
+          pagination: { cursor: `200:final`, hasMore: false },
+        }),
+      },
+    ]);
+
+    const delta = await client.getEntriesSince('books');
+
+    // Latest event wins → splitEid should be in `deleted`, NOT in `entries`.
+    assert.deepEqual(delta.deleted, [splitEid], 'Eid should land in deleted (last event was a delete)');
+    assert.equal(
+      delta.entries.find((e) => e.eid === splitEid),
+      undefined,
+      'Eid must NOT appear in entries when its last event was a delete',
+    );
+  });
+
+  it('cross-page same-Eid: late live event wins over earlier delete', async () => {
+    // Reverse scenario: delete on page 1, recreate on page 2. The Eid
+    // should end up in `entries` with the recreated data — the delete
+    // is shadowed.
+    const { client, captured } = await setUp({
+      collectionType: 'books',
+      payloads: [{ id: 'b1', title: 'recreated' }],
+    });
+    const recreateEid = captured[0].eid;
+
+    mockFetch([
+      // Page 1: delete event.
+      {
+        status: 200,
+        body: JSON.stringify({
+          entries: [{ eid: recreateEid, deleted: true }],
+          pagination: { cursor: `100:tx-tombstone`, hasMore: true },
+        }),
+      },
+      // Page 2: live event (recreate).
+      {
+        status: 200,
+        body: JSON.stringify({
+          entries: [{
+            eid: recreateEid,
+            txid: captured[0].txid,
+            tags: captured[0].tags,
+            data: bytesToBase64(captured[0].body),
+          }],
+          pagination: { cursor: `200:${captured[0].txid}`, hasMore: false },
+        }),
+      },
+    ]);
+
+    const delta = await client.getEntriesSince('books');
+
+    const liveEvent = delta.entries.find((e) => e.eid === recreateEid);
+    assert.ok(liveEvent, 'Eid should appear in entries with the recreated data');
+    assert.equal(liveEvent.data.title, 'recreated');
+    assert.equal(
+      delta.deleted.includes(recreateEid),
+      false,
+      'Eid must NOT appear in deleted when its last event was live',
+    );
+  });
+});
+
 describe('getEntriesSince — internal pagination', () => {
   afterEach(restoreFetch);
 

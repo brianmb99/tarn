@@ -2894,8 +2894,21 @@ export class TarnClient {
       throw new Error('getEntriesSince(): not logged in');
     }
 
-    const aggregatedEntries: Array<{ eid: string | null; txid: string; data: any; tags: any[] }> = [];
-    const aggregatedDeleted: string[] = [];
+    // Events arrive in (cached_at, txid) order from the server. The server
+    // collapses each Eid's rows WITHIN A PAGE to one event, but the same
+    // Eid's rows can straddle a page boundary (rare — only when an Eid has
+    // multiple updates within one delta window AND those updates land on
+    // either side of the 25-row cut). Without dedup, the SDK could emit
+    // BOTH a live event and a delete event for the same Eid in one call,
+    // which leaves the consumer's reducer dependent on apply-order.
+    //
+    // Dedup strategy: collect all events in arrival order across pages,
+    // then keep only the LAST event per Eid (latest cached_at wins because
+    // server orders ASC). Orphans (no Eid — legacy writes) pass through
+    // untouched because they can't conflict.
+    type LiveEvent = { kind: 'live'; eid: string | null; txid: string; data: any; tags: any[] };
+    type DeleteEvent = { kind: 'delete'; eid: string };
+    const arrivalOrder: Array<LiveEvent | DeleteEvent> = [];
 
     let cursor = (await getCursor(this.#appId, this.#dataLookupKey, type)) ?? '0:';
 
@@ -2914,7 +2927,7 @@ export class TarnClient {
       const wireEntries = res.json.entries || [];
       for (const evt of wireEntries) {
         if (evt.deleted) {
-          if (evt.eid) aggregatedDeleted.push(evt.eid);
+          if (evt.eid) arrivalOrder.push({ kind: 'delete', eid: evt.eid });
           continue;
         }
         if (!evt.data) {
@@ -2928,7 +2941,8 @@ export class TarnClient {
         // would need.
         await setCachedBlob(this.#appId, this.#dataLookupKey, evt.txid, blobBytes);
         const data = await this.#decryptBlob(blobBytes, evt.tags);
-        aggregatedEntries.push({
+        arrivalOrder.push({
+          kind: 'live',
           eid: evt.eid ?? null,
           txid: evt.txid,
           data,
@@ -2946,7 +2960,32 @@ export class TarnClient {
     // the same events twice produces the same state by Eid).
     await setCursor(this.#appId, this.#dataLookupKey, type, cursor);
 
-    return { entries: aggregatedEntries, deleted: aggregatedDeleted };
+    // Dedup pass: last event per Eid wins. Orphans (eid: null) keep all
+    // their events — they're not deduplicatable without an identifier.
+    const latestByEid = new Map<string, LiveEvent | DeleteEvent>();
+    const orphans: LiveEvent[] = [];
+    for (const e of arrivalOrder) {
+      if (e.kind === 'live' && e.eid === null) {
+        orphans.push(e);
+      } else {
+        latestByEid.set(e.eid as string, e);
+      }
+    }
+
+    const entries: Array<{ eid: string | null; txid: string; data: any; tags: any[] }> = [];
+    const deleted: string[] = [];
+    for (const e of orphans) {
+      entries.push({ eid: e.eid, txid: e.txid, data: e.data, tags: e.tags });
+    }
+    for (const e of latestByEid.values()) {
+      if (e.kind === 'delete') {
+        deleted.push(e.eid);
+      } else {
+        entries.push({ eid: e.eid, txid: e.txid, data: e.data, tags: e.tags });
+      }
+    }
+
+    return { entries, deleted };
   }
 
   /**

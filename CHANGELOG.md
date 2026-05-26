@@ -9,6 +9,15 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com). The
 
 ## [Unreleased]
 
+### Fixed
+
+- **SDK:** `getEntriesSince` now deduplicates events by Eid across server
+  pages (last event wins). Without this, an Eid whose multiple rows
+  straddled a 25-row page cut could surface as both a live event and a
+  delete event in the same call, leaving the consumer's reducer
+  dependent on apply-order. Contract is now: **at most one event per
+  Eid per `getEntriesSince()` call**.
+
 ### Added
 
 - **SDK / API:** Eid-narrowed single-record read path.
