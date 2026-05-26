@@ -43,9 +43,10 @@
  *     run retries it.
  */
 
-import { TarnClient } from '../client/src/tarn.js';
-import { defineSchema } from '../client/src/schema/define.js';
-import { TarnStorage } from '../client/src/storage/index.js';
+// Import from the public barrel — same module the SDK consumers use. The
+// barrel re-exports the typed wrapper TarnClient (which has `.create()`),
+// not the legacy underlying class in client/src/tarn.ts.
+import { TarnClient, defineSchema, TarnStorage } from '../client/src/index.js';
 import { readFileSync, appendFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
