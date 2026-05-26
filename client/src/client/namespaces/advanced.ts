@@ -114,14 +114,20 @@ export class AdvancedEntries<C extends IAdvancedClient> {
    * the same input produces the same list of txids (server-side de-dupe
    * via one idempotency key per batch).
    *
-   * The legacy `extraTags` arg is still accepted at the batch level —
-   * any caller-supplied tags are applied to every item. Per-item Eid +
-   * SchemaV (auto-stamped for defined types) are merged on top.
+   * Tag composition per item (left-to-right, later wins on duplicate names):
+   *   1. `extraTags` — batch-level tags applied to every item (legacy,
+   *      e.g., a `Migration: v1` marker on every entry of a bulk import).
+   *   2. `perItemExtraTags[i]` — per-item tags. Required when each entry
+   *      needs distinct metadata, e.g., `Prev: <orphan-txid>` for a
+   *      migration that chains each new entry to a specific predecessor.
+   *      Length must equal `items.length`.
+   *   3. Auto-stamped Eid + SchemaV for defined-collection types.
    */
   async batchCreate(
     type: string,
     items: Array<Record<string, unknown>>,
     extraTags: Tag[] = [],
+    perItemExtraTags?: Tag[][],
   ): Promise<Array<{ txid: string; shareKey: string | null }>> {
     if (!Array.isArray(items) || items.length === 0) {
       throw new Error('advanced.entries.batchCreate: items must be a non-empty array');
@@ -131,11 +137,19 @@ export class AdvancedEntries<C extends IAdvancedClient> {
         `advanced.entries.batchCreate: items max 25 per batch (got ${items.length})`,
       );
     }
-    // Build per-item tags: legacy batch-level extraTags + auto-stamped Eid + SchemaV.
+    if (perItemExtraTags !== undefined && perItemExtraTags.length !== items.length) {
+      throw new Error(
+        `advanced.entries.batchCreate: perItemExtraTags.length (${perItemExtraTags.length}) ` +
+        `must equal items.length (${items.length})`,
+      );
+    }
+    // Build per-item tags: batch-level extraTags + per-item extras + auto-stamped Eid + SchemaV.
     const perItem: Tag[][] = [];
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!;
+      const itemSpecific = perItemExtraTags?.[i] ?? [];
       const auto = await this.#protocolTagsFor(type, item);
-      perItem.push([...extraTags, ...auto]);
+      perItem.push([...extraTags, ...itemSpecific, ...auto]);
     }
     return this.#client.batchCreate(type, items, perItem);
   }

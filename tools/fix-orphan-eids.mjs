@@ -2,15 +2,32 @@
 /**
  * One-off repair: walk a defined collection, find entries without an Eid
  * tag (orphans — usually produced by batchCreate before the post-Eid-invariant
- * SDK fix), and re-write each one through the typed update path so the new
- * entry carries a properly-derived Eid + SchemaV. The original orphan stays
- * on Arweave (immutable) but becomes a superseded leaf in the Prev chain;
- * the server's resolver picks the new entry as the live head.
+ * SDK fix), and rewrite them in batches via the bulk-create endpoint so
+ * each new entry carries a properly-derived Eid + SchemaV plus a Prev tag
+ * pointing to its orphan predecessor. The server's resolver picks the new
+ * entry as the live head and supersedes the orphan via the Prev chain.
  *
- * Idempotent + resumable: titles successfully fixed are appended to a
- * processed-titles file (one title per line, `#` for comments). Subsequent
- * runs read that file and skip those titles. The file is pre-populatable
- * for cases where you've already fixed some entries through another path.
+ * Why batching (not per-item update)
+ *   The write rate limit is 100 calls/hour per account. A single-item
+ *   update path means 1 hit per orphan — a 266-orphan account would need
+ *   3 hours of carefully-paced writes. Batched create counts as 1 hit per
+ *   batch regardless of batch size (up to 25 items), so 266 orphans
+ *   fits in 11 hits.
+ *
+ * Rate-limit handling
+ *   If a batch returns 429, the script sleeps until the top of the next
+ *   clock hour (with a small safety margin) and retries the same batch.
+ *   The rate-limit bucket is calendar-hour keyed, so the next-hour
+ *   transition guarantees a fresh budget. Retries are unbounded by
+ *   default — the script keeps trying until the work is done or a
+ *   non-rate-limit error surfaces.
+ *
+ * Idempotency + resumability
+ *   Each successful batch appends every title in it to a processed-titles
+ *   file. Reruns skip those titles. Independently, the orphan filter
+ *   (eid === null) excludes any entry whose Eid has been written —
+ *   so even if the skip file is wiped, the script won't double-fix
+ *   anything that already has an Eid on Arweave.
  *
  * Usage (run via tsx so it picks up the TS source — no SDK build required):
  *   node --import tsx tools/fix-orphan-eids.mjs \
@@ -25,27 +42,18 @@
  *   --title-field <field>    Default: title  (used for skip-file matching)
  *   --schema-version <n>     Default: 5      (SchemaV tag value on the new entry)
  *   --skip-file <path>       Default: tools/fix-orphan-eids.<collection>.processed.txt
- *   --sleep-ms <n>           Default: 200    (between writes, to stay polite)
+ *   --batch-size <n>         Default: 25     (server max)
+ *   --max-rate-limit-waits   Default: 24     (give up after this many hour-boundary waits)
  *   --dry-run                Report what would be done without writing
  *
- * Behavior:
- *   - Auto-detects orphans (eid === null). Already-Eid'd entries are silently
- *     skipped — they're correct.
- *   - Also skips any orphan whose title appears in the skip file.
- *   - For each orphan to fix: preserves non-protocol tags (e.g., Src) on the
- *     rewrite, lets the SDK auto-stamp Eid + SchemaV.
- *   - On success, appends the title to the skip file so reruns don't re-do work.
- *
- * Safety:
- *   - --dry-run prints intended actions, no writes.
- *   - Failures on individual books don't abort the run — the script logs and
- *     continues. The failed book is NOT added to the skip file, so the next
- *     run retries it.
+ * Heads-up: max_entries
+ *   Each fix adds one new entry while leaving the orphan in D1 (superseded,
+ *   not tombstoned). If the account's `max_entries` rule is tight, the
+ *   batch will fail with "Write denied by authorization rules". Bump the
+ *   limit on the account before running, or accept partial completion
+ *   and rerun after raising it.
  */
 
-// Import from the public barrel — same module the SDK consumers use. The
-// barrel re-exports the typed wrapper TarnClient (which has `.create()`),
-// not the legacy underlying class in client/src/tarn.ts.
 import { TarnClient, defineSchema, TarnStorage } from '../client/src/index.js';
 import { readFileSync, appendFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
@@ -76,7 +84,8 @@ const skipFile = arg(
   '--skip-file',
   resolve(__dirname, `fix-orphan-eids.${collectionName}.processed.txt`),
 );
-const sleepMs = parseInt(arg('--sleep-ms', '200'), 10);
+const batchSize = Math.min(25, Math.max(1, parseInt(arg('--batch-size', '25'), 10)));
+const maxRateLimitWaits = parseInt(arg('--max-rate-limit-waits', '24'), 10);
 const dryRun = flag('--dry-run');
 
 if (!email || !password) {
@@ -86,6 +95,29 @@ if (!email || !password) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ============ Helpers ============
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function msUntilNextHour() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(next.getHours() + 1, 0, 0, 0);
+  return next.getTime() - now.getTime();
+}
+
+function formatDuration(ms) {
+  const totalSec = Math.ceil(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min === 0) return `${sec}s`;
+  return `${min}m${String(sec).padStart(2, '0')}s`;
+}
 
 // ============ Skip file ============
 
@@ -120,8 +152,8 @@ console.log(`  → ${skipTitles.size} title(s) loaded (will be skipped).`);
 // ============ SDK setup ============
 
 // Minimal schema — only `primaryKey` matters for Eid derivation. Field-level
-// validation isn't invoked by advanced.entries.update, so the actual record
-// shape can be arbitrary; we just declare the primaryKey field.
+// validation isn't invoked by advanced.entries.batchCreate; primaryKey is
+// what the auto-stamp code reads off each item.
 const schema = defineSchema({
   appId,
   version: schemaVersion,
@@ -145,11 +177,6 @@ console.log('Logged in.');
 
 // ============ Fetch entries ============
 
-// advanced.entries.getEntriesSince is exactly the right read path here: it
-// returns events shaped as { eid, txid, data, tags } with eid set to null
-// for orphan entries. In Node (no IndexedDB), the cursor isn't persisted —
-// so each invocation returns the full live state for the type, paginated
-// internally up to the SDK's safety cap. Tombstoned entries don't surface.
 console.log(`Fetching all live entries for type '${collectionName}'...`);
 const { entries: allEvents } = await tarn.advanced.entries.getEntriesSince(collectionName);
 const orphans = allEvents.filter((e) => e.eid === null);
@@ -162,72 +189,119 @@ if (orphans.length === 0) {
   process.exit(0);
 }
 
+// ============ Filter ============
+
+const toFix = [];
+const skipped = [];
+const unfixable = [];
+for (const orphan of orphans) {
+  const title = orphan.data?.[titleField] ?? '(no title)';
+  if (skipTitles.has(title)) {
+    skipped.push({ title, txid: orphan.txid });
+    continue;
+  }
+  const pkValue = orphan.data?.[primaryKeyField];
+  if (typeof pkValue !== 'string' || pkValue.length === 0) {
+    unfixable.push({ title, txid: orphan.txid });
+    continue;
+  }
+  toFix.push(orphan);
+}
+
+console.log(`  → ${toFix.length} to fix; ${skipped.length} skipped (in skip file); ${unfixable.length} unfixable (no primaryKey).`);
+if (unfixable.length > 0) {
+  console.log('Unfixable entries:');
+  for (const u of unfixable) console.log(`    ${u.title.padEnd(56)} → ${u.txid.slice(0, 14)}`);
+}
+
+if (toFix.length === 0) {
+  console.log('Nothing to fix after filtering. Exiting.');
+  process.exit(0);
+}
+
 // ============ Repair loop ============
 
-const PROTOCOL_TAGS = new Set(['App', 'Type', 'Lk', 'Prev', 'Eid', 'SchemaV', 'V', 'Enc', 'Gen', 'Ref', 'Op']);
+const batches = chunk(toFix, batchSize);
+console.log(`Processing ${toFix.length} orphan(s) in ${batches.length} batch(es) of up to ${batchSize}.`);
+console.log();
 
-let fixed = 0;
-let skipped = 0;
-let failed = 0;
-let idx = 0;
-for (const orphan of orphans) {
-  idx++;
-  const record = orphan.data;
-  const title = record?.[titleField] ?? '(no title)';
-  const txidPrefix = orphan.txid.slice(0, 14);
-  const label = `[${idx}/${orphans.length}] ${String(title).padEnd(56)} → ${txidPrefix}`;
+let fixedCount = 0;
+let failedCount = 0;
+let bucketWaitsSpent = 0;
 
-  if (skipTitles.has(title)) {
-    console.log(`${label}  SKIP (in skip file)`);
-    skipped++;
-    continue;
-  }
-
-  // Sanity: the record must carry the primaryKey field for Eid derivation
-  // to succeed on the SDK side.
-  const pkValue = record?.[primaryKeyField];
-  if (typeof pkValue !== 'string' || pkValue.length === 0) {
-    console.log(`${label}  SKIP (no usable primaryKey '${primaryKeyField}' on record)`);
-    failed++;
-    continue;
-  }
-
-  // Preserve non-protocol tags from the orphan (e.g., a `Src: audible-import`
-  // tag survives the rewrite). The SDK auto-stamps Eid + SchemaV on top.
-  const preservedTags = orphan.tags.filter((t) => !PROTOCOL_TAGS.has(t.name));
+for (let bi = 0; bi < batches.length; bi++) {
+  const batch = batches[bi];
+  const batchLabel = `[batch ${bi + 1}/${batches.length}] ${batch.length} entries`;
 
   if (dryRun) {
-    console.log(`${label}  WOULD FIX (dry run; preserved tags: ${preservedTags.map((t) => t.name).join(',') || 'none'})`);
+    console.log(`${batchLabel}  WOULD FIX (dry run)`);
+    for (const o of batch) {
+      const title = o.data?.[titleField] ?? '(no title)';
+      console.log(`    ${title.padEnd(56)} → ${o.txid.slice(0, 14)}`);
+    }
     continue;
   }
 
-  try {
-    await tarn.advanced.entries.update(orphan.txid, collectionName, record, preservedTags);
-    appendProcessed(skipFile, title);
-    fixed++;
-    console.log(`${label}  FIXED`);
-  } catch (err) {
-    failed++;
-    console.log(`${label}  FAIL — ${err?.message ?? err}`);
-  }
+  // Build per-item Prev tags. Each new entry chains via Prev to its
+  // orphan predecessor so the server's resolver picks the new (with-Eid)
+  // version as the live head and treats the orphan as superseded.
+  const records = batch.map((o) => o.data);
+  const perItemTags = batch.map((o) => [{ name: 'Prev', value: o.txid }]);
 
-  if (sleepMs > 0) await sleep(sleepMs);
+  let success = false;
+  while (!success) {
+    try {
+      await tarn.advanced.entries.batchCreate(collectionName, records, [], perItemTags);
+      success = true;
+      // Persist titles only after the wire write succeeded.
+      for (const o of batch) {
+        const title = o.data?.[titleField] ?? '(no title)';
+        appendProcessed(skipFile, title);
+      }
+      fixedCount += batch.length;
+      console.log(`${batchLabel}  FIXED`);
+    } catch (err) {
+      const msg = err?.message ?? String(err);
+      if (/rate limit/i.test(msg)) {
+        if (bucketWaitsSpent >= maxRateLimitWaits) {
+          console.log(`${batchLabel}  GIVE UP — rate-limited and out of retry budget (${maxRateLimitWaits} waits used)`);
+          failedCount += batch.length;
+          break; // exit inner retry loop, continue to next batch
+        }
+        const waitMs = msUntilNextHour() + 10_000;
+        bucketWaitsSpent++;
+        console.log(
+          `${batchLabel}  RATE LIMITED — sleeping ${formatDuration(waitMs)} until next-hour budget reset ` +
+          `(retry ${bucketWaitsSpent}/${maxRateLimitWaits})...`,
+        );
+        await sleep(waitMs);
+        // Loop back and retry the same batch.
+      } else {
+        // Non-rate-limit error: log and move on. The batch is NOT marked
+        // processed, so a rerun will retry it.
+        console.log(`${batchLabel}  FAIL — ${msg}`);
+        failedCount += batch.length;
+        break;
+      }
+    }
+  }
 }
 
 // ============ Summary ============
 
 console.log();
 console.log('========== Summary ==========');
-console.log(`  Total orphans: ${orphans.length}`);
-console.log(`  Fixed:         ${fixed}`);
-console.log(`  Skipped:       ${skipped}`);
-console.log(`  Failed:        ${failed}`);
+console.log(`  Total orphans:          ${orphans.length}`);
+console.log(`  Skipped (in skip file): ${skipped.length}`);
+console.log(`  Unfixable (no PK):      ${unfixable.length}`);
+console.log(`  Fixed:                  ${fixedCount}`);
+console.log(`  Failed:                 ${failedCount}`);
+console.log(`  Rate-limit waits used:  ${bucketWaitsSpent}`);
 if (dryRun) console.log('  (dry run — no actual writes)');
 console.log();
-console.log(`Skip file now contains entries to skip on future runs:`);
-console.log(`  ${skipFile}`);
+console.log(`Skip file: ${skipFile}`);
 console.log();
-if (failed > 0) {
-  console.log('Some entries failed. Rerun the script to retry — failed entries are NOT added to the skip file.');
+if (failedCount > 0) {
+  console.log('Some entries failed. Rerun the script to retry — failed entries are NOT in the skip file.');
   process.exit(1);
 }
