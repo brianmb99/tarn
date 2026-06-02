@@ -959,6 +959,16 @@ export class TarnClient {
   async changeCredentials(newUsername: string, newPassword: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
 
+    // Issue #27: passkey-only sessions never derived the master_key, so they
+    // lack the credential-side state required to re-wrap the new gen under
+    // the password factor. Refuse cleanly instead of throwing a confusing
+    // null-dereference downstream.
+    if (!this.#signingKeyPair || !this.#credentialLookupKey || !this.#username) {
+      throw new Error(
+        'changeCredentials(): requires a password-authenticated session — sign in with username + password first',
+      );
+    }
+
     // Phrase is required by default. Skipping it leaves the new gen without a
     // recovery wrapping; if the user later forgets the password, data written
     // under the new gen is lost.
@@ -1426,8 +1436,13 @@ export class TarnClient {
     if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('viewAccountKey(): password is required');
     }
+    // Issue #27: requires a password-authenticated session — the step-up
+    // call derives keys from the freshly-typed password, then re-signs the
+    // challenge with the password-derived signing key.
     if (!this.#username) {
-      throw new Error('viewAccountKey(): username unknown — log in first');
+      throw new Error(
+        'viewAccountKey(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
     if (!this.#dekByGen || !this.#dekByGen.has(1)) {
       throw new Error('viewAccountKey(): DEK_gen1 not available (corrupt session?)');
@@ -1754,8 +1769,14 @@ export class TarnClient {
     if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('rotateAccountKey(): password is required');
     }
+    // Issue #27: requires a password-authenticated session. The flow
+    // re-derives password keys from (username, password) and confirms the
+    // resulting credential_lookup_key matches the session's cached one;
+    // a passkey-only session has neither cached.
     if (!this.#username) {
-      throw new Error('rotateAccountKey(): username unknown — log in first');
+      throw new Error(
+        'rotateAccountKey(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
     if (!this.#dekByGen || this.#dekByGen.size === 0) {
       throw new Error('rotateAccountKey(): DEK chain unavailable (corrupt session?)');
@@ -2482,8 +2503,13 @@ export class TarnClient {
     if (typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('removePasskey(): password is required');
     }
+    // Issue #27: removePasskey re-derives password keys from the freshly-
+    // typed password + the cached username; passkey-only sessions don't
+    // have a username cached.
     if (!this.#username) {
-      throw new Error('removePasskey(): username unknown — log in with password first');
+      throw new Error(
+        'removePasskey(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
 
     // Re-derive the password KEK so #rebuildEnvelopeWithoutPasskey can
@@ -2548,7 +2574,14 @@ export class TarnClient {
     passkeyKEK: CryptoKey,
   ): Promise<string> {
     if (!this.#dekByGen || !this.#recoveryFactorMeta || !this.#credentialEncryptionKey) {
-      throw new Error('#rebuildEnvelopeWithExtraPasskey: missing client state');
+      // Issue #27: registerPasskey re-wraps the chain under
+      // {#credentialEncryptionKey, recovery KEK, new passkey KEK}; the
+      // first two are master_key-derived and absent on passkey-only
+      // sessions. Phrase it as a session-shape error so apps can route
+      // the user to "sign in with password first."
+      throw new Error(
+        '#rebuildEnvelopeWithExtraPasskey: requires a password-authenticated session — sign in with username + password first',
+      );
     }
 
     const wireChain: Array<{ gen: number; wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> }> = [];
@@ -3333,11 +3366,12 @@ export class TarnClient {
    */
   async sendConnectionRequest(recipientUsername: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
-    if (!this.#sharingKeyPair) {
-      throw new Error('sendConnectionRequest(): no sharing keypair — login first');
-    }
-    if (!this.#username) {
-      throw new Error('sendConnectionRequest(): client missing sender username — re-login');
+    // Issue #27: sharing handshake depends on master_key-derived sharing +
+    // signing keys; passkey-only sessions never derived either.
+    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+      throw new Error(
+        'sendConnectionRequest(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
 
     const { sharePub, sharePubBase64Url } = await this.getRecipientShareKey(recipientUsername);
@@ -3434,8 +3468,13 @@ export class TarnClient {
    */
   async listIncomingRequests(opts: any = {}): Promise<any> {
     await this.#requireAuth();
+    // Issue #27: incoming requests are HPKE-decrypted under the user's
+    // master_key-derived sharing private key; passkey-only sessions don't
+    // have one.
     if (!this.#sharingKeyPair) {
-      throw new Error('listIncomingRequests(): no sharing keypair — login first');
+      throw new Error(
+        'listIncomingRequests(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
     const windows = Number.isInteger(opts.windows) && opts.windows > 0
       ? opts.windows
@@ -3615,8 +3654,12 @@ export class TarnClient {
    */
   async acceptConnectionRequest(requestNonce: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
-    if (!this.#sharingKeyPair) {
-      throw new Error('acceptConnectionRequest(): no sharing keypair — login first');
+    // Issue #27: sharing handshake depends on master_key-derived sharing +
+    // signing keys.
+    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+      throw new Error(
+        'acceptConnectionRequest(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
     if (typeof requestNonce !== 'string' || requestNonce.length === 0) {
       throw new Error('requestNonce is required');
@@ -3896,11 +3939,12 @@ export class TarnClient {
    */
   async createInviteToken(opts: any = {}): Promise<any> {
     await this.#requireAuth();
-    if (!this.#sharingKeyPair) {
-      throw new Error('createInviteToken(): no sharing keypair — login first');
-    }
-    if (!this.#username) {
-      throw new Error('createInviteToken(): client missing sender username — re-login');
+    // Issue #27: invite tokens embed the inviter's signing pub + share_pub;
+    // both are master_key-derived and absent on passkey-only sessions.
+    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+      throw new Error(
+        'createInviteToken(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
     // Local-only label: stored in the inviter's issued-invites record so
     // listIssuedInvites + the auto-accept path can label the resulting
@@ -4066,11 +4110,12 @@ export class TarnClient {
    */
   async redeemInviteToken(tokenId: string, payloadKeyB64Url: string): Promise<any> {
     await this.#requireAuth();
-    if (!this.#sharingKeyPair) {
-      throw new Error('redeemInviteToken(): no sharing keypair — login first');
-    }
-    if (!this.#username) {
-      throw new Error('redeemInviteToken(): client missing sender username — re-login');
+    // Issue #27: redeeming an invite sends a connection-request payload
+    // signed with the redeemer's master_key-derived signing key.
+    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+      throw new Error(
+        'redeemInviteToken(): requires a password-authenticated session — sign in with username + password first',
+      );
     }
     if (typeof tokenId !== 'string' || tokenId.length === 0) {
       throw new Error('redeemInviteToken(): tokenId is required');
@@ -4233,8 +4278,12 @@ export class TarnClient {
    * so the cache is invalidated wholesale on credential change / recovery.
    */
   async #getPairKeysFor(connectionSharePubBase64Url: string): Promise<any> {
+    // Issue #27: pair keys derive from master_key-based sharing keys.
+    // Passkey-only sessions never derived them.
     if (!this.#sharingKeyPair) {
-      throw new Error('share log: no sharing keypair — login first');
+      throw new Error(
+        'share log: requires a password-authenticated session — sign in with username + password first',
+      );
     }
     if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
       throw new Error('share log: connectionSharePubBase64Url must be a non-empty string');
@@ -4335,6 +4384,13 @@ export class TarnClient {
     }
     if (!operationFields || typeof operationFields !== 'object') {
       throw new Error('_publishShareLogEntry: operationFields is required');
+    }
+    // Issue #27: share-log entries are signed under the user's master_key-
+    // derived ECDSA signing key. Passkey-only sessions never derived one.
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new Error(
+        '_publishShareLogEntry: requires a password-authenticated session — sign in with username + password first',
+      );
     }
 
     const pair = await this.#getPairKeysFor(connection.share_pub);
@@ -5778,20 +5834,34 @@ export class TarnClient {
    * @throws if the client is not authenticated
    */
   async serializeSession() {
-    if (!this.#signingKeyPair || !this.#credentialLookupKey || !this.#dekByGen) {
+    // A logged-in session has a populated DEK chain AND at least one of
+    // signing keys (full password-authenticated session) or a JWT (passkey-
+    // only session). Mirrors isLoggedIn(); we accept the broader shape so
+    // passkey-only sessions persist across reloads.
+    if ((this.#dekByGen?.size ?? 0) === 0) {
+      throw new Error('serializeSession(): client is not authenticated');
+    }
+    if (!this.#signingKeyPair && !this.#jwt) {
       throw new Error('serializeSession(): client is not authenticated');
     }
 
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = now + 7 * 24 * 60 * 60; // 7-day hard cap, no refresh-on-use
 
-    const [pkcs8, spki] = await Promise.all([
-      crypto.subtle.exportKey('pkcs8', this.#signingKeyPair.privateKey),
-      crypto.subtle.exportKey('spki', this.#signingKeyPair.publicKey),
-    ]);
+    // Password-derived signing key — optional on passkey-only sessions.
+    let signingPrivateKeyB64: string | null = null;
+    let signingPublicKeyB64: string | null = null;
+    if (this.#signingKeyPair) {
+      const [pkcs8, spki] = await Promise.all([
+        crypto.subtle.exportKey('pkcs8', this.#signingKeyPair.privateKey),
+        crypto.subtle.exportKey('spki', this.#signingKeyPair.publicKey),
+      ]);
+      signingPrivateKeyB64 = bytesToBase64(new Uint8Array(pkcs8));
+      signingPublicKeyB64 = bytesToBase64(new Uint8Array(spki));
+    }
 
     const dekByGen = [];
-    for (const [gen, pair] of this.#dekByGen) {
+    for (const [gen, pair] of this.#dekByGen!) {
       const raw = await crypto.subtle.exportKey('raw', pair.gcmKey);
       dekByGen.push({ gen, rawBytes: bytesToBase64(new Uint8Array(raw)) });
     }
@@ -5831,27 +5901,22 @@ export class TarnClient {
       // disappeared with the single-envelope cleanup. v1/v2 blobs from prior
       // versions of the SDK no longer resume; they fail cleanly to null and
       // the user re-authenticates.
+      //
+      // Issue #27: the password-derived fields below (username,
+      // credentialLookupKey, signingPrivate/PublicKey, sharingPrivate/PublicKey,
+      // credentialEncryptionKey, recoveryFactorMeta) are OPTIONAL — null on a
+      // passkey-only session, populated on a password-authenticated session.
+      // The v3 schema stays unchanged; resumeSession tolerates null/missing
+      // values for each (same back-compat approach as issue #25 took for
+      // credentialEncryptionKey).
       v: 3,
       createdAt: now,
       expiresAt,
       apiBase: this.#apiBase,
       appId: this.#appId,
-      username: this.#username,
       dataLookupKey: this.#dataLookupKey,
-      credentialLookupKey: this.#credentialLookupKey,
       currentGen: this.#currentGen,
       dekByGen,
-      signingPrivateKey: bytesToBase64(new Uint8Array(pkcs8)),
-      signingPublicKey: bytesToBase64(new Uint8Array(spki)),
-      sharingPrivateKey: bytesToBase64(this.#sharingKeyPair!.privateKey),
-      sharingPublicKey: bytesToBase64(this.#sharingKeyPair!.publicKey),
-      recoveryFactorMeta,
-      // Issue #25: read by resumeSession to rehydrate #credentialEncryptionKey
-      // so passkey register/remove flows succeed post-page-reload. Omitted (null)
-      // only for the brief window where a logged-in client somehow has no CEK
-      // (e.g., passkey-only authenticated session before the removePasskey
-      // password-prompt fallback runs); resumeSession tolerates null.
-      credentialEncryptionKey: credentialEncryptionKeyB64,
       jwt: this.#jwt,
       sid: this.#sid,
       // Phase 3: persist the Model B indicator so resumed sessions know
@@ -5859,6 +5924,24 @@ export class TarnClient {
       // round trip. Strict boolean | null — undefined survives JSON.parse
       // as undefined, which we coerce back to null.
       accountKeyStored: this.#accountKeyStored,
+      // ---- Password-derived (optional; null on passkey-only sessions) ----
+      username: this.#username,
+      credentialLookupKey: this.#credentialLookupKey,
+      signingPrivateKey: signingPrivateKeyB64,
+      signingPublicKey: signingPublicKeyB64,
+      sharingPrivateKey: this.#sharingKeyPair
+        ? bytesToBase64(this.#sharingKeyPair.privateKey)
+        : null,
+      sharingPublicKey: this.#sharingKeyPair
+        ? bytesToBase64(this.#sharingKeyPair.publicKey)
+        : null,
+      recoveryFactorMeta,
+      // Issue #25: read by resumeSession to rehydrate #credentialEncryptionKey
+      // so passkey register/remove flows succeed post-page-reload. Omitted (null)
+      // only for the brief window where a logged-in client somehow has no CEK
+      // (e.g., passkey-only authenticated session before the removePasskey
+      // password-prompt fallback runs); resumeSession tolerates null.
+      credentialEncryptionKey: credentialEncryptionKeyB64,
     };
 
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
@@ -5924,34 +6007,51 @@ export class TarnClient {
       if (payload.apiBase !== apiBase.replace(/\/$/, '')) return null;
       if (payload.appId !== appId) return null;
 
+      // Issue #27: only the DEK chain + minimal session identity are strictly
+      // required. The password-derived fields (username, credentialLookupKey,
+      // signing keys, sharing keys, credentialEncryptionKey, recoveryFactorMeta)
+      // are optional — populated on full sessions, null on passkey-only sessions.
+      // A passkey-only blob must still carry a JWT so the rehydrated client can
+      // hit the API; that's enforced by the additional check below.
       const required = [
-        'createdAt', 'expiresAt', 'username', 'dataLookupKey', 'credentialLookupKey',
-        'currentGen', 'dekByGen',
-        'signingPrivateKey', 'signingPublicKey', 'sharingPrivateKey', 'sharingPublicKey',
+        'createdAt', 'expiresAt', 'dataLookupKey', 'currentGen', 'dekByGen',
       ];
       for (const k of required) {
         if (payload[k] === undefined || payload[k] === null) return null;
       }
       if (!Array.isArray(payload.dekByGen) || payload.dekByGen.length === 0) return null;
 
+      // Mirror isLoggedIn() / serializeSession(): need at least signing keys
+      // (full session) or a JWT (passkey-only session). Refuse blobs that
+      // lack both — they can't perform authenticated calls.
+      const hasSigningKeys =
+        typeof payload.signingPrivateKey === 'string' &&
+        typeof payload.signingPublicKey === 'string';
+      const hasJwt = typeof payload.jwt === 'string' && payload.jwt.length > 0;
+      if (!hasSigningKeys && !hasJwt) return null;
+
       const nowSeconds = opts._nowSeconds != null ? opts._nowSeconds : Math.floor(Date.now() / 1000);
       if (typeof payload.expiresAt !== 'number' || nowSeconds >= payload.expiresAt) return null;
 
-      // Rehydrate keys.
-      const signingPrivateKey = await crypto.subtle.importKey(
-        'pkcs8',
-        bs(base64ToBytes(payload.signingPrivateKey)),
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        true,
-        ['sign'],
-      );
-      const signingPublicKey = await crypto.subtle.importKey(
-        'spki',
-        bs(base64ToBytes(payload.signingPublicKey)),
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        true,
-        ['verify'],
-      );
+      // Rehydrate keys. Signing keys are optional — only imported when present.
+      let signingPrivateKey: CryptoKey | null = null;
+      let signingPublicKey: CryptoKey | null = null;
+      if (hasSigningKeys) {
+        signingPrivateKey = await crypto.subtle.importKey(
+          'pkcs8',
+          bs(base64ToBytes(payload.signingPrivateKey)),
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          true,
+          ['sign'],
+        );
+        signingPublicKey = await crypto.subtle.importKey(
+          'spki',
+          bs(base64ToBytes(payload.signingPublicKey)),
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          true,
+          ['verify'],
+        );
+      }
       const dekByGen = new Map();
       for (const { gen, rawBytes } of payload.dekByGen) {
         if (typeof gen !== 'number' || typeof rawBytes !== 'string') return null;
@@ -6008,19 +6108,33 @@ export class TarnClient {
       const client = new TarnClient(apiBase, appId);
       // Mirror the field-set pattern at the end of login() — populate the
       // private slots directly so the resumed client behaves identically to
-      // one that just logged in.
+      // one that just logged in. Issue #27: each password-derived field is
+      // assigned only when present in the blob; passkey-only sessions leave
+      // them null and the methods that require them throw a clear
+      // "requires password-authenticated session" error.
       client.#jwt = payload.jwt || null;
       client.#sid = typeof payload.sid === 'string' ? payload.sid : null;
       client.#dataLookupKey = payload.dataLookupKey;
-      client.#credentialLookupKey = payload.credentialLookupKey;
-      client.#signingKeyPair = { privateKey: signingPrivateKey, publicKey: signingPublicKey };
       client.#dekByGen = dekByGen;
       client.#currentGen = payload.currentGen;
-      client.#username = payload.username;
-      client.#sharingKeyPair = {
-        privateKey: base64ToBytes(payload.sharingPrivateKey),
-        publicKey: base64ToBytes(payload.sharingPublicKey),
-      };
+      if (signingPrivateKey && signingPublicKey) {
+        client.#signingKeyPair = { privateKey: signingPrivateKey, publicKey: signingPublicKey };
+      }
+      if (typeof payload.credentialLookupKey === 'string' && payload.credentialLookupKey.length > 0) {
+        client.#credentialLookupKey = payload.credentialLookupKey;
+      }
+      if (typeof payload.username === 'string' && payload.username.length > 0) {
+        client.#username = payload.username;
+      }
+      if (
+        typeof payload.sharingPrivateKey === 'string' &&
+        typeof payload.sharingPublicKey === 'string'
+      ) {
+        client.#sharingKeyPair = {
+          privateKey: base64ToBytes(payload.sharingPrivateKey),
+          publicKey: base64ToBytes(payload.sharingPublicKey),
+        };
+      }
       client.#recoveryFactorMeta = recoveryFactorMeta;
       client.#credentialEncryptionKey = credentialEncryptionKey;
       // Phase 3: rehydrate the Model B indicator. Pre-Phase-3 blobs lack
@@ -6055,15 +6169,30 @@ export class TarnClient {
    * resumeSession; false on a freshly-constructed client or after clearSession
    * / deleteAccount.
    *
-   * Note this reflects key material possession, not JWT freshness — if the JWT
-   * has expired but signing keys are present, isLoggedIn() returns true and
-   * the next authenticated call will silently re-authenticate. Apps treat
-   * this as "the user is logged in," which matches user expectations.
+   * A session is logged-in when the DEK chain is populated AND the client
+   * holds at least one of:
+   *   - `#signingKeyPair` — full password-authenticated session that can
+   *     mint fresh JWTs via challenge-response (master_key-derived state).
+   *   - `#jwt` — passkey-only session. The JWT is the auth context; no
+   *     master_key is on the client, so password-side operations
+   *     (changeCredentials, viewAccountKey, sharing handshake, etc.)
+   *     deliberately refuse with a "requires password-authenticated session"
+   *     error. Read access + entry CRUD that doesn't need the master_key
+   *     works normally because the JWT carries the auth.
+   *
+   * Note this reflects key material possession, not JWT freshness — if the
+   * JWT has expired but signing keys are present, isLoggedIn() returns true
+   * and the next authenticated call will silently re-authenticate. For a
+   * passkey-only session where only the JWT is present, an expired JWT
+   * means re-authentication isn't possible client-side; the next call
+   * surfaces a 401 and the app re-prompts the passkey tap.
    *
    * @returns {boolean}
    */
   isLoggedIn() {
-    return (this.#dekByGen?.size ?? 0) > 0 && this.#signingKeyPair != null;
+    if ((this.#dekByGen?.size ?? 0) === 0) return false;
+    // Full session (signing keys present) OR passkey-only session (JWT only).
+    return this.#signingKeyPair != null || this.#jwt != null;
   }
 
   // ============ SERVER-SIDE SESSIONS (Section 7.5, issue #20) ============

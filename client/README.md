@@ -443,6 +443,8 @@ await tarn.authenticateWithPasskey({
 
 **What passkey support gets you.** A registered passkey lets the user (1) log in without typing a password — the platform authenticator's biometric prompt is enough — and (2) decrypt all existing data without holding the password. The DEK chain gains a `passkey_prf` wrapping per gen at registration; subsequent reads through that passkey unwrap normally.
 
+**The passkey-only session model.** A passkey-authenticated session has a different shape from a password-authenticated one: the client holds the JWT and the unwrapped DEK chain, but NOT the master_key-derived state (username, signing keypair, sharing keypair, credential-encryption key). That is enough to read, create, update, and delete entries — the JWT carries the auth context — and the session **persists and resumes** across reloads exactly like a password session does (`tarn.session.isLoggedIn()` returns `true`, the persisted blob round-trips, and the resumed client can keep reading and writing). What it cannot do is anything that needs the master_key: `changeCredentials`, `viewAccountKey`, `rotateAccountKey`, `registerPasskey`, `removePasskey`, and the sharing/invite handshake methods all throw a clear "requires a password-authenticated session" error. To perform any of those, the user signs in with username + password first.
+
 **What passkey support does NOT change.** Adding a passkey does not weaken the password or account-key paths — the existing wrappings stay in place. Removing a passkey strips its wrappings without touching the others. `rotateAccountKey` and `recoverAccount` do not mint a new generation, so passkey unwrappability survives both unchanged.
 
 **Fallback.** If `tarn.passkeys.isSupported()` returns false (Firefox, Chrome on a Linux box without a platform authenticator, etc.), apps should not surface the passkey affordance and should fall back to password-only auth. The SDK refuses to register a passkey on a device without PRF (the wrap would be unrecoverable), so a hopeful "let's just try" is not safe.
@@ -526,6 +528,8 @@ await tarn.session.revokeAll();                    // log out everywhere includi
 ```
 
 Apps **should** attach a device label at login time — `tarn.login(username, password, { deviceLabel: 'Chrome on MacBook' })` — so users can identify their sessions in `listDevices()`. If omitted, `deviceLabel` is `null` and users only see the opaque `sid` and timestamps. Pick something the user will recognize: a User-Agent summary, a hostname, or a name the user typed at signup.
+
+**Session persistence and the passkey-only session.** Both password and passkey logins persist transparently: the SDK serializes the in-memory session under an origin-bound IndexedDB wrapping key, writes the ciphertext to `localStorage`, and resumes it on the next `TarnClient.create()` call. Passkey-only sessions persist and resume on the same code path — the resumed client returns `isLoggedIn() === true` and supports the same read + CRUD surface that the just-authenticated client does. The persisted blob hard-expires 7 days after creation with no refresh-on-use; on expiry the user re-authenticates (re-tap for passkey, retype for password). The password-side fields (`username`, `credentialLookupKey`, signing/sharing keypairs, `credentialEncryptionKey`, `recoveryFactorMeta`) are only present in the blob when the user signed in with a password — passkey-only blobs omit them, and the methods that need them throw a "requires a password-authenticated session" error rather than null-dereferencing.
 
 ---
 
