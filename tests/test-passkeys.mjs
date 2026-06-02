@@ -158,6 +158,58 @@ await test('authenticateWithPasskey() unwraps the DEK chain and mints a session'
   // verified) and that #dekByGen is populated for subsequent reads.
 });
 
+await test('JWT issued by /auth/passkey/authenticate has 7-day TTL (issue #28)', async () => {
+  // The SDK has no JWT-refresh path for passkey-only sessions (no
+  // #signingKeyPair to re-sign a challenge). The server compensates by
+  // minting JWTs that match the 7-day session-blob lifetime.
+  //
+  // Intercept the next /auth/passkey/authenticate response so we can
+  // decode the JWT and assert exp - iat === 7 days, without exposing the
+  // private #jwt field through the public SDK surface.
+  const originalFetch = globalThis.fetch;
+  let capturedJwt = null;
+  let capturedExpiresIn = null;
+  globalThis.fetch = async (url, opts) => {
+    const res = await originalFetch(url, opts);
+    if (typeof url === 'string' && url.endsWith('/api/v1/auth/passkey/authenticate')) {
+      // Clone so the SDK can still consume the body
+      const clone = res.clone();
+      try {
+        const body = await clone.json();
+        capturedJwt = body.jwt;
+        capturedExpiresIn = body.expiresIn;
+      } catch { /* leave nulls — assert below */ }
+    }
+    return res;
+  };
+
+  try {
+    const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
+    env.pinNextAuth(coreAuth.credentialIdB64Url);
+    await c.authenticateWithPasskey({ deviceLabel: 'TTL-probe' });
+    env.clearNextAuth();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert(capturedJwt, 'expected to capture a JWT from the authenticate response');
+  const parts = capturedJwt.split('.');
+  assert(parts.length === 3, 'JWT must have three parts');
+  // base64url payload decode
+  const padded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+  const padLen = (4 - (padded.length % 4)) % 4;
+  const payload = JSON.parse(Buffer.from(padded + '='.repeat(padLen), 'base64').toString('utf8'));
+  const SEVEN_DAYS = 7 * 24 * 3600;
+  assert(typeof payload.iat === 'number' && typeof payload.exp === 'number', 'iat/exp must be present');
+  if (payload.exp - payload.iat !== SEVEN_DAYS) {
+    throw new Error(`exp - iat must equal 7*24*3600 (${SEVEN_DAYS}); got ${payload.exp - payload.iat}`);
+  }
+  if (capturedExpiresIn !== SEVEN_DAYS) {
+    throw new Error(`response.expiresIn must equal ${SEVEN_DAYS}; got ${capturedExpiresIn}`);
+  }
+  assert(payload.via_passkey === true, 'JWT must mark via_passkey: true');
+});
+
 section('List passkeys');
 
 await test('listPasskeys() returns the registered credential without leaking pubkey/salt', async () => {

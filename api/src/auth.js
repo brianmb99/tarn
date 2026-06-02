@@ -5,7 +5,17 @@
 const JWT_TTL_SECONDS = 900; // 15 minutes
 const NONCE_TTL_SECONDS = 300; // 5 minutes
 
-export { JWT_TTL_SECONDS, NONCE_TTL_SECONDS };
+// Passkey-authenticated JWTs live for the full session-blob lifetime (7 days)
+// because the SDK has no refresh path for passkey-only sessions: it can't
+// re-sign a challenge without #signingKeyPair, which is null when the user
+// signed in via passkey. Matching the JWT lifetime to the session-blob TTL
+// closes the gap the SDK's existing "exp > now + 30s" early-return covers.
+//
+// The session-blob TTL (`now + 7 * 24 * 60 * 60`) is defined client-side in
+// client/src/tarn.ts → serializeSession(). Keep these in sync. See issue #28.
+const PASSKEY_JWT_TTL_SECONDS = 7 * 24 * 3600; // 7 days
+
+export { JWT_TTL_SECONDS, NONCE_TTL_SECONDS, PASSKEY_JWT_TTL_SECONDS };
 
 // ============ CHALLENGE / NONCE ============
 
@@ -95,16 +105,20 @@ function base64urlDecode(str) {
  * Sign a JWT with HMAC-SHA256.
  * @param {Object} payload - JWT claims (sub, role, data_lookup_key, etc.)
  * @param {string} secret - Base64-encoded HMAC secret
+ * @param {number} [ttlSeconds] - Optional override for token lifetime in
+ *   seconds. Defaults to JWT_TTL_SECONDS (15 minutes). Passkey-authenticated
+ *   tokens override this to PASSKEY_JWT_TTL_SECONDS (7 days) so they match
+ *   the session-blob lifetime (issue #28).
  * @returns {Promise<string>} Signed JWT
  */
-export async function signJWT(payload, secret) {
+export async function signJWT(payload, secret, ttlSeconds = JWT_TTL_SECONDS) {
   const key = await getHMACKey(secret);
   const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
   const now = Math.floor(Date.now() / 1000);
   const body = base64url(JSON.stringify({
     ...payload,
     iat: now,
-    exp: now + JWT_TTL_SECONDS,
+    exp: now + ttlSeconds,
   }));
   const sigInput = new TextEncoder().encode(`${header}.${body}`);
   const sig = await crypto.subtle.sign('HMAC', key, sigInput);

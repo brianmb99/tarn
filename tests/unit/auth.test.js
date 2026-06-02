@@ -11,6 +11,7 @@ import {
   verifyJWT,
   _resetHMACKey,
   JWT_TTL_SECONDS,
+  PASSKEY_JWT_TTL_SECONDS,
 } from '../../api/src/auth.js';
 
 // ============ Mock D1 Store (auth_nonces) ============
@@ -251,5 +252,41 @@ describe('JWT', () => {
     const payload = await verifyJWT(token, TEST_SECRET);
     assert.ok(payload, 'Fresh JWT should verify');
     assert.ok(payload.exp > Math.floor(Date.now() / 1000), 'exp should be in the future');
+  });
+
+  // Issue #28: signJWT must accept an optional ttlSeconds override so the
+  // passkey-authenticate route can mint 7-day tokens (matching session-blob
+  // lifetime) while the password path keeps the short 15-minute default.
+  it('should honor an explicit ttlSeconds override', async () => {
+    const token = await signJWT({ sub: 'passkey-user' }, TEST_SECRET, PASSKEY_JWT_TTL_SECONDS);
+    const payload = await verifyJWT(token, TEST_SECRET);
+    assert.ok(payload, 'JWT should verify');
+    assert.equal(
+      payload.exp - payload.iat,
+      PASSKEY_JWT_TTL_SECONDS,
+      'exp - iat must equal the explicit TTL',
+    );
+    assert.equal(
+      PASSKEY_JWT_TTL_SECONDS,
+      7 * 24 * 3600,
+      'passkey TTL constant must be 7 days',
+    );
+  });
+
+  it('should preserve the short default TTL when no override is passed', async () => {
+    // Defense-in-depth for issue #28: changing the passkey TTL must not
+    // accidentally change the password-path TTL.
+    const token = await signJWT({ sub: 'password-user' }, TEST_SECRET);
+    const payload = await verifyJWT(token, TEST_SECRET);
+    assert.equal(
+      payload.exp - payload.iat,
+      JWT_TTL_SECONDS,
+      'default TTL must remain JWT_TTL_SECONDS (15 min)',
+    );
+    assert.notEqual(
+      payload.exp - payload.iat,
+      PASSKEY_JWT_TTL_SECONDS,
+      'default TTL must not silently match the passkey TTL',
+    );
   });
 });

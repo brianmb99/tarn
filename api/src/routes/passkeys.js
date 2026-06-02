@@ -35,7 +35,7 @@ import {
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
-import { signJWT } from '../auth.js';
+import { signJWT, PASSKEY_JWT_TTL_SECONDS } from '../auth.js';
 import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH, buildCredentialTags } from './auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
@@ -680,12 +680,16 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
   });
   jwtPayload.sid = sid;
 
-  const jwt = await signJWT(jwtPayload, env.JWT_SECRET);
+  // Issue #28: Passkey-authenticated JWTs live for the full 7-day session-blob
+  // lifetime. The SDK's `#ensureFreshJwt` has no refresh path for passkey-only
+  // sessions (no `#signingKeyPair` to re-sign a challenge nonce), so a short
+  // TTL would silently break the session well before the blob expires.
+  const jwt = await signJWT(jwtPayload, env.JWT_SECRET, PASSKEY_JWT_TTL_SECONDS);
   writePasskeyAudit(ctx, env, request, account.data_lookup_key, 'passkey_authenticate');
 
   return jsonResponse({
     jwt,
-    expiresIn: 900,
+    expiresIn: PASSKEY_JWT_TTL_SECONDS,
     data_lookup_key: account.data_lookup_key,
     wrapped_data_key: account.wrapped_data_key,
     account_key_stored: account.wrapped_account_key != null,
