@@ -1,24 +1,23 @@
-// Regression test for the executeFetch retry-loop body-cancellation bug.
+// Regression + 429-no-retry tests for the executeFetch helper.
 //
-// Before the fix: when the server returned 429 with Retry-After > 60 seconds,
-// executeFetch cancelled the response body BEFORE checking the long-retry
-// short-circuit. That meant the Response handed back to the caller had a
-// consumed body, and the next .text() / .json() call threw
-// "Body is unusable: Body has already been read".
+// History:
+//   - Original bug (pre-tarn#29): executeFetch retried 429 with body-cancel
+//     happening BEFORE the long-Retry-After short-circuit, which left
+//     callers holding a consumed body. The first fix moved the cancel
+//     below the early return.
+//   - tarn#29: stopped retrying 429 entirely — retrying a rate-limit signal
+//     amplifies the problem. The SDK now throws `TarnRateLimitError`
+//     directly from #executeFetch with any Retry-After value attached.
 //
-// After the fix: cancel only fires when we're committed to a retry. The
-// Retry-After-too-long path returns the Response with its body intact.
-//
-// We exercise this through TarnClient's auth-challenge endpoint, which runs
-// through #executeFetch with retry-eligible status. A 429 with Retry-After:
-// 3600 is the smallest reproducer that both proves the bug existed and that
-// the fix sticks.
+// These tests pin the post-tarn#29 contract: any 429 → exactly one fetch,
+// typed error reaches the caller, body of the 429 is captured into the
+// error; 5xx and 4xx behavior is unchanged.
 //
 // Run: node --test tests/unit/client-fetch-retry.test.js
 
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { TarnClient } from '../../client/src/tarn.js';
+import { TarnClient, TarnRateLimitError } from '../../client/src/tarn.js';
 
 const originalFetch = globalThis.fetch;
 
@@ -33,16 +32,14 @@ function makeResponse(body, status = 200, headers = {}) {
   return new Response(body, { status, headers });
 }
 
-describe('executeFetch — retry body handling (regression)', () => {
+describe('executeFetch — 429 handling (tarn#29)', () => {
   afterEach(restoreFetch);
 
-  it('returns a body-readable Response on 429 with Retry-After > 60s', async () => {
+  it('throws TarnRateLimitError on first 429 with Retry-After captured', async () => {
     // login() drives #executeFetch through the GET-eligible path. The first
     // call (auth/challenge) is retry-safe; we make it return 429 + Retry-After
-    // 3600. Pre-fix, the long-retry path cancelled the body before the early
-    // return, and the Body.text() inside #fetch threw "Body has already been
-    // read". Post-fix, the body stays readable, the JSON parse succeeds, and
-    // login surfaces the 429 as a normal error.
+    // 3600. Per tarn#29 the SDK must not retry: exactly one network call
+    // and the caller gets a typed TarnRateLimitError carrying the seconds.
     let challengeCalls = 0;
     mockFetch(async (url) => {
       if (url.endsWith('/auth/challenge')) {
@@ -64,17 +61,45 @@ describe('executeFetch — retry body handling (regression)', () => {
       caught = err;
     }
 
-    assert.ok(caught, 'login should surface an error on 429');
-    // The CRITICAL assertion: the error is the upstream 429 message, NOT
-    // "Body is unusable". Pre-fix this would be "Body is unusable: Body has
-    // already been read".
+    assert.ok(caught instanceof TarnRateLimitError,
+      `expected TarnRateLimitError, got ${caught?.name}: ${caught?.message}`);
+    assert.equal(caught.retryAfterSeconds, 3600);
+    assert.equal(caught.status, 429);
+    assert.match(caught.responseBody, /rate-limited/);
+    // Regression guard: the old body-cancel bug surfaced as this string.
     assert.doesNotMatch(
       caught.message,
       /body is unusable|already been read/i,
       `error message must not be the body-already-consumed bug; got: ${caught.message}`,
     );
-    // And the retry didn't kick in (Retry-After 3600 short-circuits the loop).
-    assert.equal(challengeCalls, 1, 'long Retry-After should NOT trigger a retry');
+    assert.equal(challengeCalls, 1, '429 must NOT be retried (tarn#29)');
+  });
+
+  it('throws TarnRateLimitError on 429 without Retry-After (retryAfterSeconds: null)', async () => {
+    let challengeCalls = 0;
+    mockFetch(async (url) => {
+      if (url.endsWith('/auth/challenge')) {
+        challengeCalls++;
+        return makeResponse(
+          JSON.stringify({ error: 'rate-limited' }),
+          429,
+          { 'Content-Type': 'application/json' },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const client = new TarnClient('https://api.tarn.dev', 'bookish');
+    let caught;
+    try {
+      await client.login('rate-limit-test@example.com', 'pw-2026');
+    } catch (err) {
+      caught = err;
+    }
+
+    assert.ok(caught instanceof TarnRateLimitError);
+    assert.equal(caught.retryAfterSeconds, null);
+    assert.equal(challengeCalls, 1, '429 still must not be retried');
   });
 
   it('still retries 5xx responses (sanity — fix did not regress the retry path)', async () => {

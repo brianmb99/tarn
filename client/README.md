@@ -678,6 +678,38 @@ Plain JavaScript works too — the inference simply doesn't run. The runtime val
 
 ---
 
+## Rate limiting
+
+The Tarn API enforces per-IP and per-endpoint rate limits. When a request is rate-limited the server responds with HTTP 429 and (usually) a `Retry-After` header.
+
+**The SDK does not auto-retry on 429.** Retrying a rate-limit signal immediately just confirms the client is going too fast and amplifies the problem — one logical sync could otherwise burn 3 quota slots in a few seconds. Instead, the first 429 surfaces as a typed `TarnRateLimitError` so the app can decide what to do.
+
+```js
+import { TarnRateLimitError } from 'tarn-client';
+
+try {
+  await tarn.notes.list();
+} catch (err) {
+  if (err instanceof TarnRateLimitError) {
+    // err.retryAfterSeconds — number | null, parsed from the Retry-After header
+    // err.responseBody     — raw body text from the 429 response (often JSON
+    //                        with { error, retry_after })
+    // err.url              — full request URL that was rate-limited
+    const wait = err.retryAfterSeconds ?? 60;
+    showToast(`Rate-limited — try again in ${wait}s`);
+    scheduleRetryIn(wait * 1000);
+    return;
+  }
+  throw err;
+}
+```
+
+**Suggested handling:** wait at least `retryAfterSeconds` before retrying. If `retryAfterSeconds` is `null`, fall back to a conservative default (60s is reasonable for most endpoints). The SDK deliberately does not enforce a wait or schedule retries on the app's behalf — that policy belongs in the app, where it can be coordinated with the UX (banner, toast, sync queue, etc.).
+
+**5xx and transient network errors still retry** transparently inside the SDK with exponential backoff. Only 429 is special-cased.
+
+---
+
 ## Security model
 
 - **Client-side encryption.** All data is AES-256-GCM encrypted before leaving the client. The server never sees plaintext.

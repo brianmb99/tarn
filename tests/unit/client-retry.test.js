@@ -1,9 +1,9 @@
-// Unit tests for TarnClient retry behavior (tarn #7).
+// Unit tests for TarnClient retry behavior (tarn #7, tarn #29).
 // Run: node --test tests/unit/client-retry.test.js
 
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { TarnClient } from '../../client/src/tarn.js';
+import { TarnClient, TarnRateLimitError } from '../../client/src/tarn.js';
 
 // ============ Fetch mocking ============
 
@@ -107,18 +107,75 @@ describe('TarnClient retry — register (POST, retry:true)', () => {
     assert.equal(registerCountFrom(fetchCalls), 2, 'should retry after network error');
   });
 
-  it('honors Retry-After on 429', async () => {
+  // tarn#29: 429 must NOT retry. The SDK throws TarnRateLimitError on the
+  // first response so the caller can schedule a retry per Retry-After
+  // instead of amplifying the rate-limit hit 3x.
+  it('does NOT retry on 429 and throws TarnRateLimitError with Retry-After', async () => {
     mockFetch([
-      { status: 429, headers: { 'retry-after': '1' }, body: '' },
-      { status: 201, body: JSON.stringify({ data_lookup_key: 'c'.repeat(64) }) },
+      { status: 429, headers: { 'retry-after': '42' }, body: JSON.stringify({ error: 'rate-limited' }) },
+    ]);
+
+    const client = new TarnClient('https://api.tarn.dev', 'bookish');
+    let caught;
+    try {
+      await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof TarnRateLimitError, `expected TarnRateLimitError, got ${caught?.name}: ${caught?.message}`);
+    assert.equal(caught.retryAfterSeconds, 42);
+    assert.equal(caught.status, 429);
+    assert.equal(registerCountFrom(fetchCalls), 1, '429 must NOT be retried (tarn#29)');
+  });
+
+  it('does NOT retry on 429 and surfaces null retryAfterSeconds when header is absent', async () => {
+    mockFetch([
+      { status: 429, body: JSON.stringify({ error: 'rate-limited' }) },
+    ]);
+
+    const client = new TarnClient('https://api.tarn.dev', 'bookish');
+    let caught;
+    try {
+      await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof TarnRateLimitError);
+    assert.equal(caught.retryAfterSeconds, null);
+    assert.equal(registerCountFrom(fetchCalls), 1);
+  });
+
+  it('does NOT retry on 429 with HTTP-date Retry-After (parsed to seconds)', async () => {
+    const future = new Date(Date.now() + 30_000).toUTCString();
+    mockFetch([
+      { status: 429, headers: { 'retry-after': future }, body: '' },
+    ]);
+
+    const client = new TarnClient('https://api.tarn.dev', 'bookish');
+    let caught;
+    try {
+      await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(caught instanceof TarnRateLimitError);
+    // ~30s; allow 5s of slack for clock drift in CI.
+    assert.ok(caught.retryAfterSeconds >= 25 && caught.retryAfterSeconds <= 35,
+      `expected ~30s, got ${caught.retryAfterSeconds}`);
+    assert.equal(registerCountFrom(fetchCalls), 1);
+  });
+
+  it('5xx retry behavior unchanged when interleaved with 429-like setup (sanity)', async () => {
+    // Ensure removing 429 from the retry path did not regress 5xx retries.
+    mockFetch([
+      { status: 503, body: '' },
+      { status: 201, body: JSON.stringify({ data_lookup_key: 'd'.repeat(64) }) },
       ...authFlowSuccessResponses(),
     ]);
 
     const client = new TarnClient('https://api.tarn.dev', 'bookish');
-    const t0 = Date.now();
     const result = await client.register('test@example.com', 'pw12345678', { recoveryAcknowledged: true });
-    const elapsed = Date.now() - t0;
     assert.equal(result.dataLookupKey.length, 64);
-    assert.ok(elapsed >= 900, `should wait ≥1s per Retry-After (waited ${elapsed}ms)`);
+    assert.equal(registerCountFrom(fetchCalls), 2);
   });
 });

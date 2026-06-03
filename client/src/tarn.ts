@@ -209,6 +209,41 @@ export class StalePasskeyError extends Error {
   }
 }
 
+/**
+ * Thrown by the SDK on any HTTP 429 response from the Tarn API. The SDK does
+ * NOT auto-retry on 429 — retrying a rate-limit signal just confirms the
+ * client is going too fast and amplifies the problem (see tarn#29). Instead,
+ * the first 429 surfaces immediately so the caller can decide what to do.
+ *
+ * `retryAfterSeconds` carries the parsed `Retry-After` header (delta-seconds
+ * or HTTP-date, normalized to seconds) when the server sent one, or `null`
+ * if absent. Recommended app behavior: surface a "rate-limited — try again
+ * in N minutes" UX and schedule a retry past `retryAfterSeconds`. Apps that
+ * want stricter ceilings (e.g. ignore Retry-After values longer than an
+ * hour) can cap or override locally; the SDK reports the server's signal
+ * verbatim and does not wait on the user's behalf.
+ *
+ * `status` is always 429; included for symmetry with other typed errors so
+ * callers can branch on `err instanceof TarnRateLimitError` without
+ * additional checks.
+ */
+export class TarnRateLimitError extends Error {
+  readonly status: 429;
+  readonly retryAfterSeconds: number | null;
+  readonly url: string;
+  readonly responseBody: string;
+  constructor(args: { url: string; retryAfterSeconds: number | null; responseBody?: string }) {
+    const ra = args.retryAfterSeconds;
+    const suffix = ra != null ? ` (Retry-After: ${ra}s)` : '';
+    super(`Rate limit exceeded${suffix}`);
+    this.name = 'TarnRateLimitError';
+    this.status = 429;
+    this.retryAfterSeconds = ra;
+    this.url = args.url;
+    this.responseBody = args.responseBody ?? '';
+  }
+}
+
 export class TarnClient {
   #apiBase: string;
   #appId: string;
@@ -6548,9 +6583,12 @@ export class TarnClient {
    * Internal fetch wrapper with transparent retry on transient failures.
    *
    * Retry policy:
-   *   - 5xx or 429 responses → retry (honoring Retry-After on 429)
-   *   - Network errors (fetch throws) → retry
-   *   - 4xx → do not retry (permanent answers: validation, auth, conflict, etc.)
+   *   - 5xx responses → retry with exponential backoff
+   *   - Network errors (fetch throws) → retry with exponential backoff
+   *   - 429 responses → DO NOT retry. Throw `TarnRateLimitError` on the first
+   *     hit, propagating `Retry-After` so the caller can schedule sensibly.
+   *     Retrying a rate-limit signal amplifies the problem (tarn#29).
+   *   - Other 4xx → do not retry (permanent answers: validation, auth, conflict).
    *
    * Retry is enabled by default for idempotent operations:
    *   - Any GET
@@ -6589,25 +6627,20 @@ export class TarnClient {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
         const res = await fetch(url, opts);
-        const isTransient = res.status >= 500 || res.status === 429;
-        if (!isTransient || attempt === MAX_ATTEMPTS - 1) {
-          return res;
+
+        // 429 → fail fast. Retrying a rate-limit signal just confirms the
+        // client is going too fast (tarn#29). Read the body so callers can
+        // inspect it via the thrown error, then throw a typed error carrying
+        // any Retry-After advice from the server.
+        if (res.status === 429) {
+          const retryAfterSeconds = parseRetryAfter(res.headers.get('Retry-After'));
+          let responseBody = '';
+          try { responseBody = await res.text(); } catch {}
+          throw new TarnRateLimitError({ url, retryAfterSeconds, responseBody });
         }
 
-        const retryAfterSec = parseRetryAfter(res.headers.get('Retry-After'));
-        // Don't honor Retry-After values longer than 60 seconds — the server
-        // is telling us to back off for a budget window we can't realistically
-        // wait for (e.g. the share-inbox fetch limit returns Retry-After: 3600).
-        // Surface the 429 to the caller with
-        // its body intact so they can decide what to do, rather than blocking
-        // the test or the UX for an hour.
-        //
-        // (Body cancel must happen AFTER this early return — cancelling and
-        // then returning the Response leaves the caller holding a consumed
-        // body and `.text()` throws "Body has already been read". That bug
-        // surfaced as cascading smoke-test failures whenever cumulative rate
-        // limits on the share-inbox path drove the API into 429 territory.)
-        if (retryAfterSec != null && retryAfterSec > 60) {
+        const isTransient = res.status >= 500;
+        if (!isTransient || attempt === MAX_ATTEMPTS - 1) {
           return res;
         }
 
@@ -6615,10 +6648,12 @@ export class TarnClient {
         // can be reused and undici can pool it cleanly.
         try { await res.body?.cancel(); } catch {}
 
-        const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : backoffMs(attempt);
+        const waitMs = backoffMs(attempt);
         console.warn(`[TarnClient] ${res.status} on ${url} — retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
         await sleep(waitMs);
       } catch (err: any) {
+        // TarnRateLimitError is intentional — propagate immediately, no retry.
+        if (err instanceof TarnRateLimitError) throw err;
         // Network error (fetch threw: DNS, TLS, connection reset, etc).
         lastErr = err;
         if (attempt === MAX_ATTEMPTS - 1) throw err;
