@@ -79,6 +79,11 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com). The
   25 items. The typed entry point for bulk writes; apps doing imports
   should prefer this over `tarn.advanced.entries.batchCreate`.
 
+  Validation is atomic across the batch: if any record fails, the
+  thrown `TarnCollectionError` lists every failing index with its
+  reason — and nothing is written. Callers see all-or-nothing
+  semantics on the wire (closes #33).
+
 - **SDK:** Per-item `extraTags` support in the underlying `batchCreate`.
   The legacy `extraTags: Tag[]` shape on `advanced.entries.batchCreate`
   still works (applied to every item); the new internal contract is

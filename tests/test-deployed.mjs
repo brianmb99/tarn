@@ -18,6 +18,7 @@
 
 import './indexeddb-shim.mjs';
 import { TarnClient } from '../client/src/tarn.js';
+import { TarnClient as TypedTarnClient, defineSchema, TarnStorage } from '../client/src/index.js';
 import {
   deriveAllKeys, exportPublicKey, wrapDataKey, signChallenge,
   encodeSharePub, deriveShareLookupKey,
@@ -134,15 +135,16 @@ await test('App sets free-tier rules for new user', async () => {
   assert(vRes.status === 200, `Verify failed: ${vRes.status}`);
   const { jwt } = await vRes.json();
 
-  // Set rules. limit must cover all writes across sections 5, 5a, 5b, 5b2
+  // Set rules. limit must cover all writes across sections 5, 5a, 5a2, 5b, 5b2
   // on the same account: 1 (section 5 single create + idempotent retry
-  // which dedupes) + 5 (5a batchCreate) + 2 (5b eid writes) + 3 (5b2 delta
-  // writes) = 11. Use 20 for headroom — matches the pattern other deep
-  // sections (handshake/share-log/etc.) use when they set rules themselves.
+  // which dedupes) + 5 (5a batchCreate) + 5 (5a2 typed Collection.batchCreate)
+  // + 2 (5b eid writes) + 3 (5b2 delta writes) = 16. Use 30 for headroom —
+  // matches the pattern other deep sections (handshake/share-log/etc.) use
+  // when they set rules themselves.
   const rulesRes = await fetch(`${API_BASE}/api/v1/accounts/${testDlk}/rules`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt}` },
-    body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 20, app: APP_ID }, { type: 'max_bytes', limit: 102400 }] }),
+    body: JSON.stringify({ rules: [{ type: 'max_entries', limit: 30, app: APP_ID }, { type: 'max_bytes', limit: 102400 }] }),
   });
   assert(rulesRes.status === 200, `Set rules failed: ${rulesRes.status}`);
 });
@@ -288,6 +290,147 @@ await test('batchCreate rejects 26+ items', async () => {
   try { await tarn.batchCreate('batch-toobig', items); } catch (e) { caught = e; }
   assert(caught, '26-item batch must throw');
   assert(/max 25/i.test(caught.message), `unexpected error: ${caught.message}`);
+});
+
+// ============ 5a2. TYPED Collection.batchCreate (issue #33) ============
+//
+// The end-to-end assertion the issue cares about: 5 records written via
+// `tarn.<collection>.batchCreate(...)` must surface through
+// `tarn.<collection>.getEntriesSince()` — proving the typed batch path
+// stamps Eid + SchemaV per item, closing the orphan gap that the
+// schema-less `advanced.entries.batchCreate` (#23) left open.
+//
+// Uses a fresh `TarnClient.create({ schema, ... })` instance against the
+// same test user so the typed surface is exercised end-to-end against
+// the live API. The schema is a minimal one-collection schema scoped to
+// this test — it shares the `bookish` appId with the rest of the suite,
+// but a unique collection name keeps the type namespace clean.
+
+console.log('\n=== 5a2. Typed Collection.batchCreate (issue #33) ===');
+
+await test('typed batchCreate writes 5 books; getEntriesSince surfaces all 5 with Eid', async () => {
+  // Unique collection name per run so we don't collide with prior runs on
+  // the same dlk. SDK persists the delta cursor per (appId, dlk, type), so a
+  // fresh type guarantees a from-scratch sync window.
+  const collectionName = `typed-batch-${Date.now()}`;
+  const schema = defineSchema({
+    appId: APP_ID,
+    version: 1,
+    collections: {
+      [collectionName]: {
+        primaryKey: 'bookId',
+        fields: {
+          bookId: 'string',
+          title: 'string',
+          author: 'string?',
+        },
+      },
+    },
+  });
+
+  const tarn = await TypedTarnClient.create({
+    apiBase: API_BASE,
+    appId: APP_ID,
+    schema,
+    storage: TarnStorage.memory(),
+  });
+  await tarn.login(testUsername, testPassword);
+
+  const records = Array.from({ length: 5 }, (_, i) => ({
+    bookId: `typed-b-${i}-${Date.now()}`,
+    title: `Typed Batch Book ${i}`,
+    author: `Author ${i}`,
+  }));
+
+  // Use bracket access — TypedTarnClient exposes collections dynamically
+  // under their schema-declared name.
+  const collection = tarn[collectionName];
+  assert(collection, `typed collection '${collectionName}' must be accessible on tarn`);
+  assert(typeof collection.batchCreate === 'function', 'batchCreate must be a method on the typed collection');
+
+  const out = await collection.batchCreate(records);
+  assert(Array.isArray(out), 'batchCreate must return an array');
+  assert(out.length === 5, `expected 5 validated records back, got ${out.length}`);
+  // Input order preserved.
+  for (let i = 0; i < 5; i++) {
+    assert(out[i].bookId === records[i].bookId, `order mismatch at ${i}: ${out[i].bookId}`);
+  }
+
+  await sleep(500); // Brief wait for write-through.
+
+  // The critical assertion: getEntriesSince must surface all 5 records —
+  // NOT drop them as "orphan delta events". This is the regression Issue
+  // #33 fixes vs the schema-less advanced.entries.batchCreate path.
+  const { entries, deleted } = await collection.getEntriesSince();
+  assert(deleted.length === 0, `expected 0 deletions on fresh collection, got ${deleted.length}`);
+  assert(entries.length >= 5, `expected ≥5 entries surfaced via getEntriesSince, got ${entries.length}`);
+
+  // Verify every written record is present, indexed by its derived Eid.
+  const expectedEids = await Promise.all(records.map((r) => collection.eidFor(r.bookId)));
+  const seenEids = new Set(entries.map((e) => e.eid));
+  for (let i = 0; i < records.length; i++) {
+    assert(
+      seenEids.has(expectedEids[i]),
+      `bookId ${records[i].bookId} (eid ${expectedEids[i]}) missing from getEntriesSince`,
+    );
+  }
+
+  // And the typed payloads round-trip cleanly.
+  const byEid = new Map(entries.map((e) => [e.eid, e.record]));
+  for (let i = 0; i < records.length; i++) {
+    const got = byEid.get(expectedEids[i]);
+    assert(got, `no record for eid ${expectedEids[i]}`);
+    assert(got.title === records[i].title, `title mismatch for ${records[i].bookId}: ${got.title}`);
+    assert(got.author === records[i].author, `author mismatch for ${records[i].bookId}: ${got.author}`);
+  }
+});
+
+await test('typed batchCreate rejects empty input without a wire call', async () => {
+  const schema = defineSchema({
+    appId: APP_ID,
+    version: 1,
+    collections: {
+      empty: {
+        primaryKey: 'id',
+        fields: { id: 'string', name: 'string' },
+      },
+    },
+  });
+  const tarn = await TypedTarnClient.create({
+    apiBase: API_BASE, appId: APP_ID, schema, storage: TarnStorage.memory(),
+  });
+  await tarn.login(testUsername, testPassword);
+  let caught = null;
+  try { await tarn.empty.batchCreate([]); } catch (e) { caught = e; }
+  assert(caught, 'empty input must throw');
+  assert(/non-empty/i.test(caught.message), `unexpected error: ${caught.message}`);
+});
+
+await test('typed batchCreate aggregates validation failures with indexes', async () => {
+  const schema = defineSchema({
+    appId: APP_ID,
+    version: 1,
+    collections: {
+      strict: {
+        primaryKey: 'id',
+        fields: { id: 'string', name: 'string' },
+      },
+    },
+  });
+  const tarn = await TypedTarnClient.create({
+    apiBase: API_BASE, appId: APP_ID, schema, storage: TarnStorage.memory(),
+  });
+  await tarn.login(testUsername, testPassword);
+  // Index 0 valid, index 1 missing required `name`. Whole batch must reject.
+  let caught = null;
+  try {
+    await tarn.strict.batchCreate([
+      { id: 'a', name: 'Good' },
+      { id: 'b' }, // missing name
+    ]);
+  } catch (e) { caught = e; }
+  assert(caught, 'mixed-validity batch must throw');
+  assert(/\[1\]/.test(caught.message), `error must mention failing index [1]; got: ${caught.message}`);
 });
 
 // ============ 5b. EID-NARROWED READ PATH ============

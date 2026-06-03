@@ -78,8 +78,13 @@ export class Collection<TRecord extends Record<string, unknown>> {
    *
    * Returns the validated records in input order, mirroring single-item
    * `create()` which returns the validated record. Throws on empty input
-   * or `items.length > 25`. Validation failures throw before the wire
-   * request — partial-success semantics across a batch don't apply.
+   * or `items.length > 25`.
+   *
+   * Validation: every record is checked against the schema before any wire
+   * call. If any record fails, throws a `TarnCollectionError` listing the
+   * failing indexes and their reasons — nothing is written. This makes the
+   * batch atomic from the caller's perspective: all records validate and
+   * ship, or none do. Partial-success semantics across a batch don't apply.
    */
   async batchCreate(items: TRecord[]): Promise<TRecord[]> {
     if (!Array.isArray(items) || items.length === 0) {
@@ -92,17 +97,64 @@ export class Collection<TRecord extends Record<string, unknown>> {
         `Collection '${this.#name}': batchCreate max 25 items per batch (got ${items.length})`,
       );
     }
-    const validated: TRecord[] = [];
-    const extraTagsPerItem: Tag[][] = [];
-    for (const r of items) {
-      const v = validateRecordForCreate(this.#name, this.#def, r) as TRecord;
-      const pk = this.#extractPrimaryKey(v as Record<string, unknown>);
-      const eid = await deriveEid(this.#appId, this.#name, pk);
-      validated.push(v);
-      extraTagsPerItem.push(this.#protocolTags(eid));
+    // Validate every record up front; collect all failures with their input
+    // index so the caller can see exactly which records to fix. The wire
+    // call only happens if every record passes — no partial writes.
+    const validated: Array<TRecord | null> = new Array(items.length).fill(null);
+    const failures: Array<{ index: number; error: string }> = [];
+    for (let i = 0; i < items.length; i++) {
+      try {
+        validated[i] = validateRecordForCreate(this.#name, this.#def, items[i]!) as TRecord;
+      } catch (err) {
+        failures.push({
+          index: i,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
-    await this.#client.batchCreate(this.#name, validated as Array<Record<string, unknown>>, extraTagsPerItem);
-    return validated;
+    if (failures.length > 0) {
+      const summary = failures
+        .map((f) => `[${f.index}] ${f.error}`)
+        .join('; ');
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': batchCreate validation failed for ` +
+        `${failures.length}/${items.length} record(s): ${summary}`,
+      );
+    }
+    // All records validated — build per-item Eid + SchemaV tags. PK
+    // extraction can still throw (empty/non-string primaryKey); that path
+    // is rare since validateRecordForCreate already enforces field types,
+    // but it's per-record, so wrap it the same way.
+    const extraTagsPerItem: Tag[][] = [];
+    for (let i = 0; i < validated.length; i++) {
+      const v = validated[i] as TRecord;
+      try {
+        const pk = this.#extractPrimaryKey(v as Record<string, unknown>);
+        const eid = await deriveEid(this.#appId, this.#name, pk);
+        extraTagsPerItem.push(this.#protocolTags(eid));
+      } catch (err) {
+        failures.push({
+          index: i,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (failures.length > 0) {
+      const summary = failures
+        .map((f) => `[${f.index}] ${f.error}`)
+        .join('; ');
+      throw new TarnCollectionError(
+        `Collection '${this.#name}': batchCreate validation failed for ` +
+        `${failures.length}/${items.length} record(s): ${summary}`,
+      );
+    }
+    const final = validated as TRecord[];
+    await this.#client.batchCreate(
+      this.#name,
+      final as Array<Record<string, unknown>>,
+      extraTagsPerItem,
+    );
+    return final;
   }
 
   /**

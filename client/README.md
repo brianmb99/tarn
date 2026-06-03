@@ -154,6 +154,13 @@ await tarn.notes.update('n1', { priority: 5 });
 
 // Tombstone.
 await tarn.notes.delete('n1');
+
+// Bulk create. Up to 25 records per call, validated as a batch.
+// One rate-limit hit; every record stamped with its Eid + SchemaV tags.
+await tarn.notes.batchCreate([
+  { noteId: 'n2', title: 'First note',  body: '...' },
+  { noteId: 'n3', title: 'Second note', body: '...' },
+]);
 ```
 
 Records are addressed by **primary key**, never by Arweave txid. The SDK maps primary keys onto the protocol's `Eid` tag so reads converge across devices.
@@ -173,6 +180,20 @@ The listed keys are deleted from the merged record *after* the patch, then the r
 - If the same field is in both `patch` and `unset`, the unset wins (delete-after-merge).
 - Unsetting a required field throws the standard "required field missing" validation error — required fields can't be cleared.
 - Reading the record back via `get()` returns a record where the cleared key is truly absent (not `null` or `undefined`).
+
+**Bulk imports.** `batchCreate` writes up to 25 records in one request and counts as a single rate-limit hit. Every record is validated against the schema before any wire call — if any record fails, nothing is written and the thrown `TarnCollectionError` lists the failing indexes:
+
+```js
+// Migration: import 18 books from an exported library in one shot.
+// 1 rate-limit hit + 1 round trip — vs 18 of each via single create().
+await tarn.books.batchCreate([
+  { bookId: 'b-001', title: 'The Idiot',           status: 'reading' },
+  { bookId: 'b-002', title: 'Mountains of My Life', status: 'finished' },
+  // ...up to 25 per batch
+]);
+```
+
+This is the right path for bulk imports and migrations. Records written through it carry the same Eid + SchemaV tags as single `create()` calls, so they surface normally through `get`, `list`, and `getEntriesSince`. Larger imports: chunk client-side and pace at ~1 batch per 36s to stay under the 100 writes/hour/account limit. The schema-less escape hatch `tarn.advanced.entries.batchCreate` still exists for app-internal types that aren't on the schema — see the [Advanced](#advanced-escape-hatches) section for the trade-offs.
 
 ### Sharing (when `shareable: true`)
 
@@ -555,26 +576,17 @@ await tarn.advanced.shareLog.unshare(connection, contentId);
 
 ### Bulk writes (`advanced.entries.batchCreate`)
 
-Bulk-write up to 25 entries in a single request. Counts as **1 rate-limit hit** regardless of batch size — vs N hits for N single-item `create` calls. Built for migration scripts, seeders, and integration tests that need to land many records under the 100 writes/hour/account limit; not a general substitute for typed `collection.create`.
+Schema-less bulk-write up to 25 entries in a single request. Counts as **1 rate-limit hit** regardless of batch size. This is the escape hatch for `type` strings that are NOT on the schema — app-internal types (state caches, share-log helpers, etc.) where you manage tags yourself.
 
 ```js
-// Migration: write 18 records from an exported library into a fresh account.
-// One rate-limit hit, ~one round-trip — vs 18 hits + 18 round-trips otherwise.
-const records = [
-  { bookId: 'b-001', title: 'The Idiot',          status: 'reading' },
-  { bookId: 'b-002', title: 'Mountains of My Life', status: 'finished' },
-  // ...up to 25 per batch
-];
-const results = await tarn.advanced.entries.batchCreate('book', records);
+// App-internal type with no schema declaration. Caller manages tags.
+const results = await tarn.advanced.entries.batchCreate('my-app-cache', records);
 // results: [{ txid, shareKey }, ...] — same order as input.
-
-// Larger imports: chunk client-side and pace at one batch per ~36s to stay
-// under 100 writes/hour. Each batch is one hit.
 ```
 
-**Schema-less by design.** Per-item validation across a batch has no clean partial-failure story — if item 3 of 25 fails validation, does the whole batch fail or do the rest commit? Until that's resolved, batch lives on `advanced.entries` and the typed `collection.create` stays single-item. If you want schema-aware validation, call your collection's `validate()` per item upstream, then batch.
+For records that DO belong to a declared collection, use the typed path: **`tarn.<collection>.batchCreate(records)`**. That path validates every record against the schema (atomically — if any record fails, nothing is written) and stamps each entry with its Eid + SchemaV tags, so the batch surfaces normally through typed reads. The advanced wrapper here will also auto-stamp Eid + SchemaV when `type` matches a declared collection — but it skips schema validation, so a typo'd field will silently land in storage. The typed path is the safer default.
 
-**Throws on `items.length === 0` or `items.length > 25`.** Idempotent — a retry on the same input produces the same list of txids (one idempotency key per batch).
+**Throws on `items.length === 0` or `items.length > 25`.** Idempotent — a retry on the same input produces the same list of txids (one idempotency key per batch). Larger imports: chunk client-side and pace at ~1 batch per 36s to stay under the 100 writes/hour/account limit.
 
 If you find yourself reaching for `advanced.*` for something the typed surface should cover, that's a signal to file an issue.
 

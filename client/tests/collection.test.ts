@@ -690,8 +690,33 @@ describe('Collection.batchCreate', () => {
     // Missing required `bookId` should fail validation.
     await assert.rejects(
       () => books.batchCreate([{ title: 'no-id', isPrivate: false } as unknown as BookRecord]),
+      TarnCollectionError,
     );
     assert.equal(mock.batchCreateCalls.length, 0, 'no wire call on validation failure');
+  });
+
+  it('aggregates all validation failures with input indexes — no wire call', async () => {
+    // Mix of valid + invalid records. Index 1 and 3 fail; the error must
+    // mention both, and no wire call happens.
+    const items: Array<Partial<BookRecord>> = [
+      { bookId: 'ok-1', title: 'Good', isPrivate: false },           // 0: ok
+      { bookId: 'bad-2', isPrivate: false },                          // 1: missing title
+      { bookId: 'ok-3', title: 'Good', isPrivate: false },           // 2: ok
+      { title: 'no-id', isPrivate: false },                           // 3: missing bookId
+    ];
+    let thrown: unknown = null;
+    try {
+      await books.batchCreate(items as BookRecord[]);
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof TarnCollectionError, 'must throw TarnCollectionError');
+    const msg = (thrown as TarnCollectionError).message;
+    // Summary names the failing indexes (1 and 3) and the count (2/4).
+    assert.match(msg, /2\/4/, `error must report failure count; got: ${msg}`);
+    assert.match(msg, /\[1\]/, `error must mention failing index 1; got: ${msg}`);
+    assert.match(msg, /\[3\]/, `error must mention failing index 3; got: ${msg}`);
+    assert.equal(mock.batchCreateCalls.length, 0, 'no wire call even when some records validate');
   });
 
   it('returns the validated records in input order', async () => {
