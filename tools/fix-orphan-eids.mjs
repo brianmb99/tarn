@@ -29,6 +29,14 @@
  *   so even if the skip file is wiped, the script won't double-fix
  *   anything that already has an Eid on Arweave.
  *
+ * Already-superseded skip
+ *   Before fixing, the script also skips any orphan whose primaryKey
+ *   value matches an existing Eid'd entry in the same collection. This
+ *   covers the case where the user already did a manual delete-and-
+ *   recreate of the same logical record — the orphan version is dead
+ *   data; rewriting it would resurrect a duplicate that the user has
+ *   intentionally deleted from their app view.
+ *
  * Usage (run via tsx so it picks up the TS source — no SDK build required):
  *   node --import tsx tools/fix-orphan-eids.mjs \
  *     --email <email> \
@@ -180,7 +188,8 @@ console.log('Logged in.');
 console.log(`Fetching all live entries for type '${collectionName}'...`);
 const { entries: allEvents } = await tarn.advanced.entries.getEntriesSince(collectionName);
 const orphans = allEvents.filter((e) => e.eid === null);
-const okCount = allEvents.length - orphans.length;
+const withEid = allEvents.filter((e) => e.eid !== null);
+const okCount = withEid.length;
 console.log(`  → ${allEvents.length} total live entries; ${orphans.length} orphans (no Eid).`);
 console.log(`  → ${okCount} already have Eid — leaving those alone.`);
 
@@ -189,10 +198,22 @@ if (orphans.length === 0) {
   process.exit(0);
 }
 
+// Build a set of primaryKey values that are ALREADY covered by an Eid'd
+// entry. Any orphan whose primaryKey lands in this set is "already
+// superseded" — the user has done a delete-and-recreate (or the Eid'd
+// version arrived via some other path), so rewriting the orphan would
+// resurrect a duplicate. Skip it.
+const livePkValues = new Set();
+for (const e of withEid) {
+  const pk = e.data?.[primaryKeyField];
+  if (typeof pk === 'string' && pk.length > 0) livePkValues.add(pk);
+}
+
 // ============ Filter ============
 
 const toFix = [];
 const skipped = [];
+const supersededByLive = [];
 const unfixable = [];
 for (const orphan of orphans) {
   const title = orphan.data?.[titleField] ?? '(no title)';
@@ -205,10 +226,24 @@ for (const orphan of orphans) {
     unfixable.push({ title, txid: orphan.txid });
     continue;
   }
+  if (livePkValues.has(pkValue)) {
+    supersededByLive.push({ title, txid: orphan.txid, pk: pkValue });
+    continue;
+  }
   toFix.push(orphan);
 }
 
-console.log(`  → ${toFix.length} to fix; ${skipped.length} skipped (in skip file); ${unfixable.length} unfixable (no primaryKey).`);
+console.log(
+  `  → ${toFix.length} to fix; ${skipped.length} skipped (in skip file); ` +
+  `${supersededByLive.length} already superseded by an Eid'd record (same ${primaryKeyField}); ` +
+  `${unfixable.length} unfixable (no primaryKey).`,
+);
+if (supersededByLive.length > 0) {
+  console.log('Already-superseded orphans (will NOT be rewritten):');
+  for (const s of supersededByLive) {
+    console.log(`    ${s.title.padEnd(56)} → ${s.txid.slice(0, 14)}  (pk ${s.pk.slice(0, 10)}...)`);
+  }
+}
 if (unfixable.length > 0) {
   console.log('Unfixable entries:');
   for (const u of unfixable) console.log(`    ${u.title.padEnd(56)} → ${u.txid.slice(0, 14)}`);
@@ -291,12 +326,13 @@ for (let bi = 0; bi < batches.length; bi++) {
 
 console.log();
 console.log('========== Summary ==========');
-console.log(`  Total orphans:          ${orphans.length}`);
-console.log(`  Skipped (in skip file): ${skipped.length}`);
-console.log(`  Unfixable (no PK):      ${unfixable.length}`);
-console.log(`  Fixed:                  ${fixedCount}`);
-console.log(`  Failed:                 ${failedCount}`);
-console.log(`  Rate-limit waits used:  ${bucketWaitsSpent}`);
+console.log(`  Total orphans:           ${orphans.length}`);
+console.log(`  Skipped (in skip file):  ${skipped.length}`);
+console.log(`  Already superseded:      ${supersededByLive.length}`);
+console.log(`  Unfixable (no PK):       ${unfixable.length}`);
+console.log(`  Fixed:                   ${fixedCount}`);
+console.log(`  Failed:                  ${failedCount}`);
+console.log(`  Rate-limit waits used:   ${bucketWaitsSpent}`);
 if (dryRun) console.log('  (dry run — no actual writes)');
 console.log();
 console.log(`Skip file: ${skipFile}`);
