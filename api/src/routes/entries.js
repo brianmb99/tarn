@@ -1,4 +1,15 @@
-// Entry listing and single-entry endpoints (read-only, unauthenticated, IP rate-limited)
+// Entry listing and single-entry endpoints (read-only).
+//
+// Rate-limit keying:
+//   - GET /api/v1/entries — requires `key` (data_lookup_key) in the URL, so
+//     we bucket on the account (mirrors the per-account write limit).
+//   - GET /api/v1/entries/:txid — `key` is OPTIONAL. When present we still
+//     bucket on the account; when absent (txid-only metadata lookup, allowed
+//     because tags are public on Arweave) we fall back to per-IP.
+//
+// Per-IP read limits used to apply uniformly here, which caused noisy-
+// neighbor failures on shared NAT (tarn#31). The account-keyed path now
+// matches the write path's identity model.
 
 import { jsonResponse, errorResponse } from '../worker.js';
 import {
@@ -10,7 +21,7 @@ import {
   fetchBlobFromGateway,
   persistBlob,
 } from '../cache.js';
-import { checkAndIncrementRateLimit } from '../rate-limit.js';
+import { checkReadRateLimitByAccount, checkReadRateLimitByIp } from '../rate_limit.js';
 
 // Convert blob_data from D1 (ArrayBuffer/Uint8Array) to base64 for JSON transport.
 // Used by handleEntryById, the ?eid= fast path, and the ?since= delta path
@@ -22,19 +33,6 @@ function blobToBase64(blob) {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
-}
-
-const MAX_READS_PER_HOUR = 300;
-
-async function checkReadRateLimit(env, request) {
-  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-  const data = new TextEncoder().encode(ip + '-tarn-read-salt');
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  const ipHash = Array.from(new Uint8Array(hash)).slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
-  const hour = new Date().toISOString().slice(0, 13);
-  const key = `read:${ipHash}:${hour}`;
-  const { allowed, count } = await checkAndIncrementRateLimit(env.RATE_KV, key, MAX_READS_PER_HOUR);
-  return { allowed, remaining: Math.max(0, MAX_READS_PER_HOUR - count) };
 }
 
 // Parse the opaque "<cachedAt>:<txid>" delta cursor. Returns null on any
@@ -64,8 +62,10 @@ export async function handleEntries(url, env, ctx, cors, request) {
     return errorResponse('Missing required params: app, type, key', 400, cors);
   }
 
-  // IP rate limit
-  const { allowed, remaining } = await checkReadRateLimit(env, request);
+  // Per-account rate limit. `key` is the caller's data_lookup_key — knowing
+  // it proves identity for read purposes (the data is encrypted anyway), so
+  // we bucket on it directly. See tarn#31 for the migration off per-IP.
+  const { allowed } = await checkReadRateLimitByAccount(env, key);
   if (!allowed) {
     return errorResponse('Rate limit exceeded', 429, { ...cors, 'Retry-After': '3600' });
   }
@@ -197,13 +197,19 @@ export async function handleEntries(url, env, ctx, cors, request) {
 }
 
 export async function handleEntryById(txid, url, env, ctx, cors, request) {
-  // IP rate limit (shares bucket with list endpoint)
-  const { allowed } = await checkReadRateLimit(env, request);
-  if (!allowed) {
-    return errorResponse('Rate limit exceeded', 429, cors);
-  }
-
   const key = url.searchParams.get('key') || null;
+
+  // When `key` is supplied this is a normal account-identified read; bucket
+  // on the account (mirrors handleEntries above). When it's omitted, we have
+  // no account identity — this is the txid-only metadata-lookup case, which
+  // we allow because tags are already public on Arweave. That path falls
+  // back to per-IP keying since there's nothing else to bucket on.
+  const { allowed } = key
+    ? await checkReadRateLimitByAccount(env, key)
+    : await checkReadRateLimitByIp(env, request);
+  if (!allowed) {
+    return errorResponse('Rate limit exceeded', 429, { ...cors, 'Retry-After': '3600' });
+  }
 
   const entry = await getEntryByTxid(env.DB, txid);
   if (!entry) {

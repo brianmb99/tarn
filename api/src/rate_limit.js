@@ -1,9 +1,35 @@
-// Write rate limiting: 100 writes per hour per data_lookup_key
-// Uses D1 atomic INSERT ... ON CONFLICT for write limits (wallet-draining defense).
-// The KV-based TOCTOU race (get-then-put) allowed concurrent requests to exceed limits.
-// D1's single-statement atomicity prevents this.
+// Write + read rate limiting.
+//
+// Writes use a D1 atomic counter (INSERT ... ON CONFLICT DO UPDATE … RETURNING
+// count) so concurrent requests can't blow past the cap by racing the KV
+// get-then-put. Writes spend Tarn's Arweave wallet, so the stronger guarantee
+// is worth the D1 round-trip.
+//
+// Reads use the KV-backed counter in rate-limit.js. The failure mode of the
+// read TOCTOU race is "slightly more reads than the cap during a burst,"
+// which is acceptable for read throttling — reads are cheap and don't drain
+// money. Both call sites fail open on store outage.
+
+import { checkAndIncrementRateLimit } from './rate-limit.js';
 
 const MAX_WRITES_PER_HOUR = 100;
+
+// Authenticated reads are keyed on data_lookup_key (mirrors the write path).
+// Originally read limits were per-IP, which caused noisy-neighbor failures on
+// shared NAT (one user — or one bad client — could lock out everyone behind
+// the same WiFi). Per-account keying gives every authenticated user their own
+// bucket, independent of network topology.
+//
+// 1000/hr is the conservative starting point suggested in tarn#31. Reads
+// happen in bursts during sync (delta-poll + per-entry blob fetch) so a
+// higher value than the 100/hr write limit is appropriate. Easy to raise
+// once we have telemetry on real session footprints.
+const MAX_READS_PER_HOUR_PER_ACCOUNT = 1000;
+
+// Unauthenticated read fallback (handleEntryById with no `key` param). Same
+// numeric cap as the per-account limit — the cap shape is "1000 reads/hour
+// per identifier"; the identifier is dlk when we have one, IP-hash otherwise.
+const MAX_READS_PER_HOUR_PER_IP = 1000;
 
 export async function checkWriteRateLimit(env, dataLookupKey) {
   const hour = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
@@ -32,3 +58,55 @@ export async function checkWriteRateLimit(env, dataLookupKey) {
 
   return { allowed: true, remaining: MAX_WRITES_PER_HOUR - count };
 }
+
+/**
+ * Per-account read rate limit. Used by every entry-read endpoint that has an
+ * authenticated identity available (i.e. the URL's `key` query param is
+ * required, or a JWT is required). Bucket key mirrors the write path:
+ * `read:<data_lookup_key>:<hour>`.
+ *
+ * @param {Env} env
+ * @param {string} dataLookupKey
+ * @returns {Promise<{allowed: boolean, remaining: number}>}
+ */
+export async function checkReadRateLimitByAccount(env, dataLookupKey) {
+  const hour = new Date().toISOString().slice(0, 13);
+  const key = `read:${dataLookupKey}:${hour}`;
+  const { allowed, count } = await checkAndIncrementRateLimit(
+    env.RATE_KV, key, MAX_READS_PER_HOUR_PER_ACCOUNT,
+  );
+  return { allowed, remaining: Math.max(0, MAX_READS_PER_HOUR_PER_ACCOUNT - count) };
+}
+
+/**
+ * Per-IP read rate limit. Only used by deliberately unauthenticated read
+ * paths — currently just `GET /api/v1/entries/{txid}` when called without a
+ * `key` query param (the "txid-only metadata lookup" case, which is allowed
+ * because entry tags are already public on Arweave). Every authenticated read
+ * path should use `checkReadRateLimitByAccount` instead.
+ *
+ * @param {Env} env
+ * @param {Request} request
+ * @returns {Promise<{allowed: boolean, remaining: number}>}
+ */
+export async function checkReadRateLimitByIp(env, request) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const data = new TextEncoder().encode(ip + '-tarn-read-salt');
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const ipHash = Array.from(new Uint8Array(hash)).slice(0, 8)
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  const hour = new Date().toISOString().slice(0, 13);
+  const key = `read-ip:${ipHash}:${hour}`;
+  const { allowed, count } = await checkAndIncrementRateLimit(
+    env.RATE_KV, key, MAX_READS_PER_HOUR_PER_IP,
+  );
+  return { allowed, remaining: Math.max(0, MAX_READS_PER_HOUR_PER_IP - count) };
+}
+
+// Re-exported for tests + any future caller that wants to assert the numeric
+// caps without importing the constants twice.
+export const _testing = {
+  MAX_WRITES_PER_HOUR,
+  MAX_READS_PER_HOUR_PER_ACCOUNT,
+  MAX_READS_PER_HOUR_PER_IP,
+};

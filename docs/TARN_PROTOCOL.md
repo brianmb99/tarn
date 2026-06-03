@@ -863,7 +863,8 @@ API:
 
 ```
 GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}
-No auth required. IP rate-limited.
+No JWT required — `key` (data_lookup_key) proves identity. Per-account
+rate-limited (1000/hr per dlk; see "Rate limiting" later in this doc).
 Returns resolved entries (tombstones applied, Prev-chains resolved).
 Client downloads + decrypts blobs from Arweave gateways.
 
@@ -1164,12 +1165,20 @@ POST /api/v1/entries/batch
   Rules evaluated once for the entire batch (max_entries checks count + batchSize).
 
 GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}[&eid={eid}|&since={cursor}]
-  Auth: none (IP rate-limited)
+  Auth: identity via the `key` query param (the data_lookup_key). No JWT
+        required — knowing the dlk is sufficient since the data is encrypted.
+  Rate limit: per-account, 1000/hr keyed on dlk. See "Rate limiting" below.
   Returns: { entries: [...], pagination: { cursor?, hasMore? } }
   Default: metadata-only list of resolved live entries.
   With &eid=: returns at most one resolved entry with blob inlined as `data`.
   With &since=: delta events ({ eid, txid, tags, data } | { eid, deleted: true }),
                 blob inlined, page-bounded (25), pagination.cursor advances.
+
+GET /api/v1/entries/{txid}[?key={data_lookup_key}]
+  Auth: optional. With `key`, response is restricted to entries belonging to
+        that dlk. Without `key`, returns metadata for any txid (tags are
+        already public on Arweave; restricting them here would be theater).
+  Rate limit: per-account when `key` is supplied; per-IP otherwise.
 
 PUT /api/v1/entries/{prior_txid}
   Auth: JWT
@@ -1180,9 +1189,33 @@ DELETE /api/v1/entries/{target_txid}
   Returns: { txid, tombstoneRef, status: 'pending' }
 ```
 
----
+### Rate limiting
 
-## Design Decisions
+Every request is throttled in one of two ways depending on whether the
+endpoint has an account identity available. The 429 response always includes
+`Retry-After: 3600` (one hour) — buckets are hourly with lazy expiry.
+
+| Class | Identifier | Cap | Store | Used by |
+|---|---|---|---|---|
+| Authenticated writes | `data_lookup_key` | 100/hr | D1 (atomic INSERT ... ON CONFLICT) | `POST/PUT/DELETE /entries`, `POST /entries/batch` (one batch = one hit) |
+| Authenticated reads | `data_lookup_key` | 1000/hr | KV | `GET /entries` (always), `GET /entries/{txid}?key=…` |
+| Unauthenticated reads | IP-hash | 1000/hr | KV | `GET /entries/{txid}` without `key` |
+| Unauthenticated other | IP-hash | endpoint-specific | KV | `POST /auth/register`, share lookup, invite preview, share-inbox/log fetches |
+
+Reads were originally per-IP across the board; that caused noisy-neighbor
+failures on shared NAT (one user, or one bad actor, could exhaust the bucket
+for every other Tarn user behind the same coffee-shop / office / mobile
+carrier IP — tarn#31). Switching authenticated reads to per-account quotas
+matches the write path's identity model and makes shared-network usage
+behave correctly.
+
+Writes use D1 because the failure mode of an over-cap write (Arweave upload
+funded by Tarn's wallet) is "real money spent." The TOCTOU-immune atomic
+counter is worth the round-trip. Reads use KV because the over-cap read is
+"slightly more reads than the cap during a burst" — acceptable for read
+throttling. Both paths fail open on store outage: better to serve traffic
+than to return 5xx when the rate-limit store is unhealthy. Rate limiting
+here is abuse mitigation, not a security boundary.
 
 ### Why HKDF-Expand (HMAC) for sub-key derivation
 Raw `SHA-256(key || domain)` is vulnerable to length-extension attacks. HMAC (which is HKDF-Expand for a single output block, per RFC 5869) is immune by construction. The structured info string `protocol || purpose || app_id || version || counter` replaces ad-hoc domain strings with a defined, versioned format that naturally accommodates per-app isolation.
