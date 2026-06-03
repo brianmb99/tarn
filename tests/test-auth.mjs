@@ -86,6 +86,21 @@ function randomHex64() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// 43-char base64url encoding of 32 random bytes. Used to satisfy the
+// share_pub requirement on register (issue #30 — share fields required).
+function randomSharePub() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Add share fields to a register payload. Required since #30 on every
+// new registration — tests need them or they 400.
+function withShareFields(body) {
+  return { share_pub: randomSharePub(), share_lookup_key: randomHex64(), ...body };
+}
+
 // ============ REGISTRATION TESTS ============
 
 console.log('\n=== Registration ===');
@@ -98,7 +113,7 @@ await test('Register: happy path', async () => {
 
   const { status, json } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
 
   assert(status === 201, `Expected 201, got ${status}: ${JSON.stringify(json)}`);
@@ -116,14 +131,14 @@ await test('Register: duplicate credential_lookup_key -> 409', async () => {
   // First registration
   const { status: s1 } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   assert(s1 === 201, `First registration should succeed, got ${s1}`);
 
   // Duplicate
   const { status: s2, json } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   assert(s2 === 409, `Expected 409, got ${s2}: ${JSON.stringify(json)}`);
 });
@@ -134,7 +149,7 @@ await test('Register: invalid credential_lookup_key -> 400', async () => {
 
   const { status } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: 'too-short', public_key: pub, wrapped_data_key: 'x', app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: 'too-short', public_key: pub, wrapped_data_key: 'x', app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   assert(status === 400, `Expected 400, got ${status}`);
 });
@@ -142,7 +157,7 @@ await test('Register: invalid credential_lookup_key -> 400', async () => {
 await test('Register: invalid public_key -> 400', async () => {
   const { status } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: 'garbage', wrapped_data_key: 'x', app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: 'garbage', wrapped_data_key: 'x', app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   assert(status === 400, `Expected 400, got ${status}`);
 });
@@ -153,7 +168,7 @@ await test('Register: missing wrapped_data_key -> 400', async () => {
 
   const { status } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: pub, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: randomHex64(), public_key: pub, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   assert(status === 400, `Expected 400, got ${status}`);
 });
@@ -171,7 +186,7 @@ await test('Login: full happy path', async () => {
   // Register
   const { json: regJson } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   const dlk = regJson.data_lookup_key;
 
@@ -216,7 +231,7 @@ await test('Verify: wrong signature -> 401', async () => {
   // Register
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
 
   // Challenge
@@ -244,7 +259,7 @@ await test('Verify: nonce replay -> 401', async () => {
   // Register
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
 
   // Challenge
@@ -282,11 +297,11 @@ await test('Verify: nonce for different credential_lookup_key -> 401', async () 
   // Register both
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk1, public_key: pub1, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk1, public_key: pub1, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk2, public_key: pub2, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk2, public_key: pub2, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
 
   // Get challenge for clk1
@@ -317,7 +332,7 @@ async function registerAndLogin() {
 
   const { json: regJson } = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
 
   const { json: cJson } = await fetchJSON('/api/v1/auth/challenge', {
@@ -460,7 +475,7 @@ await test('Sessions: device_label too long -> 400 on /auth/verify', async () =>
   const wdk = bytesToBase64(new Uint8Array(48));
   await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({ credential_lookup_key: clk, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID, share_pub: randomSharePub(), share_lookup_key: randomHex64() }),
   });
   const { json: cJson } = await fetchJSON('/api/v1/auth/challenge', {
     method: 'POST',

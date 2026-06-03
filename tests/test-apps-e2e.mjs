@@ -157,7 +157,12 @@ async function registerUser() {
 
   const regRes = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ credential_lookup_key: keys.credentialLookupKey, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID }),
+    body: JSON.stringify({
+      credential_lookup_key: keys.credentialLookupKey, public_key: pub, wrapped_data_key: wdk, app: DEFAULT_APP_ID,
+      // share fields required since #30 (random — test doesn't use share/lookup downstream)
+      share_pub: (() => { const b = new Uint8Array(32); crypto.getRandomValues(b); return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); })(),
+      share_lookup_key: (() => { const b = new Uint8Array(32); crypto.getRandomValues(b); return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join(''); })(),
+    }),
   });
   assert(regRes.status === 201, `Register failed: ${regRes.status}`);
   const dlk = regRes.json.data_lookup_key;

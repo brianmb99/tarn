@@ -66,6 +66,16 @@ async function rawRegisterAndLogin() {
   const pub = await exportPublicKey(keys.signingKeyPair.publicKey);
   const wdk = await wrapDataKey(keys.credentialEncryptionKey.gcmKey, keys.credentialEncryptionKey.kwKey);
 
+  // share fields required since #30; random values are fine — this test
+  // doesn't exercise share/lookup downstream.
+  const sharePubBytes = new Uint8Array(32);
+  crypto.getRandomValues(sharePubBytes);
+  const sharePub = btoa(String.fromCharCode(...sharePubBytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const shareLookupKeyBytes = new Uint8Array(32);
+  crypto.getRandomValues(shareLookupKeyBytes);
+  const shareLookupKey = Array.from(shareLookupKeyBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
   const regRes = await fetchJSON('/api/v1/auth/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -73,6 +83,8 @@ async function rawRegisterAndLogin() {
       public_key: pub,
       wrapped_data_key: wdk,
       app: DEFAULT_APP_ID,
+      share_pub: sharePub,
+      share_lookup_key: shareLookupKey,
     }),
   });
   assert(regRes.status === 201, `Register failed: ${regRes.status} ${regRes.text}`);

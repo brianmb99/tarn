@@ -224,18 +224,17 @@ await test('changeCredentials() rotates share_lookup_key on username change', as
 
 console.log('\n=== 6. Backward compat ===');
 
-await test('pre-#13 register (no share fields in body) succeeds and lookup returns null', async () => {
-  // Hand-construct a register call that omits share_*, simulating an old
-  // client that hasn't been updated.
+await test('register without share fields is rejected (#30 — share_lookup_key required)', async () => {
+  // Pre-#30 this scenario produced a 201 with NULL share_lookup_key on the
+  // accounts row. That NULL allowed duplicate (email, app) registrations
+  // because the unique-check skipped NULLs. #30 closes the gap by requiring
+  // both share_pub and share_lookup_key at the API boundary.
   const fUsername = randomUsername();
   const fPassword = 'pw-f-' + Date.now();
   const keys = await deriveAllKeys(fUsername, fPassword, DEFAULT_APP_ID);
   const der = await crypto.subtle.exportKey('spki', keys.signingKeyPair.publicKey);
   const pubBase64 = btoa(String.fromCharCode(...new Uint8Array(der)));
 
-  // We need a wrapped_data_key — use a bare base64 AES-KW ciphertext. The
-  // API stores it as opaque text and never parses it, so any byte string
-  // works for this test (which exercises the lookup endpoint, not login).
   const dummyDek = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const dekRaw = await crypto.subtle.exportKey('raw', dummyDek);
   const dekKw = await crypto.subtle.importKey('raw', dekRaw, 'AES-KW', true, ['wrapKey']);
@@ -250,18 +249,13 @@ await test('pre-#13 register (no share fields in body) succeeds and lookup retur
       public_key: pubBase64,
       wrapped_data_key: wrappedBase64,
       app: DEFAULT_APP_ID,
-      // no share_*, no recovery_*
+      // Deliberately no share_* — must now 400.
     }),
   });
-  assert(res.status === 201, `register without share fields failed: ${res.status} ${await res.text()}`);
-
-  const stranger = new TarnClient(BASE_URL, DEFAULT_APP_ID);
-  const { sharePub, sharePubBase64Url, discoverable } = await stranger.getRecipientShareKey(fUsername);
-  // No share_lookup_key was published, so this is indistinguishable from an
-  // unknown username — the lookup returns null + discoverable=false.
-  assert(sharePub === null, `pre-#13 account should look up to null, got ${sharePub}`);
-  assert(sharePubBase64Url === null, 'sharePubBase64Url should be null');
-  assert(discoverable === false, 'pre-#13 account should be opaque to lookups');
+  assert(res.status === 400, `register without share fields should now 400, got ${res.status}: ${await res.clone().text()}`);
+  const body = await res.json();
+  assert(/share_lookup_key is required/.test(body.error || ''),
+    `expected "share_lookup_key is required" error, got: ${body.error}`);
 });
 
 // ============ SUMMARY ============

@@ -232,30 +232,34 @@ export async function handleRegister(request, env, ctx, cors) {
     }
   }
 
-  // Optional sharing fields (issue #13). All three are required together —
-  // share_pub (43-char base64url X25519 pubkey), share_lookup_key (64-char
-  // hex, derivable from username alone), share_discoverable (bool, default true).
-  // Pre-#13 clients omit them entirely; the rebuild path treats absent fields
-  // as null in D1 (no share keypair published).
-  const shareFieldsCount =
-    (share_pub != null ? 1 : 0) +
-    (share_lookup_key != null ? 1 : 0);
-  if (shareFieldsCount !== 0 && shareFieldsCount !== 2) {
-    return errorResponse('share_pub and share_lookup_key must be provided together', 400, cors);
+  // Sharing fields are REQUIRED on every new registration (issue #30 —
+  // closes the per-app email-uniqueness gap that allowed two distinct
+  // accounts to coexist for the same (email, app) when one of them was a
+  // pre-#13 row with NULL share_lookup_key). Requiring both at the API
+  // boundary means every new row in `accounts` has a non-NULL
+  // share_lookup_key, which migration 0009's partial unique index then
+  // enforces.
+  //
+  // Legacy NULL rows from pre-#13 D1 state remain in place but cannot be
+  // collided against (the SELECT in the up-front check below skips NULLs).
+  // Operator action is required to backfill or remove those legacy rows;
+  // see `docs/TARN_PROTOCOL.md` for the migration story.
+  if (share_lookup_key == null || (typeof share_lookup_key === 'string' && share_lookup_key.length === 0)) {
+    return errorResponse('share_lookup_key is required', 400, cors);
   }
-  let shareDiscoverableInt = null;
-  if (share_pub != null) {
-    if (typeof share_pub !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(share_pub)) {
-      return errorResponse('Invalid share_pub: must be 43-char base64url (32 raw bytes)', 400, cors);
-    }
-    if (!isValidHex64(share_lookup_key)) {
-      return errorResponse('Invalid share_lookup_key: must be 64-char lowercase hex', 400, cors);
-    }
-    if (share_discoverable != null && typeof share_discoverable !== 'boolean') {
-      return errorResponse('share_discoverable must be a boolean', 400, cors);
-    }
-    shareDiscoverableInt = share_discoverable === false ? 0 : 1;
+  if (share_pub == null) {
+    return errorResponse('share_pub is required', 400, cors);
   }
+  if (!isValidHex64(share_lookup_key)) {
+    return errorResponse('Invalid share_lookup_key: must be 64-char lowercase hex', 400, cors);
+  }
+  if (typeof share_pub !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(share_pub)) {
+    return errorResponse('Invalid share_pub: must be 43-char base64url (32 raw bytes)', 400, cors);
+  }
+  if (share_discoverable != null && typeof share_discoverable !== 'boolean') {
+    return errorResponse('share_discoverable must be a boolean', 400, cors);
+  }
+  const shareDiscoverableInt = share_discoverable === false ? 0 : 1;
 
   // Idempotency: if an account already exists for this credential_lookup_key,
   // check whether this is a retry of a previous successful register (same payload)

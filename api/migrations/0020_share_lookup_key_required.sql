@@ -1,0 +1,64 @@
+-- 0020_share_lookup_key_required.sql
+--
+-- Issue #30: tighten the per-app email uniqueness guarantee around
+-- `accounts.share_lookup_key`.
+--
+-- Background
+-- ----------
+-- share_lookup_key is per-app HKDF-derived from the normalized email (see
+-- 0009_share_keypair.sql). The protocol intends it to be the per-app
+-- "username already taken" pivot: two registrations for the same email
+-- under the same app should always collide on this column.
+--
+-- The original migration (0009) made the column nullable so accounts
+-- registered before #13 (sharing) shipped could continue to function. The
+-- partial unique index `idx_accounts_share_lookup_key` only constrains
+-- non-NULL values, so a NULL legacy row plus a non-NULL new row with the
+-- same effective email never collide and both rows succeed — the bug that
+-- produced two distinct DLKs for what the user thought was one account.
+--
+-- Going-forward invariant
+-- -----------------------
+-- This migration captures the invariant `share_lookup_key IS NOT NULL` for
+-- accounts created via the API from this migration forward. Enforcement
+-- lives in two places that work together:
+--
+--   1. API boundary (api/src/routes/auth.js handleRegister): rejects a
+--      register payload with missing/null/empty share_lookup_key with HTTP
+--      400. This is the primary gate — every new row that lands via the
+--      Cloudflare Worker now has a non-NULL share_lookup_key by
+--      construction.
+--
+--   2. The existing partial unique index `idx_accounts_share_lookup_key`
+--      (from migration 0009) gives the database-side uniqueness guarantee
+--      for those non-NULL values. Together, (1) + the existing index mean
+--      no two new API-driven rows can share a share_lookup_key, and no new
+--      row can be NULL.
+--
+-- Why no NOT NULL constraint or BEFORE INSERT trigger
+-- ---------------------------------------------------
+-- SQLite cannot add a NOT NULL constraint to an existing column without a
+-- table rebuild. A BEFORE INSERT trigger would block the disaster-recovery
+-- rebuild path (`tools/rebuild-from-arweave.mjs`), which intentionally
+-- inserts pre-#13 credential blobs with NULL share_lookup_key. Rejecting
+-- those at the DB layer would make a clean-room rebuild impossible.
+--
+-- Legacy NULLs (operator action, out of scope for this migration)
+-- ---------------------------------------------------------------
+-- Any rows with NULL share_lookup_key that exist *today* in remote D1
+-- continue to exist. Per the issue, a separate operator-driven
+-- self-healing flow (client computes share_lookup_key from email at next
+-- login, server upserts) will backfill them. This migration intentionally
+-- does NOT touch existing NULL rows — that is operator territory.
+--
+-- The index below is purely a helper: it makes "find every account with
+-- NULL share_lookup_key" an O(matching rows) lookup so operators can
+-- audit progress on backfill.
+
+-- Partial index on NULL rows for operator audit queries. The expected row
+-- count is small (legacy accounts only) and the index stays empty under
+-- the steady-state invariant — making it both cheap to maintain and
+-- self-monitoring (a non-empty index = backfill still pending).
+CREATE INDEX IF NOT EXISTS idx_accounts_share_lookup_key_null
+  ON accounts(credential_lookup_key)
+  WHERE share_lookup_key IS NULL;
