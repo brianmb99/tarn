@@ -13,6 +13,8 @@
 
 import type { ITarnClient, Tag } from '../../collections/index.js';
 import { deriveEid } from '../../collections/eid.js';
+import type { CollectionDef } from '../../schema/index.js';
+import { validateRecordForCreate, TarnSchemaError } from '../../schema/index.js';
 
 export interface IAdvancedClient extends ITarnClient {
   // ITarnClient already covers entry CRUD + blob + shareKey + sharing primitives.
@@ -21,19 +23,26 @@ export interface IAdvancedClient extends ITarnClient {
 
 /**
  * Schema info passed down from TarnClient.create so the advanced surface
- * can transparently stamp Eid + SchemaV tags when callers write to a `type`
- * that corresponds to a defined collection. The escape-hatch semantics stay
- * intact for unknown types — those writes still go through with whatever
- * tags the caller supplies (no auto-stamping).
+ * can transparently validate payloads and stamp Eid + SchemaV tags when
+ * callers write to a `type` that corresponds to a defined collection. The
+ * escape-hatch semantics stay intact for unknown types — those writes still
+ * go through with whatever tags the caller supplies (no validation, no
+ * auto-stamping).
  *
  * Invariant the SDK now upholds: every data-bearing write to a defined
- * collection carries an Eid tag, regardless of whether it went through
- * the typed Collection<T> surface or the advanced escape hatch. The wire
- * protocol can rely on it; the delta-sync surface can rely on it.
+ * collection is validated against the schema AND carries an Eid tag
+ * derived from the validated record's primaryKey, regardless of whether
+ * it went through the typed Collection<T> surface or the advanced escape
+ * hatch. The wire protocol can rely on it; the delta-sync surface can
+ * rely on it; users no longer end up with silent orphans on chain.
  */
 export interface AdvancedSchemaInfo {
-  /** Map from collection name (the `type` arg) to its primaryKey field. */
-  primaryKeyByType: ReadonlyMap<string, string>;
+  /**
+   * Map from collection name (the `type` arg) to its full CollectionDef.
+   * Used both to enforce schema validation on writes targeting a defined
+   * collection and to look up the primaryKey field name for Eid derivation.
+   */
+  collectionsByType: ReadonlyMap<string, CollectionDef>;
   /** Top-level schema version — used as the SchemaV tag value. */
   schemaVersion: number;
   /** App id, used to derive Eids. */
@@ -59,44 +68,106 @@ export class AdvancedEntries<C extends IAdvancedClient> {
   }
 
   /**
-   * If `type` corresponds to a defined collection, derive the Eid + SchemaV
-   * tags from the payload's primaryKey field and return them. Otherwise
-   * returns an empty array (schema-less type — caller manages tags).
+   * Prepare a write to `type` with `payload` and caller-supplied `extraTags`.
    *
-   * Throws when the type IS defined but the payload's primaryKey value is
-   * missing or non-string. The escape hatch will not silently produce
-   * an orphan in a typed collection.
+   * When `type` matches a defined collection (the failure mode this code
+   * exists to prevent — silent orphans landing in a typed collection via
+   * the escape hatch):
+   *   1. Validate the payload against the schema using the same
+   *      `validateRecordForCreate` the typed Collection.create path uses.
+   *      A missing primaryKey, unknown field, or type mismatch throws
+   *      TarnSchemaError — nothing is written.
+   *   2. Derive the Eid from the validated record's primaryKey via the same
+   *      `deriveEid` the typed path uses.
+   *   3. If the caller already supplied an `Eid` tag in extraTags, honor
+   *      it but assert it matches the derived value. A mismatch is almost
+   *      certainly a caller bug (records would become unreachable via the
+   *      typed read path) and throws TarnSchemaError. If the caller's Eid
+   *      matches, the auto-stamp is suppressed so the wire carries a single
+   *      Eid tag (no duplicates).
+   *   4. Similarly, suppress the auto SchemaV tag if the caller already
+   *      supplied one.
+   *
+   * For an undefined `type` (legitimate escape-hatch use — app-internal
+   * types, prototypes, share-log helpers), passes through unchanged: no
+   * validation, no auto-stamping, no normalization of the payload.
+   *
+   * Returns the payload that should be written (validated/normalized for
+   * defined collections, original for undefined types) and the extraTags
+   * array to apply on the wire.
    */
-  async #protocolTagsFor(type: string, payload: Record<string, unknown>): Promise<Tag[]> {
-    if (!this.#schemaInfo) return [];
-    const primaryKeyField = this.#schemaInfo.primaryKeyByType.get(type);
-    if (primaryKeyField === undefined) return [];
-    const pkValue = payload[primaryKeyField];
+  async #prepareWrite(
+    type: string,
+    payload: Record<string, unknown>,
+    extraTags: Tag[],
+  ): Promise<{ payload: Record<string, unknown>; tags: Tag[] }> {
+    if (!this.#schemaInfo) return { payload, tags: extraTags };
+    const def = this.#schemaInfo.collectionsByType.get(type);
+    if (def === undefined) return { payload, tags: extraTags };
+
+    // Validate. `validateRecordForCreate` enforces required fields (including
+    // the primaryKey), rejects unknown fields, applies defaults, and coerces
+    // dates. Throws TarnSchemaError on any failure — caller never gets a
+    // half-written record on the wire.
+    const validated = validateRecordForCreate(type, def, payload);
+
+    // Extract the primaryKey from the validated record. validateRecordForCreate
+    // already required it to be present and the right type, but we also
+    // need non-empty (Eid derivation collapses on '').
+    const pkValue = validated[def.primaryKey];
     if (typeof pkValue !== 'string' || pkValue.length === 0) {
-      throw new Error(
-        `advanced.entries: type '${type}' is a defined collection but the payload ` +
-        `is missing a usable primaryKey at field '${primaryKeyField}' (expected non-empty string)`,
+      throw new TarnSchemaError(
+        `advanced.entries: type '${type}' primaryKey '${def.primaryKey}' ` +
+        `must be a non-empty string`,
       );
     }
-    const eid = await deriveEid(this.#schemaInfo.appId, type, pkValue);
-    return [
-      { name: 'Eid', value: eid },
-      { name: 'SchemaV', value: String(this.#schemaInfo.schemaVersion) },
-    ];
+    const derivedEid = await deriveEid(this.#schemaInfo.appId, type, pkValue);
+
+    // Reconcile caller-supplied tags. If the caller already put `Eid` or
+    // `SchemaV` in extraTags, respect them but validate Eid matches what
+    // we'd derive (mismatches are caller bugs — typed reads would drop
+    // the record). Then suppress the auto-stamp for any tag they supplied
+    // so we don't ship duplicates.
+    let callerHasEid = false;
+    let callerHasSchemaV = false;
+    for (const tag of extraTags) {
+      if (tag.name === 'Eid') {
+        if (tag.value !== derivedEid) {
+          throw new TarnSchemaError(
+            `advanced.entries: caller-supplied Eid '${tag.value}' does not match ` +
+            `derived Eid '${derivedEid}' for type '${type}' primaryKey '${pkValue}'. ` +
+            `Either omit the Eid tag (the SDK will derive it) or correct the value.`,
+          );
+        }
+        callerHasEid = true;
+      } else if (tag.name === 'SchemaV') {
+        callerHasSchemaV = true;
+      }
+    }
+    const auto: Tag[] = [];
+    if (!callerHasEid) auto.push({ name: 'Eid', value: derivedEid });
+    if (!callerHasSchemaV) {
+      auto.push({ name: 'SchemaV', value: String(this.#schemaInfo.schemaVersion) });
+    }
+    return { payload: validated, tags: [...extraTags, ...auto] };
   }
 
   /**
-   * Schema-less entry create. When `type` matches a defined collection, the
-   * Eid + SchemaV tags are auto-stamped from the payload's primaryKey;
-   * caller-supplied tags are preserved and prepended.
+   * Schema-less entry create. When `type` matches a defined collection the
+   * payload is validated against the schema and Eid + SchemaV tags are
+   * auto-stamped — same invariants as `tarn.<collection>.create()`. A
+   * mismatched caller-supplied Eid throws TarnSchemaError; a payload
+   * missing the collection's primaryKey throws TarnSchemaError. For an
+   * undefined `type`, behaves as a pure pass-through (no validation,
+   * no auto-stamping).
    */
   async create(
     type: string,
     payload: Record<string, unknown>,
     extraTags: Tag[] = [],
   ): Promise<{ txid: string; shareKey: string | null }> {
-    const auto = await this.#protocolTagsFor(type, payload);
-    return this.#client.createEntry(type, payload, [...extraTags, ...auto]);
+    const { payload: finalPayload, tags } = await this.#prepareWrite(type, payload, extraTags);
+    return this.#client.createEntry(type, finalPayload, tags);
   }
 
   /**
@@ -104,11 +175,14 @@ export class AdvancedEntries<C extends IAdvancedClient> {
    * regardless of batch size (vs N hits for N single calls). Returns
    * `[{ txid, shareKey }]` in input order.
    *
-   * When `type` matches a defined collection, the SDK auto-stamps Eid +
-   * SchemaV per item from each item's primaryKey field — so batched
-   * entries are NOT orphans on the wire. This pairs with the protocol
-   * invariant that every write to a defined collection carries an Eid.
-   * Throws if any item is missing its primaryKey for a defined type.
+   * When `type` matches a defined collection, every item is validated
+   * against the schema and gets Eid + SchemaV auto-stamped from its
+   * primaryKey — same invariants as `tarn.<collection>.batchCreate()`.
+   * Validation is atomic across the batch: if ANY item fails, an error
+   * listing all failing indexes is thrown and nothing is written. This
+   * matches the typed `Collection.batchCreate` semantics and closes the
+   * "silent orphan via escape hatch" gap that motivated this surface's
+   * tightening (Tarn #34).
    *
    * Throws on empty input or `items.length > 25`. Idempotent: a retry on
    * the same input produces the same list of txids (server-side de-dupe
@@ -143,20 +217,50 @@ export class AdvancedEntries<C extends IAdvancedClient> {
         `must equal items.length (${items.length})`,
       );
     }
-    // Build per-item tags: batch-level extraTags + per-item extras + auto-stamped Eid + SchemaV.
-    const perItem: Tag[][] = [];
+    // Build per-item (payload, tags) up front. For a defined `type`, every
+    // item's #prepareWrite runs validation + Eid derivation + caller-tag
+    // reconciliation; failures are collected by input index so the caller
+    // sees every problem in one error, not just the first. No wire call
+    // happens unless every item passes.
+    const preparedPayloads: Array<Record<string, unknown> | null> = new Array(items.length).fill(null);
+    const preparedTags: Array<Tag[]> = new Array(items.length);
+    const failures: Array<{ index: number; error: string }> = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i]!;
       const itemSpecific = perItemExtraTags?.[i] ?? [];
-      const auto = await this.#protocolTagsFor(type, item);
-      perItem.push([...extraTags, ...itemSpecific, ...auto]);
+      const callerTags: Tag[] = [...extraTags, ...itemSpecific];
+      try {
+        const prepared = await this.#prepareWrite(type, item, callerTags);
+        preparedPayloads[i] = prepared.payload;
+        preparedTags[i] = prepared.tags;
+      } catch (err) {
+        failures.push({
+          index: i,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
-    return this.#client.batchCreate(type, items, perItem);
+    if (failures.length > 0) {
+      const summary = failures
+        .map((f) => `[${f.index}] ${f.error}`)
+        .join('; ');
+      throw new TarnSchemaError(
+        `advanced.entries.batchCreate: validation failed for ` +
+        `${failures.length}/${items.length} item(s) of type '${type}': ${summary}`,
+      );
+    }
+    const finalItems = preparedPayloads as Array<Record<string, unknown>>;
+    return this.#client.batchCreate(type, finalItems, preparedTags);
   }
 
   /**
-   * Schema-less update. When `type` matches a defined collection, the
-   * Eid + SchemaV tags are auto-stamped from the payload's primaryKey.
+   * Schema-less update. When `type` matches a defined collection the
+   * payload is validated against the schema and Eid + SchemaV are
+   * auto-stamped from the payload's primaryKey — same invariants as the
+   * create path. Update carries a full payload (apps doing a partial
+   * update on a typed collection should use `tarn.<collection>.update(pk,
+   * patch)` which does the read-merge-write); the escape hatch only
+   * accepts a complete record because there's nothing to merge against.
    */
   async update(
     priorTxid: string,
@@ -164,8 +268,8 @@ export class AdvancedEntries<C extends IAdvancedClient> {
     payload: Record<string, unknown>,
     extraTags: Tag[] = [],
   ): Promise<{ txid: string; shareKey: string | null }> {
-    const auto = await this.#protocolTagsFor(type, payload);
-    return this.#client.updateEntry(priorTxid, type, payload, [...extraTags, ...auto]);
+    const { payload: finalPayload, tags } = await this.#prepareWrite(type, payload, extraTags);
+    return this.#client.updateEntry(priorTxid, type, finalPayload, tags);
   }
 
   /**

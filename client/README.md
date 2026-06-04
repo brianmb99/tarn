@@ -558,6 +558,8 @@ Apps **should** attach a device label at login time — `tarn.login(username, pa
 
 Power-user surface for prototyping, debugging, and use cases the typed namespaces don't cover. Most apps never need this.
 
+For an `arbitrary-type` that is NOT declared in your schema, these methods are pure pass-through — no validation, no auto-stamping, the caller manages every tag. When the `type` argument DOES match a declared collection, the SDK enforces the same invariants as the typed `Collection<T>` surface (schema validation + Eid auto-stamp); see the [Bulk writes](#bulk-writes-advancedentriesbatchcreate) section below for details.
+
 ```js
 // Schema-less entry CRUD — bypasses the collection layer entirely.
 await tarn.advanced.entries.create('arbitrary-type', { foo: 'bar' });
@@ -584,7 +586,9 @@ const results = await tarn.advanced.entries.batchCreate('my-app-cache', records)
 // results: [{ txid, shareKey }, ...] — same order as input.
 ```
 
-For records that DO belong to a declared collection, use the typed path: **`tarn.<collection>.batchCreate(records)`**. That path validates every record against the schema (atomically — if any record fails, nothing is written) and stamps each entry with its Eid + SchemaV tags, so the batch surfaces normally through typed reads. The advanced wrapper here will also auto-stamp Eid + SchemaV when `type` matches a declared collection — but it skips schema validation, so a typo'd field will silently land in storage. The typed path is the safer default.
+For records that DO belong to a declared collection, prefer the typed path: **`tarn.<collection>.batchCreate(records)`**. That path validates every record against the schema (atomically — if any record fails, nothing is written) and stamps each entry with its Eid + SchemaV tags, so the batch surfaces normally through typed reads.
+
+The advanced wrappers (`create` / `batchCreate` / `update`) enforce the same invariants when `type` matches a declared collection — schema validation runs, Eid + SchemaV are auto-stamped from each item's primaryKey, and a mixed-validity batch throws with input-indexed reasons before anything reaches the wire. Caller-supplied `Eid` / `SchemaV` tags are respected if present (no double-stamp), but a caller-supplied `Eid` that disagrees with the SDK-derived value throws `TarnSchemaError` — that's almost always a caller bug that would orphan the record from the typed read path. This closes the silent-orphan gap for defined collections regardless of which write surface the caller uses; the typed path is still recommended for ergonomics (full TS inference on the record shape).
 
 **Throws on `items.length === 0` or `items.length > 25`.** Idempotent — a retry on the same input produces the same list of txids (one idempotency key per batch). Larger imports: chunk client-side and pace at ~1 batch per 36s to stay under the 100 writes/hour/account limit.
 

@@ -132,18 +132,22 @@ export class TarnClient<S extends AnySchema> {
     this.accountKey = new AccountKeyNamespace(args.underlying, args.appId);
     this.passkeys = new PasskeysNamespace(args.underlying);
 
-    // Schema info for the advanced surface: it auto-stamps Eid + SchemaV
-    // whenever a caller writes to a `type` that corresponds to a defined
-    // collection. Keeps the escape hatch from silently creating orphans
-    // for typed collections, while preserving schema-less semantics for
-    // unknown types (share-state, app-internal, etc.).
-    const primaryKeyByType = new Map<string, string>();
-    const schemaInner = args.schema as unknown as { collections: Record<string, { primaryKey: string }>; version: number };
+    // Schema info for the advanced surface: it validates payloads and
+    // auto-stamps Eid + SchemaV whenever a caller writes to a `type` that
+    // corresponds to a defined collection. Keeps the escape hatch from
+    // silently creating orphans (or accepting records that violate the
+    // declared schema) in typed collections, while preserving schema-less
+    // semantics for unknown types (share-state, app-internal, etc.).
+    const collectionsByType = new Map<string, CollectionDef>();
+    const schemaInner = args.schema as unknown as {
+      collections: Record<string, CollectionDef>;
+      version: number;
+    };
     for (const [name, def] of Object.entries(schemaInner.collections)) {
-      primaryKeyByType.set(name, def.primaryKey);
+      collectionsByType.set(name, def);
     }
     this.advanced = new AdvancedNamespace(args.underlying, {
-      primaryKeyByType,
+      collectionsByType,
       schemaVersion: schemaInner.version,
       appId: args.appId,
     });

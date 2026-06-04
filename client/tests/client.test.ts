@@ -11,6 +11,7 @@ import { defineSchema, TarnClient, TarnStorage } from '../src/index.js';
 import type { CollectionDef } from '../src/index.js';
 import type { IUnderlyingClient } from '../src/client/index.js';
 import type { DecryptedEntry, ShareConnection, Tag, UnderlyingConnection } from '../src/collections/index.js';
+import { deriveEid } from '../src/collections/eid.js';
 
 // ============ Stub underlying client ============
 //
@@ -1014,7 +1015,10 @@ describe('TarnClient.advanced', () => {
     const items = [{ bookId: 'b1', title: 'A', isPrivate: false }, { title: 'no-pk' }];
     await assert.rejects(
       () => tarn.advanced.entries.batchCreate('books', items),
-      /missing a usable primaryKey/,
+      // Schema validation surfaces the missing required primaryKey as the
+      // standard "required field 'X' is missing" message from
+      // validateRecordForCreate, prefixed with the failing input index.
+      /\[1\] .*required field 'bookId' is missing/,
     );
     // Nothing got forwarded — the throw happens before the wire call.
     assert.equal(stub.batchCreateCalls.length, 0);
@@ -1052,6 +1056,134 @@ describe('TarnClient.advanced', () => {
       /max 25/i,
     );
     assert.equal(stub.batchCreateCalls.length, 0, 'underlying not called on bad input');
+  });
+
+  // ---- Tarn #34: SDK invariant — refuse untagged writes to defined collections ----
+  //
+  // These tests pin down the guarantee that the untyped escape hatch can NEVER
+  // produce a silent orphan in a defined collection. The same invariants the
+  // typed Collection.create / batchCreate uphold (schema validation + Eid
+  // stamping) now apply to advanced.entries.create / batchCreate as well.
+
+  it('advanced.entries.create on a defined collection validates payload (missing primaryKey → TarnSchemaError)', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    // 'books' has required primaryKey 'bookId' — omit it.
+    await assert.rejects(
+      () => tarn.advanced.entries.create('books', { title: 'X' }),
+      /required field 'bookId' is missing/,
+    );
+    // No wire call — validation fails before reaching the stub.
+    assert.equal(stub.entries.length, 0);
+  });
+
+  it('advanced.entries.create on a defined collection rejects unknown fields (typo protection)', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    await assert.rejects(
+      () => tarn.advanced.entries.create('books', { bookId: 'b1', titel: 'typo' }),
+      /unknown field 'titel'/,
+    );
+    assert.equal(stub.entries.length, 0);
+  });
+
+  it('advanced.entries.create on a defined collection auto-stamps Eid + SchemaV', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    await tarn.advanced.entries.create('books', { bookId: 'b1', title: 'A' });
+    assert.equal(stub.entries.length, 1);
+    const tags = stub.entries[0]!.tags;
+    const eid = tags.find((t) => t.name === 'Eid');
+    const schemaV = tags.find((t) => t.name === 'SchemaV');
+    assert.ok(eid, 'Eid must be auto-stamped on a defined-collection write');
+    assert.ok(schemaV, 'SchemaV must be auto-stamped on a defined-collection write');
+    assert.equal(schemaV.value, '4');
+  });
+
+  it('advanced.entries.create on an UNdefined type passes through with no validation or auto-stamp', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    // Schema-less type — escape hatch's legitimate use case. Random fields,
+    // no Eid/SchemaV added by the SDK.
+    await tarn.advanced.entries.create('app-cache-blob', { whatever: 'goes', here: 123 });
+    assert.equal(stub.entries.length, 1);
+    const tags = stub.entries[0]!.tags;
+    assert.ok(!tags.find((t) => t.name === 'Eid'), 'no auto Eid for undefined type');
+    assert.ok(!tags.find((t) => t.name === 'SchemaV'), 'no auto SchemaV for undefined type');
+  });
+
+  it('advanced.entries.create respects a caller-supplied Eid that matches the derived value', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    // Compute the canonical Eid the SDK would derive for (appId, type, pk).
+    const derived = await deriveEid('bookish', 'books', 'b1');
+    await tarn.advanced.entries.create(
+      'books',
+      { bookId: 'b1', title: 'A' },
+      [{ name: 'Eid', value: derived }],
+    );
+    assert.equal(stub.entries.length, 1);
+    const eidTags = stub.entries[0]!.tags.filter((t) => t.name === 'Eid');
+    // No double-stamp: caller's Eid is respected, the auto one is suppressed.
+    assert.equal(eidTags.length, 1, 'caller Eid must not be double-stamped');
+    assert.equal(eidTags[0]!.value, derived);
+  });
+
+  it('advanced.entries.create throws TarnSchemaError when caller-supplied Eid does not match derived value', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    await assert.rejects(
+      () => tarn.advanced.entries.create(
+        'books',
+        { bookId: 'b1', title: 'A' },
+        [{ name: 'Eid', value: 'definitely-wrong' }],
+      ),
+      /caller-supplied Eid 'definitely-wrong' does not match/,
+    );
+    assert.equal(stub.entries.length, 0, 'no wire call on Eid mismatch');
+  });
+
+  it('advanced.entries.create round-trips: untyped write is then visible via the typed get path', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    // The whole point of the invariant: a record written through the escape
+    // hatch must be reachable via the typed read path. Eid stamping is the
+    // bridge — typed get derives Eid from primaryKey, the read path matches
+    // on Eid, so the record surfaces.
+    await tarn.advanced.entries.create('books', { bookId: 'b1', title: 'Round-Trip' });
+    const tarnTyped = tarn as unknown as {
+      books: { get(pk: string): Promise<{ bookId: string; title: string } | null> };
+    };
+    const read = await tarnTyped.books.get('b1');
+    assert.ok(read, 'typed get should find the record written via advanced.entries.create');
+    assert.equal(read.bookId, 'b1');
+    assert.equal(read.title, 'Round-Trip');
+  });
+
+  it('advanced.entries.batchCreate on a defined collection reports all failing indexes (no partial writes)', async () => {
+    const stub = new StubUnderlying();
+    const tarn = await makeClient(stub);
+    // Mix of valid + invalid items. Indexes 1 and 3 fail (missing primaryKey
+    // and missing title respectively). Error must mention both; nothing
+    // hits the wire.
+    const items = [
+      { bookId: 'b1', title: 'ok-0' },          // 0: ok
+      { title: 'no-pk' },                       // 1: missing bookId
+      { bookId: 'b2', title: 'ok-2' },          // 2: ok
+      { bookId: 'b3' },                         // 3: missing title
+    ];
+    let thrown: unknown = null;
+    try {
+      await tarn.advanced.entries.batchCreate('books', items);
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof Error, 'must throw');
+    const msg = (thrown as Error).message;
+    assert.match(msg, /2\/4/, `error must report failure count; got: ${msg}`);
+    assert.match(msg, /\[1\]/, `error must mention failing index 1; got: ${msg}`);
+    assert.match(msg, /\[3\]/, `error must mention failing index 3; got: ${msg}`);
+    assert.equal(stub.batchCreateCalls.length, 0, 'no wire call when any item fails');
   });
 
   it('advanced.shareLog.read returns the connection state map', async () => {

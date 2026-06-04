@@ -433,6 +433,123 @@ await test('typed batchCreate aggregates validation failures with indexes', asyn
   assert(/\[1\]/.test(caught.message), `error must mention failing index [1]; got: ${caught.message}`);
 });
 
+// ============ 5a3. Tarn #34: advanced.entries refuses untagged writes ============
+//
+// The complement to #33: even the untyped escape hatch
+// (`advanced.entries.create` / `.batchCreate`) cannot silently produce
+// orphan entries in a defined collection. Before #34, calling
+// `tarn.advanced.entries.create('books', { title: 'X' })` would land a
+// record on chain with no Eid and no validation — the typed read path
+// would then drop it as an "orphan delta event". This block asserts the
+// new invariant end-to-end against the live API: untyped writes to a
+// defined collection MUST validate + auto-stamp Eid, and the typed read
+// path MUST then surface them as if they came through the typed surface.
+//
+// Together with 5a2, this closes the silent-orphan gap for every caller,
+// not just those who happen to use the typed surface.
+
+console.log('\n=== 5a3. advanced.entries invariant for defined collections (issue #34) ===');
+
+await test('advanced.entries.create on a defined collection: validates, stamps Eid, typed read surfaces it', async () => {
+  // Unique collection name per run for cursor isolation, same pattern as #33.
+  const collectionName = `untyped-create-${Date.now()}`;
+  const schema = defineSchema({
+    appId: APP_ID,
+    version: 1,
+    collections: {
+      [collectionName]: {
+        primaryKey: 'bookId',
+        fields: {
+          bookId: 'string',
+          title: 'string',
+        },
+      },
+    },
+  });
+  const tarn = await TypedTarnClient.create({
+    apiBase: API_BASE, appId: APP_ID, schema, storage: TarnStorage.memory(),
+  });
+  await tarn.login(testUsername, testPassword);
+
+  // 1. Missing primaryKey must throw — nothing reaches the wire.
+  let missingPk = null;
+  try {
+    await tarn.advanced.entries.create(collectionName, { title: 'no-pk' });
+  } catch (e) {
+    missingPk = e;
+  }
+  assert(missingPk, 'untyped create without primaryKey must throw');
+  assert(/required field 'bookId' is missing/.test(missingPk.message),
+    `expected schema validation error; got: ${missingPk.message}`);
+
+  // 2. Valid untyped create succeeds, then surfaces through the typed read
+  //    path — Eid was stamped, so it is not an orphan.
+  const bookId = `untyped-b-${Date.now()}`;
+  await tarn.advanced.entries.create(collectionName, { bookId, title: 'Untyped-Round-Trip' });
+
+  await sleep(500);
+  const collection = tarn[collectionName];
+  const fetched = await collection.get(bookId);
+  assert(fetched, `untyped write must be visible via typed get(); got null for bookId=${bookId}`);
+  assert(fetched.title === 'Untyped-Round-Trip',
+    `unexpected title round-trip; got '${fetched.title}'`);
+});
+
+await test('advanced.entries.batchCreate on a defined collection: aggregate errors, no orphan writes on success', async () => {
+  const collectionName = `untyped-batch-${Date.now()}`;
+  const schema = defineSchema({
+    appId: APP_ID,
+    version: 1,
+    collections: {
+      [collectionName]: {
+        primaryKey: 'bookId',
+        fields: {
+          bookId: 'string',
+          title: 'string',
+        },
+      },
+    },
+  });
+  const tarn = await TypedTarnClient.create({
+    apiBase: API_BASE, appId: APP_ID, schema, storage: TarnStorage.memory(),
+  });
+  await tarn.login(testUsername, testPassword);
+
+  // 1. Mixed-validity batch must throw with input-indexed reasons, NOTHING
+  //    written. The whole batch is rejected up front.
+  let caught = null;
+  try {
+    await tarn.advanced.entries.batchCreate(collectionName, [
+      { bookId: 'ok-0', title: 'A' },
+      { title: 'no-pk' }, // 1: missing bookId
+    ]);
+  } catch (e) {
+    caught = e;
+  }
+  assert(caught, 'mixed-validity untyped batch must throw');
+  assert(/\[1\]/.test(caught.message),
+    `error must include failing input index [1]; got: ${caught.message}`);
+
+  // 2. Valid batch succeeds — every item surfaces through the typed read
+  //    path with its derived Eid (no orphans).
+  const stamp = Date.now();
+  const records = Array.from({ length: 3 }, (_, i) => ({
+    bookId: `ub-${i}-${stamp}`,
+    title: `Untyped Batch ${i}`,
+  }));
+  const out = await tarn.advanced.entries.batchCreate(collectionName, records);
+  assert(Array.isArray(out) && out.length === 3,
+    `expected 3 wire results, got ${out?.length}`);
+
+  await sleep(500);
+  const collection = tarn[collectionName];
+  for (const r of records) {
+    const fetched = await collection.get(r.bookId);
+    assert(fetched, `untyped batchCreate item ${r.bookId} must be visible via typed get()`);
+    assert(fetched.title === r.title, `title mismatch for ${r.bookId}: ${fetched.title}`);
+  }
+});
+
 // ============ 5b. EID-NARROWED READ PATH ============
 //
 // Verifies the API's ?eid= filter and the SDK's getEntryByEid wrapper. This
