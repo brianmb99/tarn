@@ -47,6 +47,7 @@ export {
   validateAccountKey,
   AccountKeyPinningError,
   TarnRateLimitError,
+  TarnPasskeyOnlyError,
 } from './tarn.js';
 
 export type {

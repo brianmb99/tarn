@@ -210,6 +210,34 @@ export class StalePasskeyError extends Error {
 }
 
 /**
+ * Thrown when an SDK operation that requires password-derived state is
+ * invoked on a passkey-authenticated session. Passkey sessions populate
+ * `#jwt` + `#dekByGen` (enough for entry CRUD, listing, blob fetch, and
+ * session lifecycle), but they never derive `#signingKeyPair`,
+ * `#sharingKeyPair`, `#credentialLookupKey`, `#credentialEncryptionKey`,
+ * or `#username` — the master-key-derived material lives only in the
+ * password code path. Operations that depend on that material (share-log
+ * read/write, connection handshake, credential rotation, account-key
+ * management) must therefore reject passkey-only sessions with a typed
+ * error rather than crash on a null-deref.
+ *
+ * Apps catch this distinctly so they can prompt the user to step up to a
+ * password sign-in for the specific operation (e.g., "Sharing requires a
+ * password — sign in to continue") without conflating it with rate limits,
+ * stale-passkey wraps, or network errors.
+ *
+ * The set of operations that throw this is defined by the Tarn passkey
+ * contract (see `client/README.md` "Passkey session capabilities" and
+ * `docs/SDK_ARCHITECTURE.md`).
+ */
+export class TarnPasskeyOnlyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TarnPasskeyOnlyError';
+  }
+}
+
+/**
  * Thrown by the SDK on any HTTP 429 response from the Tarn API. The SDK does
  * NOT auto-retry on 429 — retrying a rate-limit signal just confirms the
  * client is going too fast and amplifies the problem (see tarn#29). Instead,
@@ -999,8 +1027,8 @@ export class TarnClient {
     // the password factor. Refuse cleanly instead of throwing a confusing
     // null-dereference downstream.
     if (!this.#signingKeyPair || !this.#credentialLookupKey || !this.#username) {
-      throw new Error(
-        'changeCredentials(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'changeCredentials(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
 
@@ -1475,8 +1503,8 @@ export class TarnClient {
     // call derives keys from the freshly-typed password, then re-signs the
     // challenge with the password-derived signing key.
     if (!this.#username) {
-      throw new Error(
-        'viewAccountKey(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'viewAccountKey(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
     if (!this.#dekByGen || !this.#dekByGen.has(1)) {
@@ -1585,7 +1613,9 @@ export class TarnClient {
    */
   async #performStepUp(password: string, scope: string): Promise<string> {
     if (!this.#username) {
-      throw new Error('#performStepUp: username unknown — log in first');
+      throw new TarnPasskeyOnlyError(
+        '#performStepUp: requires a password-authenticated session — sign in with username + password first.',
+      );
     }
     const reKeys = await deriveAllKeys(this.#username, password, this.#appId);
     const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
@@ -1658,7 +1688,9 @@ export class TarnClient {
       throw new Error(`enableKeyStorage(): invalid account key: ${validation.reason}`);
     }
     if (!this.#username) {
-      throw new Error('enableKeyStorage(): username unknown — log in first');
+      throw new TarnPasskeyOnlyError(
+        'enableKeyStorage(): requires a password-authenticated session — sign in with username + password first.',
+      );
     }
     if (!this.#dekByGen || !this.#dekByGen.has(1)) {
       throw new Error('enableKeyStorage(): DEK_gen1 not available (corrupt session?)');
@@ -1809,8 +1841,8 @@ export class TarnClient {
     // resulting credential_lookup_key matches the session's cached one;
     // a passkey-only session has neither cached.
     if (!this.#username) {
-      throw new Error(
-        'rotateAccountKey(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'rotateAccountKey(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
     if (!this.#dekByGen || this.#dekByGen.size === 0) {
@@ -2542,8 +2574,8 @@ export class TarnClient {
     // typed password + the cached username; passkey-only sessions don't
     // have a username cached.
     if (!this.#username) {
-      throw new Error(
-        'removePasskey(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'removePasskey(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
 
@@ -2614,8 +2646,8 @@ export class TarnClient {
       // first two are master_key-derived and absent on passkey-only
       // sessions. Phrase it as a session-shape error so apps can route
       // the user to "sign in with password first."
-      throw new Error(
-        '#rebuildEnvelopeWithExtraPasskey: requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        '#rebuildEnvelopeWithExtraPasskey: requires a password-authenticated session — sign in with username + password first.',
       );
     }
 
@@ -3404,8 +3436,8 @@ export class TarnClient {
     // Issue #27: sharing handshake depends on master_key-derived sharing +
     // signing keys; passkey-only sessions never derived either.
     if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
-      throw new Error(
-        'sendConnectionRequest(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'sendConnectionRequest(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
 
@@ -3507,8 +3539,8 @@ export class TarnClient {
     // master_key-derived sharing private key; passkey-only sessions don't
     // have one.
     if (!this.#sharingKeyPair) {
-      throw new Error(
-        'listIncomingRequests(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'listIncomingRequests(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
     const windows = Number.isInteger(opts.windows) && opts.windows > 0
@@ -3692,8 +3724,8 @@ export class TarnClient {
     // Issue #27: sharing handshake depends on master_key-derived sharing +
     // signing keys.
     if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
-      throw new Error(
-        'acceptConnectionRequest(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'acceptConnectionRequest(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
     if (typeof requestNonce !== 'string' || requestNonce.length === 0) {
@@ -3977,8 +4009,8 @@ export class TarnClient {
     // Issue #27: invite tokens embed the inviter's signing pub + share_pub;
     // both are master_key-derived and absent on passkey-only sessions.
     if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
-      throw new Error(
-        'createInviteToken(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'createInviteToken(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
     // Local-only label: stored in the inviter's issued-invites record so
@@ -4148,8 +4180,8 @@ export class TarnClient {
     // Issue #27: redeeming an invite sends a connection-request payload
     // signed with the redeemer's master_key-derived signing key.
     if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
-      throw new Error(
-        'redeemInviteToken(): requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'redeemInviteToken(): requires a password-authenticated session — sign in with username + password first.',
       );
     }
     if (typeof tokenId !== 'string' || tokenId.length === 0) {
@@ -4313,11 +4345,13 @@ export class TarnClient {
    * so the cache is invalidated wholesale on credential change / recovery.
    */
   async #getPairKeysFor(connectionSharePubBase64Url: string): Promise<any> {
-    // Issue #27: pair keys derive from master_key-based sharing keys.
-    // Passkey-only sessions never derived them.
+    // Issue #27 + #32: pair keys derive from master_key-based sharing keys.
+    // Passkey-only sessions never derived them. Throws the typed error so
+    // any caller — public or private — that reaches here on a passkey-only
+    // session gets the same affordance as the public-entry guards.
     if (!this.#sharingKeyPair) {
-      throw new Error(
-        'share log: requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        'share log: requires a password-authenticated session — sign in with username + password first.',
       );
     }
     if (typeof connectionSharePubBase64Url !== 'string' || connectionSharePubBase64Url.length === 0) {
@@ -4420,11 +4454,13 @@ export class TarnClient {
     if (!operationFields || typeof operationFields !== 'object') {
       throw new Error('_publishShareLogEntry: operationFields is required');
     }
-    // Issue #27: share-log entries are signed under the user's master_key-
-    // derived ECDSA signing key. Passkey-only sessions never derived one.
+    // Issue #27 + #32: share-log entries are signed under the user's
+    // master_key-derived ECDSA signing key. Passkey-only sessions never
+    // derived one. Throws the typed error so the public callers' guards
+    // and this one surface identically to apps.
     if (!this.#signingKeyPair || !this.#sharingKeyPair) {
-      throw new Error(
-        '_publishShareLogEntry: requires a password-authenticated session — sign in with username + password first',
+      throw new TarnPasskeyOnlyError(
+        '_publishShareLogEntry: requires a password-authenticated session — sign in with username + password first.',
       );
     }
 
@@ -4703,6 +4739,16 @@ export class TarnClient {
    */
   async readShareLog(connection: any, opts: any = {}): Promise<any> {
     await this.#requireAuth();
+    // Issue #32 / D2: the guard for this lives buried in `#getPairKeysFor`.
+    // Mirror it at the public entry so the typed `TarnPasskeyOnlyError` is
+    // the FIRST thing a passkey-only caller sees, and so a future code
+    // path that bypasses `#getPairKeysFor` (e.g., a cache-only fast path)
+    // can't quietly let passkey-only sessions through.
+    if (!this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'readShareLog: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     if (!connection || typeof connection.share_pub !== 'string') {
       throw new Error('readShareLog(): connection.share_pub is required');
     }
@@ -4916,6 +4962,15 @@ export class TarnClient {
    * @returns {Promise<{ seq: number, tag: string, txid: string, retried?: number }>}
    */
   async shareContent(connection: any, contentId: string, txId: string, cekBase64Url: string): Promise<any> {
+    // Issue #32: defense-in-depth guard. `#hydrateOutboundState` and
+    // `_publishShareLogEntry` both have their own guards, but rejecting
+    // here at the public entry surfaces the typed error before any
+    // unrelated argument validation or cache lookups run.
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'shareContent: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     await this.#hydrateOutboundState(connection);
     const tentative = this.#tentativeOutboundState(connection);
     tentative[contentId] = { tx_id: txId, cek: cekBase64Url };
@@ -4936,6 +4991,11 @@ export class TarnClient {
    * retry semantics as {@link shareContent}.
    */
   async updateShareContent(connection: any, contentId: string, newTxId: string): Promise<any> {
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'updateShareContent: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     await this.#hydrateOutboundState(connection);
     const tentative = this.#tentativeOutboundState(connection);
     if (tentative[contentId]) {
@@ -4958,6 +5018,11 @@ export class TarnClient {
    * For cryptographic revocation, use a `rotate` (5d) instead.
    */
   async unshareContent(connection: any, contentId: string): Promise<any> {
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'unshareContent: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     await this.#hydrateOutboundState(connection);
     const tentative = this.#tentativeOutboundState(connection);
     delete tentative[contentId];
@@ -4985,6 +5050,11 @@ export class TarnClient {
    * @returns {Promise<{ seq: number, tag: string, txid: string }>}
    */
   async snapshotShareLog(connection: any, state?: any): Promise<any> {
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'snapshotShareLog: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     if (state === undefined) {
       await this.#hydrateOutboundState(connection);
       state = this.#tentativeOutboundState(connection);
@@ -5032,6 +5102,17 @@ export class TarnClient {
    */
   async removeConnection(connection: any, opts: any = {}): Promise<any> {
     await this.#requireAuth();
+    // Issue #32: removeConnection mutates the persisted connections record
+    // (a sharing primitive) and — when `notify: true` — publishes to the
+    // peer's share-log via `#hydrateOutboundState` + `_publishShareLogEntry`.
+    // Both paths need master_key-derived state. Reject passkey-only sessions
+    // up front rather than letting the inner guard fire after the
+    // connections-record load.
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'removeConnection: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     if (!connection || typeof connection.share_pub !== 'string') {
       throw new Error('removeConnection(): connection.share_pub is required');
     }
@@ -5122,6 +5203,14 @@ export class TarnClient {
    */
   async revokeContentFromConnections(contentId: string, opts: any = {}): Promise<any> {
     await this.#requireAuth();
+    // Issue #32: revokeContentFromConnections fans out signed rotate
+    // operations to each connection's outbound share-log. Same master_key
+    // dependency as the rest of the share-log surface.
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'revokeContentFromConnections: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
     if (typeof contentId !== 'string' || contentId.length === 0) {
       throw new Error('revokeContentFromConnections(): contentId is required');
     }
@@ -5441,6 +5530,19 @@ export class TarnClient {
    * symmetric AES-GCM key) and our OWN signing pub for verification.
    */
   async #hydrateOutboundState(connection: any): Promise<void> {
+    // Issue #32: passkey-only sessions never derived the master_key-based
+    // signing/sharing keys. Anything that hydrates outbound share-log state
+    // would crash here on a null-deref of `#signingKeyPair!.publicKey` (or
+    // fail later inside `#getPairKeysFor`). Reject with a typed error so
+    // apps can render a clear "requires a password-authenticated session"
+    // affordance instead of catching a generic TypeError.
+    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'Sharing operations require a password-authenticated session — ' +
+        'sign in with username + password first.',
+      );
+    }
+
     const existing = this.#outboundStateCache.get(connection.share_pub);
     if (existing?.hydrated) return;
 
