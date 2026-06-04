@@ -256,3 +256,31 @@ The redesign was scoped to one app to migrate (Bookish, the reference app). With
 - **Recovery client.** The "always access your data" client described in §7 is on the roadmap. The protocol-level pieces are done; the client itself is a separate deliverable.
 - **`tarn.ts` public-method types.** The protocol-layer client's public methods accept `: any` parameters in places where the typed surface above already constrains the inputs. Tightening those is a follow-up; the new typed surface is what apps see, and it's fully constrained.
 - **Schema-evolution helpers.** `defineSchema({ ..., onUnknownField: 'strip' | 'preserve' | 'error' })` for opt-in laxer reads, and an opinion on whether a `migrate()` helper belongs in the SDK or in app code. The current SDK is strict-only ('error' equivalent); the field-evolution rules in `client/README.md` are the explicit answer for now. Apps write their own migration loops with `list()` + `update()`.
+
+---
+
+## 11. Passkey session contract
+
+The SDK supports two initial-auth paths — password (`login` / `register` / `recoverAccount`) and passkey (`authenticateWithPasskey`) — and one design principle ties them together:
+
+> Initial auth step differs. Everything downstream — "you're authenticated, here's your data" — is identical EXCEPT for a small, documented set of operations that genuinely require master_key-derived state.
+
+The cleanest mental model is to think of session state as two layers:
+
+- **Common-ground state** populated by both auth paths: `#jwt` (bearer auth context), `#dekByGen` (DEK chain unwrapped via either the password KEK or the passkey PRF KEK), `#currentGen`, `#dataLookupKey`.
+- **Master_key-derived state** populated by the password path only: `#username`, `#credentialLookupKey`, `#credentialEncryptionKey`, `#signingKeyPair`, `#sharingKeyPair`. Passkeys deliberately do not re-derive these — the WebAuthn PRF is a stable wrapping secret for the DEK chain, not a substitute for the master key.
+
+Any SDK operation whose only data dependency is the common-ground state MUST work identically across auth methods. Any SDK operation that reads master_key-derived state MUST reject passkey-only sessions with `TarnPasskeyOnlyError` rather than crash on a null-deref. Both rules are tested in `tests/unit/passkey-session-symmetry.test.js`.
+
+The asymmetric surface — by audit, every public/private path that touches master_key-derived state — is:
+
+1. **Credential and account-key management** — `changeCredentials`, `viewAccountKey`, `rotateAccountKey`, `enableKeyStorage`, `disableKeyStorage`, `removePasskey` (re-derives `#credentialEncryptionKey` on demand if the caller supplies a password — see `tarn.ts:2553-2556`).
+2. **Connection handshake** — `sendConnectionRequest`, `acceptConnectionRequest`, `createInviteToken`, `redeemInviteToken`, `listIncomingRequests`. These need `#sharingKeyPair` (HPKE) and `#signingKeyPair` (handshake signatures).
+3. **Share-log writes** — `shareContent`, `updateShareContent`, `unshareContent`, `snapshotShareLog`, `removeConnection`, `revokeContentFromConnections`, and the private internals they share (`#hydrateOutboundState`, `_publishShareLogEntry`, the rotate-identity announcement helpers).
+4. **Share-log reads (pair-keyed)** — `readShareLog`, `syncShareLog`. Pair-key derivation requires `#sharingKeyPair.privateKey`.
+
+`TarnPasskeyOnlyError` is exported from `index.ts` so apps can branch on `err instanceof TarnPasskeyOnlyError` to route the user through a step-up password sign-in. The error message also always contains the substring `"requires a password-authenticated session"` so legacy string-match code continues to work.
+
+Defense-in-depth: every public method on the asymmetric surface guards explicitly at its entry, rather than relying on the inner helper (`#hydrateOutboundState`, `#getPairKeysFor`, `_publishShareLogEntry`) to catch the missing state. This is belt-and-braces — even if a future code path opens a new route through an asymmetric op (e.g., a cache-only fast path that bypasses the helper), the public entry's guard still rejects passkey-only sessions correctly. SDK contributors adding new public methods on the asymmetric surface MUST add the same guard pattern at the new entry.
+
+The contract is enforced by `tests/unit/passkey-session-symmetry.test.js` (asserts each asymmetric op throws the typed error; asserts the symmetric lifecycle methods accept passkey-only state without complaint). The Phase 1 audit in `docs/PASSKEY_SESSION_AUDIT.md` documents the field-by-field reasoning that led to this contract.

@@ -472,6 +472,45 @@ await tarn.authenticateWithPasskey({
 
 **Multi-device.** Apple iCloud Keychain and Google Password Manager sync passkeys across the user's devices; in those cases, registering on one device makes the credential available on all. For non-syncing authenticators (Windows Hello, hardware security keys), the user must register one per device they want to log in from.
 
+### Passkey session capabilities
+
+The contract is "downstream symmetry, asymmetric initial auth". After the user is authenticated — whether by password or by passkey — the SDK surface is the same EXCEPT for a small, documented set of operations that genuinely require master_key-derived state (signing keypair, sharing keypair, credential-encryption key, username, credential-lookup key). Passkey-only sessions never derive that material; calling one of those operations on a passkey-only session throws `TarnPasskeyOnlyError` (exported from the package) so apps can render a clear "sign in with your password to do this" affordance.
+
+**Works identically on both auth methods** (no special-casing required in apps):
+
+- Entry CRUD on every collection: `create`, `get`, `update`, `delete`, `list`, `batchCreate`
+- Delta sync: `getEntriesSince`, `getEntryByEid`
+- Advanced entries surface: `tarn.advanced.entries.*`
+- Blob fetch and shared-blob decryption
+- Session lifecycle: `tarn.session.isLoggedIn()`, `serializeSession`, `TarnClient.resumeSession`, server-side session listing/revocation
+- Reading shared content the recipient already holds the per-content `cek` for (the JWT carries the bearer; no per-pair derivation needed for the reader side of an already-resolved share)
+- Passkey management on a session that's already authenticated by passkey: `tarn.passkeys.list`, `tarn.passkeys.isSupported`, `authenticateWithPasskey` (including stale-credential repair via `stalePasskeyHandler`)
+
+**Throws `TarnPasskeyOnlyError` on a passkey-only session** (sign in with username + password first):
+
+- Credential and account-key management — `changeCredentials`, `viewAccountKey`, `rotateAccountKey`, `enableKeyStorage`, `disableKeyStorage`, `tarn.passkeys.register`, `tarn.passkeys.remove`
+- Connection handshake — `sendConnectionRequest`, `acceptConnectionRequest`, `createInviteToken`, `redeemInviteToken`, `listIncomingRequests`
+- Share-log writes — `Collection.share`, `Collection.shareWithAll`, `Collection.unshare`, the underlying `shareContent` / `updateShareContent` / `unshareContent` / `snapshotShareLog` on the protocol layer, plus `removeConnection` and `revokeContentFromConnections`
+- Share-log reads (pair-keyed) — `Collection.listShared`, the underlying `readShareLog` / `syncShareLog`. These derive a per-connection pair key from the user's `sharing_priv`, which passkey-only sessions don't carry.
+
+Apps that need any of the asymmetric operations should catch `TarnPasskeyOnlyError` and route the user through a password sign-in (`tarn.login(username, password)`) before retrying. The error message contains "requires a password-authenticated session" so a generic message-substring check works too, but the typed error is the stable contract.
+
+```js
+import { TarnPasskeyOnlyError } from '@tarn/sdk';
+
+try {
+  await tarn.books.share(connection, bookId);
+} catch (err) {
+  if (err instanceof TarnPasskeyOnlyError) {
+    // Surface "Sharing requires your password — sign in to continue."
+    await app.promptForPasswordSignIn();
+    await tarn.books.share(connection, bookId); // retry after password auth
+  } else {
+    throw err;
+  }
+}
+```
+
 ### What happens when you change your password
 
 `changeCredentials` mints a new generation of the data key. For password and account-key factors that's fine — the SDK has both KEKs in hand and re-wraps the new gen automatically. For passkeys, the SDK does NOT have the PRF output (it never persists it), so the new gen would ship without any passkey wrapping unless the user re-taps each registered authenticator at change time. Without that, passkey-only sessions could read pre-change data but not anything written under the new gen — a real break in the passkey UX promise.
