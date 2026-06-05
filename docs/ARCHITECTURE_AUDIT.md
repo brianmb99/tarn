@@ -12,7 +12,9 @@ This is a findings record, not a work order. Issues are filed separately after t
 
 The **implementations are sound** — write-ordering, idempotency, atomic rate limits, JWT validation, CORS, per-app isolation, typed-collection validation, Eid determinism are all confirmed healthy and tested. The risk is concentrated in **two places, both structural, neither a code-quality problem**:
 
-1. **The recoverability promise is unverified and partially unimplemented.** "Arweave is the source of truth; D1 is a disposable cache" holds for the *data plane* (entries) but breaks for the *identity plane*: app registrations and passkey credentials live only in D1, and the rebuild path has never been run end-to-end.
+1. **The recoverability promise is unverified — but the mechanism is largely built.** "Arweave is the source of truth; D1 is a disposable cache" is implemented for the data plane *and* the identity plane (see CORRECTION below). The genuine gap is BE-1: the end-to-end rebuild has never been *run* to prove it.
+
+> **CORRECTION (2026-06-04, verified against code — supersedes BE-2/BE-3 below).** The original back-end audit claimed app registrations and passkey credentials are D1-only with no Arweave mirror ("that code path does not exist"). **That was wrong** — it was an unverified absence-claim from a subagent that only inspected `routes/auth.js` + `tools/`. The mirror is implemented: `api/src/app-reg.js` (`Type=app-reg` wire format), `api/src/routes/passkey-reg.js` (`persistPasskeyRegBlob` / `persistPasskeyRegTombstone`), the Phase-A/B writers in `routes/apps.js` (lines 174–192) and `routes/passkeys.js` (lines 456, 936), and the Phase-C rebuild reader `tools/rebuild-from-arweave.mjs` (reconstructs apps, accounts, passkey_credentials, rules, share_inbox, share_log) all exist — Phases A/B/C of `ARWEAVE_RECOVERABILITY_FIX_PLAN.md`. So BE-2/BE-3's "unrecoverable" severity is retracted. The real, surviving finding is **BE-1: it has never been proven end-to-end** (the test scaffold is a `process.exit(0)` stub). Open items to confirm during the proof (tarn#35): (a) that the canonical app-*registration* path publishes `app-reg` — not only the invite-template-update path; (b) the `TARN_PROTOCOL.md` `app-reg` claim is in fact TRUE (the audit wrongly called it false).
 2. **Schema versioning is a no-op end-to-end.** The `SchemaV` tag is stamped on every write and read by nothing — not the API (correct, zero-knowledge) and not the SDK (a latent landmine). The first schema version bump has no defined behavior.
 
 Everything else is medium/low hardening.
@@ -30,7 +32,9 @@ Everything else is medium/low hardening.
 
 ## Back-end findings (API ↔ Arweave/D1)
 
-### Headline: D1 cannot currently be proven rebuildable from Arweave; the identity plane can't be rebuilt at all.
+### Headline: D1 rebuild is implemented (data + identity plane) but never proven end-to-end.
+
+> See the **CORRECTION** under "The one-paragraph story" above. BE-2/BE-3 below ("no Arweave mirror") are RETRACTED — the app-reg/passkey-reg writers and the rebuild reader exist. The surviving finding is BE-1: prove it (tarn#35). The BE-2/BE-3 rows are left in place for provenance, struck through in intent.
 
 | ID | Title | Severity | Status | Confidence |
 |----|-------|----------|--------|-----------|
