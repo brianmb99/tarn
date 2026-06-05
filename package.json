@@ -14,6 +14,7 @@
     "test:share-log":"node --import tsx tests/test-share-log.mjs",
     "test:handshake":"node --import tsx tests/test-handshake.mjs",
     "test:recovery": "node --import tsx tests/test-recovery.mjs",
+    "test:recovery-combos": "node --import tsx tests/test-recovery-combinations.mjs",
     "test:account-key": "node --import tsx tests/test-account-key.mjs",
     "test:passkeys": "node --import tsx tests/test-passkeys.mjs",
     "test:sessions": "node --import tsx tests/test-sessions.mjs",
