@@ -785,6 +785,23 @@ Tarn is the sole write path for any data associated with a (`data_lookup_key`, `
 
 **Rebuild from Arweave:** Recoverable tables (apps, accounts, passkey_credentials, accounts.rules_json, share_inbox, share_log, entries) rebuildable from Arweave blob scans. The operational rebuild tool is `tools/rebuild-from-arweave.mjs` — see [Operational rebuild from Arweave](#operational-rebuild-from-arweave) below. After rebuild, `cache_meta` markers are cleared so the next read for each tuple re-bootstraps from the restored `entries` rows.
 
+### Delta-sync cursor
+
+The delta endpoint (`GET /api/v1/entries?...&since={cursor}`) lets a client poll for "everything that changed since my last sync" without replaying full history. The cursor is **opaque to the client** — the SDK stores the string verbatim in IndexedDB (`tarn-sync-cursors`, scoped by `appId:dlk:type`) and echoes back whatever the server last returned. Server-side, its format and ordering are precisely defined below.
+
+**Cursor format.** `"<cached_at>:<txid>"` — a decimal millisecond timestamp, a literal colon, then the entry's Arweave txid. The first-sync fallback is `"0:"` (everything since epoch). The pair is a composite sort key: `cached_at` is the primary ordering field and `txid` is a deterministic tiebreak for rows that share the same millisecond (batch writes land together). The server scans `WHERE (cached_at, txid) > (since.cached_at, since.txid) ORDER BY cached_at ASC, txid ASC LIMIT 25`, backed by `idx_entries_since (lookup_key, type, cached_at, txid)`.
+
+**`cached_at` is a D1-write-time clock, not an Arweave clock.** It is `Date.now()` on the Worker at the instant the row is inserted into D1 — set by the synchronous write-through path (`upsertWriteThrough`) and, on cold bootstrap only, by the GraphQL ingest path (`edgeToRow`). It is **not** derived from the Arweave block timestamp. Arweave confirmation latency affects only the separate `block_timestamp` column (the `confirmed` flag), never the cursor's ordering key.
+
+**Monotonicity guarantee — an entry cannot be permanently skipped.** Because Tarn is the sole write path and write-through is synchronous (the client gets success only after the row is in D1), an entry's `cached_at` is fixed at the moment it first becomes visible to any reader, and it never moves afterward:
+
+- The write path marks the tuple bootstrapped on first write, so `refreshCache` — the only code that re-runs `upsertEntries` and would bump `cached_at` on conflict — short-circuits forever after for that tuple. There is no cron, alarm, or background job that re-ingests confirmed entries.
+- A row therefore cannot appear *behind* a cursor that has already advanced past its `cached_at`: the row was already present (with that same `cached_at`) when the cursor passed that point, so the `(cached_at, txid) >` predicate either already returned it or will on the catch-up scan. Late Arweave confirmation reorders nothing — it only flips `confirmed` on a row the cursor has already seen.
+
+This is the difference the architecture audit (SDK-3) flagged: the cursor orders by D1-insert time (safe), not by Arweave block time (which could reorder). The audited failure mode — "an earlier entry confirms after the client advances its cursor and is missed forever" — cannot occur, because confirmation does not change `cached_at` and the row was visible at write-through time.
+
+**Idempotency.** Cursor persistence happens only after the SDK's pagination loop fully drains (`getEntriesSince`, `client/src/tarn.ts`). A mid-loop failure leaves the stored cursor unadvanced, so the next sync re-fetches the same window — safe, because events are keyed by Eid and re-applying them is idempotent. The wire never carries duplicate live+delete events for one Eid in a single call: the SDK deduplicates per Eid, last-occurrence-wins, before returning.
+
 ---
 
 ## Flows
@@ -882,6 +899,10 @@ Blobs are inlined for live events (page-bounded at 25 entries). The
 response's pagination.cursor is the opaque cursor to pass on the next
 poll. The protocol-level tombstone row never appears on the wire — the
 server resolves it into a semantic deletion event.
+
+Cursor format and the monotonicity guarantee (why out-of-order Arweave
+confirmation cannot skip an entry) are specified under "Delta-sync
+cursor" in the API State section.
 ```
 
 ### 5. Update data
