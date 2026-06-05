@@ -168,6 +168,17 @@ Each `shareable: true` collection on the schema becomes a typed namespace on the
 // Create. Validates against the schema. Returns the validated record.
 await tarn.notes.create({ noteId: 'n1', title: 'Quarterly review', body: 'Pull metrics' });
 
+// Retry-safe create. Pass a STABLE idempotencyKey (derived from the record's
+// persistent identity, e.g. its primaryKey) to make a logical write safe to
+// re-attempt. A retry that sends the same key — an offline-replay path
+// re-running a queued op after a crash, or a requeue after a lost response —
+// hits the API's 24h dedup and returns the original result instead of writing
+// a second entry. Omit it for the default (each call is treated as distinct).
+await tarn.notes.create(
+  { noteId: 'n1', title: 'Quarterly review', body: 'Pull metrics' },
+  { idempotencyKey: 'notes:n1' },
+);
+
 // Get one. Returns null if no record matches.
 const note = await tarn.notes.get('n1');
 

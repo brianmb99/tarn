@@ -44,6 +44,7 @@ export interface ITarnClient {
     type: string,
     plaintext: Record<string, unknown>,
     extraTags?: Tag[],
+    opts?: { idempotencyKey?: string },
   ): Promise<{ txid: string; shareKey: string | null }>;
 
   /**

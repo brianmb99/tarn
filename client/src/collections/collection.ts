@@ -66,12 +66,25 @@ export class Collection<TRecord extends Record<string, unknown>> {
     this.#migrations = args.migrations;
   }
 
-  /** Create a new record. Validates against the schema, attaches Eid + SchemaV tags. */
-  async create(record: TRecord): Promise<TRecord> {
+  /**
+   * Create a new record. Validates against the schema, attaches Eid + SchemaV tags.
+   *
+   * Pass `opts.idempotencyKey` to make the write retry-safe across the seam:
+   * the key is forwarded verbatim as the API's `X-Idempotency-Key`, so a
+   * caller that retries the SAME logical create (e.g. an offline-replay path
+   * re-running a queued op after a crash, or after a lost response) sends the
+   * SAME key and the API's 24h dedup collapses the duplicate — no second
+   * remote entry. Omit it (the default) and each call mints a fresh key
+   * internally, i.e. today's behavior: every attempt is treated as distinct.
+   * The key must be stable across attempts to dedup; derive it from the
+   * record's persistent identity (e.g. its primaryKey), not per-call randomness.
+   * See tarn #8 / bookish#225 (seam S-2).
+   */
+  async create(record: TRecord, opts?: { idempotencyKey?: string }): Promise<TRecord> {
     const validated = validateRecordForCreate(this.#name, this.#def, record);
     const pk = this.#extractPrimaryKey(validated);
     const eid = await deriveEid(this.#appId, this.#name, pk);
-    await this.#client.createEntry(this.#name, validated, this.#protocolTags(eid));
+    await this.#client.createEntry(this.#name, validated, this.#protocolTags(eid), opts);
     return validated as TRecord;
   }
 

@@ -2781,7 +2781,12 @@ export class TarnClient {
    * @param {Array<{name: string, value: string}>} extraTags
    * @returns {Promise<{txid: string}>}
    */
-  async createEntry(type: string, plaintext: any, extraTags: Tag[] = []): Promise<any> {
+  async createEntry(
+    type: string,
+    plaintext: any,
+    extraTags: Tag[] = [],
+    opts: { idempotencyKey?: string } = {},
+  ): Promise<any> {
     await this.#requireAuth();
 
     const { encrypted, tags: cryptoTags, shareKey } = await this.#encryptForWrite(plaintext);
@@ -2794,12 +2799,20 @@ export class TarnClient {
       ...extraTags,
     ];
 
+    // A caller-supplied idempotency key makes a logical write retry-safe: the
+    // same key on a re-attempt (offline replay, lost response) hits the API's
+    // 24h dedup and returns the original response instead of minting a second
+    // DataItem. Absent one, fall back to a fresh per-call key (#8): still
+    // retry-safe for the SDK's own in-flight retries, but a fresh attempt by
+    // the app is treated as distinct.
+    const idempotencyKey = opts.idempotencyKey || generateIdempotencyKey();
+
     const res = await this.#fetchRaw('/api/v1/entries', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.#jwt}`,
         'X-Arweave-Tags': JSON.stringify(tags),
-        'X-Idempotency-Key': generateIdempotencyKey(), // retry-safe (#8)
+        'X-Idempotency-Key': idempotencyKey, // retry-safe (#8)
         'Content-Type': 'application/octet-stream',
       },
       body: encrypted,
