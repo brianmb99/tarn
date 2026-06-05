@@ -8,9 +8,27 @@
 
 ---
 
+> **VERIFICATION STATUS (updated 2026-06-05, tarn#35).** The two load-bearing
+> gaps this audit flagged — `apps` (no `app-reg` mirror) and `passkey_credentials`
+> (D1-only) — have since been **closed** (Phases A/B of
+> `ARWEAVE_RECOVERABILITY_FIX_PLAN.md`: `api/src/app-reg.js`,
+> `api/src/routes/passkey-reg.js`, the writers in `routes/apps.js` /
+> `routes/passkeys.js`, and the Phase-C reader `tools/rebuild-from-arweave.mjs`).
+> The end-to-end rebuild has now been **run against mainnet Arweave** and
+> verified: a fresh app + 2 accounts + 2 passkeys + per-account rules were
+> registered through the live API (real Turbo uploads), D1 was wiped, and
+> `tools/rebuild-from-arweave.mjs --confirm` reconstructed `apps`, `accounts`,
+> `passkey_credentials`, and `accounts.rules_json` **identically** modulo the
+> documented acceptable-loss columns. The §1 "PARTIAL" verdict below is the
+> ORIGINAL pre-fix finding, retained for provenance. See **§6. Operational
+> verification** for the proven procedure, the acceptable-loss list, and the
+> mainnet-indexing caveat.
+
 ## 1. TL;DR
 
-**Verdict: PARTIAL — recoverability holds for user data, credential blobs, app rules, app schemas, share-inbox blobs, and share-log blobs. It does NOT hold for app registrations, account-key audit logs, passkey credentials, or any transient/session/rate-limit state.**
+**Verdict (original, pre-fix): PARTIAL — recoverability holds for user data, credential blobs, app rules, app schemas, share-inbox blobs, and share-log blobs. It does NOT hold for app registrations, account-key audit logs, passkey credentials, or any transient/session/rate-limit state.**
+
+*(Superseded — see the VERIFICATION STATUS banner above and §6. The app-registration and passkey-credential gaps are closed and the rebuild is proven.)*
 
 The architectural promise stated in `docs/TARN_PROTOCOL.md` line 866 — "All tables fully rebuildable from Arweave. Entries self-heal on cache miss. Accounts rebuilt from `Type=cred` blobs. Apps rebuilt from `Type=app-reg` blobs." — is OVERSTATED in two ways:
 
@@ -300,3 +318,107 @@ All transient kinds: `auth_nonces`, `step_up_tokens`, `webauthn_challenges`, `se
 ## Closing note
 
 The protocol doc's claim "All tables fully rebuildable from Arweave" should be revised to reflect reality: credential blobs + share blobs + user data are recoverable, but app-registration and passkey-credential tables — added after the original claim was written — are not. The audit log gap is minor; the rebuild-tooling gap is operational rather than architectural (the bytes are there, the script isn't).
+
+> The above closing note is the ORIGINAL pre-fix conclusion. As of the Phase
+> A/B/C work and the tarn#35 verification, the app-registration and
+> passkey-credential mirrors exist and the rebuild is proven. See §6.
+
+---
+
+## 6. Operational verification (tarn#35) — VERIFIED for clean data; robustness caveat below
+
+> **ROBUSTNESS CAVEAT (tarn#41, found by independent global rebuild 2026-06-05).** The scoped proof below (a fresh app + 2 unique-email accounts) reconstructs identically and is valid. But a *global* `rebuild-from-arweave --confirm` over the real dev Arweave history **aborts partway through accounts** with `UNIQUE constraint failed: accounts.share_lookup_key` — real history contains multiple `Type=cred` blobs with distinct `data_lookup_key` but the same `share_lookup_key` (re-registrations + legacy two-accounts-same-email predating #30), and the rebuild's `ON CONFLICT(data_lookup_key)` doesn't dedup the separate `UNIQUE(share_lookup_key)` index. Observed: 7 apps rebuilt, 353/1346 accounts, then fatal. So recoverability is **proven for clean data but not yet robust to messy history** — tarn#41 tracks the fix (pick latest cred per share_lookup_key by block timestamp). The mechanism is sound; the rebuild tool needs collision-dedup before it's production-grade for a real wipe.
+
+The "Tarn is rebuildable from Arweave" property has been exercised end-to-end
+against **mainnet Arweave** (Turbo uploads, real bytes) by
+`tests/test-rebuild-from-arweave.mjs`. This section records the proven
+procedure, the acceptable-loss list it asserts, and the operational caveats.
+
+### What was proven
+
+A FRESH app (`rebuildtest-<run-id>`, unique per run) was registered via the
+canonical `tools/register-app-from-key.mjs` path, then 2 accounts, 2 passkeys
+(virtual-authenticator harness), and per-account write rules were created
+through the LIVE local API so the real Arweave-mirror writers fired. The full
+identity plane was then reconstructed from Arweave alone:
+
+| Table | Rebuilt from | Result |
+|---|---|---|
+| `apps` | `App=tarn, Type=app-reg, Lk=<app_id>` | identical (`public_key`, `invite_url_template`) |
+| `accounts` | `App=tarn, Type=cred, Lk=<clk>[, RLk=<rlk>]` | identical on every exact column (`credential_lookup_key`, `public_key`, `wrapped_data_key`, `app`, recovery fields, share fields, `wrapped_account_key`) |
+| `passkey_credentials` | `App=tarn, Type=passkey-reg, CredId=<id>` | identical on `account_id`, `public_key`, `prf_salt`, `device_label` |
+| `accounts.rules_json` | `App=<app_id>, Type=app-config, Lk=<dlk>` | identical (per-account rules restored) |
+| `entries` | lazy `refreshCache` cold-bootstrap on first read | recovered on read (not pre-populated by the tool — by design) |
+
+The **tarn#36 question is answered YES**: the canonical app-registration path
+(`tools/generate-app-key.mjs` / `tools/register-app-from-key.mjs`) publishes a
+`Type=app-reg` blob to Arweave (Arweave-first ordering — it publishes, then
+prints the D1 seed SQL; it aborts before printing SQL if the publish fails).
+The invite-template-update path (`routes/apps.js`) republishes a fresh
+`app-reg` blob too. So `apps` is recoverable from registration onward, not only
+after an invite-template edit.
+
+### Proven procedure (operator runbook)
+
+1. **Disable the Turbo skip** so writes upload for real: comment out
+   `TARN_SKIP_TURBO` in `api/.dev.vars`, then start `cd api && npx wrangler dev
+   --port 8787`. (CRITICAL: if a stale `workerd` from a prior `wrangler dev` is
+   still running, it keeps the old `TARN_SKIP_TURBO=true` and silently no-ops
+   every upload — kill all `workerd` processes before starting.)
+2. Run `node --import tsx tests/test-rebuild-from-arweave.mjs
+   --i-accept-destructive-wipe --run-id <suffix> --gateway
+   https://turbo-gateway.com`.
+3. The test: registers app+accounts+passkeys+rules+entries → polls the gateway
+   until the mirror blobs are GraphQL/body queryable → snapshots the
+   this-app-scoped rows → wipes local D1 (`api/scripts/wipe-accounts.sql` +
+   this-app `apps` row + `cache_meta`) → runs `tools/rebuild-from-arweave.mjs
+   --confirm` → re-snapshots → diffs modulo the acceptable losses below.
+4. **Restore `TARN_SKIP_TURBO=true` in `api/.dev.vars`** after the run so the
+   normal integration suites (which assume the skip) keep working.
+
+### Acceptable-loss list (asserted by the diff)
+
+The rebuilt rows must match the pre-wipe snapshot EXCEPT these columns, which
+are documented runtime/metadata state deliberately not mirrored to Arweave:
+
+- `accounts.created_at` — block-timestamp approximation; the credential blob
+  carries no wall-clock, so the rebuild uses `block.timestamp` (or `Date.now()`
+  for not-yet-mined bundles).
+- `passkey_credentials.sign_count` — WebAuthn replay counter; resets to `0`.
+  The first post-rebuild assertion is benign (the verifier short-circuits when
+  stored and presented counters are both 0, the dominant OS-synced-passkey
+  case).
+- `passkey_credentials.last_used_at` — UX scaffold; resets to `NULL`.
+- `share_log.data_lookup_key` — sender attribution is not an Arweave tag;
+  rebuilt as the empty-string sentinel `''`.
+
+Also NOT rebuilt (transient/by-design, per the tool's `--help`): `cache_meta`
+bootstrap markers, `sessions`, `step_up_tokens`, `webauthn_challenges`,
+`pending_txs`, `idempotency_keys`, `write_rate_limits`,
+`account_key_fetch_log`, `RATE_KV`.
+
+### Mainnet indexing-latency caveat
+
+The rebuild reads via GraphQL, so freshly-uploaded Turbo data items must first
+be indexed. Observed latency:
+
+- **`turbo-gateway.com`** — indexes its own Turbo bundles in ~7–12 min. Its
+  GraphQL indexer is occasionally `UPSTREAM_CIRCUIT_OPEN`; the test's poll
+  falls back to a body fetch as the readiness signal.
+- **`arweave.net`** — L1 GraphQL lags ~15–25 min (bundle must confirm → post to
+  L1 → mine → index). More reliable, slower. This is the gateway the worker's
+  `entries` cold-bootstrap (`api/src/arweave.js`) is hardcoded to, so the
+  `entries` recovery leg lags independently of the identity-plane rebuild.
+
+The test polls (with a generous `--index-timeout-ms`) and, if blobs never index
+in the window, reports a precise "indexing latency" blocker and does NOT wipe
+D1 or fake a pass.
+
+### >100 KB Turbo paid path
+
+The `/api/v1/entries` endpoint hard-caps payloads at `MAX_UPLOAD_BYTES`
+(100 KiB) and returns 413 above it — there is no oversized write path through
+the API. The test exercises the Turbo PAID path by uploading one 140 KiB
+DataItem directly via `api/src/turbo.js` with the operator wallet, confirming
+Turbo accepts it (a 402/403 would be recorded as "BLOCKED — wallet needs Turbo
+credits", an operator action, not a test failure).

@@ -309,8 +309,21 @@ function d1ExecFile(sql) {
   if (!opts.confirm) {
     return { skipped: true };
   }
+  // Strip explicit transaction control. Recent wrangler (4.x) runs `d1 execute
+  // --file` against the local Durable-Object-backed D1, which REJECTS raw
+  // `BEGIN`/`COMMIT`/`SAVEPOINT` statements ("use state.storage.transaction()
+  // instead"). The batch builders below emit `BEGIN; ... COMMIT;` for advisory
+  // atomicity, but every statement is idempotent (`INSERT ... ON CONFLICT DO
+  // UPDATE` / `DO NOTHING`), so applying them without an explicit transaction
+  // is safe — a partial batch is healed on the next re-run (the tool's
+  // documented idempotency guarantee). We drop the wrappers here so the fix is
+  // in one place rather than across six builders.
+  const cleaned = sql
+    .split('\n')
+    .filter((line) => !/^\s*(BEGIN|COMMIT)\s*;\s*$/i.test(line))
+    .join('\n');
   const tmp = `${TMP_DIR}rebuild-${Date.now()}-${Math.random().toString(36).slice(2)}.sql`;
-  writeFileSync(tmp, sql);
+  writeFileSync(tmp, cleaned);
   const result = spawnSync(
     'npx',
     ['wrangler', 'd1', 'execute', opts.d1Binding, target, '--file', tmp],
