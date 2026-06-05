@@ -430,11 +430,45 @@ describe('Collection.update', () => {
     assert.equal(createEid, updateEid);
   });
 
-  it('rejects updating the primaryKey', async () => {
+  it('rejects an update that changes the primaryKey', async () => {
+    // Changing the primaryKey would mint a new Eid and silently fork the
+    // logical record (SDK-6). Must throw a typed TarnCollectionError naming
+    // both the existing and the attempted value.
     await assert.rejects(
       () => books.update('b1', { bookId: 'b2' } as Partial<BookRecord>),
-      /cannot update primaryKey 'bookId'/,
+      (err: unknown) => {
+        assert.ok(err instanceof TarnCollectionError, 'expected TarnCollectionError');
+        assert.match(err.message, /cannot change primaryKey 'bookId'/);
+        assert.match(err.message, /Existing: 'b1'/);
+        assert.match(err.message, /patch: 'b2'/);
+        return true;
+      },
     );
+    // Nothing was written — the immutability check fires before the wire call.
+    assert.equal(mock.updateCalls.length, 0, 'no entry should be written on rejection');
+  });
+
+  it('allows an update that includes the SAME primaryKey value (no-op)', async () => {
+    // Including the primaryKey with its current value is harmless — it's
+    // stripped before merge and must not be treated as a mutation.
+    await books.update('b1', { bookId: 'b1', rating: 5 } as Partial<BookRecord>);
+
+    assert.equal(mock.updateCalls.length, 1);
+    const call = mock.updateCalls[0]!;
+    assert.equal(call.plaintext['bookId'], 'b1');
+    assert.equal(call.plaintext['rating'], 5);
+    // Eid is unchanged from the original create — no fork.
+    const createEid = mock.createCalls[0]!.extraTags.find((t) => t.name === 'Eid')!.value;
+    const updateEid = call.extraTags.find((t) => t.name === 'Eid')!.value;
+    assert.equal(createEid, updateEid);
+  });
+
+  it('allows an update that omits the primaryKey entirely (the normal case)', async () => {
+    await books.update('b1', { rating: 4 });
+
+    assert.equal(mock.updateCalls.length, 1);
+    assert.equal(mock.updateCalls[0]!.plaintext['bookId'], 'b1');
+    assert.equal(mock.updateCalls[0]!.plaintext['rating'], 4);
   });
 
   it('rejects unknown fields in patch', async () => {

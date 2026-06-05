@@ -167,6 +167,8 @@ Records are addressed by **primary key**, never by Arweave txid. The SDK maps pr
 
 `update()` is **partial-merge**. Pass only what's changing; the SDK reads the current record from Arweave, merges, re-validates as a full record, and writes a chained entry. Full-replace is `update(id, { ...current, ...patch })` if you ever want it.
 
+**The primary key is immutable.** A record's identity (`Eid`) is derived from `hash(appId, collection, primaryKey)`, so changing the primary key would mint a brand-new `Eid`, orphan the original record's history, and silently fork the logical record into two. `update()` enforces this: if your patch includes the primary-key field with a value that differs from the existing record's, the call throws a `TarnCollectionError` and nothing is written. Including the primary-key field with its *current* value is a harmless no-op — it's stripped before the merge. If you genuinely need to "rename" a record's key, model it as a delete of the old key plus a create of the new one.
+
 **Clearing fields.** To remove a field from an existing record, pass its name via the `unset` option:
 
 ```js

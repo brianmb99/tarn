@@ -173,14 +173,47 @@ export class Collection<TRecord extends Record<string, unknown>> {
    * The `keyof TRecord & string` constraint on the unset list lets
    * callers spell the field names with normal autocomplete, without
    * `as any` casts.
+   *
+   * primaryKey immutability is enforced here, not by convention. The Eid is
+   * derived as `hash(appId, collection, primaryKey)`; changing the primaryKey
+   * would mint a new Eid and silently fork the logical record (the old Eid's
+   * entries orphan). So if the patch carries the primaryKey field with a value
+   * differing from the existing record's, this throws `TarnCollectionError`.
+   * Including the primaryKey with the *same* value is a harmless no-op — it's
+   * stripped before merge so it can't perturb anything downstream.
    */
   async update(
     primaryKey: string,
     patch: Partial<TRecord>,
     opts?: { unset?: Array<keyof TRecord & string> },
   ): Promise<TRecord> {
-    const validatedPatch = validateRecordForUpdate(this.#name, this.#def, patch);
     const { entry, current } = await this.#findCurrent(primaryKey);
+
+    // Enforce primaryKey immutability before validation. We compare against
+    // the existing record's primaryKey rather than the `primaryKey` argument
+    // because that argument is the lookup key by definition — the record on
+    // the wire is the source of truth. A same-value primaryKey in the patch
+    // is a no-op (stripped here); a differing value forks the record's Eid.
+    const pkField = this.#def.primaryKey;
+    const patchObj = patch as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(patchObj, pkField)) {
+      const patchPk = patchObj[pkField];
+      const existingPk = (current as Record<string, unknown>)[pkField];
+      if (patchPk !== existingPk) {
+        throw new TarnCollectionError(
+          `Collection '${this.#name}': cannot change primaryKey '${pkField}' on ` +
+          `update (immutable per logical record). ` +
+          `Existing: '${String(existingPk)}', patch: '${String(patchPk)}'`,
+        );
+      }
+      // Same value — strip it so validateRecordForUpdate (which rejects any
+      // primaryKey in a patch) treats this as the no-op it is.
+      const rest: Record<string, unknown> = { ...patchObj };
+      delete rest[pkField];
+      patch = rest as Partial<TRecord>;
+    }
+
+    const validatedPatch = validateRecordForUpdate(this.#name, this.#def, patch);
 
     // Merge, then re-validate as a full record so defaults, required-field,
     // and type rules apply to the result. This is more conservative than
