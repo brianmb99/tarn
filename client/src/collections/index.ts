@@ -10,3 +10,9 @@ export type { ListOpts } from './collection.js';
 export { deriveEid } from './eid.js';
 export { TarnCollectionError } from './types.js';
 export type { ITarnClient, DecryptedEntry, Tag, ShareConnection, UnderlyingConnection } from './types.js';
+export {
+  TarnSchemaVersionError,
+  readSchemaVTag,
+  dispatchSchemaVersion,
+  OLDEST_SCHEMA_VERSION,
+} from './schema-version.js';

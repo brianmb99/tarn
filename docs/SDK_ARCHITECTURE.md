@@ -255,7 +255,8 @@ The redesign was scoped to one app to migrate (Bookish, the reference app). With
 - **Bookish migration.** The pre-redesign SDK shape (`createEntry`/`getEntries`/etc. on a plain `TarnClient` instance) is still what Bookish depends on. The migration is the next deliverable; this document is the pitch artifact for it.
 - **Recovery client.** The "always access your data" client described in §7 is on the roadmap. The protocol-level pieces are done; the client itself is a separate deliverable.
 - **`tarn.ts` public-method types.** The protocol-layer client's public methods accept `: any` parameters in places where the typed surface above already constrains the inputs. Tightening those is a follow-up; the new typed surface is what apps see, and it's fully constrained.
-- **Schema-evolution helpers.** `defineSchema({ ..., onUnknownField: 'strip' | 'preserve' | 'error' })` for opt-in laxer reads, and an opinion on whether a `migrate()` helper belongs in the SDK or in app code. The current SDK is strict-only ('error' equivalent); the field-evolution rules in `client/README.md` are the explicit answer for now. Apps write their own migration loops with `list()` + `update()`.
+- **General migration engine.** Read-side `SchemaV` dispatch and a no-op-today forward-migration seam are shipped (see §12). What's deferred: a full per-version migration framework (rewrite-on-read with persistence, schema diffing, automatic field coercion). The current seam (declared `migrations[v]` functions applied in-memory on read) is enough to keep cross-version reads safe and explicit; richer tooling is a follow-up when a real migration forces the requirements.
+- **Schema-evolution helpers.** `defineSchema({ ..., onUnknownField: 'strip' | 'preserve' | 'error' })` for opt-in laxer reads. The current SDK is strict-only ('error' equivalent) for same-version reads; the field-evolution rules in `client/README.md` are the explicit answer for now.
 
 ---
 
@@ -284,3 +285,35 @@ The asymmetric surface — by audit, every public/private path that touches mast
 Defense-in-depth: every public method on the asymmetric surface guards explicitly at its entry, rather than relying on the inner helper (`#hydrateOutboundState`, `#getPairKeysFor`, `_publishShareLogEntry`) to catch the missing state. This is belt-and-braces — even if a future code path opens a new route through an asymmetric op (e.g., a cache-only fast path that bypasses the helper), the public entry's guard still rejects passkey-only sessions correctly. SDK contributors adding new public methods on the asymmetric surface MUST add the same guard pattern at the new entry.
 
 The contract is enforced by `tests/unit/passkey-session-symmetry.test.js` (asserts each asymmetric op throws the typed error; asserts the symmetric lifecycle methods accept passkey-only state without complaint). The Phase 1 audit in `docs/PASSKEY_SESSION_AUDIT.md` documents the field-by-field reasoning that led to this contract.
+
+---
+
+## 12. Schema versioning
+
+Every typed write stamps a `SchemaV` Arweave tag carrying the schema version the writer used (`Collection.#protocolTags`, and the `advanced.entries` auto-stamp for defined collections). The read side now **consumes** it (Tarn #37; audit finding SDK-1). Before this, the tag was write-only — the first schema-version bump would have had no defined cross-version read behavior, and the strict validator would have either silently stripped unknown fields or thrown on a missing-required mismatch. That landmine is now closed.
+
+**The policy (the conservative MVP contract — implemented in `collections/schema-version.ts`, applied by every `Collection<T>` read path):**
+
+For each fetched entry, the SDK reads the `SchemaV` tag and compares it to the client's `schema.version`:
+
+| Case | Behavior |
+|------|----------|
+| `entryV === clientV` | Normal path — record passed through unchanged (today's behavior). |
+| `entryV  <  clientV` | **Backward-compatible evolution.** Any declared per-version migrators (`schema.migrations[v]` for `v` in `[entryV, clientV-1]`) run in ascending order, then the record passes through. With no migrations declared this is a pure pass-through. |
+| `entryV  >  clientV` | **Future entry the client can't understand.** Never fed to the strict validator (which would corrupt it). The dispatcher raises `TarnSchemaVersionError`. |
+| missing `SchemaV` tag | Treated as the **oldest** version (`1`). Legacy / orphan entries never crash — they fall into the `entryV <= clientV` paths. |
+
+**Skip-vs-throw for the future-version case (explicit decision):**
+
+- **`list()` and `getEntriesSince()` SKIP-WITH-WARNING.** A single record written by a newer client must not break a whole-collection read or a whole sync. This matches the existing defensive posture for orphan / malformed entries (logged + skipped). The app sees the other records normally; the future-version one is omitted with a `console.warn`.
+- **Single-record reads (`get()`, and `#findCurrent` behind `update`/`share`/`shareWithAll`) THROW `TarnSchemaVersionError`.** When an app asks for one specific record by primary key, silently returning `null` would be indistinguishable from "not found" and could mask data the user knows exists. `update` additionally must refuse: a read-modify-write would otherwise persist the record back under the *older* current-client schema and drop the future fields. The app should catch the error and prompt the user to upgrade.
+
+`delete(pk)` is unaffected — it only needs the entry's txid to tombstone and never feeds the decrypted record to a validator, so a future-version record can still be deleted.
+
+**The migration seam (no-op today, by design).** The schema DSL already accepts `migrations?: Record<number, Migration>` where `Migration = (old) => newRecord`; `defineSchema` validates it eagerly (keys must be positive integers strictly less than the current `version`). Until #37 this map was inert. It is now the wired forward-migration seam: a `migrations[v]` function migrates a record written under version `v` to the shape of version `v+1`, and the read path chains them. **Today, with no app declaring migrations, the seam is a pure pass-through** — so the supported contract is: *only additive / backward-compatible schema changes are safe without a migrator.* When a real breaking change lands, declare the migrator(s) and the read path picks them up with no further SDK change — no second landmine.
+
+`TarnSchemaVersionError` is exported from `index.ts` (alongside `TarnSchemaError`, `TarnCollectionError`, `TarnPasskeyOnlyError`) so apps can branch on `err instanceof TarnSchemaVersionError`. It carries `entryVersion`, `clientVersion`, and `txid`.
+
+The contract is enforced by `client/tests/schema-version.test.ts` (the pure dispatcher's four cases, plus each `Collection<T>` read path's skip-vs-throw behavior).
+
+**Note on the API / wire layer.** The Tarn API does not read `SchemaV` — correctly, it's zero-knowledge and treats blobs as opaque. The protocol-layer client (`tarn.ts`) is also schema-agnostic (it knows `Gen` for DEK selection but not the app's schema version). Version dispatch therefore lives entirely in the schema-aware `Collection<T>` layer, the only place the client's `schema.version` is known.

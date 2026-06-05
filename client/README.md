@@ -97,6 +97,15 @@ export const schema = defineSchema({
 
 Schemas carry a numeric `version`. Bumping it republishes the schema (via `tools/publish-schema.mjs`) under a new `V=` Arweave tag so the recovery client can pick the version that matches each record's `SchemaV` tag.
 
+**Read-side version dispatch.** Every record carries the `SchemaV` it was written under, and the SDK reads it on every fetch (Tarn #37). The contract:
+
+- **Older record, newer client** → read normally (the additive-change rows below), or transformed by a declared migrator (see "Inline forward-migrators").
+- **Same version** → normal read.
+- **Newer record, older client** (a record written by an app version that's ahead of the one running) → the SDK will **not** feed it to the strict validator (that would silently corrupt it). `list()` and `getEntriesSince()` **skip it with a console warning** so one newer record can't break a whole read; single-record `get()` / `update()` **throw `TarnSchemaVersionError`** (catch it and prompt the user to upgrade the app). `delete()` still works on such a record.
+- **No `SchemaV` tag** (legacy data) → treated as the oldest version; never crashes.
+
+So, today, **only the backward-compatible (additive) changes in the table below are safe by default.** A breaking change requires either a default/deprecation (per the table) or an inline forward-migrator.
+
 Three rules cover the common cases:
 
 | Change | Backward-compat? | What you do |
@@ -110,7 +119,23 @@ Three rules cover the common cases:
 | **Tighten an enum** (drop a value) | **no** | Older records carrying the dropped value fail. Don't drop; deprecate. |
 | **Loosen an enum** (add a value) | yes | Older records still satisfy the union. |
 
-**Migration pattern.** Tarn doesn't ship a `migrate()` helper — apps write their own walk because the right semantics (one-shot vs. lazy, error handling, partial-failure recovery) are app-specific.
+**Inline forward-migrators (the read-time seam).** `defineSchema()` accepts an optional `migrations: { [v]: (old) => newRecord }` map: `migrations[v]` transforms a record written under version `v` into the shape of version `v+1`. The SDK chains these in memory on read for any record older than the current `version` — so an older record can be reshaped on the fly without rewriting it on Arweave. The map is validated at `defineSchema()` time (keys must be positive integers strictly below `version`).
+
+```js
+const schema = defineSchema({
+  appId: 'myapp',
+  version: 2,
+  collections: { /* ... */ },
+  migrations: {
+    // v1 records had `name`; v2 splits it. Applied on read for v1 entries.
+    1: (old) => ({ ...old, displayName: old.name, name: undefined }),
+  },
+});
+```
+
+This is the lightweight, no-rewrite option — it does not persist anything, so it costs zero Arweave writes. Use it for shape changes you can compute purely from the old record.
+
+**One-shot rewrite migration.** When you'd rather rewrite records permanently (or the transform isn't pure), Tarn doesn't ship a `migrate()` helper for the walk itself — apps write their own loop because the right semantics (one-shot vs. lazy, error handling, partial-failure recovery) are app-specific.
 
 **Cost matters.** Every `update()` is a new permanent Arweave entry, paid via Turbo from the app's funder. Records aren't mutated in place — chained entries append a new version each time, and old versions stay on Arweave forever. A one-shot migration of N records on K users is N×K permanent paid writes. Small entries currently fall under Turbo's free tier, but that's pricing policy, not a guarantee.
 

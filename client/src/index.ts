@@ -31,7 +31,7 @@ export type {
   RecordOfCollection,
 } from './schema/index.js';
 
-export { Collection, TarnCollectionError } from './collections/index.js';
+export { Collection, TarnCollectionError, TarnSchemaVersionError } from './collections/index.js';
 export type { ITarnClient } from './collections/index.js';
 
 export { TarnStorage } from './storage/index.js';

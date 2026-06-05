@@ -301,6 +301,12 @@ async function buildCollections<S extends AnySchema>(
   const out: Record<string, Collection<Record<string, unknown>>> = {};
   const collections = (schema as unknown as SchemaInput).collections;
   const version = (schema as unknown as SchemaInput).version;
+  // Per-version forward-migrators (optional). Threaded into every Collection so
+  // read-side SchemaV dispatch (Tarn #37) can migrate older entries forward.
+  // The schema layer shares one migrations map across all collections; a
+  // migrator receives + returns a plain record, so collections that don't need
+  // it simply leave the record untouched.
+  const migrations = (schema as unknown as SchemaInput).migrations;
 
   for (const [name, def] of Object.entries(collections)) {
     out[name] = new Collection({
@@ -309,6 +315,7 @@ async function buildCollections<S extends AnySchema>(
       name,
       def: def as CollectionDef,
       schemaVersion: version,
+      migrations,
     });
   }
 

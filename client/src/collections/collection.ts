@@ -15,11 +15,12 @@
  * is the only path that legitimately fans out across every entry.
  */
 
-import type { CollectionDef, CollectionRecord } from '../schema/index.js';
+import type { CollectionDef, CollectionRecord, Migration } from '../schema/index.js';
 import { validateRecordForCreate, validateRecordForUpdate } from '../schema/index.js';
 import { deriveEid } from './eid.js';
 import { TarnCollectionError } from './types.js';
 import type { DecryptedEntry, ITarnClient, ShareConnection, Tag } from './types.js';
+import { dispatchSchemaVersion, TarnSchemaVersionError } from './schema-version.js';
 
 /**
  * Options bag accepted by `list()`. Reserved for forward compatibility (e.g.,
@@ -40,6 +41,7 @@ export class Collection<TRecord extends Record<string, unknown>> {
   readonly #name: string;
   readonly #def: CollectionDef;
   readonly #schemaVersion: number;
+  readonly #migrations: Record<number, Migration> | undefined;
 
   constructor(args: {
     client: ITarnClient;
@@ -47,12 +49,21 @@ export class Collection<TRecord extends Record<string, unknown>> {
     name: string;
     def: CollectionDef;
     schemaVersion: number;
+    /**
+     * Per-version forward-migrators declared in the schema
+     * (`migrations[v]` migrates a v→(v+1) record). Optional; the read-side
+     * version dispatch applies them to older entries on read. Undefined /
+     * empty means only additive (backward-compatible) schema changes are
+     * supported — see `schema-version.ts` and `docs/SDK_ARCHITECTURE.md`.
+     */
+    migrations?: Record<number, Migration> | undefined;
   }) {
     this.#client = args.client;
     this.#appId = args.appId;
     this.#name = args.name;
     this.#def = args.def;
     this.#schemaVersion = args.schemaVersion;
+    this.#migrations = args.migrations;
   }
 
   /** Create a new record. Validates against the schema, attaches Eid + SchemaV tags. */
@@ -248,11 +259,22 @@ export class Collection<TRecord extends Record<string, unknown>> {
     await this.#client.deleteEntry(entry.txid, this.#name, this.#protocolTags(eid));
   }
 
-  /** Return the live record for this primaryKey, or null if absent. */
+  /**
+   * Return the live record for this primaryKey, or null if absent.
+   *
+   * Single-record reads SURFACE a future-version entry as a thrown
+   * `TarnSchemaVersionError` rather than skipping it (Tarn #37 policy): when
+   * an app explicitly asks for one record by key, silently returning null
+   * would be indistinguishable from "not found" and could mask data the user
+   * knows exists. The caller should prompt the user to upgrade the app.
+   */
   async get(primaryKey: string): Promise<TRecord | null> {
     const eid = await deriveEid(this.#appId, this.#name, primaryKey);
     const entry = await this.#client.getEntryByEid(this.#name, eid);
-    return entry ? (entry.data as TRecord) : null;
+    if (!entry) return null;
+    // Throws TarnSchemaVersionError for a future-version entry (intentional —
+    // single-record reads don't swallow it).
+    return this.#applySchemaVersion(entry) as TRecord;
   }
 
   /**
@@ -294,8 +316,25 @@ export class Collection<TRecord extends Record<string, unknown>> {
         continue;
       }
       try {
-        entries.push({ record: e.data as TRecord, eid: e.eid });
+        // Read-side SchemaV dispatch (Tarn #37): migrate older entries
+        // forward; SKIP-WITH-WARNING a future-version entry so one newer
+        // record can't break a whole sync (same posture as orphan drops).
+        const record = dispatchSchemaVersion({
+          record: e.data,
+          tags: e.tags,
+          clientVersion: this.#schemaVersion,
+          migrations: this.#migrations,
+          txid: e.txid,
+        }) as TRecord;
+        entries.push({ record, eid: e.eid });
       } catch (err) {
+        if (err instanceof TarnSchemaVersionError) {
+          console.warn(
+            `[TarnClient] Collection '${this.#name}': skipping delta entry ${e.txid} ` +
+            `written under a newer schema version: ${err.message}`,
+          );
+          continue;
+        }
         console.warn(
           `[TarnClient] Collection '${this.#name}': skipping malformed delta entry ${e.txid}: `,
           err instanceof Error ? err.message : err,
@@ -315,14 +354,32 @@ export class Collection<TRecord extends Record<string, unknown>> {
     return await deriveEid(this.#appId, this.#name, primaryKey);
   }
 
-  /** Return all live records in this collection. Returns [] if none. */
+  /**
+   * Return all live records in this collection. Returns [] if none.
+   *
+   * Read-side SchemaV dispatch (Tarn #37): each entry is version-checked.
+   * Older entries are migrated forward (no-op when no migrations declared);
+   * an entry written under a FUTURE schema version is SKIPPED-WITH-WARNING
+   * rather than thrown — a single record from a newer client must not break a
+   * whole-collection read, the same defensive posture as the orphan / malformed
+   * branch below.
+   */
   async list(_opts: ListOpts = {}): Promise<TRecord[]> {
     const entries = await this.#client.getEntries(this.#name);
     const out: TRecord[] = [];
     for (const e of entries) {
       try {
-        out.push(e.data as TRecord);
+        out.push(this.#applySchemaVersion(e) as TRecord);
       } catch (err) {
+        if (err instanceof TarnSchemaVersionError) {
+          // Future-version entry: skip so one newer record can't break the
+          // whole list. The app should prompt the user to upgrade.
+          console.warn(
+            `[TarnClient] Collection '${this.#name}': skipping entry ${e.txid} ` +
+            `written under a newer schema version: ${err.message}`,
+          );
+          continue;
+        }
         // Underlying entries are already validated at write; this branch
         // exists for entries written by buggy/legacy clients. Log and skip,
         // consistent with how readShareLog handles unverifiable entries.
@@ -451,6 +508,30 @@ export class Collection<TRecord extends Record<string, unknown>> {
   }
 
   /**
+   * Apply read-side SchemaV version dispatch to a freshly-decrypted entry
+   * (Tarn #37). Reads the entry's `SchemaV` tag and branches on it:
+   *   - same version → returns the record unchanged.
+   *   - older version → migrates forward via declared `migrations` (no-op
+   *     when none are declared — the backward-compatible-evolution contract).
+   *   - newer version → throws `TarnSchemaVersionError` (the strict validator
+   *     must never see a future entry; it would silently strip fields).
+   *
+   * Centralizes the policy so every read path (`get`, `list`,
+   * `getEntriesSince`, `#findCurrent`) dispatches identically. Each caller
+   * decides whether a thrown `TarnSchemaVersionError` is fatal (single-record
+   * `get` / `#findCurrent`) or skip-with-warning (`list` / `getEntriesSince`).
+   */
+  #applySchemaVersion(entry: DecryptedEntry): Record<string, unknown> {
+    return dispatchSchemaVersion({
+      record: entry.data,
+      tags: entry.tags,
+      clientVersion: this.#schemaVersion,
+      migrations: this.#migrations,
+      txid: entry.txid,
+    });
+  }
+
+  /**
    * Throw if the collection is not declared shareable. Apps see this as a
    * usage error; the schema is the source of truth for what can be shared.
    */
@@ -477,7 +558,15 @@ export class Collection<TRecord extends Record<string, unknown>> {
     return `${this.#name}:`;
   }
 
-  /** Locate the live txid + decoded record for a primaryKey, or throw. */
+  /**
+   * Locate the live txid + decoded record for a primaryKey, or throw.
+   *
+   * Like `get`, this is a single-record path (update / share / shareWithAll),
+   * so a future-version entry surfaces as `TarnSchemaVersionError` rather than
+   * being silently skipped — refusing to read-modify-write a record we don't
+   * fully understand is the safe choice (an update would otherwise be written
+   * back under the OLDER current-client schema, dropping the future fields).
+   */
   async #findCurrent(primaryKey: string): Promise<{ entry: DecryptedEntry; current: TRecord }> {
     const eid = await deriveEid(this.#appId, this.#name, primaryKey);
     const entry = await this.#client.getEntryByEid(this.#name, eid);
@@ -486,7 +575,8 @@ export class Collection<TRecord extends Record<string, unknown>> {
         `Collection '${this.#name}': no record with primaryKey '${primaryKey}'`,
       );
     }
-    return { entry, current: entry.data as TRecord };
+    const current = this.#applySchemaVersion(entry) as TRecord;
+    return { entry, current };
   }
 
   #extractPrimaryKey(record: Record<string, unknown>): string {
@@ -519,6 +609,7 @@ export function createCollection<TRecord extends Record<string, unknown>>(args: 
   name: string;
   def: CollectionDef;
   schemaVersion: number;
+  migrations?: Record<number, Migration> | undefined;
 }): Collection<TRecord> {
   return new Collection<TRecord>(args);
 }
