@@ -142,6 +142,6 @@ SDK-7 (typed reads drop orphans) + Bookish import tooling writing untyped (`audi
 | 11–15 | tarn#42 | ✅ done — JWT-refresh serialize, field-fidelity test, typed errors, docs |
 | 16 | bookish#229 | ✅ done — passkey error boundary verified clean; dedup hardened |
 | — | **tarn#41** (found by independent rebuild) | ✅ done — share_lookup_key dedup; rebuild now completes on messy data |
-| — | **tarn#43** (found by BE-6 verify) | ⏳ OPEN — credential-change share_lookup_key validation asymmetry (LOW, auth-path; awaiting deploy decision) |
+| — | **tarn#43** (BE-6 verify) | ❌ CLOSED — NOT a bug; BE-6 mis-read. Credential-change already validates `new_share_lookup_key` (`auth.js:674-685`), same as register. |
 
-The only open item is **tarn#43** — a LOW-severity, defense-in-depth validation asymmetry on the credential-change path, not reachable via the honest SDK, filed for an explicit auth-path-deploy decision rather than patched blind.
+**No open items.** tarn#43 was filed off BE-6's claim of a credential-change validation asymmetry, but direct inspection of `auth.js:668-690` before any change showed the validation already exists (share_pub + share_lookup_key must be provided together and are both format-validated). Closed as not-a-bug — no code change, no deploy. (Third subagent absence-claim this session reversed by reading the actual code, after BE-2/BE-3.)
