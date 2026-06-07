@@ -147,6 +147,7 @@ export function rebuildAccounts(edges, bodies) {
     tombstoned: 0,
     bodyMisses: 0,
     parseErrors: 0,
+    shareKeySuperseded: 0,
   };
 
   // 1. Build the tombstone-ref set. A live blob whose txid is referenced by
@@ -218,6 +219,12 @@ export function rebuildAccounts(edges, bodies) {
     const createdAt = ts ? ts * 1000 : Date.now();
 
     rows.push({
+      // block_timestamp is the winning credential blob's Arweave confirmation
+      // time (seconds, or null if unconfirmed). It is NOT a D1 column — it is
+      // carried so the share_lookup_key dedup below can pick the most-recent
+      // registration per email, matching live #30 semantics. Stripped before
+      // the row is emitted to SQL.
+      block_timestamp: ts ?? null,
       credential_lookup_key: credLookupKey,
       public_key: winner.parsed.public_key,
       data_lookup_key: dlk,
@@ -235,10 +242,91 @@ export function rebuildAccounts(edges, bodies) {
       share_lookup_key: winner.parsed.share_lookup_key ?? null,
       wrapped_account_key: winner.parsed.wrapped_account_key ?? null,
     });
-    stats.rebuilt += 1;
   }
 
-  return { rows, stats };
+  // Second dedup pass: the `accounts` table has a partial UNIQUE index on
+  // non-NULL `share_lookup_key` (idx_accounts_share_lookup_key, per #30).
+  // Real Arweave history can contain multiple credential blobs with DISTINCT
+  // data_lookup_key but the SAME share_lookup_key (the same email re-registered
+  // as different accounts over dev history — legit pre-#30 / test cruft). The
+  // per-dlk resolution above does not catch that collision, so without this
+  // pass two surviving rows would violate the UNIQUE(share_lookup_key) index
+  // and abort the whole `wrangler d1 execute --file` batch (#41). We keep only
+  // the most-recent registration per non-NULL share_lookup_key, matching live
+  // semantics. NULL share_lookup_key rows (legacy) have no uniqueness
+  // constraint and are all kept.
+  const deduped = dedupeBySharelookupKey(rows);
+  stats.shareKeySuperseded = rows.length - deduped.length;
+  // Strip the dedup-only helper field; it is not a D1 column.
+  const emitted = deduped.map(({ block_timestamp, ...row }) => row);
+  stats.rebuilt = emitted.length;
+
+  return { rows: emitted, stats };
+}
+
+/**
+ * Collapse account-candidate rows so that no two surviving rows share a
+ * non-NULL `share_lookup_key`. This mirrors the live #30 uniqueness invariant:
+ * a given email's `share_lookup_key` is held by its most-recent registration.
+ *
+ * Winner rule (same notion of "newest" as the per-dlk credential supersede):
+ *   - Highest `block_timestamp` wins (Arweave block confirmation time, seconds).
+ *   - A null/undefined `block_timestamp` (unconfirmed at scan time) is treated
+ *     as newest — it sorts after any confirmed timestamp, so it wins. This
+ *     matches `sortEdgesByTimestamp`, which sorts missing timestamps to the end
+ *     ("latest").
+ *   - Tie on `block_timestamp`: deterministic pick by the lexicographically
+ *     LARGEST `credential_lookup_key` (the stable per-row identifier), mirroring
+ *     the id-based tiebreak in the per-dlk sort where the last element wins.
+ *
+ * Rows with a NULL/empty `share_lookup_key` are never deduped — they carry no
+ * uniqueness constraint and are all returned. Input order of surviving rows is
+ * otherwise preserved.
+ *
+ * Pure: does not mutate the input array or its row objects.
+ *
+ * @param {Array<{credential_lookup_key: string, share_lookup_key: ?string, block_timestamp: ?number}>} accounts
+ * @returns {Array} the deduped subset (a new array; same row object references)
+ */
+export function dedupeBySharelookupKey(accounts) {
+  // Index of the current winner per non-null share_lookup_key.
+  const winnerByShareKey = new Map();
+  // Marks losing positions so we can preserve order for everything else.
+  const dropped = new Set();
+
+  function newer(a, b) {
+    // Returns true if candidate `a` should beat current winner `b`.
+    const ta = a.block_timestamp == null ? Number.POSITIVE_INFINITY : a.block_timestamp;
+    const tb = b.block_timestamp == null ? Number.POSITIVE_INFINITY : b.block_timestamp;
+    if (ta !== tb) return ta > tb;
+    // Tie-break: lexicographically larger credential_lookup_key wins.
+    const ia = a.credential_lookup_key ?? '';
+    const ib = b.credential_lookup_key ?? '';
+    return ia.localeCompare(ib) > 0;
+  }
+
+  for (let i = 0; i < accounts.length; i++) {
+    const row = accounts[i];
+    const sk = row.share_lookup_key;
+    if (sk == null || sk === '') continue; // NULL/empty: no uniqueness constraint.
+    const current = winnerByShareKey.get(sk);
+    if (!current) {
+      winnerByShareKey.set(sk, { row, index: i });
+      continue;
+    }
+    if (newer(row, current.row)) {
+      dropped.add(current.index);
+      winnerByShareKey.set(sk, { row, index: i });
+    } else {
+      dropped.add(i);
+    }
+  }
+
+  const out = [];
+  for (let i = 0; i < accounts.length; i++) {
+    if (!dropped.has(i)) out.push(accounts[i]);
+  }
+  return out;
 }
 
 // ============ PASSKEY CREDENTIALS ============

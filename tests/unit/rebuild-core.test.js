@@ -18,6 +18,7 @@ import {
   groupByTag,
   rebuildApps,
   rebuildAccounts,
+  dedupeBySharelookupKey,
   rebuildPasskeys,
   rebuildAppConfigRules,
   rebuildShareInbox,
@@ -309,6 +310,165 @@ describe('rebuildAccounts', () => {
     assert.equal(rows.length, 1);
     assert.equal(stats.bodyMisses, 1);
     assert.equal(stats.parseErrors, 1);
+  });
+
+  it('drops the older of two distinct-dlk / same-share_lookup_key accounts (#41)', () => {
+    // Two registrations of the same email (same share_lookup_key) as distinct
+    // accounts (distinct data_lookup_key + credential_lookup_key). The partial
+    // UNIQUE(share_lookup_key) index would reject the second INSERT; the dedup
+    // must keep only the latest by block timestamp.
+    const sk = 's'.repeat(64);
+    const eOld = credEdge('tx-old', 'a'.repeat(64), { ts: 100 });
+    const eNew = credEdge('tx-new', 'b'.repeat(64), { ts: 200 });
+    const bodies = new Map([
+      ['tx-old', credBody({ dlk: 'd1'.padEnd(64, '0'), share_lookup_key: sk })],
+      ['tx-new', credBody({ dlk: 'd2'.padEnd(64, '0'), share_lookup_key: sk })],
+    ]);
+    const { rows, stats } = rebuildAccounts([eOld, eNew], bodies);
+    assert.equal(rows.length, 1, 'only the latest registration survives');
+    assert.equal(rows[0].credential_lookup_key, 'b'.repeat(64), 'latest-by-timestamp wins');
+    assert.equal(rows[0].data_lookup_key, 'd2'.padEnd(64, '0'));
+    assert.equal(stats.shareKeySuperseded, 1);
+    assert.equal(stats.rebuilt, 1);
+    // No helper field leaks into the emitted row.
+    assert.equal('block_timestamp' in rows[0], false, 'block_timestamp stripped from emitted row');
+  });
+
+  it('keeps all NULL share_lookup_key accounts (legacy, no uniqueness)', () => {
+    const eA = credEdge('txA', 'a'.repeat(64), { ts: 100 });
+    const eB = credEdge('txB', 'b'.repeat(64), { ts: 200 });
+    const bodies = new Map([
+      // No share_lookup_key → null on both.
+      ['txA', credBody({ dlk: 'da'.padEnd(64, '0') })],
+      ['txB', credBody({ dlk: 'db'.padEnd(64, '0') })],
+    ]);
+    const { rows, stats } = rebuildAccounts([eA, eB], bodies);
+    assert.equal(rows.length, 2, 'NULL share_lookup_key never dedups');
+    assert.equal(stats.shareKeySuperseded, 0);
+  });
+});
+
+// ============ SHARE-LOOKUP-KEY DEDUP (#41) ============
+
+describe('dedupeBySharelookupKey', () => {
+  // Minimal candidate factory matching the shape rebuildAccounts emits internally.
+  function cand(clk, share_lookup_key, block_timestamp) {
+    return { credential_lookup_key: clk, share_lookup_key, block_timestamp };
+  }
+
+  function assertNoShareKeyCollision(rows) {
+    const seen = new Set();
+    for (const r of rows) {
+      if (r.share_lookup_key == null || r.share_lookup_key === '') continue;
+      assert.equal(seen.has(r.share_lookup_key), false,
+        `duplicate non-null share_lookup_key survived: ${r.share_lookup_key}`);
+      seen.add(r.share_lookup_key);
+    }
+  }
+
+  it('distinct dlk + same non-null share_lookup_key → only latest-by-timestamp survives', () => {
+    const sk = 's'.repeat(64);
+    const out = dedupeBySharelookupKey([
+      cand('clk-old', sk, 100),
+      cand('clk-new', sk, 200),
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].credential_lookup_key, 'clk-new');
+    assertNoShareKeyCollision(out);
+  });
+
+  it('same share_lookup_key but one NULL → both survive (NULL never dedups)', () => {
+    const sk = 's'.repeat(64);
+    const out = dedupeBySharelookupKey([
+      cand('clk-null', null, 100),
+      cand('clk-keyed', sk, 200),
+    ]);
+    assert.equal(out.length, 2, 'a NULL row never collides with a keyed row');
+    assertNoShareKeyCollision(out);
+  });
+
+  it('multiple NULL share_lookup_key rows all survive', () => {
+    const out = dedupeBySharelookupKey([
+      cand('clk-1', null, 100),
+      cand('clk-2', null, 200),
+      cand('clk-3', '', 300), // empty string treated as no-constraint too
+    ]);
+    assert.equal(out.length, 3);
+  });
+
+  it('distinct share_lookup_keys → both survive', () => {
+    const out = dedupeBySharelookupKey([
+      cand('clk-1', 'a'.repeat(64), 100),
+      cand('clk-2', 'b'.repeat(64), 200),
+    ]);
+    assert.equal(out.length, 2);
+    assertNoShareKeyCollision(out);
+  });
+
+  it('tie on block_timestamp → deterministic pick: lexicographically largest credential_lookup_key', () => {
+    const sk = 's'.repeat(64);
+    const out = dedupeBySharelookupKey([
+      cand('clk-aaa', sk, 100),
+      cand('clk-zzz', sk, 100), // same ts; larger clk wins
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].credential_lookup_key, 'clk-zzz');
+    // Order-independent: same winner regardless of input order.
+    const out2 = dedupeBySharelookupKey([
+      cand('clk-zzz', sk, 100),
+      cand('clk-aaa', sk, 100),
+    ]);
+    assert.equal(out2[0].credential_lookup_key, 'clk-zzz');
+  });
+
+  it('null block_timestamp (unconfirmed) is treated as newest', () => {
+    const sk = 's'.repeat(64);
+    const out = dedupeBySharelookupKey([
+      cand('clk-confirmed', sk, 999),
+      cand('clk-unconfirmed', sk, null),
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].credential_lookup_key, 'clk-unconfirmed',
+      'unconfirmed (null ts) sorts newest, matching sortEdgesByTimestamp');
+  });
+
+  it('three same-key candidates collapse to the single newest', () => {
+    const sk = 's'.repeat(64);
+    const out = dedupeBySharelookupKey([
+      cand('clk-1', sk, 100),
+      cand('clk-2', sk, 300),
+      cand('clk-3', sk, 200),
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].credential_lookup_key, 'clk-2');
+    assertNoShareKeyCollision(out);
+  });
+
+  it('no two survivors ever share a non-null share_lookup_key (mixed batch)', () => {
+    const sk1 = 's1'.padEnd(64, '0');
+    const sk2 = 's2'.padEnd(64, '0');
+    const out = dedupeBySharelookupKey([
+      cand('clk-a', sk1, 100),
+      cand('clk-b', sk1, 200), // dup of sk1
+      cand('clk-c', sk2, 150),
+      cand('clk-d', null, 175),
+      cand('clk-e', sk2, 50),  // dup of sk2
+      cand('clk-f', null, 80),
+    ]);
+    // sk1: clk-b, sk2: clk-c, plus two NULLs (clk-d, clk-f) = 4 survivors.
+    assert.equal(out.length, 4);
+    assertNoShareKeyCollision(out);
+    const clks = out.map((r) => r.credential_lookup_key).sort();
+    assert.deepEqual(clks, ['clk-b', 'clk-c', 'clk-d', 'clk-f']);
+  });
+
+  it('does not mutate the input array or rows', () => {
+    const sk = 's'.repeat(64);
+    const input = [cand('clk-old', sk, 100), cand('clk-new', sk, 200)];
+    const snapshot = JSON.parse(JSON.stringify(input));
+    dedupeBySharelookupKey(input);
+    assert.equal(input.length, 2, 'input length unchanged');
+    assert.deepEqual(JSON.parse(JSON.stringify(input)), snapshot, 'input rows unchanged');
   });
 });
 

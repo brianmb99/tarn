@@ -428,7 +428,8 @@ async function rebuildAccountsStep(summary) {
         share_pub = excluded.share_pub,
         share_discoverable = excluded.share_discoverable,
         share_lookup_key = excluded.share_lookup_key,
-        wrapped_account_key = excluded.wrapped_account_key;\n`;
+        wrapped_account_key = excluded.wrapped_account_key
+      ON CONFLICT(share_lookup_key) WHERE share_lookup_key IS NOT NULL DO NOTHING;\n`;
     }
     sql += 'COMMIT;\n';
     d1ExecFile(sql);
@@ -622,7 +623,7 @@ async function main() {
     info(`apps:                ${summary.apps.rebuilt} rebuilt (${summary.apps.found} found, ${summary.apps.bodyMisses + summary.apps.parseErrors} skipped)`);
   } else { info('apps:                SKIPPED'); }
   if (summary.accounts) {
-    info(`accounts:           ${summary.accounts.rebuilt} rebuilt (${summary.accounts.found} found, ${summary.accounts.tombstoned} tombstoned, ${summary.accounts.bodyMisses + summary.accounts.parseErrors} skipped)`);
+    info(`accounts:           ${summary.accounts.rebuilt} rebuilt (${summary.accounts.found} found, ${summary.accounts.tombstoned} tombstoned, ${summary.accounts.bodyMisses + summary.accounts.parseErrors} skipped, ${summary.accounts.shareKeySuperseded ?? 0} share-key-superseded)`);
   } else { info('accounts:           SKIPPED'); }
   if (summary.passkeys) {
     info(`passkey_credentials: ${summary.passkeys.rebuilt} rebuilt (${summary.passkeys.found} found, ${summary.passkeys.tombstoned} tombstoned, ${summary.passkeys.bodyMisses + summary.passkeys.parseErrors} skipped)`);
