@@ -233,6 +233,12 @@ await tarn.books.batchCreate([
 
 This is the right path for bulk imports and migrations. Records written through it carry the same Eid + SchemaV tags as single `create()` calls, so they surface normally through `get`, `list`, and `getEntriesSince`. Larger imports: chunk client-side and pace at ~1 batch per 36s to stay under the 100 writes/hour/account limit. The schema-less escape hatch `tarn.advanced.entries.batchCreate` still exists for app-internal types that aren't on the schema — see the [Advanced](#advanced-escape-hatches) section for the trade-offs.
 
+#### Typed reads drop orphan entries; untyped reads return them
+
+Typed collection reads — `tarn.<collection>.list()` and `tarn.<collection>.getEntriesSince()` — are **Eid-addressed**. A record is identified by the `Eid` tag the SDK derives from its primary key, and every well-formed `create` / `update` / `batchCreate` through the typed surface stamps that tag. An entry on the wire that has **no `Eid` tag** ("orphan" — a legacy write, or a record written through the untyped escape hatch without per-item Eids) is by construction not something a typed collection produced, so the typed layer **drops it and logs a `console.warn`** (`Collection '<name>': dropping orphan delta event…` / `skipping malformed entry…`). Entries written under a *newer* `SchemaV` than the client knows are likewise skipped-with-warning, so one record from a future client can't break a whole-collection read.
+
+The untyped layer makes the opposite choice. `tarn.advanced.entries.*` is a pure pass-through: a raw read of a type returns **every** entry the server has, orphans included — it has no Eid contract to enforce. So the same data can appear "missing" through `tarn.books.list()` yet present through the advanced surface. This is by design, not a bug: the typed surface trades completeness for a clean per-record identity, and the untyped surface is the escape hatch when you need to see (or repair) orphans. If a typed read is missing records you know were written, suspect orphans — read the type through `tarn.advanced.entries` to confirm, and migrate those writes to the typed surface (or re-stamp their Eids) to make them surface normally.
+
 ### Sharing (when `shareable: true`)
 
 ```js
@@ -671,6 +677,22 @@ The advanced wrappers (`create` / `batchCreate` / `update`) enforce the same inv
 
 If you find yourself reaching for `advanced.*` for something the typed surface should cover, that's a signal to file an issue.
 
+### Reserved system types (why they bypass Eid / SchemaV)
+
+A handful of entry `type` strings are **reserved** by Tarn itself and are managed by SDK primitives, not by app schemas. `defineSchema()` rejects any app collection that tries to claim one of these names:
+
+| Reserved type | Owned by | Purpose |
+|---------------|----------|---------|
+| `cred` | auth flow | credential / DEK-envelope mappings |
+| `connection` | `tarn.connections.*` | friend connections |
+| `share-log-state` | share-log (`tarn.advanced.shareLog.*`) | per-pair share-log entries |
+| `share-inbox` | connection handshake | inbound connection-request material |
+| `recovery-factor` | recovery / account-key | recovery key-derivation material |
+| `app-config` | operator tooling | per-account app rules / config |
+| `app-schema` | `publish-schema.mjs` | published schema documents |
+
+These records are **deliberately not Eid-addressed and carry no `SchemaV` tag.** They are protocol-internal structures with their own identity, ordering, and versioning rules — for example, share-log entries are addressed by per-pair stealth tags and sequence numbers, not by a derived Eid, and the credential envelope has its own generation chain. Stamping them with an app-collection `Eid`/`SchemaV` would be meaningless at best and would collide with the protocol's own addressing at worst. So if you inspect these types on the wire (or via the untyped surface) and notice they lack `Eid`/`SchemaV`, that is correct and intentional — they are not orphans and there is no auto-tagging to "fix." The reserved set is the single source of truth (`RESERVED_TYPE_NAMES`, exported from the SDK); a future system type must be added there and wired into the primitive that owns it.
+
 ---
 
 ## App registration
@@ -768,6 +790,36 @@ const note = await tarn.notes.get('n1');
 ```
 
 Plain JavaScript works too — the inference simply doesn't run. The runtime validators still enforce the schema at write time.
+
+---
+
+## Error taxonomy
+
+The SDK throws **typed error classes** for the failure modes apps realistically branch on — auth state, capability gaps, rate limits, schema/validation problems, and account-key tampering. Each is exported from the package root and sets a stable `.name`, so you can match with `instanceof` (preferred) or `err.name`. Everything else (network failures, unexpected 5xx, programmer errors) surfaces as a plain `Error` — the taxonomy is deliberately **bounded**, not exhaustive.
+
+```js
+import {
+  TarnNotAuthenticatedError,
+  TarnPasskeyOnlyError,
+  TarnRateLimitError,
+  TarnCollectionError,
+  TarnSchemaError,
+  TarnSchemaVersionError,
+  AccountKeyPinningError,
+} from 'tarn-client';
+```
+
+| Class | Thrown when | Typical app response |
+|-------|-------------|----------------------|
+| `TarnNotAuthenticatedError` | An authenticated method is called on a client that never logged in (no JWT, no signing keys), or whose JWT expired with no signing keys available to silently re-authenticate. Raised by the internal auth gate every authenticated method passes through. | Route the user to the sign-in screen. |
+| `TarnPasskeyOnlyError` | An operation that needs password-derived (master-key) state is invoked on a passkey-authenticated session — share-log read/write, connection handshake, `changeCredentials`, and other account-key/credential-rotation ops. | Prompt a step-up: "This needs a password — sign in with your password to continue." |
+| `TarnRateLimitError` | Any HTTP 429 from the API. Carries `retryAfterSeconds`, `url`, `responseBody`, `status`. The SDK does **not** auto-retry 429 (see [Rate limiting](#rate-limiting)). | Surface "rate-limited, try again in N", schedule a retry past `retryAfterSeconds`. |
+| `TarnCollectionError` | A typed collection operation violates an invariant — failed schema validation on `create`/`update`/`batchCreate` (with the failing indexes for batches), or an attempt to mutate an immutable primary key via `update`. | Treat as a caller/validation bug; show the field error. |
+| `TarnSchemaError` | `defineSchema()` is given an invalid schema (bad field types, a collection claiming a reserved system type, etc.), or an advanced write supplies an `Eid` that disagrees with the SDK-derived value. | Fix the schema / call site — a programmer error, not a runtime condition. |
+| `TarnSchemaVersionError` | A read encounters an entry written under a **newer** `SchemaV` than this client knows how to migrate. The typed read layer catches this internally and skips-with-warning rather than surfacing it; it is exported for apps that drive version dispatch directly. | Prompt the user to update the app. |
+| `AccountKeyPinningError` | `tarn.accountKey.view()` detects a tampered or mis-bound account-key wrap (the stored wrap doesn't bind to this account). | Surface a security warning — the stored key material is not trustworthy. |
+
+Note: `StalePasskeyError` is also raised by the passkey authentication path (a credential with no wrapping for the current generation), but it is surfaced through the passkey-auth flow's handler contract rather than re-exported from the package root — match it by `err.name === 'StalePasskeyError'` if you need to branch on it directly. See [Passkeys](#passkeys).
 
 ---
 

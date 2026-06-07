@@ -876,6 +876,18 @@ API:
   6. Return: { txid, status: 'pending' }
 ```
 
+#### Turbo upload is a single point of failure on writes (20s timeout, no retry, no fallback)
+
+The Arweave upload step is **synchronous and must succeed before the API returns success to the client** (write-through ordering: Turbo accepts → D1 commits → 200; see [D1 authority](#d1-authority)). That upload is a **single `fetch` to one Turbo endpoint**, bounded by `AbortSignal.timeout(20000)` — a 20-second ceiling (deliberately under the Cloudflare Worker 30s wall-time limit so the Worker can still return a CORS-bearing error). There is:
+
+- **no retry** — one attempt, no backoff loop inside the Worker;
+- **no fallback gateway** — exactly one upload URL; if Turbo is degraded, every write fails;
+- **no queue/deferral** — the request fails in-band rather than parking the write for later.
+
+When the upload times out or returns non-2xx, the API responds **`502`** with `{ error: "Arweave upload failed: …" }` and **nothing is committed to D1** (no split-brain — a failed upload leaves no half-written entry). This makes Turbo availability a hard dependency for the write path: a Turbo outage is a full write outage.
+
+**Client guidance.** Treat `502` on a write as transient and **back off, then retry** (exponential backoff, jittered). Because writes carry an idempotency key (`X-Idempotency-Key`, 24h dedup), a retry of a write that *did* land — e.g. the upload succeeded but the response was lost — returns the original result instead of double-writing, so retrying a 502 is safe. Do **not** tight-loop retry; a 502 most often means Turbo itself is degraded and hammering it will not help. (Reads are unaffected: they serve from D1, which is independent of Turbo availability.)
+
 ### 4. Retrieve data
 
 ```
@@ -1237,6 +1249,28 @@ counter is worth the round-trip. Reads use KV because the over-cap read is
 throttling. Both paths fail open on store outage: better to serve traffic
 than to return 5xx when the rate-limit store is unhealthy. Rate limiting
 here is abuse mitigation, not a security boundary.
+
+#### Registration rate-limiting is per-IP via KV and fails open
+
+`POST /api/v1/auth/register` is unauthenticated (no account identity exists
+yet), so it is throttled **per source IP**: the API hashes
+`CF-Connecting-IP` (SHA-256, truncated) into a KV key
+`register:<ipHash>:<hour>` with an hourly bucket (cap: **100 registrations
+per IP per hour**, `RATE_KV`, TTL 3600s). This is coarse by design — IP
+throttling is sufficient abuse mitigation at current scale; CAPTCHA /
+proof-of-work is deferred future work.
+
+Because the bucket lives in KV, registration **fails open** when KV is
+unavailable. `checkAndIncrementRateLimit` allows the request (logging a
+warning) in three cases: (1) no `RATE_KV` binding present, (2) the KV `get`
+throws, and (3) the KV `put` throws (the counter isn't incremented but the
+request still proceeds). The reasoning matches the general policy above —
+during a KV outage, letting legitimate registrations through is strictly
+better than 5xx-ing every new user. The trade-off is explicit: a KV outage
+window is also a window with no registration rate limit. Acceptable because
+the cost ceiling on registration is bounded elsewhere (app-rules DENY default
+means a freshly-registered account can't write until the operator sets
+rules), so a registration flood alone does not spend Arweave-wallet money.
 
 ### Why HKDF-Expand (HMAC) for sub-key derivation
 Raw `SHA-256(key || domain)` is vulnerable to length-extension attacks. HMAC (which is HKDF-Expand for a single output block, per RFC 5869) is immune by construction. The structured info string `protocol || purpose || app_id || version || counter` replaces ad-hoc domain strings with a defined, versioned format that naturally accommodates per-app isolation.
