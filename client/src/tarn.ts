@@ -272,10 +272,33 @@ export class TarnRateLimitError extends Error {
   }
 }
 
+/**
+ * Thrown when an authenticated SDK operation is invoked on a client that has
+ * never logged in (no JWT and no signing keys), or whose JWT has expired with
+ * no signing keys available to silently re-authenticate. This is the typed
+ * signal apps catch to route the user back to the sign-in screen, distinct
+ * from a network failure, a rate limit, or a passkey-capability gap.
+ *
+ * Raised by `#requireAuth()` — the gate every authenticated method passes
+ * through. A freshly-constructed client, a client after `clearSession()`, or
+ * a resumed session whose 7-day blob cap has elapsed all surface this on the
+ * next authenticated call.
+ */
+export class TarnNotAuthenticatedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TarnNotAuthenticatedError';
+  }
+}
+
 export class TarnClient {
   #apiBase: string;
   #appId: string;
   #jwt: string | null = null;
+  // SDK-2: single in-flight JWT-refresh promise. Set by #requireAuth() while
+  // a silent re-authentication is running, cleared when it settles, so
+  // concurrent expired-JWT callers await one refresh instead of racing N.
+  #jwtRefreshPromise: Promise<void> | null = null;
   #dataLookupKey: string | null = null;
   #credentialLookupKey: string | null = null;
   #credentialEncryptionKey: DataKeyHandles | null = null;
@@ -1055,8 +1078,15 @@ export class TarnClient {
     const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
 
     if (!this.#recoveryFactorMeta) {
-      // Should never happen — every account has a recovery factor at register.
-      throw new Error('changeCredentials(): missing recovery-factor metadata (corrupt session?)');
+      // SDK-10: a session that reached this point has signing keys, a
+      // credential lookup key, and a username (the guard above passed) but no
+      // recovery-factor metadata — the master-key-derived state a password
+      // login captures but a passkey assertion never does. Surface the typed
+      // passkey-capability error with an actionable message instead of an
+      // indirect "corrupt session?" generic.
+      throw new TarnPasskeyOnlyError(
+        'changeCredentials(): requires a password-authenticated session — sign in with username + password first.',
+      );
     }
 
     // Multi-factor re-wrap. Build the new chain (existing gens + a fresh
@@ -6551,7 +6581,7 @@ export class TarnClient {
    */
   async #requireAuth() {
     if (!this.#jwt && !this.#signingKeyPair) {
-      throw new Error('Not authenticated — call register() or login() first');
+      throw new TarnNotAuthenticatedError('Not authenticated — call register() or login() first');
     }
 
     // Check JWT expiry
@@ -6568,14 +6598,30 @@ export class TarnClient {
       }
     }
 
-    // JWT is missing or expired — re-authenticate if we have signing keys
+    // JWT is missing or expired — re-authenticate if we have signing keys.
     if (this.#signingKeyPair && this.#credentialLookupKey) {
-      this.#jwt = null;
-      await this.#authenticate();
+      // SDK-2: serialize concurrent refreshes. Without this guard, two
+      // operations that both observe the expired JWT each null it and call
+      // #authenticate() independently — racing two challenge/verify round
+      // trips that overwrite each other's #jwt/#sid. The API's per-nonce
+      // check makes the loser's verify fail (a confusing transient 401 the
+      // app sees mid-operation) rather than corrupt state, but the duplicate
+      // round trip and spurious error are still wrong. A single in-flight
+      // promise collapses N concurrent expired-JWT callers onto one refresh:
+      // the first starts it, the rest await the same promise.
+      if (!this.#jwtRefreshPromise) {
+        this.#jwt = null;
+        this.#jwtRefreshPromise = this.#authenticate().finally(() => {
+          this.#jwtRefreshPromise = null;
+        });
+      }
+      await this.#jwtRefreshPromise;
       return;
     }
 
-    throw new Error('JWT expired and no signing keys available — call login() to re-authenticate');
+    throw new TarnNotAuthenticatedError(
+      'JWT expired and no signing keys available — call login() to re-authenticate',
+    );
   }
 
   async #authenticate() {

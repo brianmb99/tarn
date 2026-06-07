@@ -370,6 +370,71 @@ describe('Tarn #32 — session lifecycle is symmetric across auth methods', () =
   });
 });
 
+// ============ SDK-10 — changeCredentials passkey-capability errors ============
+
+// Strip ONLY recoveryFactorMeta from a full-session blob. This produces the
+// narrow state SDK-10 targets: signing keys + username + credentialLookupKey
+// all present (so the upfront passkey-only guard passes), but no
+// recovery-factor metadata — the deeper branch that previously threw a generic
+// "missing recovery-factor metadata (corrupt session?)" Error.
+async function noRecoveryMetaBlob(fullBlob) {
+  const payload = await decryptBlobToPayload(fullBlob);
+  payload.recoveryFactorMeta = null;
+  return await reencryptPayload(payload);
+}
+
+describe('SDK-10 — changeCredentials rejects under-provisioned sessions with TarnPasskeyOnlyError', () => {
+  afterEach(restoreFetch);
+
+  it('passkey-only session: changeCredentials throws TarnPasskeyOnlyError (upfront guard)', async () => {
+    const client = await passkeyOnlyClient('sdk10-passkey-only@example.com');
+    let thrown = null;
+    try {
+      await client.changeCredentials('new@example.com', 'new-password-2026', {
+        acceptRecoveryGap: true, skipRotationAnnounce: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, 'changeCredentials must throw on a passkey-only session');
+    assert.ok(
+      thrown instanceof TarnPasskeyOnlyError,
+      `must be TarnPasskeyOnlyError, got ${thrown?.constructor?.name}: ${thrown?.message}`,
+    );
+    assert.equal(thrown.name, 'TarnPasskeyOnlyError');
+    assert.match(thrown.message, /password-authenticated session/);
+  });
+
+  it('session missing recovery-factor metadata: throws TarnPasskeyOnlyError, not a generic Error', async () => {
+    // SDK-10 core case: signing keys + username + credentialLookupKey present
+    // (upfront guard passes) but recoveryFactorMeta absent. Before the fix this
+    // threw `new Error('...missing recovery-factor metadata (corrupt session?)')`.
+    const fullBlob = await (await registerClient('sdk10-no-recmeta@example.com')).serializeSession();
+    const blob = await noRecoveryMetaBlob(fullBlob);
+    const client = await TarnClient.resumeSession('https://api.tarn.dev', APP, blob);
+    assert.ok(client, 'sanity: resume with null recoveryFactorMeta must succeed');
+
+    let thrown = null;
+    try {
+      // phrase supplied so we get PAST the "must supply phrase" check and reach
+      // the recovery-factor-metadata branch specifically.
+      await client.changeCredentials('new2@example.com', 'new-password-2026', {
+        phrase: 'word '.repeat(24).trim(), skipRotationAnnounce: true,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown, 'changeCredentials must throw when recovery-factor metadata is missing');
+    assert.ok(
+      thrown instanceof TarnPasskeyOnlyError,
+      `must be TarnPasskeyOnlyError (SDK-10), got ${thrown?.constructor?.name}: ${thrown?.message}`,
+    );
+    assert.equal(thrown.name, 'TarnPasskeyOnlyError');
+    assert.match(thrown.message, /password-authenticated session/);
+    assert.doesNotMatch(thrown.message, /corrupt session/, 'old indirect message must be gone');
+  });
+});
+
 // ============ TarnPasskeyOnlyError shape ============
 
 describe('Tarn #32 — TarnPasskeyOnlyError is a proper typed error', () => {
