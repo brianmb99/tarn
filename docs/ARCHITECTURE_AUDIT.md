@@ -126,3 +126,22 @@ SDK-7 (typed reads drop orphans) + Bookish import tooling writing untyped (`audi
 | 16 | BOOKISH-4/5: verify passkey auth error boundary; improve dedup hash | LOW | bookish | defer |
 
 **The four that matter:** rows 1–3 (the two CRITICAL recoverability gaps + the SchemaV landmine) and row 5 (the cheap double-write fix). Everything else is hardening that can be sequenced behind them.
+
+---
+
+## Resolution status (2026-06-07)
+
+**All rows resolved.** Every implemented change was verified against the actual code, not trusted on agent report — which is how the wrong findings (BE-2/BE-3, the cursor suspicion) and the real gaps (#41, #43) were both caught.
+
+| Rows | Issues | Status |
+|---|---|---|
+| 1–3 (CRITICAL) | tarn#35, #36, #37 | ✅ done + verified (recoverability proven on real data; SchemaV dispatch wired) |
+| 4 | tarn#38 | ✅ done — cursor verified **safe** (suspicion didn't hold) |
+| 5 (HIGH) | bookish#225 | ✅ done — idempotency key threaded; SDK+app |
+| 6–10 (MEDIUM) | tarn#39/#40, bookish#226/#227/#228 | ✅ done + verified (incl. design review on #226, 110 browser tests) |
+| 11–15 | tarn#42 | ✅ done — JWT-refresh serialize, field-fidelity test, typed errors, docs |
+| 16 | bookish#229 | ✅ done — passkey error boundary verified clean; dedup hardened |
+| — | **tarn#41** (found by independent rebuild) | ✅ done — share_lookup_key dedup; rebuild now completes on messy data |
+| — | **tarn#43** (found by BE-6 verify) | ⏳ OPEN — credential-change share_lookup_key validation asymmetry (LOW, auth-path; awaiting deploy decision) |
+
+The only open item is **tarn#43** — a LOW-severity, defense-in-depth validation asymmetry on the credential-change path, not reachable via the honest SDK, filed for an explicit auth-path-deploy decision rather than patched blind.
