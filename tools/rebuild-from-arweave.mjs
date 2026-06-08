@@ -84,6 +84,7 @@ import {
   rebuildShareInbox,
   rebuildShareLog,
 } from './lib/rebuild-core.mjs';
+import { diffRebuild, formatDriftReport } from './lib/rebuild-diff.mjs';
 
 // ============ ARG PARSING ============
 
@@ -97,6 +98,7 @@ const opts = {
   prefetchContent: false,
   remote: false,
   confirm: false,
+  check: false,
   maxPages: 200,
   quiet: false,
   help: false,
@@ -106,6 +108,7 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--help' || a === '-h') opts.help = true;
   else if (a === '--confirm') opts.confirm = true;
+  else if (a === '--check') opts.check = true;
   else if (a === '--remote') opts.remote = true;
   else if (a === '--quiet') opts.quiet = true;
   else if (a === '--prefetch-content') opts.prefetchContent = true;
@@ -129,6 +132,14 @@ if (opts.help) {
   process.exit(0);
 }
 
+// --check is strictly read-only and the on-demand counterpart to the hourly
+// drift cron (#44). It must NEVER write, so it is mutually exclusive with
+// --confirm. Reject the combination loudly rather than silently picking one.
+if (opts.check && opts.confirm) {
+  console.error('--check is read-only and cannot be combined with --confirm (which writes).');
+  process.exit(1);
+}
+
 function printHelp() {
   // Trimmed help output; full operator docs live in the module header.
   console.log(`
@@ -142,6 +153,12 @@ Usage:
 
 Common flags:
   --confirm                Write to D1 (default: dry-run, parse + count only)
+  --check                  Non-destructive drift check: reconstruct from Arweave,
+                           DIFF against live D1, print a drift report, and exit
+                           non-zero if anything diverges (0 if clean). Reads D1
+                           (SELECT only) and NEVER writes. Mutually exclusive
+                           with --confirm. This is the on-demand counterpart to
+                           the hourly drift cron (#44) and can be wired into ops.
   --remote                 Run wrangler against --remote D1 (default: --local)
   --arweave-gateway URL    GraphQL endpoint (default: https://arweave.net)
   --gateways "A,B,C"       Body-fetch fallback list (default: Turbo, arweave.net)
@@ -303,6 +320,63 @@ function d1Query(sql) {
   if (start < 0) return { results: [] };
   const parsed = JSON.parse(out.slice(start));
   return Array.isArray(parsed) ? parsed[0] : parsed;
+}
+
+// ---- Live-D1 readers for --check (SELECT only; never write) ----
+//
+// These read the CURRENT live D1 state for each recoverable table via the same
+// `wrangler d1 execute --json --command` path (`d1Query`) the tool already uses,
+// honoring --local/--remote and --app scoping. They return plain row arrays
+// shaped to match the reducer output so diffRebuild() can compare directly.
+// BLOB columns (ciphertext) are read as `hex(...)` so the comparison is
+// independent of how wrangler serializes a raw BLOB across versions; the diff's
+// normBlob() treats a bare hex string as canonical.
+
+function readLiveApps() {
+  const where = opts.app ? ` WHERE app_id = ${sqlString(opts.app)}` : '';
+  return d1Query(`SELECT app_id, public_key, invite_url_template FROM apps${where}`).results || [];
+}
+
+function readLiveAccounts() {
+  // accounts is keyed by data_lookup_key, not app_id, but is scoped by the
+  // `app` column when --app is given (matches the reducer's emitted `app`).
+  const where = opts.app ? ` WHERE app = ${sqlString(opts.app)}` : '';
+  return d1Query(
+    `SELECT credential_lookup_key, public_key, data_lookup_key, wrapped_data_key, app, rules_json, `
+    + `recovery_lookup_key, recovery_public_key, share_pub, share_discoverable, share_lookup_key, `
+    + `wrapped_account_key, created_at FROM accounts${where}`,
+  ).results || [];
+}
+
+function readLivePasskeys(accountDlks) {
+  // passkey_credentials has no app column; scope by the in-scope accounts'
+  // data_lookup_keys (account_id) when --app narrows the set.
+  let where = '';
+  if (opts.app) {
+    if (!accountDlks || accountDlks.length === 0) return [];
+    const inList = accountDlks.map((d) => sqlString(d)).join(', ');
+    where = ` WHERE account_id IN (${inList})`;
+  }
+  return d1Query(
+    `SELECT account_id, credential_id, public_key, prf_salt, device_label, sign_count, last_used_at, created_at `
+    + `FROM passkey_credentials${where}`,
+  ).results || [];
+}
+
+function readLiveShareInbox() {
+  const where = opts.app ? ` WHERE app_id = ${sqlString(opts.app)}` : '';
+  return d1Query(
+    `SELECT txid, app_id, inbox_tag, blob_type, hex(ciphertext) AS ciphertext, published_at `
+    + `FROM share_inbox${where}`,
+  ).results || [];
+}
+
+function readLiveShareLog() {
+  const where = opts.app ? ` WHERE app_id = ${sqlString(opts.app)}` : '';
+  return d1Query(
+    `SELECT txid, app_id, log_tag, blob_type, hex(ciphertext) AS ciphertext, data_lookup_key, published_at `
+    + `FROM share_log${where}`,
+  ).results || [];
 }
 
 function d1ExecFile(sql) {
@@ -477,14 +551,14 @@ async function rebuildPasskeysStep(summary) {
 
 async function rebuildAppConfigStep(summary, knownAppIds) {
   if (opts.skip.has('app-config') || opts.skip.has('rules')) {
-    info('Phase app-config rules: SKIPPED'); return;
+    info('Phase app-config rules: SKIPPED'); return null;
   }
   info(`\nPhase app-config rules: discovering Type=app-config blobs (${elapsed()})`);
   const apps = opts.app ? [opts.app] : (knownAppIds || []);
   if (apps.length === 0) {
     info('Phase app-config rules: no apps in scope; skipping');
     summary.appConfig = { found: 0, applied: 0, bodyMisses: 0, parseErrors: 0 };
-    return;
+    return null;
   }
   const allEdges = [];
   for (const app of apps) {
@@ -509,13 +583,14 @@ async function rebuildAppConfigStep(summary, knownAppIds) {
     d1ExecFile(sql);
   }
   info(`Phase app-config rules: ${stats.applied} ${opts.confirm ? 'applied' : '(dry-run, would apply)'}`);
+  return updates;
 }
 
 // ============ STEP 5 — share_inbox ============
 
 async function rebuildShareInboxStep(summary) {
   if (opts.skip.has('share_inbox') || opts.skip.has('share-inbox')) {
-    info('Phase share_inbox: SKIPPED'); return;
+    info('Phase share_inbox: SKIPPED'); return null;
   }
   info(`\nPhase share_inbox: discovering App=tarn-share connection blobs (${elapsed()})`);
   const allEdges = [];
@@ -547,13 +622,14 @@ async function rebuildShareInboxStep(summary) {
     }
   }
   info(`Phase share_inbox: ${rows.length} ${opts.confirm ? 'rebuilt' : '(dry-run, would rebuild)'}`);
+  return rows;
 }
 
 // ============ STEP 6 — share_log ============
 
 async function rebuildShareLogStep(summary) {
   if (opts.skip.has('share_log') || opts.skip.has('share-log')) {
-    info('Phase share_log: SKIPPED'); return;
+    info('Phase share_log: SKIPPED'); return null;
   }
   info(`\nPhase share_log: discovering Type=share-log-v1 blobs (${elapsed()})`);
   const tags = [
@@ -583,34 +659,56 @@ async function rebuildShareLogStep(summary) {
     }
   }
   info(`Phase share_log: ${rows.length} ${opts.confirm ? 'rebuilt' : '(dry-run, would rebuild)'}`);
+  return rows;
 }
 
 // ============ MAIN ============
 
 async function main() {
-  info(`tarn rebuild-from-arweave — ${opts.confirm ? 'CONFIRM (writing)' : 'DRY-RUN'}`);
+  const mode = opts.check ? 'CHECK (read-only diff)' : (opts.confirm ? 'CONFIRM (writing)' : 'DRY-RUN');
+  info(`tarn rebuild-from-arweave — ${mode}`);
   info(`  D1 binding: ${opts.d1Binding} ${target}`);
   info(`  Arweave gateway: ${opts.arweaveGateway}`);
   info(`  Body gateways: ${opts.gateways.join(', ')}`);
   if (opts.app) info(`  Scoped to app: ${opts.app}`);
   if (opts.skip.size > 0) info(`  Skipping: ${[...opts.skip].join(', ')}`);
-  if (!opts.confirm) info(`  (No D1 writes will occur; pass --confirm to apply.)`);
+  if (opts.check) info(`  (--check: reconstruct + DIFF only. SELECTs run; NO D1 writes.)`);
+  else if (!opts.confirm) info(`  (No D1 writes will occur; pass --confirm to apply.)`);
 
   const summary = {
     apps: null, accounts: null, passkeys: null, appConfig: null, shareInbox: null, shareLog: null,
   };
+  // In --check we hold onto the reconstructed rows per table so we can diff
+  // them against live D1 after the reconstruction phase.
+  const expected = {
+    apps: [], accounts: [], passkey_credentials: [], share_inbox: [], share_log: [],
+  };
   let exitCode = 0;
+  let reconstructed = false;
   try {
     const apps = await rebuildAppsStep(summary);
-    await rebuildAccountsStep(summary);
-    await rebuildPasskeysStep(summary);
+    const accounts = await rebuildAccountsStep(summary);
+    const passkeys = await rebuildPasskeysStep(summary);
     const knownAppIds = apps?.map((r) => r.app_id) ?? [];
-    await rebuildAppConfigStep(summary, knownAppIds);
-    await rebuildShareInboxStep(summary);
-    await rebuildShareLogStep(summary);
+    const appConfigUpdates = await rebuildAppConfigStep(summary, knownAppIds);
+    const shareInbox = await rebuildShareInboxStep(summary);
+    const shareLog = await rebuildShareLogStep(summary);
     if (opts.prefetchContent) {
       info('\nPhase entries (prefetch): NOT IMPLEMENTED in v1. Use refreshCache lazily.');
     }
+    if (opts.check) {
+      expected.apps = apps ?? [];
+      // Fold the app-config rules into the expected accounts rows: the rebuild
+      // applies rules via UPDATE accounts SET rules_json, so the expected
+      // accounts.rules_json is the app-config update for that dlk (else null,
+      // as the reducer emits). This makes app-config drift surface as an
+      // accounts.rules_json mismatch — matching how it lives in D1.
+      expected.accounts = applyRulesToAccounts(accounts ?? [], appConfigUpdates);
+      expected.passkey_credentials = passkeys ?? [];
+      expected.share_inbox = shareInbox ?? [];
+      expected.share_log = shareLog ?? [];
+    }
+    reconstructed = true;
   } catch (err) {
     exitCode = 1;
     warn(`\nFATAL: ${err.message}`);
@@ -638,9 +736,76 @@ async function main() {
     info(`share_log:         ${summary.shareLog.rebuilt} rebuilt (${summary.shareLog.found} found, ${summary.shareLog.bodyMisses} body-miss)`);
   } else { info('share_log:         SKIPPED'); }
   info(`total time:         ${elapsed()}`);
-  info(opts.confirm ? '(D1 writes were applied.)' : '(DRY-RUN: no D1 writes applied. Re-run with --confirm to apply.)');
+  if (opts.check) {
+    info('(CHECK: no D1 writes. Diffing reconstruction against live D1 below.)');
+  } else {
+    info(opts.confirm ? '(D1 writes were applied.)' : '(DRY-RUN: no D1 writes applied. Re-run with --confirm to apply.)');
+  }
+
+  // ---- --check: diff reconstruction vs live D1, set exit code on drift ----
+  if (opts.check) {
+    if (!reconstructed) {
+      // Reconstruction failed (GraphQL/gateway error). We cannot certify
+      // "no drift" without a complete reconstruction — exit non-zero, leaving
+      // the FATAL above as the cause.
+      warn('\n--check: reconstruction did not complete; cannot diff. Exiting non-zero.');
+      process.exit(exitCode || 1);
+    }
+    // Only diff tables that were actually reconstructed (not --skip'd). A
+    // skipped table has no expected baseline, so diffing it against live D1
+    // would be a false positive.
+    const tables = [];
+    if (summary.apps) tables.push('apps');
+    if (summary.accounts) tables.push('accounts');
+    if (summary.passkeys) tables.push('passkey_credentials');
+    if (summary.shareInbox) tables.push('share_inbox');
+    if (summary.shareLog) tables.push('share_log');
+
+    // If the app-config step was --skip'd there is no reconstructed rules
+    // baseline (the reducer leaves accounts.rules_json = null), so comparing it
+    // against live D1's real rules would be a false positive. Drop it from the
+    // accounts comparison in that case only.
+    const ignoreCols = {};
+    if (!summary.appConfig) ignoreCols.accounts = ['rules_json'];
+
+    let report;
+    try {
+      const accountDlks = expected.accounts.map((r) => r.data_lookup_key);
+      const actual = {
+        apps: summary.apps ? readLiveApps() : [],
+        accounts: summary.accounts ? readLiveAccounts() : [],
+        passkey_credentials: summary.passkeys ? readLivePasskeys(accountDlks) : [],
+        share_inbox: summary.shareInbox ? readLiveShareInbox() : [],
+        share_log: summary.shareLog ? readLiveShareLog() : [],
+      };
+      report = diffRebuild(expected, actual, { tables, ignoreCols });
+    } catch (err) {
+      warn(`\n--check: failed reading live D1 for diff: ${err.message}`);
+      process.exit(1);
+    }
+    info('\n' + formatDriftReport(report));
+    info(
+      '\n(--check is the on-demand counterpart to the hourly drift cron '
+      + '(#44, api/src/observability/drift.js); wire it into ops to assert '
+      + 'row-level recoverability on demand.)',
+    );
+    process.exit(report.clean ? 0 : 1);
+  }
 
   process.exit(exitCode);
+}
+
+// Fold app-config rules updates (Map<dlk, rules_json>) into reconstructed
+// account rows so the expected accounts.rules_json matches what the rebuild
+// would write (UPDATE accounts SET rules_json WHERE data_lookup_key = dlk).
+// Accounts with no app-config blob keep the reducer's null. Pure: returns new
+// row objects, does not mutate inputs.
+function applyRulesToAccounts(accounts, appConfigUpdates) {
+  if (!appConfigUpdates || appConfigUpdates.size === 0) return accounts;
+  return accounts.map((r) => {
+    const rules = appConfigUpdates.get(r.data_lookup_key);
+    return rules == null ? r : { ...r, rules_json: rules };
+  });
 }
 
 main().catch((err) => {
