@@ -280,6 +280,27 @@ function validateEnvelopeShape(envelopeStr) {
   return null;
 }
 
+/**
+ * tarn#63 — validate a client-supplied `expected_generation` field for the
+ * envelope compare-and-swap. Returns either:
+ *   { ok: true, expected: <int|null> }   — null means "client did not send one"
+ *   { ok: false, error: <string> }       — present but malformed (caller → 400)
+ *
+ * Lenient on ABSENCE (null/undefined): a legacy client / bundle that predates
+ * the CAS protocol omits the field, and we must not 400 it out of existence
+ * during the migrate→deploy→ship-SDK window. Such a write falls back to a
+ * read-current-then-write (preserving today's last-write-wins for legacy
+ * callers only). STRICT on PRESENCE: a sent value must be a non-negative
+ * integer or it's a client bug we want to surface.
+ */
+function parseExpectedGeneration(value) {
+  if (value === undefined || value === null) return { ok: true, expected: null };
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    return { ok: false, error: 'expected_generation must be a non-negative integer' };
+  }
+  return { ok: true, expected: value };
+}
+
 // ============ POST /api/v1/auth/passkey/register-options ============
 
 export async function handlePasskeyRegisterOptions(request, env, ctx, cors) {
@@ -381,7 +402,7 @@ export async function handlePasskeyRegister(request, env, ctx, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential, prf_salt, new_envelope, device_label } = body || {};
+  const { credential, prf_salt, new_envelope, device_label, expected_generation } = body || {};
   if (!credential || typeof credential !== 'object') {
     return errorResponse('credential is required', 400, cors);
   }
@@ -392,6 +413,8 @@ export async function handlePasskeyRegister(request, env, ctx, cors) {
   if (envErr) return errorResponse(`new_envelope: ${envErr}`, 400, cors);
   const labelErr = validateDeviceLabel(device_label);
   if (labelErr) return errorResponse(labelErr, 400, cors);
+  const gen = parseExpectedGeneration(expected_generation);
+  if (!gen.ok) return errorResponse(gen.error, 400, cors);
 
   // Pull the original challenge by digest of the supplied clientDataJSON →
   // simplewebauthn does the canonical binding for us, but we still need to
@@ -444,43 +467,83 @@ export async function handlePasskeyRegister(request, env, ctx, cors) {
   const publicKeyB64 = bytesToBase64Url(reg.credential.publicKey);
   const signCount = reg.credential.counter;
 
-  // Atomic: insert the credential row + write the new envelope. If a
-  // concurrent request lost the race for the credential_id (unique), the
-  // second insert fails — surface as 409.
-  let row;
+  // tarn#63 — db.batch CANNOT be used for the CAS here. A conditional UPDATE
+  // that matches 0 rows does NOT throw, so it would NOT abort a D1 batch — the
+  // sibling credential INSERT would still commit, defeating the guard. So we
+  // run the envelope CAS as a STANDALONE statement FIRST and only INSERT the
+  // credential row if the CAS actually landed.
+  //
+  // Read the current generation first to disambiguate 404 (no account) from
+  // 409 (stale expected) and to supply the expected value for legacy callers.
+  const cur = await env.DB.prepare(
+    'SELECT envelope_generation FROM accounts WHERE data_lookup_key = ?1'
+  ).bind(auth.data_lookup_key).first();
+  if (!cur) {
+    return errorResponse('Account not found', 404, cors);
+  }
+  const expectedGen = gen.expected === null ? cur.envelope_generation : gen.expected;
+
+  // Step 1: conditional envelope CAS (standalone). On a CAS miss we 409 and
+  // never touch passkey_credentials, so there is NO orphan credential row.
+  const updated = await env.DB.prepare(
+    `UPDATE accounts
+        SET wrapped_data_key = ?2,
+            envelope_generation = envelope_generation + 1
+      WHERE data_lookup_key = ?1
+        AND envelope_generation = ?3
+      RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
+                recovery_lookup_key, recovery_public_key,
+                share_pub, share_discoverable, share_lookup_key,
+                wrapped_account_key, data_lookup_key, envelope_generation`
+  ).bind(auth.data_lookup_key, new_envelope, expectedGen).first();
+  if (!updated) {
+    return jsonResponse(
+      {
+        error: 'envelope generation conflict — re-fetch and retry',
+        code: 'ENVELOPE_GENERATION_CONFLICT',
+        current_generation: cur.envelope_generation,
+      },
+      409,
+      cors,
+    );
+  }
+
+  // Step 2: insert the credential row. The CAS already committed.
+  //
+  // Residual window (CAS committed, INSERT fails): the envelope now carries a
+  // passkey_prf wrapping for `credentialId` with no passkey_credentials row.
+  // This is HARMLESS and self-correcting: the orphan wrapping is dead weight
+  // (no credential row can ever use it), the DEK chain stays fully intact
+  // (password + recovery + the orphan wrapping), and NO auth factor is lost.
+  // A retry of register re-runs cleanly (the failed INSERT never committed, so
+  // the UNIQUE guard is not tripped on the same credential_id). We chose this
+  // ordering over INSERT-first because the alternative residual — a registered
+  // credential with no envelope wrapping — surfaces as a visible "stale"
+  // passkey the user must manually repair, whereas an orphan wrapping is
+  // invisible and inert.
   try {
-    row = await env.DB.batch([
-      env.DB.prepare(
-        'INSERT INTO passkey_credentials (account_id, credential_id, public_key, prf_salt, sign_count, device_label, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)'
-      ).bind(
-        auth.data_lookup_key,
-        credentialId,
-        publicKeyB64,
-        prf_salt,
-        signCount,
-        device_label || null,
-        Date.now(),
-      ),
-      env.DB.prepare(
-        `UPDATE accounts
-            SET wrapped_data_key = ?2
-          WHERE data_lookup_key = ?1
-          RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
-                    recovery_lookup_key, recovery_public_key,
-                    share_pub, share_discoverable, share_lookup_key,
-                    wrapped_account_key, data_lookup_key`
-      ).bind(auth.data_lookup_key, new_envelope),
-    ]);
+    await env.DB.prepare(
+      'INSERT INTO passkey_credentials (account_id, credential_id, public_key, prf_salt, sign_count, device_label, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)'
+    ).bind(
+      auth.data_lookup_key,
+      credentialId,
+      publicKeyB64,
+      prf_salt,
+      signCount,
+      device_label || null,
+      Date.now(),
+    ).run();
   } catch (err) {
     if (/UNIQUE/i.test(err.message || '')) {
+      // The credential_id is already registered (a concurrent register won the
+      // INSERT, or a retry after a successful prior INSERT). The CAS we just
+      // committed re-wrote the envelope to (re)include this credential's
+      // wrapping, which is idempotently correct — the credential row already
+      // exists and now has a matching wrapping. Surface 409 so the caller
+      // knows the credential was not freshly created by THIS request.
       return errorResponse('Credential already registered', 409, cors);
     }
     throw err;
-  }
-
-  const updated = row[1].results?.[0];
-  if (!updated) {
-    return errorResponse('Account not found', 404, cors);
   }
 
   writePasskeyAudit(ctx, env, request, auth.data_lookup_key, 'passkey_register');
@@ -505,6 +568,9 @@ export async function handlePasskeyRegister(request, env, ctx, cors) {
     credential_id: credentialId,
     device_label: device_label || null,
     created_at: createdAt,
+    // tarn#63 — the post-write generation, so the SDK can advance its local
+    // CAS token for a follow-up envelope mutation in the same session.
+    envelope_generation: updated.envelope_generation,
   }, 201, cors);
 }
 
@@ -642,7 +708,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
 
   // Find the bound account (need app + data_lookup_key).
   const account = await env.DB.prepare(
-    'SELECT data_lookup_key, app, wrapped_data_key, wrapped_account_key FROM accounts WHERE data_lookup_key = ?1'
+    'SELECT data_lookup_key, app, wrapped_data_key, wrapped_account_key, envelope_generation FROM accounts WHERE data_lookup_key = ?1'
   ).bind(credRow.account_id).first();
   if (!account) {
     return errorResponse('Account not found', 401, cors);
@@ -751,6 +817,9 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
     expiresIn: PASSKEY_JWT_TTL_SECONDS,
     data_lookup_key: account.data_lookup_key,
     wrapped_data_key: account.wrapped_data_key,
+    // tarn#63 — the envelope's optimistic-concurrency token, so the
+    // stale-credential refresh flow can send it as expected_generation.
+    envelope_generation: account.envelope_generation,
     account_key_stored: account.wrapped_account_key != null,
     credential_id: credRow.credential_id,
     stale_credential: staleCredential,
@@ -852,7 +921,7 @@ export async function handlePasskeyRefreshCredential(request, env, ctx, cors) {
   } catch {
     return errorResponse('Invalid JSON body', 400, cors);
   }
-  const { credential_id, new_envelope } = body || {};
+  const { credential_id, new_envelope, expected_generation } = body || {};
   if (typeof credential_id !== 'string' || credential_id.length === 0) {
     return errorResponse('credential_id is required', 400, cors);
   }
@@ -865,6 +934,8 @@ export async function handlePasskeyRefreshCredential(request, env, ctx, cors) {
   }
   const envErr = validateEnvelopeShape(new_envelope);
   if (envErr) return errorResponse(`new_envelope: ${envErr}`, 400, cors);
+  const gen = parseExpectedGeneration(expected_generation);
+  if (!gen.ok) return errorResponse(gen.error, 400, cors);
 
   // Confirm the credential belongs to this account (defense in depth —
   // the JWT already proved it, but we re-check at the DB).
@@ -895,17 +966,46 @@ export async function handlePasskeyRefreshCredential(request, env, ctx, cors) {
     return errorResponse('new_envelope: parse failed during stale-state check', 400, cors);
   }
 
+  // tarn#63 — read the current generation first so we can (a) disambiguate
+  // "account not found" (404) from a CAS conflict (409), and (b) supply the
+  // expected value for legacy callers that don't send one. A standalone
+  // UPDATE here (no batch), so CAS-miss handling is straightforward: the
+  // conditional WHERE matches 0 rows → .first() is null → we 409.
+  const cur = await env.DB.prepare(
+    'SELECT envelope_generation FROM accounts WHERE data_lookup_key = ?1'
+  ).bind(auth.data_lookup_key).first();
+  if (!cur) {
+    return errorResponse('Account not found', 404, cors);
+  }
+  // Legacy client (no expected_generation): fall back to the current value so
+  // the CAS always matches — preserves pre-tarn#63 last-write-wins for old
+  // bundles only. New SDK always sends an explicit expected_generation.
+  const expectedGen = gen.expected === null ? cur.envelope_generation : gen.expected;
+
   const updated = await env.DB.prepare(
     `UPDATE accounts
-        SET wrapped_data_key = ?2
+        SET wrapped_data_key = ?2,
+            envelope_generation = envelope_generation + 1
       WHERE data_lookup_key = ?1
+        AND envelope_generation = ?3
       RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
                 recovery_lookup_key, recovery_public_key,
                 share_pub, share_discoverable, share_lookup_key,
-                wrapped_account_key, data_lookup_key`
-  ).bind(auth.data_lookup_key, new_envelope).first();
+                wrapped_account_key, data_lookup_key, envelope_generation`
+  ).bind(auth.data_lookup_key, new_envelope, expectedGen).first();
   if (!updated) {
-    return errorResponse('Account not found', 404, cors);
+    // The row exists (we just read it) but the CAS matched 0 rows → another
+    // device advanced the generation between this caller's fetch and write.
+    // Tell the SDK to re-fetch and re-apply onto the fresh base.
+    return jsonResponse(
+      {
+        error: 'envelope generation conflict — re-fetch and retry',
+        code: 'ENVELOPE_GENERATION_CONFLICT',
+        current_generation: cur.envelope_generation,
+      },
+      409,
+      cors,
+    );
   }
 
   writePasskeyAudit(ctx, env, request, auth.data_lookup_key, 'passkey_refresh_credential');
@@ -914,6 +1014,7 @@ export async function handlePasskeyRefreshCredential(request, env, ctx, cors) {
   return jsonResponse({
     refreshed: true,
     credential_id,
+    envelope_generation: updated.envelope_generation,
   }, 200, cors);
 }
 
@@ -954,9 +1055,11 @@ export async function handleDeletePasskey(request, env, ctx, credentialId, cors)
   } catch {
     return errorResponse('Invalid JSON body', 400, cors);
   }
-  const { new_envelope } = body || {};
+  const { new_envelope, expected_generation } = body || {};
   const envErr = validateEnvelopeShape(new_envelope);
   if (envErr) return errorResponse(`new_envelope: ${envErr}`, 400, cors);
+  const gen = parseExpectedGeneration(expected_generation);
+  if (!gen.ok) return errorResponse(gen.error, 400, cors);
 
   // Confirm the credential belongs to this account.
   const credRow = await env.DB.prepare(
@@ -972,22 +1075,54 @@ export async function handleDeletePasskey(request, env, ctx, credentialId, cors)
   // a passkey cannot be the only path in. Documented here so we don't
   // forget when the password-optional flow lands.
 
-  const result = await env.DB.batch([
-    env.DB.prepare('DELETE FROM passkey_credentials WHERE id = ?1').bind(credRow.id),
-    env.DB.prepare(
-      `UPDATE accounts
-          SET wrapped_data_key = ?2
-        WHERE data_lookup_key = ?1
-        RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
-                  recovery_lookup_key, recovery_public_key,
-                  share_pub, share_discoverable, share_lookup_key,
-                  wrapped_account_key, data_lookup_key`
-    ).bind(auth.data_lookup_key, new_envelope),
-  ]);
-  const updated = result[1].results?.[0];
-  if (!updated) {
+  // tarn#63 — same db.batch atomicity trap as register: a conditional UPDATE
+  // that matches 0 rows does NOT throw, so it would NOT abort a batch — the
+  // sibling DELETE would still commit. Run the envelope CAS STANDALONE FIRST;
+  // only DELETE the credential row if the CAS landed.
+  const cur = await env.DB.prepare(
+    'SELECT envelope_generation FROM accounts WHERE data_lookup_key = ?1'
+  ).bind(auth.data_lookup_key).first();
+  if (!cur) {
     return errorResponse('Account not found', 404, cors);
   }
+  const expectedGen = gen.expected === null ? cur.envelope_generation : gen.expected;
+
+  // Step 1: conditional envelope CAS (standalone). On a CAS miss we 409 and
+  // never DELETE the credential row.
+  const updated = await env.DB.prepare(
+    `UPDATE accounts
+        SET wrapped_data_key = ?2,
+            envelope_generation = envelope_generation + 1
+      WHERE data_lookup_key = ?1
+        AND envelope_generation = ?3
+      RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
+                recovery_lookup_key, recovery_public_key,
+                share_pub, share_discoverable, share_lookup_key,
+                wrapped_account_key, data_lookup_key, envelope_generation`
+  ).bind(auth.data_lookup_key, new_envelope, expectedGen).first();
+  if (!updated) {
+    return jsonResponse(
+      {
+        error: 'envelope generation conflict — re-fetch and retry',
+        code: 'ENVELOPE_GENERATION_CONFLICT',
+        current_generation: cur.envelope_generation,
+      },
+      409,
+      cors,
+    );
+  }
+
+  // Step 2: delete the credential row. The CAS already committed.
+  //
+  // Residual window (CAS committed, DELETE fails): the envelope no longer
+  // carries this credential's passkey_prf wrapping, but its
+  // passkey_credentials row survives. This is the SAFE-failing direction for a
+  // REMOVE: the passkey can no longer unwrap the latest gen (its wrapping is
+  // gone), so it is effectively defanged even though the row lingers. It
+  // surfaces as the existing "stale credential" state and a retry of
+  // removePasskey is idempotent (DELETE by id is a no-op the second time; the
+  // already-built envelope simply omits the wrapping again).
+  await env.DB.prepare('DELETE FROM passkey_credentials WHERE id = ?1').bind(credRow.id).run();
 
   writePasskeyAudit(ctx, env, request, auth.data_lookup_key, 'passkey_remove');
   persistCredentialBlobFromRowWithEnvelope(ctx, env, updated);
@@ -999,5 +1134,9 @@ export async function handleDeletePasskey(request, env, ctx, credentialId, cors)
   // `routes/passkey-reg.js` header for rationale.
   persistPasskeyRegTombstone(ctx, env, auth.data_lookup_key, credentialId);
 
-  return jsonResponse({ removed: true, credential_id: credentialId }, 200, cors);
+  return jsonResponse({
+    removed: true,
+    credential_id: credentialId,
+    envelope_generation: updated.envelope_generation,
+  }, 200, cors);
 }

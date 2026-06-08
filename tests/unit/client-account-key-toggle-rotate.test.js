@@ -27,6 +27,7 @@ import assert from 'node:assert/strict';
 import {
   TarnClient,
   AccountKeyPinningError,
+  TarnEnvelopeConflictError,
   generateAccountKey,
 } from '../../client/src/tarn.js';
 
@@ -352,5 +353,73 @@ describe('TarnClient.rotateAccountKey', () => {
     ]);
     const out = await client.enableKeyStorage({ password: 'pw-2026', accountKey: newKey });
     assert.deepEqual(out, { stored: true });
+  });
+
+  // tarn#63 — the envelope compare-and-swap retry loop. The first rotate POST
+  // 409s with ENVELOPE_GENERATION_CONFLICT; the SDK must re-fetch the envelope
+  // + new generation (/auth/challenge), re-mint a fresh step-up token, re-apply
+  // the rotation onto the fresh base, and retry — landing a 200, with the retry
+  // carrying the refreshed expected_generation.
+  it('retries on a 409 ENVELOPE_GENERATION_CONFLICT: re-fetch + re-apply + succeed', async () => {
+    const { client, registerBody } = await registerModelB();
+    // The valid envelope the account was created with — reused as the winner's
+    // envelope that the post-409 re-fetch returns.
+    const liveEnvelope = registerBody.wrapped_data_key;
+    assert.ok(liveEnvelope, 'register body must carry the original envelope');
+
+    restoreFetch();
+    mockFetch([
+      // attempt 1: step-up challenge + token, then rotate → 409 conflict
+      { status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok-1', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
+      { status: 409, body: JSON.stringify({ error: 'envelope generation conflict — re-fetch and retry', code: 'ENVELOPE_GENERATION_CONFLICT', current_generation: 1 }) },
+      // CAS re-fetch: /auth/challenge returns the winner's envelope + new gen
+      { status: 200, body: JSON.stringify({ nonce: 'e'.repeat(64), data_lookup_key: 'd'.repeat(64), wrapped_data_key: liveEnvelope, envelope_generation: 1 }) },
+      // attempt 2: fresh step-up challenge + token, then rotate → 200
+      { status: 200, body: JSON.stringify({ nonce: 'f'.repeat(64), data_lookup_key: 'd'.repeat(64) }) },
+      { status: 200, body: JSON.stringify({ step_up_token: 'tok-2', expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) },
+      { status: 200, body: JSON.stringify({ rotated: true, envelope_generation: 2 }) },
+    ]);
+
+    const out = await client.rotateAccountKey({ password: 'pw-2026' });
+    assert.ok(out.accountKey, 'rotation must succeed after the CAS retry');
+
+    const rotateCalls = fetchCalls.filter(c => c.url.endsWith('/account/rotate-account-key'));
+    assert.equal(rotateCalls.length, 2, 'must POST rotate twice (one 409, one 200)');
+
+    // The retry must carry the REFRESHED expected_generation (1) and a FRESH
+    // step-up token (tok-2), not the consumed first one.
+    const retryBody = JSON.parse(rotateCalls[1].body);
+    assert.equal(retryBody.expected_generation, 1, 'retry must send the re-fetched generation');
+    assert.equal(rotateCalls[1].headers['X-Step-Up-Token'], 'tok-2', 'retry must use a freshly-minted step-up token');
+
+    // A /auth/challenge re-fetch happened between the two rotate POSTs.
+    const challengeCalls = fetchCalls.filter(c => c.url.endsWith('/auth/challenge'));
+    assert.ok(challengeCalls.length >= 1, 'CAS retry must re-fetch via /auth/challenge');
+  });
+
+  // tarn#63 — exhausting the retry budget surfaces the typed conflict error.
+  it('throws TarnEnvelopeConflictError after exhausting the CAS retry budget', async () => {
+    const { client, registerBody } = await registerModelB();
+    const liveEnvelope = registerBody.wrapped_data_key;
+    restoreFetch();
+    // Every rotate attempt 409s; every re-fetch succeeds. The loop should burn
+    // its budget (5) and throw the typed error rather than spin forever.
+    const responses = [];
+    for (let i = 0; i < 5; i++) {
+      responses.push({ status: 200, body: JSON.stringify({ nonce: 'c'.repeat(64), data_lookup_key: 'd'.repeat(64) }) }); // step-up challenge
+      responses.push({ status: 200, body: JSON.stringify({ step_up_token: `tok-${i}`, expires_at: Date.now() + 60000, scope: 'account_key_fetch' }) }); // step-up
+      responses.push({ status: 409, body: JSON.stringify({ code: 'ENVELOPE_GENERATION_CONFLICT', current_generation: i + 1 }) }); // rotate → conflict
+      if (i < 4) {
+        // re-fetch challenge (not needed after the last attempt) — return a
+        // real envelope so #refetchEnvelopeForCas can parse + re-hydrate.
+        responses.push({ status: 200, body: JSON.stringify({ nonce: 'e'.repeat(64), data_lookup_key: 'd'.repeat(64), wrapped_data_key: liveEnvelope, envelope_generation: i + 1 }) });
+      }
+    }
+    mockFetch(responses);
+    await assert.rejects(
+      () => client.rotateAccountKey({ password: 'pw-2026' }),
+      (err) => err instanceof TarnEnvelopeConflictError && err.attempts === 5,
+    );
   });
 });

@@ -372,10 +372,20 @@ export async function handleRotateAccountKey(request, env, ctx, cors) {
     new_recovery_lookup_key,
     new_recovery_public_key,
     new_wrapped_account_key,
+    expected_generation,
   } = body || {};
 
   if (!new_envelope || typeof new_envelope !== 'string' || new_envelope.length === 0) {
     return errorResponse('new_envelope is required', 400, cors);
+  }
+  // tarn#63 — optimistic-concurrency token for the envelope CAS. Lenient on
+  // absence (legacy callers), strict on presence (non-negative integer).
+  let expectedGenInput = null;
+  if (expected_generation !== undefined && expected_generation !== null) {
+    if (typeof expected_generation !== 'number' || !Number.isInteger(expected_generation) || expected_generation < 0) {
+      return errorResponse('expected_generation must be a non-negative integer', 400, cors);
+    }
+    expectedGenInput = expected_generation;
   }
   if (!isValidHex64(new_recovery_lookup_key)) {
     return errorResponse('Invalid new_recovery_lookup_key: must be 64-char lowercase hex', 400, cors);
@@ -399,13 +409,16 @@ export async function handleRotateAccountKey(request, env, ctx, cors) {
     `SELECT credential_lookup_key, public_key, wrapped_data_key, app,
             recovery_lookup_key, recovery_public_key,
             share_pub, share_discoverable, share_lookup_key,
-            wrapped_account_key, data_lookup_key
+            wrapped_account_key, data_lookup_key, envelope_generation
        FROM accounts
       WHERE data_lookup_key = ?1`
   ).bind(auth.data_lookup_key).first();
   if (!current) {
     return errorResponse('Account not found', 404, cors);
   }
+  // tarn#63 — legacy caller (no expected_generation) falls back to the current
+  // value so the CAS always matches; the new SDK always sends an explicit one.
+  const expectedGen = expectedGenInput === null ? current.envelope_generation : expectedGenInput;
   // The caller MUST NOT submit credential_lookup_key as the new recovery
   // lookup (mirrors the register / changeCredentials invariant — the two
   // identifier spaces must stay disjoint per account).
@@ -426,10 +439,11 @@ export async function handleRotateAccountKey(request, env, ctx, cors) {
     }
   }
 
-  // D1 batch — single statement update against one row is already atomic;
-  // the explicit batch here is to keep the call structurally consistent
-  // with multi-row operations elsewhere (e.g. credential change). All four
-  // fields land in one statement, so there is no partial-state window.
+  // Single-statement update against one row is already atomic; all five
+  // fields (envelope + recovery_* + wrap + the generation bump) land together,
+  // so there is no partial-state window. tarn#63 adds the envelope CAS guard:
+  // the UPDATE only matches when envelope_generation = expected, and it bumps
+  // the generation in the same statement.
   let update;
   try {
     update = await env.DB.prepare(
@@ -437,18 +451,21 @@ export async function handleRotateAccountKey(request, env, ctx, cors) {
           SET wrapped_data_key       = ?2,
               recovery_lookup_key    = ?3,
               recovery_public_key    = ?4,
-              wrapped_account_key    = ?5
+              wrapped_account_key    = ?5,
+              envelope_generation    = envelope_generation + 1
         WHERE data_lookup_key = ?1
+          AND envelope_generation = ?6
         RETURNING credential_lookup_key, public_key, wrapped_data_key, app,
                   recovery_lookup_key, recovery_public_key,
                   share_pub, share_discoverable, share_lookup_key,
-                  wrapped_account_key, data_lookup_key`
+                  wrapped_account_key, data_lookup_key, envelope_generation`
     ).bind(
       auth.data_lookup_key,
       new_envelope,
       new_recovery_lookup_key,
       new_recovery_public_key,
       new_wrapped_account_key ?? null,
+      expectedGen,
     ).first();
   } catch (err) {
     // UNIQUE constraint on recovery_lookup_key — another account raced us.
@@ -458,11 +475,22 @@ export async function handleRotateAccountKey(request, env, ctx, cors) {
     throw err;
   }
   if (!update) {
-    return errorResponse('Account not found', 404, cors);
+    // We read `current` above, so the row exists — a null result here means
+    // the CAS matched 0 rows: another device advanced the envelope generation
+    // between this caller's fetch and write. Tell the SDK to re-fetch + retry.
+    return jsonResponse(
+      {
+        error: 'envelope generation conflict — re-fetch and retry',
+        code: 'ENVELOPE_GENERATION_CONFLICT',
+        current_generation: current.envelope_generation,
+      },
+      409,
+      cors,
+    );
   }
 
   writeAudit(ctx, env, request, auth.data_lookup_key, 'rotate');
   persistCredentialBlobFromRow(ctx, env, update);
 
-  return jsonResponse({ rotated: true }, 200, cors);
+  return jsonResponse({ rotated: true, envelope_generation: update.envelope_generation }, 200, cors);
 }

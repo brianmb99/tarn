@@ -1,0 +1,39 @@
+-- 0023_envelope_generation.sql
+--
+-- tarn#63 — optimistic-concurrency (compare-and-swap) guard on the auth DEK
+-- envelope (`accounts.wrapped_data_key`).
+--
+-- THE HAZARD (verified): every server-side writer of `wrapped_data_key`
+-- blind-overwrote a client-computed envelope with no version check:
+--   - routes/passkeys.js  handlePasskeyRegister          (UPDATE inside a batch)
+--   - routes/passkeys.js  handleDeletePasskey            (UPDATE inside a batch)
+--   - routes/passkeys.js  handlePasskeyRefreshCredential (standalone UPDATE)
+--   - routes/account.js   handleRotateAccountKey         (standalone UPDATE)
+-- The envelope is a CLIENT-side read-modify-write: the SDK fetches the
+-- envelope, unwraps, mutates one wrapping, re-wraps, and POSTs the whole thing
+-- back. With no `WHERE <expected version>` guard, two devices mutating the
+-- SAME base envelope concurrently → last-write-wins → the earlier device's
+-- change is SILENTLY LOST. For the auth envelope a lost wrapping can lock a
+-- factor (passkey / recovery) out of the DEK chain.
+--
+-- FIX: a monotonic generation counter. Every envelope write becomes a
+-- conditional UPDATE:
+--     UPDATE accounts
+--        SET wrapped_data_key = ?new,
+--            envelope_generation = envelope_generation + 1
+--      WHERE data_lookup_key = ?
+--        AND envelope_generation = ?expected
+--   RETURNING envelope_generation
+-- If it matches 0 rows the caller's `expected` was stale → 409, and the SDK
+-- re-fetches, re-applies its mutation onto the fresh base, and retries.
+--
+-- Zero-knowledge note: `envelope_generation` is a plain monotonic integer. It
+-- carries no key / plaintext material; it is only a version token.
+--
+-- Additive / backward-compatible: NOT NULL DEFAULT 0 means every existing row
+-- gets generation 0 with no data migration. A client that does not yet send an
+-- `expected_generation` is handled leniently by the writers (treated as the
+-- current value — see the route comments) so the deploy ordering
+-- (migrate → deploy worker → ship SDK) is safe.
+
+ALTER TABLE accounts ADD COLUMN envelope_generation INTEGER NOT NULL DEFAULT 0;

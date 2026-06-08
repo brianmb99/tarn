@@ -51,6 +51,7 @@ export {
   TarnNotAuthenticatedError,
   TarnPartialListError,
   TarnShareLogConflictError,
+  TarnEnvelopeConflictError,
 } from './tarn.js';
 
 export type {

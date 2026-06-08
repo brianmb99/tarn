@@ -388,6 +388,40 @@ export class TarnShareLogConflictError extends Error {
   }
 }
 
+/**
+ * Thrown by the envelope-mutation methods (`registerPasskey`, `removePasskey`,
+ * `rotateAccountKey`, and the stale-credential refresh) when the server-side
+ * compare-and-swap on `accounts.wrapped_data_key` (tarn#63) keeps losing to a
+ * concurrent device and the bounded 409 retry budget is exhausted.
+ *
+ * The auth DEK envelope is a client-side read-modify-write: the SDK fetches the
+ * envelope + its `envelope_generation`, mutates one wrapping, and submits the
+ * whole thing back with the generation it read. The server bumps the generation
+ * on every successful write and 409s any write whose `expected_generation` is
+ * stale. On 409 the SDK re-fetches, re-applies this device's mutation onto the
+ * fresh base, and retries. A genuine conflict storm (many devices changing the
+ * envelope at once) can still burn the whole budget — this typed error lets a
+ * caller distinguish that recoverable, retryable condition from a hard failure
+ * so it can surface "another device is updating your account — try again" and
+ * safely retry the SAME operation later.
+ *
+ * Carries `attempts` (retries spent) and `operationType` for diagnostics.
+ */
+export class TarnEnvelopeConflictError extends Error {
+  readonly attempts: number;
+  readonly operationType: string;
+  constructor(args: { attempts: number; operationType: string }) {
+    super(
+      `envelope update for ${args.operationType} lost a multi-device write ` +
+      `race: exhausted ${args.attempts} compare-and-swap retries on ` +
+      `accounts.wrapped_data_key. Safe to retry — no data was overwritten.`,
+    );
+    this.name = 'TarnEnvelopeConflictError';
+    this.attempts = args.attempts;
+    this.operationType = args.operationType;
+  }
+}
+
 export class TarnClient {
   #apiBase: string;
   #appId: string;
@@ -502,6 +536,17 @@ export class TarnClient {
   // wrappings byte-for-byte even though we don't have the PRF outputs to
   // re-wrap. Empty Map = no passkeys registered (the common case).
   #passkeyWrappingsByGen: Map<number, Array<{ credentialId: string; wrappedBase64: string }>> = new Map();
+
+  // tarn#63 — optimistic-concurrency token for the auth DEK envelope
+  // (accounts.wrapped_data_key). Captured from every envelope-fetch response
+  // (password challenge, recovery challenge, passkey authenticate). The
+  // envelope-mutation methods (registerPasskey, removePasskey, rotateAccountKey,
+  // and the stale-credential refresh) send it back as `expected_generation`;
+  // the server runs a compare-and-swap and 409s if another device advanced it.
+  // On 409 the SDK re-fetches the envelope + generation, re-applies this
+  // device's mutation onto the fresh base, and retries (bounded). Null until
+  // the first envelope fetch.
+  #envelopeGeneration: number | null = null;
 
   // Section 7.5 (issue #20) — server-side session id from the JWT's `sid` claim.
   // Sent back as `previous_sid` on /auth/verify so the server reuses the same
@@ -743,6 +788,8 @@ export class TarnClient {
       throw new Error(`recoverAccount(): challenge failed: ${challengeRes.json?.error || challengeRes.status}`);
     }
     const { nonce, data_lookup_key, wrapped_data_key } = challengeRes.json;
+    // tarn#63 — capture the envelope generation for later CAS writes.
+    this.#captureEnvelopeGeneration(challengeRes.json.envelope_generation);
 
     // Steps 3-4: derive recovery KEK from the envelope salt + phrase, then
     // unwrap the DEK chain via the recovery factor.
@@ -1047,6 +1094,8 @@ export class TarnClient {
     this.#credentialEncryptionKey = keys.credentialEncryptionKey;
     this.#signingKeyPair = keys.signingKeyPair;
     this.#dataLookupKey = challengeRes.json.data_lookup_key;
+    // tarn#63 — capture the envelope generation for later CAS writes.
+    this.#captureEnvelopeGeneration(challengeRes.json.envelope_generation);
 
     // Unwrap the DEK chain via the password factor.
     const unwrapped = await unwrapDataKeyChain(
@@ -1466,6 +1515,128 @@ export class TarnClient {
       if (list.length > 0) m.set(entry.gen, list);
     }
     this.#passkeyWrappingsByGen = m;
+  }
+
+  /**
+   * tarn#63 helper. Record the envelope's optimistic-concurrency generation
+   * from a fetch response (password/recovery challenge, passkey authenticate).
+   * Tolerates a pre-tarn#63 server that omits the field: stays null, and the
+   * mutation methods then send no `expected_generation` (the server falls back
+   * to its lenient last-write-wins path), so an old API + new SDK still works.
+   */
+  #captureEnvelopeGeneration(value: unknown): void {
+    this.#envelopeGeneration =
+      typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+  }
+
+  /**
+   * tarn#63 — build the JSON body for an envelope CAS write, attaching
+   * `expected_generation` only when we actually have one (so a pre-tarn#63
+   * server keeps working). Mutates a shallow copy; never logs the envelope.
+   */
+  #withExpectedGeneration<T extends Record<string, unknown>>(body: T): T {
+    if (this.#envelopeGeneration !== null) {
+      return { ...body, expected_generation: this.#envelopeGeneration };
+    }
+    return body;
+  }
+
+  /**
+   * tarn#63 — re-fetch the live auth envelope and re-hydrate the cached state
+   * that the envelope-mutation methods rebuild from, after a CAS 409. This is
+   * the "re-apply onto the fresh base" half of the conflict loop: we pull the
+   * winner's envelope, re-snapshot the recovery + passkey wrappings and the new
+   * generation, then the caller re-runs its own mutation (add / remove / rotate)
+   * on top of the refreshed snapshot.
+   *
+   * Uses /auth/challenge with the cached credential_lookup_key — it issues a
+   * fresh nonce (which we discard) and returns the current wrapped_data_key +
+   * envelope_generation without consuming any single-use auth. Requires a
+   * password-side session (a cached #credentialLookupKey), which all three
+   * password-rewrap mutation methods (registerPasskey, removePasskey,
+   * rotateAccountKey) already require.
+   *
+   * The DEK chain (#dekByGen) is NOT touched: register/remove/rotate do not
+   * rotate gens, so the underlying DEKs are unchanged; only the set of
+   * wrappings on each gen can differ between devices.
+   */
+  async #refetchEnvelopeForCas(): Promise<void> {
+    if (!this.#credentialLookupKey) {
+      // No password-side identity to re-challenge with (e.g. passkey-only
+      // session). Callers that can hit this path supply their own re-fetch.
+      throw new Error('#refetchEnvelopeForCas: no cached credential_lookup_key to re-fetch with');
+    }
+    const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+      method: 'POST',
+      retry: true, // fresh nonce per call — safe to retry
+      body: { credential_lookup_key: this.#credentialLookupKey },
+    });
+    if (challengeRes.status !== 200) {
+      throw new Error(
+        `#refetchEnvelopeForCas: challenge failed: ${challengeRes.json?.error || challengeRes.status}`,
+      );
+    }
+    const wire = challengeRes.json?.wrapped_data_key;
+    if (typeof wire !== 'string') {
+      throw new Error('#refetchEnvelopeForCas: challenge did not return wrapped_data_key');
+    }
+    this.#captureEnvelopeGeneration(challengeRes.json.envelope_generation);
+    const reparsed = parseWrappedDataKey(wire);
+    // Re-hydrate the recovery-wrapping + passkey-wrapping snapshots so the next
+    // rebuild emits the winner's wrappings verbatim plus this device's change.
+    const recWrappingsByGen = new Map<number, string>();
+    for (const entry of reparsed.dekChain) {
+      const w = entry.wrappings.find(x => x.factor === FACTOR_RECOVERY_PHRASE);
+      if (w) recWrappingsByGen.set(entry.gen, w.wrappedBase64);
+    }
+    this.#recoveryFactorMeta = {
+      salt: reparsed.recovery.salt,
+      kdfParams: reparsed.recovery.kdfParams,
+      wrappingsByGen: recWrappingsByGen,
+    };
+    this.#capturePasskeyWrappings(reparsed);
+  }
+
+  /**
+   * tarn#63 — drive an envelope-mutation request through the CAS retry loop.
+   *
+   * `build` produces the request body (rebuilding the envelope from the CURRENT
+   * cached snapshot and attaching `expected_generation`). `send` posts it and
+   * returns `{ status, json }`. On HTTP 409 with the envelope-conflict code we
+   * re-fetch + re-hydrate (`#refetchEnvelopeForCas`) and let `build` run again
+   * against the fresh base, bounded by `maxAttempts`. Any other status (success
+   * or hard error) returns immediately for the caller to handle.
+   *
+   * `refetch` is overridable so the passkey-only stale-refresh path can supply
+   * its own re-fetch (it has no cached credential_lookup_key).
+   */
+  async #casWrite(args: {
+    operationType: string;
+    maxAttempts?: number;
+    build: () => Promise<Record<string, unknown>>;
+    send: (body: Record<string, unknown>) => Promise<{ status: number; json: any }>;
+    refetch?: () => Promise<void>;
+  }): Promise<{ status: number; json: any }> {
+    const maxAttempts = args.maxAttempts ?? 5;
+    const refetch = args.refetch ?? (() => this.#refetchEnvelopeForCas());
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      attempt++;
+      const body = this.#withExpectedGeneration(await args.build());
+      const res = await args.send(body);
+      const isEnvelopeConflict =
+        res.status === 409 && res.json?.code === 'ENVELOPE_GENERATION_CONFLICT';
+      if (!isEnvelopeConflict) {
+        return res;
+      }
+      if (attempt >= maxAttempts) {
+        throw new TarnEnvelopeConflictError({ attempts: attempt, operationType: args.operationType });
+      }
+      // Re-apply onto the fresh base: pull the winner's envelope + generation,
+      // re-hydrate the snapshots, then loop so `build` re-derives the mutation.
+      await refetch();
+    }
   }
 
   /**
@@ -2020,38 +2191,7 @@ export class TarnClient {
     ]);
     const newRecoveryPublicKey = await exportPublicKey(newRecoverySigningKeyPair.publicKey);
 
-    // 3. Re-wrap every gen under {existing password KEK, NEW recovery KEK}.
-    //    Build the chain in gen order and wrap each entry under both
-    //    factors; new salt goes into the envelope's recovery section.
-    const chain: Array<{ gen: number; key: CryptoKey }> = [];
-    for (const [gen, pair] of this.#dekByGen!) {
-      chain.push({ gen, key: pair.gcmKey });
-    }
-    chain.sort((a, b) => a.gen - b.gen);
-
-    // Phase 6: preserve passkey wrappings byte-for-byte. Rotation
-    // changes the recovery factor only — the underlying DEKs and any
-    // registered passkeys are unaffected.
-    const passkeyExtras = new Map<number, Array<{ factor: string; wrappedBase64: string; credentialId: string }>>();
-    for (const [gen, list] of this.#passkeyWrappingsByGen) {
-      passkeyExtras.set(gen, list.map(p => ({
-        factor: FACTOR_PASSKEY_PRF,
-        wrappedBase64: p.wrappedBase64,
-        credentialId: p.credentialId,
-      })));
-    }
-
-    const newWrappedDataKey = await wrapDataKeyChainEnvelope(
-      chain,
-      [
-        { name: FACTOR_PASSWORD,        wrappingKey: reKeys.credentialEncryptionKey.kwKey },
-        { name: FACTOR_RECOVERY_PHRASE, wrappingKey: newRecoveryKEK.kwKey },
-      ],
-      { salt: newRecoverySalt },
-      passkeyExtras,
-    );
-
-    // 4. New wrap_account_key only if Model B. We treat #accountKeyStored
+    // 3. New wrap_account_key only if Model B. We treat #accountKeyStored
     //    as the source of truth here; if it's null (resumed session that
     //    never re-verified), we play it safe and skip the wrap. The user
     //    can re-enable storage explicitly via enableKeyStorage afterwards.
@@ -2064,43 +2204,90 @@ export class TarnClient {
       newWrappedAccountKey = await wrapAccountKey(dekGen1.gcmKey, newPhrase);
     }
 
-    // 5. Step-up: mint a single-use token bound to the same password. We
-    //    run this AFTER the wrong-password tripwire above so the user gets
-    //    a clean "wrong password" error rather than "step-up auth failed"
-    //    on the most common operator mistake. Step-up itself re-derives the
-    //    credential keys from the same password, so a credential mismatch
-    //    here would surface as a 401 from /auth/challenge — but we already
-    //    short-circuited that case.
-    const stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
+    // 4. Re-wrap every gen under {existing password KEK, NEW recovery KEK},
+    //    preserving passkey wrappings byte-for-byte. Rotation changes the
+    //    recovery factor only — the underlying DEKs and any registered
+    //    passkeys are unaffected. The new recovery state (phrase, salt, KEK,
+    //    lookup, pubkey, wrapped account key) is generated ONCE above; only the
+    //    envelope re-wrap is recomputed per CAS attempt so that on a 409 we
+    //    fold THIS rotation onto the winner's (possibly different) passkey
+    //    wrapping set.
+    let newWrappedDataKey = '';
+    const buildEnvelope_ = async (): Promise<string> => {
+      const chain: Array<{ gen: number; key: CryptoKey }> = [];
+      for (const [gen, pair] of this.#dekByGen!) {
+        chain.push({ gen, key: pair.gcmKey });
+      }
+      chain.sort((a, b) => a.gen - b.gen);
+      const passkeyExtras = new Map<number, Array<{ factor: string; wrappedBase64: string; credentialId: string }>>();
+      for (const [gen, list] of this.#passkeyWrappingsByGen) {
+        passkeyExtras.set(gen, list.map(p => ({
+          factor: FACTOR_PASSKEY_PRF,
+          wrappedBase64: p.wrappedBase64,
+          credentialId: p.credentialId,
+        })));
+      }
+      return await wrapDataKeyChainEnvelope(
+        chain,
+        [
+          { name: FACTOR_PASSWORD,        wrappingKey: reKeys.credentialEncryptionKey.kwKey },
+          { name: FACTOR_RECOVERY_PHRASE, wrappingKey: newRecoveryKEK.kwKey },
+        ],
+        { salt: newRecoverySalt },
+        passkeyExtras,
+      );
+    };
 
-    // 6. Submit. The API performs an atomic UPDATE across all four fields.
-    //    JWT and the step-up token both required (Phase 4.1).
-    const res = await this.#fetchRaw('/api/v1/account/rotate-account-key', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.#jwt}`,
-        'X-Step-Up-Token': stepUpToken,
-        'Content-Type': 'application/json',
+    // 5+6. Submit through the tarn#63 CAS loop. The step-up token is single-use
+    //    and consumed server-side BEFORE the CAS, so it is re-minted per attempt
+    //    inside build(). Two distinct 409s are possible: the envelope-generation
+    //    conflict (#casWrite retries it) and the recovery_lookup_key collision
+    //    (returned to us below — astronomically unlikely, but propagated).
+    let rotateStepUp = '';
+    const res = await this.#casWrite({
+      operationType: 'rotateAccountKey',
+      build: async () => {
+        // Re-mint per attempt: the token is single-use and consumed before the
+        // CAS, so a 409 retry needs a fresh one.
+        rotateStepUp = await this.#performStepUp(opts.password, 'account_key_fetch');
+        newWrappedDataKey = await buildEnvelope_();
+        return {
+          new_envelope: newWrappedDataKey,
+          new_recovery_lookup_key: newRecoveryLookupKey,
+          new_recovery_public_key: newRecoveryPublicKey,
+          new_wrapped_account_key: newWrappedAccountKey,
+        };
       },
-      body: JSON.stringify({
-        new_envelope: newWrappedDataKey,
-        new_recovery_lookup_key: newRecoveryLookupKey,
-        new_recovery_public_key: newRecoveryPublicKey,
-        new_wrapped_account_key: newWrappedAccountKey,
-      }),
+      send: async (body) => {
+        const raw = await this.#fetchRaw('/api/v1/account/rotate-account-key', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.#jwt}`,
+            'X-Step-Up-Token': rotateStepUp,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        });
+        const t = await raw.text();
+        let j: any = null;
+        try { j = JSON.parse(t); } catch {}
+        return { status: raw.status, json: j };
+      },
     });
-    const text = await res.text();
-    let json: any = null;
-    try { json = JSON.parse(text); } catch {}
+    const json: any = res.json;
     if (res.status === 409) {
-      // Salt + entropy collision yielding the same recovery_lookup_key as
-      // another account is astronomically unlikely (HMAC over 32 random
-      // bytes → 256-bit space), but propagate the conflict cleanly so the
-      // app can prompt a retry.
+      // Not the envelope-generation conflict (#casWrite would have retried or
+      // thrown TarnEnvelopeConflictError). This is the recovery_lookup_key
+      // collision — a salt+entropy clash yielding the same recovery_lookup_key
+      // as another account (HMAC over 32 random bytes → 256-bit space, so
+      // astronomically unlikely), but propagate cleanly so the app can retry.
       throw new Error(`rotateAccountKey(): conflict: ${json?.error || 'recovery_lookup_key in use'}`);
     }
     if (res.status !== 200) {
       throw new Error(`rotateAccountKey(): rotation failed: ${json?.error || res.status}`);
+    }
+    if (typeof json?.envelope_generation === 'number') {
+      this.#captureEnvelopeGeneration(json.envelope_generation);
     }
 
     // 6. Update cached recovery-factor metadata so a subsequent
@@ -2272,25 +2459,44 @@ export class TarnClient {
     //    Existing wrappings are preserved verbatim (AES-KW is deterministic;
     //    the recovery wrappings come from the cached snapshot).
     const credentialId = credential.id; // base64url string
-    const newEnvelope = await this.#rebuildEnvelopeWithExtraPasskey(
-      credentialId,
-      passkeyKEK,
-    );
 
-    // 5. Submit. Server verifies the WebAuthn ceremony, stores the
-    //    credential row, swaps the envelope, and republishes to Arweave.
-    const regRes = await this.#fetch('/api/v1/auth/passkey/register', {
-      method: 'POST',
-      auth: true,
-      body: {
-        credential,
-        prf_salt: prfSaltB64Url,
-        new_envelope: newEnvelope,
-        device_label: opts.deviceLabel ?? null,
+    // 5. Submit through the tarn#63 CAS loop. The envelope is rebuilt on each
+    //    attempt: on a 409 we re-fetch the winner's envelope, re-hydrate the
+    //    snapshots, and #rebuildEnvelopeWithExtraPasskey re-adds THIS device's
+    //    new passkey wrapping on top of the fresh base (so a concurrent
+    //    register/remove on another device is not clobbered). Server verifies
+    //    the WebAuthn ceremony, stores the credential row, swaps the envelope.
+    //
+    //    NOTE: the WebAuthn registration challenge is single-use, so a 409
+    //    retry resubmits the SAME `credential`. The server consumes the
+    //    challenge on the FIRST attempt; if a CAS 409 then forces a retry, the
+    //    re-submitted credential would fail challenge re-binding. In practice
+    //    the envelope CAS is checked AFTER challenge consumption on the server,
+    //    so this window exists — but register conflicts are vanishingly rare
+    //    (two devices enrolling a passkey in the same instant) and the failure
+    //    is a clean error the user retries, not a lost update. Documented as a
+    //    residual; the safe property (no silent lost update) holds.
+    let newEnvelope = '';
+    const regRes = await this.#casWrite({
+      operationType: 'registerPasskey',
+      build: async () => {
+        newEnvelope = await this.#rebuildEnvelopeWithExtraPasskey(credentialId, passkeyKEK);
+        return {
+          credential,
+          prf_salt: prfSaltB64Url,
+          new_envelope: newEnvelope,
+          device_label: opts.deviceLabel ?? null,
+        };
       },
+      send: (body) => this.#fetch('/api/v1/auth/passkey/register', { method: 'POST', auth: true, body }),
     });
     if (regRes.status !== 201) {
       throw new Error(`registerPasskey(): register failed: ${regRes.json?.error || regRes.status}`);
+    }
+    // The CAS bumped the server generation; advance our local token so a
+    // follow-up envelope mutation in this same session sends the right expected.
+    if (typeof regRes.json?.envelope_generation === 'number') {
+      this.#captureEnvelopeGeneration(regRes.json.envelope_generation);
     }
 
     // Refresh the local snapshot of passkey wrappings so subsequent
@@ -2408,6 +2614,9 @@ export class TarnClient {
       credential_id,
       stale_credential,
     } = authRes.json;
+    // tarn#63 — capture the envelope generation for later CAS writes (e.g. the
+    // stale-credential refresh below).
+    this.#captureEnvelopeGeneration(authRes.json.envelope_generation);
     if (!jwt || !wrapped_data_key || !credential_id) {
       throw new Error('authenticateWithPasskey(): server response missing required fields');
     }
@@ -2630,48 +2839,80 @@ export class TarnClient {
     }
     const newWrapped = await this.#wrapDekRaw(latestGcmKey, args.passkeyKEK);
 
-    // Build the updated envelope: identical to the live envelope plus a
-    // single new wrapping at the latest gen.
-    const wireChain = parsed.dekChain.map(entry => {
-      const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> =
-        entry.wrappings.map(w => ({
-          factor: w.factor,
-          wrappedBase64: w.wrappedBase64,
-          ...(w.credentialId ? { credentialId: w.credentialId } : {}),
-        }));
-      if (entry.gen === latest.gen) {
-        // Defensive: if a (passkey_prf, credId) wrapping somehow already
-        // exists on the latest gen (race with another device), don't
-        // duplicate — overwrite by removing any prior copy.
-        const filtered = wrappings.filter(
-          w => !(w.factor === FACTOR_PASSKEY_PRF && w.credentialId === args.credentialId),
-        );
-        filtered.push({
-          factor: FACTOR_PASSKEY_PRF,
-          wrappedBase64: newWrapped,
-          credentialId: args.credentialId,
-        });
-        return { gen: entry.gen, wrappings: filtered };
-      }
-      return { gen: entry.gen, wrappings };
-    });
-    const newEnvelope = buildEnvelope(wireChain, {
-      salt: parsed.recovery.salt,
-      kdfParams: parsed.recovery.kdfParams,
-    });
+    // tarn#63 — apply the repair (add this credential's passkey_prf wrapping at
+    // the latest gen, preserve everything else) onto a base envelope, returning
+    // the new wire string. Recomputed per CAS attempt against the current base.
+    const applyRepair = (baseWire: string): string => {
+      const p = parseWrappedDataKey(baseWire);
+      const latestGen = p.dekChain[p.dekChain.length - 1]!.gen;
+      const wireChain = p.dekChain.map(entry => {
+        const wrappings: Array<{ factor: string; wrappedBase64: string; credentialId?: string }> =
+          entry.wrappings.map(w => ({
+            factor: w.factor,
+            wrappedBase64: w.wrappedBase64,
+            ...(w.credentialId ? { credentialId: w.credentialId } : {}),
+          }));
+        if (entry.gen === latestGen) {
+          // Defensive: drop any prior copy of this credential's wrapping so we
+          // don't duplicate, then append the freshly-derived one.
+          const filtered = wrappings.filter(
+            w => !(w.factor === FACTOR_PASSKEY_PRF && w.credentialId === args.credentialId),
+          );
+          filtered.push({
+            factor: FACTOR_PASSKEY_PRF,
+            wrappedBase64: newWrapped,
+            credentialId: args.credentialId,
+          });
+          return { gen: entry.gen, wrappings: filtered };
+        }
+        return { gen: entry.gen, wrappings };
+      });
+      return buildEnvelope(wireChain, { salt: p.recovery.salt, kdfParams: p.recovery.kdfParams });
+    };
 
-    const refreshRes = await this.#fetch('/api/v1/auth/passkey/refresh-credential', {
-      method: 'POST',
-      auth: true,
-      body: {
-        credential_id: args.credentialId,
-        new_envelope: newEnvelope,
+    // The base envelope evolves across CAS retries. Start with the one returned
+    // by the passkey-authenticate response (args.wrappedDataKey); on a 409,
+    // refetch re-challenges via the password-derived credential_lookup_key
+    // (this is a passkey-only session, so #credentialLookupKey may be null —
+    // we derive it from the handler-supplied username+password) and replaces
+    // the base with the winner's envelope.
+    let currentBase = args.wrappedDataKey;
+    let newEnvelope = '';
+    const refreshRes = await this.#casWrite({
+      operationType: 'refreshCredential',
+      build: async () => {
+        newEnvelope = applyRepair(currentBase);
+        return { credential_id: args.credentialId, new_envelope: newEnvelope };
+      },
+      send: (body) => this.#fetch('/api/v1/auth/passkey/refresh-credential', {
+        method: 'POST',
+        auth: true,
+        body,
+      }),
+      refetch: async () => {
+        const clk = reKeys.credentialLookupKey;
+        const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
+          method: 'POST',
+          retry: true,
+          body: { credential_lookup_key: clk },
+        });
+        if (challengeRes.status !== 200 || typeof challengeRes.json?.wrapped_data_key !== 'string') {
+          throw new StalePasskeyError({
+            credentialId: args.credentialId,
+            message: 'stale-credential repair: re-fetch after conflict failed',
+          });
+        }
+        currentBase = challengeRes.json.wrapped_data_key;
+        this.#captureEnvelopeGeneration(challengeRes.json.envelope_generation);
       },
     });
     if (refreshRes.status !== 200) {
       throw new Error(
         `stale-credential repair: refresh-credential failed: ${refreshRes.json?.error || refreshRes.status}`,
       );
+    }
+    if (typeof refreshRes.json?.envelope_generation === 'number') {
+      this.#captureEnvelopeGeneration(refreshRes.json.envelope_generation);
     }
 
     // Update local DEK chain to include the now-repaired latest gen.
@@ -2741,30 +2982,49 @@ export class TarnClient {
       this.#credentialEncryptionKey = reKeys.credentialEncryptionKey;
     }
 
-    const stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
-
-    // Re-wrap the existing chain dropping the targeted credential_id.
-    // Preserve all other wrappings byte-for-byte (no decryption; the
-    // server doesn't have the keys to verify, just the shape).
-    const newEnvelope = await this.#rebuildEnvelopeWithoutPasskey(opts.credentialId);
-
-    const res = await this.#fetchRaw(
-      `/api/v1/account/passkeys/${encodeURIComponent(opts.credentialId)}`,
-      {
-        method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${this.#jwt}`,
-          'X-Step-Up-Token': stepUpToken,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ new_envelope: newEnvelope }),
+    // Submit through the tarn#63 CAS loop. On each attempt the envelope is
+    // rebuilt by stripping the targeted credential_id and preserving all OTHER
+    // wrappings byte-for-byte. On a 409 we re-fetch the winner's envelope and
+    // re-hydrate the snapshots, so #rebuildEnvelopeWithoutPasskey re-applies the
+    // removal on top of the fresh base (a concurrent add/remove on another
+    // device is preserved, not clobbered).
+    //
+    // The step-up token is single-use AND the server consumes it before the
+    // CAS, so a 409 retry must mint a FRESH token. We re-mint inside build()
+    // (which runs once per attempt) using the password already in scope.
+    let newEnvelope = '';
+    let stepUpToken = '';
+    const result = await this.#casWrite({
+      operationType: 'removePasskey',
+      build: async () => {
+        stepUpToken = await this.#performStepUp(opts.password, 'account_key_fetch');
+        newEnvelope = await this.#rebuildEnvelopeWithoutPasskey(opts.credentialId);
+        return { new_envelope: newEnvelope };
       },
-    );
-    const text = await res.text();
-    let json: any = null;
-    try { json = JSON.parse(text); } catch {}
-    if (res.status !== 200) {
-      throw new Error(`removePasskey(): failed: ${json?.error || res.status}`);
+      send: async (body) => {
+        const res = await this.#fetchRaw(
+          `/api/v1/account/passkeys/${encodeURIComponent(opts.credentialId)}`,
+          {
+            method: 'DELETE',
+            headers: {
+              'Authorization': `Bearer ${this.#jwt}`,
+              'X-Step-Up-Token': stepUpToken,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+          },
+        );
+        const text = await res.text();
+        let json: any = null;
+        try { json = JSON.parse(text); } catch {}
+        return { status: res.status, json };
+      },
+    });
+    if (result.status !== 200) {
+      throw new Error(`removePasskey(): failed: ${result.json?.error || result.status}`);
+    }
+    if (typeof result.json?.envelope_generation === 'number') {
+      this.#captureEnvelopeGeneration(result.json.envelope_generation);
     }
 
     // Refresh local snapshot so a subsequent envelope-mutating flow

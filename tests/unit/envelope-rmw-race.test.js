@@ -68,16 +68,24 @@ function readWrapped(envelopeStr, credId) {
 }
 
 // In-memory `accounts` + `passkey_credentials` D1 shim covering exactly the
-// statements handlePasskeyRefreshCredential issues:
+// statements handlePasskeyRefreshCredential issues (tarn#63 version):
 //   - SELECT id FROM passkey_credentials WHERE credential_id=?1 AND account_id=?2
-//   - UPDATE accounts SET wrapped_data_key=?2 WHERE data_lookup_key=?1 RETURNING ...
+//   - SELECT envelope_generation FROM accounts WHERE data_lookup_key=?1  (pre-read)
+//   - UPDATE accounts SET wrapped_data_key=?2, envelope_generation = envelope_generation + 1
+//       WHERE data_lookup_key=?1 AND envelope_generation=?3 RETURNING ...  (CAS)
 //   - (best-effort audit) INSERT INTO account_key_fetch_log ...
+//
+// The CAS UPDATE faithfully models D1: it only mutates (and only RETURNs a row)
+// when the supplied expected generation matches the stored one; otherwise it
+// affects 0 rows and `.first()` resolves to null — which the handler turns into
+// a 409. This is what makes the lost-update impossible.
 function makeD1(initialEnvelope) {
   const account = {
     credential_lookup_key: 'clk', public_key: 'pub', wrapped_data_key: initialEnvelope,
     app: 'bookish', recovery_lookup_key: null, recovery_public_key: null,
     share_pub: null, share_discoverable: 1, share_lookup_key: null,
     wrapped_account_key: null, data_lookup_key: DLK,
+    envelope_generation: 0,
   };
   const creds = new Set([CRED_A, CRED_B]);
   const db = {
@@ -91,10 +99,17 @@ function makeD1(initialEnvelope) {
             const [credId, accId] = args;
             return (creds.has(credId) && accId === DLK) ? { id: credId } : null;
           }
-          if (/UPDATE accounts\s+SET wrapped_data_key = \?2/.test(sql)) {
-            const [dlk, envelope] = args;
-            if (dlk !== DLK) return null;
-            account.wrapped_data_key = envelope; // BLIND overwrite — the bug under test.
+          if (/SELECT envelope_generation FROM accounts WHERE data_lookup_key = \?1/.test(sql)) {
+            const [dlk] = args;
+            return dlk === DLK ? { envelope_generation: account.envelope_generation } : null;
+          }
+          if (/UPDATE accounts\s+SET wrapped_data_key = \?2,\s*envelope_generation = envelope_generation \+ 1/.test(sql)) {
+            const [dlk, envelope, expectedGen] = args;
+            // Compare-and-swap: only commit when dlk matches AND the expected
+            // generation equals the stored one. 0-row match → null (→ 409).
+            if (dlk !== DLK || expectedGen !== account.envelope_generation) return null;
+            account.wrapped_data_key = envelope;
+            account.envelope_generation += 1;
             return { ...account };
           }
           return null;
@@ -144,81 +159,126 @@ describe('tarn#62a — envelope read-modify-write race (concurrent passkey refre
     const env = { DB: db, JWT_SECRET };
     const jwtA = await jwtForCred(CRED_A);
 
-    // Client A reads the base envelope, refreshes ONLY its own wrapping.
+    // Client A reads the base envelope + its generation (0), refreshes ONLY
+    // its own wrapping, and submits with expected_generation matching.
     const base = db._account.wrapped_data_key;
+    const gen0 = db._account.envelope_generation;
     const newEnv = makeEnvelope({ [CRED_A]: 'fresh-A', [CRED_B]: readWrapped(base, CRED_B) });
     const res = await handlePasskeyRefreshCredential(
-      makeRequest(jwtA, { credential_id: CRED_A, new_envelope: newEnv }), env, ctx, cors,
+      makeRequest(jwtA, { credential_id: CRED_A, new_envelope: newEnv, expected_generation: gen0 }), env, ctx, cors,
     );
     assert.equal(res.status, 200);
     assert.equal(readWrapped(db._account.wrapped_data_key, CRED_A), 'fresh-A');
     assert.equal(readWrapped(db._account.wrapped_data_key, CRED_B), 'stale');
+    // The CAS bumped the generation and the response surfaces the new value.
+    assert.equal(db._account.envelope_generation, gen0 + 1);
+    const body = await res.json();
+    assert.equal(body.envelope_generation, gen0 + 1);
   });
 
-  it('REAL BUG (documented): two concurrent refreshes on the same base envelope LOSE one update', async () => {
+  it('CAS catches the race: two concurrent refreshes on the same base/gen → one 200, one 409 (no silent loss)', async () => {
     const db = makeD1(makeEnvelope({ [CRED_A]: 'stale', [CRED_B]: 'stale' }));
     const env = { DB: db, JWT_SECRET };
     const jwtA = await jwtForCred(CRED_A);
     const jwtB = await jwtForCred(CRED_B);
 
-    // Both devices read the SAME base envelope BEFORE either writes (the
-    // read-modify-write window). This is exactly the multi-device sequence the
-    // SDK produces: fetch envelope → mutate locally → POST.
+    // Both devices read the SAME base envelope + the SAME generation (0) BEFORE
+    // either writes — the read-modify-write window. This is exactly the
+    // multi-device sequence the SDK produces: fetch envelope+gen → mutate
+    // locally → POST with expected_generation.
     const base = db._account.wrapped_data_key;
-    const baseB_forA = readWrapped(base, CRED_B); // A sees B's CURRENT wrapping
-    const baseA_forB = readWrapped(base, CRED_A); // B sees A's CURRENT wrapping
+    const sharedGen = db._account.envelope_generation; // both read gen 0
+    const baseB_forA = readWrapped(base, CRED_B);
+    const baseA_forB = readWrapped(base, CRED_A);
 
-    // A wants {A: fresh-A, B: <unchanged from base>}
     const envFromA = makeEnvelope({ [CRED_A]: 'fresh-A', [CRED_B]: baseB_forA });
-    // B wants {A: <unchanged from base>, B: fresh-B}
     const envFromB = makeEnvelope({ [CRED_A]: baseA_forB, [CRED_B]: 'fresh-B' });
 
-    // Drive them concurrently. D1 serializes the two UPDATEs; both started from
-    // the same base, so whichever lands LAST overwrites the other's change.
+    // Drive them concurrently, BOTH claiming expected_generation = 0. D1
+    // serializes the two CAS UPDATEs: the first matches gen 0 and bumps to 1;
+    // the second now mismatches (stored gen is 1, expected is 0) → 0 rows → 409.
     const [resA, resB] = await Promise.all([
-      handlePasskeyRefreshCredential(makeRequest(jwtA, { credential_id: CRED_A, new_envelope: envFromA }), env, ctx, cors),
-      handlePasskeyRefreshCredential(makeRequest(jwtB, { credential_id: CRED_B, new_envelope: envFromB }), env, ctx, cors),
+      handlePasskeyRefreshCredential(makeRequest(jwtA, { credential_id: CRED_A, new_envelope: envFromA, expected_generation: sharedGen }), env, ctx, cors),
+      handlePasskeyRefreshCredential(makeRequest(jwtB, { credential_id: CRED_B, new_envelope: envFromB, expected_generation: sharedGen }), env, ctx, cors),
     ]);
-    assert.equal(resA.status, 200);
-    assert.equal(resB.status, 200, 'no CAS guard exists, so the second write is ACCEPTED (not 409) — this is the bug');
 
+    // Exactly one 200 and one 409 — the conflict is CAUGHT, not silently lost.
+    const statuses = [resA.status, resB.status].sort();
+    assert.deepEqual(statuses, [200, 409],
+      `expected one 200 + one 409; got ${resA.status} and ${resB.status}`);
+
+    // The loser's 409 body carries the conflict code + the current generation
+    // so the SDK knows to re-fetch and retry.
+    const loser = resA.status === 409 ? resA : resB;
+    const loserBody = await loser.json();
+    assert.equal(loserBody.code, 'ENVELOPE_GENERATION_CONFLICT');
+    assert.equal(typeof loserBody.current_generation, 'number');
+
+    // Crucially: the winner's update is intact and NOTHING was overwritten by
+    // the loser. The generation advanced exactly once.
+    assert.equal(db._account.envelope_generation, sharedGen + 1);
     const finalA = readWrapped(db._account.wrapped_data_key, CRED_A);
     const finalB = readWrapped(db._account.wrapped_data_key, CRED_B);
-
-    // The correct end state would be BOTH fresh (A=fresh-A AND B=fresh-B). The
-    // actual end state has exactly ONE fresh and one reverted-to-stale — a lost
-    // update. We assert that at least one update was lost (last-write-wins), so
-    // the test is deterministic regardless of which Promise settled last.
-    const bothFresh = finalA === 'fresh-A' && finalB === 'fresh-B';
-    assert.equal(bothFresh, false,
-      'EXPECTED FAILURE-OF-SAFETY: a CAS guard would land both updates; today one is lost');
-
-    const oneLost =
-      (finalA === 'fresh-A' && finalB === 'stale') ||
-      (finalA === 'stale' && finalB === 'fresh-B');
-    assert.ok(oneLost,
-      `lost-update signature not observed; finalA=${finalA} finalB=${finalB}`);
+    // Exactly one of the two is fresh (the winner's); the other stayed at its
+    // base value — but NO accepted write was clobbered (the loser was rejected,
+    // not silently dropped). This is the safe outcome.
+    const exactlyOneFresh =
+      (finalA === 'fresh-A' && finalB !== 'fresh-B') ||
+      (finalB === 'fresh-B' && finalA !== 'fresh-A');
+    assert.ok(exactlyOneFresh, `winner's write must survive; finalA=${finalA} finalB=${finalB}`);
   });
 
-  // The behaviour we WANT after the server grows a compare-and-swap / gen guard
-  // on wrapped_data_key. Marked todo so the suite stays green while flagging the
-  // gap; flip to a real assertion when the guard lands (then this should pass
-  // and the "REAL BUG" test above should be inverted/removed).
-  it('no lost update when both refreshes commit (requires server-side CAS — NOT yet implemented)', { todo: 'tarn#62a: add optimistic-concurrency guard on accounts.wrapped_data_key' }, async () => {
+  // The behaviour we WANT — and now HAVE — once the server enforces the
+  // generation CAS: the loser of the race gets a 409, RE-FETCHES the winner's
+  // envelope + new generation, RE-APPLIES its own mutation onto that fresh
+  // base, and RETRIES with the new expected_generation. Then BOTH wrappings
+  // land. Here we drive the retry by hand (the SDK does this internally via
+  // #casWrite); the point is to prove the SERVER admits a correctly-retried
+  // second write and nothing is lost.
+  it('no lost update: loser re-fetches + re-applies onto the winner and both refreshes land', async () => {
     const db = makeD1(makeEnvelope({ [CRED_A]: 'stale', [CRED_B]: 'stale' }));
     const env = { DB: db, JWT_SECRET };
     const jwtA = await jwtForCred(CRED_A);
     const jwtB = await jwtForCred(CRED_B);
+
     const base = db._account.wrapped_data_key;
+    const sharedGen = db._account.envelope_generation;
+
+    // A and B both build from gen 0 and submit concurrently with expected gen 0.
     const envFromA = makeEnvelope({ [CRED_A]: 'fresh-A', [CRED_B]: readWrapped(base, CRED_B) });
     const envFromB = makeEnvelope({ [CRED_A]: readWrapped(base, CRED_A), [CRED_B]: 'fresh-B' });
-    await Promise.all([
-      handlePasskeyRefreshCredential(makeRequest(jwtA, { credential_id: CRED_A, new_envelope: envFromA }), env, ctx, cors),
-      handlePasskeyRefreshCredential(makeRequest(jwtB, { credential_id: CRED_B, new_envelope: envFromB }), env, ctx, cors),
+    const [resA, resB] = await Promise.all([
+      handlePasskeyRefreshCredential(makeRequest(jwtA, { credential_id: CRED_A, new_envelope: envFromA, expected_generation: sharedGen }), env, ctx, cors),
+      handlePasskeyRefreshCredential(makeRequest(jwtB, { credential_id: CRED_B, new_envelope: envFromB, expected_generation: sharedGen }), env, ctx, cors),
     ]);
-    // With a CAS guard the loser would 409 and retry against the winner's
-    // envelope, so BOTH wrappings end up fresh.
+
+    // One won, one got 409. Identify the loser and what fresh value it owns.
+    const aWon = resA.status === 200;
+    const loserJwt = aWon ? jwtB : jwtA;
+    const loserCred = aWon ? CRED_B : CRED_A;
+    const loserFresh = aWon ? 'fresh-B' : 'fresh-A';
+    const loserRes = aWon ? resB : resA;
+    assert.equal((aWon ? resA : resB).status, 200);
+    assert.equal(loserRes.status, 409);
+
+    // SDK-style retry: re-fetch the winner's live envelope + current gen,
+    // re-apply the loser's own change onto it, resubmit with the fresh gen.
+    const freshBase = db._account.wrapped_data_key;
+    const freshGen = db._account.envelope_generation; // = 1
+    const retryEnv = makeEnvelope({
+      [CRED_A]: loserCred === CRED_A ? loserFresh : readWrapped(freshBase, CRED_A),
+      [CRED_B]: loserCred === CRED_B ? loserFresh : readWrapped(freshBase, CRED_B),
+    });
+    const retryRes = await handlePasskeyRefreshCredential(
+      makeRequest(loserJwt, { credential_id: loserCred, new_envelope: retryEnv, expected_generation: freshGen }),
+      env, ctx, cors,
+    );
+    assert.equal(retryRes.status, 200, 'the correctly-retried second write must be admitted');
+
+    // Both wrappings are now fresh — no lost update.
     assert.equal(readWrapped(db._account.wrapped_data_key, CRED_A), 'fresh-A');
     assert.equal(readWrapped(db._account.wrapped_data_key, CRED_B), 'fresh-B');
+    // Generation advanced exactly twice (one per accepted write).
+    assert.equal(db._account.envelope_generation, sharedGen + 2);
   });
 });

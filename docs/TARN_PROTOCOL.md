@@ -141,6 +141,26 @@ The envelope is byte-stable for the same `(username, password, app, recovery_phr
 
 > **Note on prior envelope versions.** Earlier drafts supported a v1 bare-base64 single-key shape (PBKDF2-era), a v2 single-key JSON envelope (early Argon2id), and a v3 single-factor chain envelope (forward-secret rotation pre-recovery-factor). The `v` field was renumbered to `1` after those legacy paths were cut, so the current shape's `v: 1` is the post-cleanup definition above — not the pre-cleanup bare-base64 shape.
 
+#### Optimistic concurrency: `envelope_generation` (tarn#63)
+
+The envelope is a **client-side read-modify-write**: the SDK fetches `wrapped_data_key`, unwraps it, mutates one wrapping (add a passkey, remove a passkey, rotate the recovery factor), re-wraps, and POSTs the whole envelope back. With no version guard, two devices mutating the same base envelope concurrently would last-write-wins — the earlier device's change silently lost. For the auth DEK envelope a lost wrapping can lock a factor out of the chain, so this path carries a compare-and-swap.
+
+- The `accounts` row carries a monotonic integer column `envelope_generation` (migration `0023`, `NOT NULL DEFAULT 0`). It is NOT part of the envelope JSON — it is a plain version token on the row, carrying no key or plaintext material (zero-knowledge preserved).
+- **Every fetch path that returns `wrapped_data_key` for a later mutation also returns `envelope_generation`:** the password login challenge (`POST /auth/challenge`), the recovery-flow challenge (same endpoint, `recovery_lookup_key` body), and the passkey authenticate response (`POST /auth/passkey/authenticate`). The SDK caches it.
+- **Every server-side writer of `wrapped_data_key` is a conditional CAS:**
+  ```sql
+  UPDATE accounts
+     SET wrapped_data_key = ?new,
+         envelope_generation = envelope_generation + 1   -- [+ other cols]
+   WHERE data_lookup_key = ?
+     AND envelope_generation = ?expected
+  RETURNING envelope_generation
+  ```
+  The writers are: `POST /auth/passkey/register`, `DELETE /account/passkeys/:id`, `POST /auth/passkey/refresh-credential`, and `POST /account/rotate-account-key`. Each accepts an `expected_generation` field in its request body (validated: a non-negative integer when present). When the CAS matches 0 rows the server responds **`409`** with `{ "error": ..., "code": "ENVELOPE_GENERATION_CONFLICT", "current_generation": <int> }`. On success the response body carries the new `envelope_generation`.
+- **SDK behaviour on 409.** The envelope-mutation methods (`registerPasskey`, `removePasskey`, `rotateAccountKey`, and the stale-credential refresh) capture the cached generation, send it as `expected_generation`, and on a `ENVELOPE_GENERATION_CONFLICT` 409 **re-fetch** the live envelope + generation, **re-apply this device's mutation onto the fresh base** (re-derive the new envelope from the winner's state — not a blind resend of stale bytes), and **retry**, bounded to 5 attempts. Exhaustion throws the typed `TarnEnvelopeConflictError` (safe to retry — no write was overwritten). The retry is entirely internal to the SDK; apps need no changes.
+- **Backward compatibility.** The column is additive (existing rows default to generation 0). A client that does not send `expected_generation` is handled leniently — the writer reads the current generation and uses it as the expected value, preserving pre-tarn#63 last-write-wins for legacy bundles only. This makes the deploy ordering (apply migration → deploy worker → ship new SDK) safe: an old bundle keeps working against the new worker, and a new SDK against an old worker simply omits the field (the worker without the column is the pre-tarn#63 worker, which ignores it).
+- **`db.batch` atomicity caveat.** `register` and `delete-passkey` pair the envelope CAS with a sibling write (a `passkey_credentials` INSERT / DELETE). A conditional UPDATE that matches 0 rows does NOT throw, so it does NOT abort a D1 `db.batch` — the sibling would still commit. Both writers therefore run the envelope CAS as a **standalone statement first**; only if it commits (`RETURNING` yields a row) do they perform the dependent INSERT/DELETE. On a CAS miss they 409 and never touch `passkey_credentials`. The residual (CAS commits, then the dependent write fails) is the already-handled "stale credential" condition and never weakens the DEK chain — see the route source for the ordering rationale.
+
 #### Forward-secret DEK rotation
 
 On every credential change, the client mints a fresh random DEK at gen N+1 and appends it to the chain. Subsequent writes use the new gen; old gens remain in the chain so prior data is still readable. An attacker who later compromises the OLD `credential_encryption_key` cannot decrypt content written after the rotation (the new gen DEK is not derivable from old credentials).
@@ -300,7 +320,8 @@ Request body:
   "new_envelope":             "<full updated wrapped_data_key envelope (string)>",
   "new_recovery_lookup_key":  "<64-char hex>",
   "new_recovery_public_key":  "<base64 SPKI P-256>",
-  "new_wrapped_account_key":  "<base64 ciphertext or null>"
+  "new_wrapped_account_key":  "<base64 ciphertext or null>",
+  "expected_generation":      "<non-negative integer (tarn#63, optional)>"
 }
 ```
 
@@ -310,17 +331,18 @@ Request body:
 
 The SDK helper `tarn.accountKey.rotate()` reads `isStored()` to make this choice automatically.
 
-**Atomicity.** The four fields (`wrapped_data_key`, `recovery_lookup_key`, `recovery_public_key`, `wrapped_account_key`) update in a single D1 statement. There is no partial-state window. After D1 commits, the credential blob is republished to Arweave (best-effort, in `waitUntil`).
+**Atomicity.** The five fields (`wrapped_data_key`, `recovery_lookup_key`, `recovery_public_key`, `wrapped_account_key`, and the `envelope_generation` bump) update in a single D1 statement guarded by the [envelope CAS](#optimistic-concurrency-envelope_generation-tarn63) (`WHERE envelope_generation = ?expected`). There is no partial-state window. After D1 commits, the credential blob is republished to Arweave (best-effort, in `waitUntil`).
 
 **Recovery-salt rotation.** The protocol does NOT mandate that the salt change across rotation, but the SDK's `tarn.accountKey.rotate()` generates a fresh salt as part of the new envelope. Reasoning: rotation is an explicit "evict the recovery factor" operation, and refreshing the salt completes the eviction (a security-scoped attacker who recorded the old salt + ciphertext gains nothing against the new state). Old data wrapped under the old salt + old KEK remains on Arweave forever (immutable history) but is unwrappable without the now-defunct old phrase. Apps that drive the wire protocol directly may keep the old salt if they wish; the API stores whatever the client sends.
 
-Response: `200 OK` with `{ "rotated": true }`. Audit row: `op = 'rotate'`.
+Response: `200 OK` with `{ "rotated": true, "envelope_generation": <int> }`. Audit row: `op = 'rotate'`.
 
 Errors:
-- `400` for invalid envelope / lookup key / public key / wrap shape.
+- `400` for invalid envelope / lookup key / public key / wrap shape, or a malformed `expected_generation` (must be a non-negative integer when present).
 - `400` if `new_recovery_lookup_key === credential_lookup_key` (the two identifier spaces must stay disjoint, mirroring the register / changeCredentials invariant).
-- `409` if `new_recovery_lookup_key` collides with another account's recovery lookup key (astronomically unlikely with 256-bit HMAC output, but propagated cleanly so the SDK can surface a retry).
-- `401` for missing/invalid JWT or step-up token (single-use, 60s TTL — the SDK mints a fresh one for every rotate call), `403` for app-role JWTs.
+- `409` with `code: "ENVELOPE_GENERATION_CONFLICT"` (tarn#63) if `expected_generation` is stale — another device advanced the envelope between this caller's fetch and write. Body carries `current_generation`. The SDK re-fetches + re-applies + retries internally (bounded; `TarnEnvelopeConflictError` on exhaustion). NOTE: because the step-up token is consumed before the CAS, the SDK mints a FRESH step-up token on each retry.
+- `409 "new_recovery_lookup_key already in use"` if the new recovery lookup key collides with another account's (astronomically unlikely with 256-bit HMAC output, but propagated cleanly so the SDK can surface a retry). This is a distinct 409 from the envelope conflict — distinguished by the absence of the `ENVELOPE_GENERATION_CONFLICT` code.
+- `401` for missing/invalid JWT or step-up token (single-use, 60s TTL — the SDK mints a fresh one for every rotate call AND every CAS retry), `403` for app-role JWTs.
 
 **Effect on `recoverAccount`.** Post-rotation, the OLD account key no longer authenticates `recoverAccount` (the OLD `recovery_lookup_key` no longer maps to any account row, so `/auth/challenge` returns 404). The NEW key works as expected. Pre-rotation data remains decryptable under either the password OR the new recovery factor (the DEK chain itself is unchanged; only the wrappings rotated).
 
@@ -374,12 +396,12 @@ CREATE TABLE passkey_credentials (
 #### Endpoints
 
 - `POST /api/v1/auth/passkey/register-options` — JWT-authed (logged-in user). Returns `{ options, prf_salt }`. Server stores the registration challenge in `webauthn_challenges` (60 s TTL, single-use).
-- `POST /api/v1/auth/passkey/register` — JWT-authed. Body: `{ credential, prf_salt, new_envelope, device_label? }`. Server verifies the WebAuthn registration response, stores the credential row, atomically replaces the envelope, republishes to Arweave. Returns `{ credential_id, device_label, created_at }`.
+- `POST /api/v1/auth/passkey/register` — JWT-authed. Body: `{ credential, prf_salt, new_envelope, device_label?, expected_generation? }`. Server verifies the WebAuthn registration response, runs the envelope CAS (standalone, see [envelope_generation](#optimistic-concurrency-envelope_generation-tarn63)) then inserts the credential row, republishes to Arweave. Returns `{ credential_id, device_label, created_at, envelope_generation }`. `409` with `code: "ENVELOPE_GENERATION_CONFLICT"` on a stale `expected_generation`; `409 "Credential already registered"` on a duplicate credential ID.
 - `POST /api/v1/auth/passkey/authentication-options` — public, **per-IP rate-limited** (60/hr; tarn#59). Body: `{ credential_id? }`. Returns `{ options, rp_id }`. The per-credential PRF salts the client needs are carried inside `options.extensions.prf.evalByCredential` (keyed by `credential_id`); the endpoint no longer echoes a redundant top-level `allow_credentials` array. Two flows: with `credential_id` (account-identified re-tap) the server narrows `options.allowCredentials` to that one credential; without it (usernameless / discoverable sign-in) `options.allowCredentials` is empty and the authenticator self-presents its resident credentials — the standard discoverable WebAuthn shape. Server stores the authentication challenge in `webauthn_challenges` (60 s TTL). **Residual exposure (tarn#59, deferred):** in the discoverable flow the server still has to enumerate every credential into `evalByCredential` so the client can evaluate the right PRF salt for whichever resident credential the user selects in this single round trip. Eliminating that enumeration is a breaking protocol change (single global salt + passkey re-registration, or a second round trip after credential selection) — left as a human decision.
-- `POST /api/v1/auth/passkey/authenticate` — public. Body: `{ credential, previous_sid?, device_label? }`. Server verifies the assertion against the stored public key, increments sign_count, mints a session JWT. Returns `{ jwt, expiresIn, data_lookup_key, wrapped_data_key, account_key_stored, credential_id, stale_credential }`. The JWT carries `via_passkey: true` and `passkey_cred_id: <credential_id>` claims so the refresh-credential endpoint can verify the caller is repairing the same credential they just signed in with.
-- `POST /api/v1/auth/passkey/refresh-credential` — JWT-authed (passkey-side JWT only — `via_passkey: true` plus a matching `passkey_cred_id`). Body: `{ credential_id, new_envelope }`. Repairs a stale credential (see "Stale credentials and re-tap" below). The credential_id in the body MUST match the JWT's `passkey_cred_id`. The new envelope MUST include a `passkey_prf` wrapping for this credential at the latest gen — the server rejects envelopes that would re-establish the stale state. No step-up token is required: the passkey assertion that produced the JWT is the moral equivalent of a fresh re-authentication.
+- `POST /api/v1/auth/passkey/authenticate` — public. Body: `{ credential, previous_sid?, device_label? }`. Server verifies the assertion against the stored public key, increments sign_count, mints a session JWT. Returns `{ jwt, expiresIn, data_lookup_key, wrapped_data_key, envelope_generation, account_key_stored, credential_id, stale_credential }`. `envelope_generation` (tarn#63) is the optimistic-concurrency token for a later envelope mutation (e.g. the stale-credential refresh). The JWT carries `via_passkey: true` and `passkey_cred_id: <credential_id>` claims so the refresh-credential endpoint can verify the caller is repairing the same credential they just signed in with.
+- `POST /api/v1/auth/passkey/refresh-credential` — JWT-authed (passkey-side JWT only — `via_passkey: true` plus a matching `passkey_cred_id`). Body: `{ credential_id, new_envelope, expected_generation? }`. Repairs a stale credential (see "Stale credentials and re-tap" below). The credential_id in the body MUST match the JWT's `passkey_cred_id`. The new envelope MUST include a `passkey_prf` wrapping for this credential at the latest gen — the server rejects envelopes that would re-establish the stale state. Runs the envelope CAS; returns `{ refreshed, credential_id, envelope_generation }` or `409 ENVELOPE_GENERATION_CONFLICT`. No step-up token is required: the passkey assertion that produced the JWT is the moral equivalent of a fresh re-authentication.
 - `GET /api/v1/account/passkeys` — JWT-authed. Returns `{ passkeys: [{ credential_id, device_label, created_at, last_used_at, stale }, ...] }`. Public keys and PRF salts are NOT exposed (those are auth-internal). The `stale` boolean (Phase 6.2) is computed server-side per credential by parsing the live envelope and checking whether a `passkey_prf` wrapping exists for this `credential_id` at the latest gen — see "Stale credentials and re-tap" for the meaning. Surfacing it here lets a Settings UI render a "Refresh recommended" indicator without waiting for the user to bounce off a stale credential at login time.
-- `DELETE /api/v1/account/passkeys/:credential_id` — JWT + step-up token. Body: `{ new_envelope }`. Strips the credential row and the matching wrappings, republishes to Arweave. Step-up reuses the existing `account_key_fetch` scope (the security posture is identical to the account-key toggles).
+- `DELETE /api/v1/account/passkeys/:credential_id` — JWT + step-up token. Body: `{ new_envelope, expected_generation? }`. Runs the envelope CAS (standalone) then deletes the credential row, republishes to Arweave. Returns `{ removed, credential_id, envelope_generation }` or `409 ENVELOPE_GENERATION_CONFLICT`. Step-up reuses the existing `account_key_fetch` scope (the security posture is identical to the account-key toggles).
 
 #### Stale credentials and re-tap (Phase 6.1)
 

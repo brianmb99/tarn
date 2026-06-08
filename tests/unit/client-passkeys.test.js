@@ -700,7 +700,6 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
         // /auth/passkey/authentication-options
         { status: 200, body: JSON.stringify({
           options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
-          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
           rp_id: 'localhost',
         }) },
         // /auth/passkey/authenticate
@@ -768,7 +767,6 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
       mockFetch([
         { status: 200, body: JSON.stringify({
           options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
-          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
           rp_id: 'localhost',
         }) },
         { status: 200, body: JSON.stringify({
@@ -829,7 +827,6 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
       mockFetch([
         { status: 200, body: JSON.stringify({
           options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
-          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
           rp_id: 'localhost',
         }) },
         { status: 200, body: JSON.stringify({
@@ -900,7 +897,6 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
       mockFetch([
         { status: 200, body: JSON.stringify({
           options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
-          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
           rp_id: 'localhost',
         }) },
         { status: 200, body: JSON.stringify({
@@ -993,7 +989,6 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
         // /auth/passkey/authentication-options
         { status: 200, body: JSON.stringify({
           options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
-          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
           rp_id: 'localhost',
         }) },
         // /auth/passkey/authenticate — stale_credential: true
@@ -1069,7 +1064,6 @@ describe('Phase 6.1 — authenticateWithPasskey stale-credential handling', () =
       mockFetch([
         { status: 200, body: JSON.stringify({
           options: { rpId: 'localhost', challenge: 'AAAA', allowCredentials: [{ id: credentialId, type: 'public-key' }], extensions: { prf: { evalByCredential: { [credentialId]: { first: 'AAAA' } } } } },
-          allow_credentials: [{ credential_id: credentialId, prf_salt: 'AAAA' }],
           rp_id: 'localhost',
         }) },
         { status: 200, body: JSON.stringify({

@@ -437,7 +437,7 @@ export async function handleChallenge(request, env, cors) {
       return errorResponse('Invalid recovery_lookup_key', 400, cors);
     }
     const recoveryAccount = await env.DB.prepare(
-      'SELECT data_lookup_key, wrapped_data_key FROM accounts WHERE recovery_lookup_key = ?1'
+      'SELECT data_lookup_key, wrapped_data_key, envelope_generation FROM accounts WHERE recovery_lookup_key = ?1'
     ).bind(recovery_lookup_key).first();
     if (!recoveryAccount) {
       return errorResponse('Unknown recovery_lookup_key', 404, cors);
@@ -448,6 +448,9 @@ export async function handleChallenge(request, env, cors) {
       nonce,
       data_lookup_key: recoveryAccount.data_lookup_key,
       wrapped_data_key: recoveryAccount.wrapped_data_key,
+      // tarn#63 — the envelope's optimistic-concurrency token, so a later
+      // envelope mutation in this session can send it as expected_generation.
+      envelope_generation: recoveryAccount.envelope_generation,
     }, 200, cors);
   }
 
@@ -457,7 +460,7 @@ export async function handleChallenge(request, env, cors) {
 
   // Look up in accounts table first
   const account = await env.DB.prepare(
-    'SELECT data_lookup_key, wrapped_data_key FROM accounts WHERE credential_lookup_key = ?1'
+    'SELECT data_lookup_key, wrapped_data_key, envelope_generation FROM accounts WHERE credential_lookup_key = ?1'
   ).bind(credential_lookup_key).first();
 
   if (account) {
@@ -467,6 +470,9 @@ export async function handleChallenge(request, env, cors) {
       nonce,
       data_lookup_key: account.data_lookup_key,
       wrapped_data_key: account.wrapped_data_key,
+      // tarn#63 — the envelope's optimistic-concurrency token, so a later
+      // envelope mutation in this session can send it as expected_generation.
+      envelope_generation: account.envelope_generation,
     }, 200, cors);
   }
 
