@@ -215,7 +215,10 @@ await test('Idempotent write: retry with same X-Idempotency-Key returns same txi
 
 await test('Read entry from D1 cache', async () => {
   await sleep(500); // Brief wait for write-through
-  const res = await fetch(`${API_BASE}/api/v1/entries?app=${APP_ID}&type=entry&key=${testDlk}`);
+  // #60: metadata reads require a session JWT.
+  const tarn = new TarnClient(API_BASE, APP_ID);
+  await tarn.login(testUsername, testPassword);
+  const res = await fetch(`${API_BASE}/api/v1/entries?app=${APP_ID}&type=entry&key=${testDlk}`, { headers: { 'Authorization': `Bearer ${tarn._testJwt()}` } });
   const json = await res.json();
   assert(res.status === 200, `Read failed: ${res.status}`);
   assert(json.entries.length >= 1, `Expected entries, got ${json.entries.length}`);
@@ -225,13 +228,19 @@ await test('Read entry from D1 cache', async () => {
 
 await test('Entry available on Turbo gateway', async () => {
   await sleep(3000); // Wait for background Turbo upload
-  const res = await fetch(`https://turbo-gateway.com/${entryTxid}`, { signal: AbortSignal.timeout(10000) });
-  if (res.ok) {
-    const bytes = (await res.arrayBuffer()).byteLength;
-    console.log(`    ${bytes} bytes on Turbo gateway (encrypted)`);
-  } else {
-    console.log(`    Gateway returned ${res.status} — may need more time`);
-    // Not a hard failure — Turbo upload is background/async
+  try {
+    const res = await fetch(`https://turbo-gateway.com/${entryTxid}`, { signal: AbortSignal.timeout(10000) });
+    if (res.ok) {
+      const bytes = (await res.arrayBuffer()).byteLength;
+      console.log(`    ${bytes} bytes on Turbo gateway (encrypted)`);
+    } else {
+      console.log(`    Gateway returned ${res.status} — may need more time`);
+    }
+  } catch (err) {
+    // A throw here is gateway propagation/timeout, not a deploy fault — the
+    // Turbo upload is background/async and the public gateway is eventually
+    // consistent. The D1-cache read above already proves the write worked.
+    console.log(`    Gateway fetch failed (${err.message}) — normal for a fresh upload (async propagation)`);
   }
   // Pass regardless — the D1 cache test above proves the write worked
 });
@@ -580,6 +589,7 @@ await test('?eid= filter returns at most one live entry with inline blob', async
   // Raw API call to prove the filter works at the SQL layer.
   const res = await fetch(
     `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${eidType}&key=${testDlk}&eid=${encodeURIComponent(eid)}`,
+    { headers: { 'Authorization': `Bearer ${tarn._testJwt()}` } },
   );
   const json = await res.json();
   assert(res.status === 200, `?eid= filter returned ${res.status}`);
@@ -636,7 +646,7 @@ await test('?since= returns events with inline blobs and an advancing cursor', a
 
   // First sync from the beginning.
   const url1 = `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${deltaType}&key=${testDlk}&since=${encodeURIComponent('0:')}`;
-  const res1 = await fetch(url1);
+  const res1 = await fetch(url1, { headers: { 'Authorization': `Bearer ${tarn._testJwt()}` } });
   const json1 = await res1.json();
   assert(res1.status === 200, `delta first sync returned ${res1.status}`);
   assert(Array.isArray(json1.entries), 'response missing entries array');
@@ -650,7 +660,7 @@ await test('?since= returns events with inline blobs and an advancing cursor', a
   // Second sync with the cursor: should see zero new events (nothing changed).
   const cursor = json1.pagination.cursor;
   const url2 = `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${deltaType}&key=${testDlk}&since=${encodeURIComponent(cursor)}`;
-  const res2 = await fetch(url2);
+  const res2 = await fetch(url2, { headers: { 'Authorization': `Bearer ${tarn._testJwt()}` } });
   const json2 = await res2.json();
   assert(res2.status === 200, `delta warm sync returned ${res2.status}`);
   assert(json2.entries.length === 0, `warm sync should see zero events, got ${json2.entries.length}`);
@@ -671,7 +681,7 @@ await test('deletion surfaces as { eid, deleted: true } — no tombstone leakage
 
   // Capture the cursor at the "just after the create" mark.
   const baseUrl = `${API_BASE}/api/v1/entries?app=${APP_ID}&type=${deltaType}&key=${testDlk}`;
-  const after1 = await fetch(`${baseUrl}&since=${encodeURIComponent('0:')}`).then((r) => r.json());
+  const after1 = await fetch(`${baseUrl}&since=${encodeURIComponent('0:')}`, { headers: { 'Authorization': `Bearer ${tarn._testJwt()}` } }).then((r) => r.json());
   const cursorAfterCreate = after1.pagination.cursor;
   // Confirm we see the live entry at this point.
   assert(after1.entries.some((e) => e.eid === eid && !e.deleted),
@@ -685,7 +695,7 @@ await test('deletion surfaces as { eid, deleted: true } — no tombstone leakage
 
   // Polling with the post-create cursor should now surface the deletion as
   // a semantic event — never as a tombstone row.
-  const after2 = await fetch(`${baseUrl}&since=${encodeURIComponent(cursorAfterCreate)}`).then((r) => r.json());
+  const after2 = await fetch(`${baseUrl}&since=${encodeURIComponent(cursorAfterCreate)}`, { headers: { 'Authorization': `Bearer ${tarn._testJwt()}` } }).then((r) => r.json());
   const deletion = after2.entries.find((e) => e.eid === eid && e.deleted === true);
   assert(deletion, 'tombstone must surface as { eid, deleted: true } event');
   assert(!('txid' in deletion) || !deletion.data,
