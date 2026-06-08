@@ -43,6 +43,8 @@ import {
   handleGetAppInviteTemplate,
 } from './routes/invites.js';
 import { setSkipTurboFromEnv } from './turbo.js';
+import { handleGetHealthReport } from './routes/admin.js';
+import { runScheduledChecks } from './observability/scheduled.js';
 
 // ============ CORS ============
 
@@ -308,10 +310,40 @@ export default {
         return await handleSetSchema(schemaMatch[1], request, env, ctx, cors);
       }
 
+      // Admin — latest health report (authenticated, app role; optionally
+      // locked to ADMIN_APP_ID). Written by the scheduled() cron handler.
+      if (path === '/api/v1/admin/health-report' && method === 'GET') {
+        return await handleGetHealthReport(request, env, ctx, cors);
+      }
+
       return errorResponse('Not found', 404, cors);
     } catch (err) {
       console.error('[tarn-api] Unhandled error:', err.message, err.stack);
       return errorResponse('Internal server error', 500, cors);
     }
+  },
+
+  // ============ CRON / SCHEDULED ============
+  //
+  // CORE observability sweep. Wired to the `[triggers] crons` entry in
+  // wrangler.toml (hourly). Runs readiness + D1<->Arweave drift + Turbo
+  // balance/runway + aux-table cleanup, persists a report to health_reports,
+  // and alerts via ALERT_WEBHOOK_URL when unhealthy.
+  //
+  // We wrap the whole sweep in ctx.waitUntil so the cron invocation is held
+  // open until the async work (GraphQL queries, Turbo lookups, D1 writes,
+  // optional webhook) completes. runScheduledChecks itself never throws —
+  // every leg is internally try/caught — but we guard here too so a thrown
+  // import/wiring error can't crash the scheduled runtime silently.
+  async scheduled(event, env, ctx) {
+    // Note: the observability sweep never UPLOADS to Turbo (it only reads the
+    // wallet balance and price endpoints), so the request-scoped
+    // TARN_SKIP_TURBO global is irrelevant here and we deliberately do not
+    // touch it.
+    ctx.waitUntil(
+      runScheduledChecks(env).catch((err) => {
+        console.error('[tarn-api][observability] scheduled sweep crashed:', err?.message, err?.stack);
+      }),
+    );
   },
 };

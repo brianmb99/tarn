@@ -1,7 +1,8 @@
-// Health check endpoint
+// Health check / readiness endpoint
 
 import { jsonResponse } from '../worker.js';
 import { PROTOCOL_VERSION } from '../constants.js';
+import { checkReadiness } from '../observability/scheduled.js';
 
 const ARWEAVE_GRAPHQL = 'https://arweave.net/graphql';
 
@@ -29,7 +30,20 @@ export async function handleHealth(env, cors) {
     checks.arweave = { reachable: false, error: err.message };
   }
 
-  const healthy = checks.d1?.reachable && checks.arweave?.reachable;
+  // Readiness (CORE observability): APP_SIGNING_KEY parseable + Turbo reachable.
+  // Shared with the scheduled() cron so /health and the cron agree on what
+  // "ready to serve writes" means. A missing/unparseable signing key means we
+  // can't sign Arweave DataItems at all; an unreachable Turbo means uploads
+  // will fail — both are readiness failures, so /health returns 503.
+  const readiness = await checkReadiness(env);
+  checks.signing_key = readiness.signing_key;
+  checks.turbo = readiness.turbo;
+
+  const healthy =
+    checks.d1?.reachable &&
+    checks.arweave?.reachable &&
+    readiness.signing_key?.ok &&
+    readiness.turbo?.ok;
 
   return jsonResponse(
     { healthy, version: PROTOCOL_VERSION, checks },

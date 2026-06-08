@@ -5,6 +5,7 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { getAddress } from '../ans104.js';
 import { PROTOCOL_VERSION } from '../constants.js';
+import { fetchTurboBalance } from '../observability/funding.js';
 
 /**
  * GET /api/v1/status
@@ -34,6 +35,19 @@ export async function handleStatus(request, env, ctx, cors) {
         if (priceRes.ok) {
           const priceData = await priceRes.json();
           status.wallet.turbo_price_100kb_winc = priceData.winc;
+        }
+      } catch {}
+
+      // Turbo wallet balance (winc). The runway calculation lives in the
+      // scheduled() cron; here we just surface the raw balance so operators
+      // can eyeball it from /status. Resilient — fetchTurboBalance never
+      // throws and a 404 (wallet never funded) is reported as 0.
+      try {
+        const bal = await fetchTurboBalance(address);
+        if (bal.ok) {
+          status.wallet.turbo_balance = bal.winc;
+        } else {
+          status.wallet.turbo_balance_error = bal.error;
         }
       } catch {}
     } catch {}
