@@ -62,6 +62,18 @@ export async function handleEntries(url, env, ctx, cors, request) {
     return errorResponse('Missing required params: app, type, key', 400, cors);
   }
 
+  // tarn#60 — `key` is a data_lookup_key, which is always a 64-char lowercase
+  // hex string (SHA-256-shaped; see TARN_PROTOCOL.md). Reject anything else up
+  // front, before any DB / cache / rate-limit work. This is non-breaking
+  // (every legitimate dlk matches) and shrinks the unauthenticated
+  // metadata-enumeration surface: a prober can no longer spend our rate-limit
+  // KV keyspace on arbitrary attacker-controlled strings, and malformed keys
+  // fail fast instead of fanning out into cache lookups. Mirrors the existing
+  // validation on GET /api/v1/lookup.
+  if (!/^[a-f0-9]{64}$/.test(key)) {
+    return errorResponse('Invalid key format: expected 64-char hex', 400, cors);
+  }
+
   // Per-account rate limit. `key` is the caller's data_lookup_key — knowing
   // it proves identity for read purposes (the data is encrypted anyway), so
   // we bucket on it directly. See tarn#31 for the migration off per-IP.

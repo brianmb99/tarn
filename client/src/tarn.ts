@@ -2320,8 +2320,12 @@ export class TarnClient {
    * to a logged-in client.
    *
    * Flow:
-   *   1. POST /auth/passkey/authentication-options → { options,
-   *      allow_credentials: [{ credential_id, prf_salt }, ...] }
+   *   1. POST /auth/passkey/authentication-options → { options, rp_id }.
+   *      The per-credential PRF salts ride inside
+   *      `options.extensions.prf.evalByCredential` (keyed by credential_id);
+   *      we read the salt from there, never from a top-level list. (tarn#59
+   *      removed the redundant `allow_credentials` echo; the discoverable
+   *      flow leaves `options.allowCredentials` empty.)
    *   2. navigator.credentials.get(options) — user authenticates.
    *   3. Extract the PRF output for the credential the user picked.
    *   4. POST /auth/passkey/authenticate → { jwt, wrapped_data_key, ... }

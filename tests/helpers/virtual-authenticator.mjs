@@ -396,6 +396,22 @@ export function installPasskeyTestEnv({ origin = 'http://localhost:3000', rpId =
           const id = bytesToBase64Url(new Uint8Array(a.id));
           if (registry.has(id)) { pickedB64 = id; break; }
         }
+        // tarn#59 — discoverable flow: the server now leaves allowCredentials
+        // empty (the standard usernameless shape), so a real platform
+        // authenticator self-selects from its resident credentials. Simulate
+        // that by picking a registered credential the RP knows about — i.e.
+        // one named in the PRF evalByCredential map (which still enumerates
+        // the RP's credentials). Falls back to any registered credential so
+        // single-passkey tests "just work" without an explicit pin.
+        if (!pickedB64 && allowed.length === 0) {
+          const ebcKeys = Object.keys(publicKey.extensions?.prf?.evalByCredential || {});
+          for (const id of ebcKeys) {
+            if (registry.has(id)) { pickedB64 = id; break; }
+          }
+          if (!pickedB64) {
+            for (const id of registry.keys()) { pickedB64 = id; break; }
+          }
+        }
       }
       if (!pickedB64) throw new Error('virtual authenticator: no allowed credential found in registry');
 

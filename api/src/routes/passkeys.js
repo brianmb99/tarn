@@ -36,6 +36,7 @@ import {
 import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { signJWT, PASSKEY_JWT_TTL_SECONDS } from '../auth.js';
+import { checkAndIncrementRateLimit } from '../rate-limit.js';
 import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH, buildCredentialTags } from './auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
@@ -51,6 +52,30 @@ import {
 
 const WEBAUTHN_CHALLENGE_TTL_SECONDS = 60;
 const RP_NAME = 'Tarn';
+
+// Abuse cap for the public, unauthenticated passkey authentication-options
+// endpoint (tarn#59). Keyed per-IP, mirroring the other public endpoints
+// (register / lookup / share-lookup / inbox-fetch). Each options call mints a
+// WebAuthn challenge row + (in the discoverable flow) reads the credential
+// table, so an unbounded public endpoint is both a scraping surface and a
+// write-amplification vector. 60/hr is generous for a real sign-in ceremony
+// (a user retrying a few times still fits comfortably) while shutting down
+// bulk enumeration. Fails open on KV outage, same as every other limiter.
+const MAX_PASSKEY_AUTH_OPTIONS_PER_HOUR = 60;
+
+async function checkPasskeyAuthOptionsRateLimit(env, request) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const data = new TextEncoder().encode(ip + '-tarn-passkey-authopts-salt');
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const ipHash = Array.from(new Uint8Array(hash)).slice(0, 8)
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  const hour = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
+  const key = `passkey-authopts:${ipHash}:${hour}`;
+  const { allowed, count } = await checkAndIncrementRateLimit(
+    env.RATE_KV, key, MAX_PASSKEY_AUTH_OPTIONS_PER_HOUR,
+  );
+  return { allowed, remaining: Math.max(0, MAX_PASSKEY_AUTH_OPTIONS_PER_HOUR - count) };
+}
 
 /**
  * Allowlist of (origin → rp_id) pairs. Tarn-issued passkeys must have an
@@ -491,6 +516,14 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
     return errorResponse('Origin not allowed for passkey operations', 400, cors);
   }
 
+  // tarn#59 — this endpoint is public and (in the discoverable flow) reads the
+  // credential table, so it must be rate-limited to blunt bulk enumeration and
+  // challenge-row write amplification. Per-IP, hourly, fails open.
+  const { allowed } = await checkPasskeyAuthOptionsRateLimit(env, request);
+  if (!allowed) {
+    return errorResponse('Rate limit exceeded', 429, { ...cors, 'Retry-After': '3600' });
+  }
+
   let body;
   try {
     body = await request.json();
@@ -499,31 +532,52 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
   }
   const credentialIdHint = typeof body?.credential_id === 'string' ? body.credential_id : null;
 
-  // Discoverable flow: when no credential_id is supplied, return ALL of
-  // the relying party's credentials so the authenticator can pick. In
-  // practice with PRF there's no privacy concern (the credential_id is
-  // already the public identifier of the passkey), so this is fine.
-  // When a credential_id IS supplied, narrow to just that one (faster
-  // for known-account flows).
-  let rows;
+  // tarn#59 — two flows, two postures:
+  //
+  //   credential_id supplied (account-identified re-tap, e.g. the SDK's
+  //   re-wrap ceremony): narrow to exactly that credential. We return it in
+  //   `allowCredentials` so the authenticator is steered to the right key,
+  //   and supply its single salt via the PRF map. Scoped — no other account's
+  //   credential is touched.
+  //
+  //   no credential_id (usernameless / discoverable sign-in, what Bookish
+  //   does): use a STANDARD discoverable flow — `allowCredentials` is left
+  //   empty so the authenticator presents its own resident credentials rather
+  //   than us enumerating the table into the allow-list. We no longer dump the
+  //   table into a top-level `allow_credentials` array either (no client reads
+  //   it — verified against the live Bookish bundle).
+  //
+  //   Residual (deferred, see issue): the discoverable flow STILL has to put
+  //   every credential_id → prf_salt into `options.extensions.prf
+  //   .evalByCredential`, because the PRF salt is per-credential and the
+  //   client must be able to evaluate it for whichever resident credential the
+  //   user picks in this single round trip. Removing that enumeration requires
+  //   a breaking protocol change (a global salt, or a second round trip after
+  //   credential selection) and is left as a human decision.
+  let credentials;
   if (credentialIdHint) {
-    rows = await env.DB.prepare(
+    const rows = await env.DB.prepare(
       'SELECT credential_id, prf_salt FROM passkey_credentials WHERE credential_id = ?1'
     ).bind(credentialIdHint).all();
+    credentials = rows.results || [];
   } else {
-    rows = await env.DB.prepare(
+    const rows = await env.DB.prepare(
       'SELECT credential_id, prf_salt FROM passkey_credentials'
     ).all();
+    credentials = rows.results || [];
   }
-  const credentials = rows.results || [];
 
   const challenge = generateChallengeBytes();
-  const challengeB64Url = bytesToBase64Url(challenge);
 
   const options = await generateAuthenticationOptions({
     rpID: rp.rpId,
     timeout: 60_000,
-    allowCredentials: credentials.map(r => ({ id: r.credential_id })),
+    // Discoverable flow → empty allow-list (authenticator self-presents its
+    // resident credentials). Account-identified re-tap → steer to the one
+    // credential the caller named.
+    allowCredentials: credentialIdHint
+      ? credentials.map(r => ({ id: r.credential_id }))
+      : [],
     userVerification: 'preferred',
     challenge,
     extensions: {
@@ -546,15 +600,12 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
     'INSERT INTO webauthn_challenges (challenge, data_lookup_key, purpose, issued_at, expires_at, consumed_at) VALUES (?1, NULL, ?2, ?3, ?4, NULL)'
   ).bind(options.challenge, 'authenticate', issuedAt, expiresAt).run();
 
-  // Echo the per-credential prf_salt back so the SDK can derive the
-  // wrapping key locally after the assertion. Repeated here for clarity
-  // even though it's already in the extensions block.
+  // tarn#59 — the salts the client needs are already carried in
+  // `options.extensions.prf.evalByCredential`; we no longer echo a separate
+  // top-level `allow_credentials` array (it was a redundant second copy of the
+  // credential→salt map that no client consumes).
   return jsonResponse({
     options,
-    allow_credentials: credentials.map(r => ({
-      credential_id: r.credential_id,
-      prf_salt: r.prf_salt,
-    })),
     rp_id: rp.rpId,
   }, 200, cors);
 }

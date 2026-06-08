@@ -375,7 +375,7 @@ CREATE TABLE passkey_credentials (
 
 - `POST /api/v1/auth/passkey/register-options` — JWT-authed (logged-in user). Returns `{ options, prf_salt }`. Server stores the registration challenge in `webauthn_challenges` (60 s TTL, single-use).
 - `POST /api/v1/auth/passkey/register` — JWT-authed. Body: `{ credential, prf_salt, new_envelope, device_label? }`. Server verifies the WebAuthn registration response, stores the credential row, atomically replaces the envelope, republishes to Arweave. Returns `{ credential_id, device_label, created_at }`.
-- `POST /api/v1/auth/passkey/authentication-options` — public. Returns `{ options, allow_credentials: [{ credential_id, prf_salt }, ...], rp_id }`. Server stores the authentication challenge in `webauthn_challenges` (60 s TTL).
+- `POST /api/v1/auth/passkey/authentication-options` — public, **per-IP rate-limited** (60/hr; tarn#59). Body: `{ credential_id? }`. Returns `{ options, rp_id }`. The per-credential PRF salts the client needs are carried inside `options.extensions.prf.evalByCredential` (keyed by `credential_id`); the endpoint no longer echoes a redundant top-level `allow_credentials` array. Two flows: with `credential_id` (account-identified re-tap) the server narrows `options.allowCredentials` to that one credential; without it (usernameless / discoverable sign-in) `options.allowCredentials` is empty and the authenticator self-presents its resident credentials — the standard discoverable WebAuthn shape. Server stores the authentication challenge in `webauthn_challenges` (60 s TTL). **Residual exposure (tarn#59, deferred):** in the discoverable flow the server still has to enumerate every credential into `evalByCredential` so the client can evaluate the right PRF salt for whichever resident credential the user selects in this single round trip. Eliminating that enumeration is a breaking protocol change (single global salt + passkey re-registration, or a second round trip after credential selection) — left as a human decision.
 - `POST /api/v1/auth/passkey/authenticate` — public. Body: `{ credential, previous_sid?, device_label? }`. Server verifies the assertion against the stored public key, increments sign_count, mints a session JWT. Returns `{ jwt, expiresIn, data_lookup_key, wrapped_data_key, account_key_stored, credential_id, stale_credential }`. The JWT carries `via_passkey: true` and `passkey_cred_id: <credential_id>` claims so the refresh-credential endpoint can verify the caller is repairing the same credential they just signed in with.
 - `POST /api/v1/auth/passkey/refresh-credential` — JWT-authed (passkey-side JWT only — `via_passkey: true` plus a matching `passkey_cred_id`). Body: `{ credential_id, new_envelope }`. Repairs a stale credential (see "Stale credentials and re-tap" below). The credential_id in the body MUST match the JWT's `passkey_cred_id`. The new envelope MUST include a `passkey_prf` wrapping for this credential at the latest gen — the server rejects envelopes that would re-establish the stale state. No step-up token is required: the passkey assertion that produced the JWT is the moral equivalent of a fresh re-authentication.
 - `GET /api/v1/account/passkeys` — JWT-authed. Returns `{ passkeys: [{ credential_id, device_label, created_at, last_used_at, stale }, ...] }`. Public keys and PRF salts are NOT exposed (those are auth-internal). The `stale` boolean (Phase 6.2) is computed server-side per credential by parsing the live envelope and checking whether a `passkey_prf` wrapping exists for this `credential_id` at the latest gen — see "Stale credentials and re-tap" for the meaning. Surfacing it here lets a Settings UI render a "Refresh recommended" indicator without waiting for the user to bounce off a stale credential at login time.
@@ -1233,7 +1233,7 @@ endpoint has an account identity available. The 429 response always includes
 | Authenticated writes | `data_lookup_key` | 100/hr | D1 (atomic INSERT ... ON CONFLICT) | `POST/PUT/DELETE /entries`, `POST /entries/batch` (one batch = one hit) |
 | Authenticated reads | `data_lookup_key` | 1000/hr | KV | `GET /entries` (always), `GET /entries/{txid}?key=…` |
 | Unauthenticated reads | IP-hash | 1000/hr | KV | `GET /entries/{txid}` without `key` |
-| Unauthenticated other | IP-hash | endpoint-specific | KV | `POST /auth/register`, share lookup, invite preview, share-inbox/log fetches |
+| Unauthenticated other | IP-hash | endpoint-specific | KV | `POST /auth/register`, share lookup, invite preview, share-inbox/log fetches, **`POST /auth/passkey/authentication-options` (60/hr; tarn#59)** |
 
 Reads were originally per-IP across the board; that caused noisy-neighbor
 failures on shared NAT (one user, or one bad actor, could exhaust the bucket
@@ -1241,6 +1241,50 @@ for every other Tarn user behind the same coffee-shop / office / mobile
 carrier IP — tarn#31). Switching authenticated reads to per-account quotas
 matches the write path's identity model and makes shared-network usage
 behave correctly.
+
+#### Residual: `GET /entries?key=<dlk>` metadata-enumeration surface (tarn#60 — DEFERRED)
+
+`GET /api/v1/entries?...&key=<dlk>` is intentionally unauthenticated: the
+`key` (data_lookup_key) is treated as a read capability, and the data is
+zero-knowledge encrypted, so the server never needs a JWT to serve a read.
+The known residual (tarn#60): the `dlk` is **not a secret**. It is emitted in
+several authenticated responses (`/auth/verify`, `/auth/passkey/authenticate`,
+etc.) and is published on Arweave as the public `Lk` tag on every entry/
+credential write. Anyone who learns a victim's `dlk` can therefore read that
+account's **encrypted** metadata stream — entry counts, `Eid`s, tags,
+ciphertext, write timing — bounded only by the 1000/hr per-`dlk` read bucket.
+Zero-knowledge still holds (no plaintext is exposed), but it is a broad
+scraping / activity-inference surface, and because the limit is keyed on the
+`dlk`, an attacker scraping a victim's `dlk` shares the victim's own bucket
+(an availability nuisance, not an escalation).
+
+**What is hardened today (non-breaking):** nothing in the `/entries` response
+echoes the `dlk` gratuitously (the only place it appears is the `Lk` Arweave
+tag, which is already public on-chain — trimming it would be security theater
+and risks breaking tag-parsing clients), and the read path remains
+rate-limited per account.
+
+**Why the obvious fixes are deferred (each is breaking):**
+
+- *Require a JWT for metadata reads.* The live read path (`getEntriesSince`,
+  the list path) deliberately sends **no** `Authorization` header — the SDK's
+  `#fetch` only attaches the JWT when `auth: true` is passed, and the read
+  calls do not. Adding a JWT requirement would break every deployed client's
+  delta-sync immediately. A migration would need the SDK to start sending the
+  JWT on reads first, ship, wait for adoption, then enforce.
+- *Lower the per-account cap.* Heavy initial sync (delta-poll + per-entry blob
+  backfill) legitimately bursts; 1000/hr was the deliberate tarn#31 choice.
+  Lowering it risks throttling legitimate catch-up sync.
+- *Add a per-IP enumeration ceiling.* This re-creates the exact tarn#31
+  failure: CGNAT / carrier-grade NAT puts thousands of distinct mobile users
+  behind one IP, so any per-IP cap on this path would throttle unrelated legit
+  users. Rejected for the same reason reads moved off per-IP in the first
+  place.
+
+The genuinely complete fix (treat the `dlk` as a bearer secret, or split a
+separate read-capability token from the public `Lk` tag) is a protocol-level
+change with client-migration cost. It is left as a **human decision**, not
+guessed at here.
 
 Writes use D1 because the failure mode of an over-cap write (Arweave upload
 funded by Tarn's wallet) is "real money spent." The TOCTOU-immune atomic
