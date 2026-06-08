@@ -13,6 +13,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleEntries } from '../../api/src/routes/entries.js';
+import { signJWT } from '../../api/src/auth.js';
 
 // A DB / KV that throws if touched — proves the format check short-circuits
 // BEFORE any rate-limit or cache work for a malformed key.
@@ -23,7 +24,26 @@ const explodingEnv = {
 
 const ctx = { waitUntil() {} };
 const cors = {};
+// The format-rejection cases (malformed key) must 400 BEFORE the auth check —
+// the regex runs first by design — so a request with no Authorization header
+// still proves the fast-fail property.
 const request = { headers: { get() { return null; } } };
+
+// tarn#60 — once a key passes the format gate the route requires a user-role
+// JWT matching that account. The "valid key passes the gate" case below needs
+// one. We omit `sid` so requireAuth takes the stateless grandfather branch and
+// never touches a sessions table.
+const JWT_SECRET = btoa('entries-key-format-test-secret');
+async function authedRequestFor(dlk) {
+  const jwt = await signJWT({ sub: dlk, role: 'user' }, JWT_SECRET);
+  return {
+    headers: {
+      get(name) {
+        return name === 'Authorization' ? `Bearer ${jwt}` : null;
+      },
+    },
+  };
+}
 
 function urlFor(key) {
   return new URL(`https://api.tarn.dev/api/v1/entries?app=bookish&type=entry&key=${key}`);
@@ -69,11 +89,15 @@ describe('handleEntries — key format validation (tarn#60)', () => {
   });
 
   it('a well-formed 64-char hex key PASSES the format gate (proceeds to rate-limit)', async () => {
-    // For a valid key the handler must move PAST validation into the
-    // rate-limit check. We detect that by handing it a RATE_KV that records a
-    // get — if validation had rejected the key, RATE_KV would never be read.
+    // For a valid key the handler must move PAST validation (and the tarn#60
+    // auth check) into the rate-limit check. We detect that by handing it a
+    // RATE_KV that records a get — if validation or auth had rejected the
+    // request, RATE_KV would never be read. The request carries a matching
+    // user-role JWT so the account-match check passes.
+    const request = await authedRequestFor(VALID_DLK);
     let kvTouched = false;
     const env = {
+      JWT_SECRET,
       RATE_KV: {
         async get() { kvTouched = true; return null; },
         async put() {},

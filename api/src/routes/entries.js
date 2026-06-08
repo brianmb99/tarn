@@ -1,17 +1,31 @@
 // Entry listing and single-entry endpoints (read-only).
 //
+// Authentication (tarn#60):
+//   - GET /api/v1/entries — requires a user-role session JWT whose account
+//     (auth.data_lookup_key) matches the `key` query param. Knowing a dlk is
+//     no longer sufficient to read an account's encrypted metadata: the dlk
+//     stopped being a read bearer-token. 401 on missing/invalid JWT, 403 when
+//     the JWT belongs to a different account.
+//   - GET /api/v1/entries/:txid — same requirement when a `key` param is
+//     supplied (the SDK's blob-fetch path always supplies the JWT now). The
+//     `key`-less variant (txid-only metadata lookup) is still allowed without
+//     auth because entry tags are already public on Arweave — the encrypted
+//     blob body is the only secret, and that's what this route returns, so the
+//     gate there is "do you know the exact content-addressed txid."
+//
 // Rate-limit keying:
-//   - GET /api/v1/entries — requires `key` (data_lookup_key) in the URL, so
-//     we bucket on the account (mirrors the per-account write limit).
-//   - GET /api/v1/entries/:txid — `key` is OPTIONAL. When present we still
-//     bucket on the account; when absent (txid-only metadata lookup, allowed
-//     because tags are public on Arweave) we fall back to per-IP.
+//   - Both routes bucket on the authenticated account (read:<dlk>:<hour>),
+//     mirroring the per-account write limit. Because reads now carry a JWT,
+//     the bucket identity is the session's account rather than an
+//     attacker-supplied dlk. The key-less by-txid path still falls back to
+//     per-IP (no account identity to bucket on).
 //
 // Per-IP read limits used to apply uniformly here, which caused noisy-
 // neighbor failures on shared NAT (tarn#31). The account-keyed path now
 // matches the write path's identity model.
 
 import { jsonResponse, errorResponse } from '../worker.js';
+import { requireAuth } from '../middleware/auth.js';
 import {
   getResolvedEntries,
   getResolvedEntryByEid,
@@ -74,9 +88,32 @@ export async function handleEntries(url, env, ctx, cors, request) {
     return errorResponse('Invalid key format: expected 64-char hex', 400, cors);
   }
 
-  // Per-account rate limit. `key` is the caller's data_lookup_key — knowing
-  // it proves identity for read purposes (the data is encrypted anyway), so
-  // we bucket on it directly. See tarn#31 for the migration off per-IP.
+  // tarn#60 — require a user-role session JWT, and enforce that the JWT's
+  // account matches the dlk being read. A dlk is no longer a read
+  // bearer-token: an unauthenticated party that learns one can no longer
+  // enumerate the account's encrypted metadata. Zero-knowledge is preserved
+  // (the server still never sees plaintext); this only gates WHO may pull a
+  // given account's encrypted rows.
+  //
+  // Ordering note: the cheap key-format regex runs first (above) so a
+  // malformed key still fails fast with 400 and never touches the JWT
+  // verifier / DB / KV. The regex reveals nothing — the key is
+  // attacker-supplied — so there's no pre-auth disclosure concern.
+  const auth = await requireAuth(request, env, ctx);
+  if (!auth) {
+    return errorResponse('Unauthorized', 401, cors);
+  }
+  // App-role JWTs are platform credentials, not account sessions — they have
+  // no business reading a user's encrypted metadata, and auth.data_lookup_key
+  // is the app_id for them (would never match a real dlk anyway). Require a
+  // user-role session.
+  if (auth.role !== 'user' || auth.data_lookup_key !== key) {
+    return errorResponse('Forbidden', 403, cors);
+  }
+
+  // Per-account rate limit, keyed on the authenticated account's dlk (now
+  // proven by the JWT rather than asserted by the URL param). Mirrors the
+  // per-account write limit. See tarn#31 for the migration off per-IP.
   const { allowed } = await checkReadRateLimitByAccount(env, key);
   if (!allowed) {
     return errorResponse('Rate limit exceeded', 429, { ...cors, 'Retry-After': '3600' });
@@ -211,11 +248,34 @@ export async function handleEntries(url, env, ctx, cors, request) {
 export async function handleEntryById(txid, url, env, ctx, cors, request) {
   const key = url.searchParams.get('key') || null;
 
-  // When `key` is supplied this is a normal account-identified read; bucket
-  // on the account (mirrors handleEntries above). When it's omitted, we have
-  // no account identity — this is the txid-only metadata-lookup case, which
-  // we allow because tags are already public on Arweave. That path falls
-  // back to per-IP keying since there's nothing else to bucket on.
+  // tarn#60 scoping for the by-txid route.
+  //
+  // A txid is a 43-char Arweave content hash — it is NOT enumerable from a
+  // dlk, so this route is not the metadata-enumeration vector #60 closes
+  // (that's the `?key=<dlk>` list path). The body it returns is the AES-GCM
+  // encrypted blob; tags are already public on Arweave. We therefore keep two
+  // modes:
+  //
+  //   - `key` supplied → account-identified read. The SDK's authenticated
+  //     paths that pass `key` (none today inline it, but the contract is
+  //     explicit) must present a matching user-role JWT: 401 missing/invalid,
+  //     403 different account. Bucket on the account.
+  //   - `key` omitted → txid-only fetch. The SDK's #fetchBlob path attaches
+  //     the session JWT (so this is an authenticated read in practice), but
+  //     because a txid is content-addressed and non-enumerable, and the body
+  //     is encrypted, we do NOT make the JWT mandatory or tie it to a specific
+  //     account here. An unauthenticated caller that already knows the exact
+  //     txid still gets the encrypted bytes (it can't enumerate them from a
+  //     dlk), and falls back to per-IP rate limiting.
+  let auth = null;
+  if (key) {
+    auth = await requireAuth(request, env, ctx);
+    if (!auth) return errorResponse('Unauthorized', 401, cors);
+    if (auth.role !== 'user' || auth.data_lookup_key !== key) {
+      return errorResponse('Forbidden', 403, cors);
+    }
+  }
+
   const { allowed } = key
     ? await checkReadRateLimitByAccount(env, key)
     : await checkReadRateLimitByIp(env, request);
@@ -228,9 +288,10 @@ export async function handleEntryById(txid, url, env, ctx, cors, request) {
     return errorResponse('Entry not found', 404, cors);
   }
 
-  // If key provided, verify ownership. Without key, returns metadata for any txid.
-  // This is intentional: entry tags are public on Arweave (only the blob body is encrypted).
-  // Restricting metadata here would be security theater — it's already on-chain.
+  // If key provided, verify ownership. Without key, returns the encrypted blob
+  // for any txid the caller already knows (txids are content-addressed and
+  // non-enumerable; the body is encrypted). Restricting further here would be
+  // security theater — the tags are already on-chain.
   if (key && entry.lookup_key && entry.lookup_key !== key) {
     return errorResponse('Entry not found', 404, cors);
   }

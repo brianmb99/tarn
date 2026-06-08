@@ -914,8 +914,13 @@ When the upload times out or returns non-2xx, the API responds **`502`** with `{
 
 ```
 GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}
-No JWT required — `key` (data_lookup_key) proves identity. Per-account
-rate-limited (1000/hr per dlk; see "Rate limiting" later in this doc).
+Headers: Authorization: Bearer <session JWT>
+Requires a user-role session JWT whose account matches `key`
+(data_lookup_key). 401 on missing/invalid JWT, 403 when the JWT is for a
+different account (or is an app-role token). The `key` param is no longer a
+read bearer-token — it identifies WHICH account to read, and the JWT proves
+the caller is entitled to read it (tarn#60). Per-account rate-limited
+(1000/hr per dlk, now keyed on the JWT-proven account; see "Rate limiting").
 Returns resolved entries (tombstones applied, Prev-chains resolved).
 Client downloads + decrypts blobs from Arweave gateways.
 
@@ -1220,9 +1225,15 @@ POST /api/v1/entries/batch
   Rules evaluated once for the entire batch (max_entries checks count + batchSize).
 
 GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}[&eid={eid}|&since={cursor}]
-  Auth: identity via the `key` query param (the data_lookup_key). No JWT
-        required — knowing the dlk is sufficient since the data is encrypted.
-  Rate limit: per-account, 1000/hr keyed on dlk. See "Rate limiting" below.
+  Headers: Authorization: Bearer <session JWT>
+  Auth: REQUIRED. A user-role session JWT whose account matches `key`
+        (tarn#60). The `key` param identifies which account to read; the JWT
+        proves entitlement. The dlk is no longer a read bearer-token.
+  Errors: 401 (missing/invalid JWT), 403 (JWT for a different account, or an
+          app-role token), 400 (malformed key — checked before auth so it
+          fast-fails without touching the verifier).
+  Rate limit: per-account, 1000/hr keyed on the JWT-proven dlk. See "Rate
+              limiting" below.
   Returns: { entries: [...], pagination: { cursor?, hasMore? } }
   Default: metadata-only list of resolved live entries.
   With &eid=: returns at most one resolved entry with blob inlined as `data`.
@@ -1230,9 +1241,13 @@ GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}[&eid={eid}|&sinc
                 blob inlined, page-bounded (25), pagination.cursor advances.
 
 GET /api/v1/entries/{txid}[?key={data_lookup_key}]
-  Auth: optional. With `key`, response is restricted to entries belonging to
-        that dlk. Without `key`, returns metadata for any txid (tags are
-        already public on Arweave; restricting them here would be theater).
+  Auth: With `key`, REQUIRED — a user-role session JWT matching that dlk
+        (401/403 as above), and the response is restricted to entries
+        belonging to it. Without `key`, the txid-only fetch stays public: a
+        txid is content-addressed and non-enumerable, and the body is
+        encrypted, so this is not the tarn#60 enumeration vector. The SDK's
+        blob-fetch path attaches the JWT when it has one (defense in depth)
+        but does not send `key`.
   Rate limit: per-account when `key` is supplied; per-IP otherwise.
 
 PUT /api/v1/entries/{prior_txid}
@@ -1253,8 +1268,8 @@ endpoint has an account identity available. The 429 response always includes
 | Class | Identifier | Cap | Store | Used by |
 |---|---|---|---|---|
 | Authenticated writes | `data_lookup_key` | 100/hr | D1 (atomic INSERT ... ON CONFLICT) | `POST/PUT/DELETE /entries`, `POST /entries/batch` (one batch = one hit) |
-| Authenticated reads | `data_lookup_key` | 1000/hr | KV | `GET /entries` (always), `GET /entries/{txid}?key=…` |
-| Unauthenticated reads | IP-hash | 1000/hr | KV | `GET /entries/{txid}` without `key` |
+| Authenticated reads | `data_lookup_key` (JWT-proven) | 1000/hr | KV | `GET /entries` (always — now JWT-gated, tarn#60), `GET /entries/{txid}?key=…` |
+| Unauthenticated reads | IP-hash | 1000/hr | KV | `GET /entries/{txid}` without `key` (txid-only, body encrypted) |
 | Unauthenticated other | IP-hash | endpoint-specific | KV | `POST /auth/register`, share lookup, invite preview, share-inbox/log fetches, **`POST /auth/passkey/authentication-options` (60/hr; tarn#59)** |
 
 Reads were originally per-IP across the board; that caused noisy-neighbor
@@ -1264,49 +1279,53 @@ carrier IP — tarn#31). Switching authenticated reads to per-account quotas
 matches the write path's identity model and makes shared-network usage
 behave correctly.
 
-#### Residual: `GET /entries?key=<dlk>` metadata-enumeration surface (tarn#60 — DEFERRED)
+#### `GET /entries?key=<dlk>` metadata-enumeration surface (tarn#60 — CLOSED)
 
-`GET /api/v1/entries?...&key=<dlk>` is intentionally unauthenticated: the
-`key` (data_lookup_key) is treated as a read capability, and the data is
-zero-knowledge encrypted, so the server never needs a JWT to serve a read.
-The known residual (tarn#60): the `dlk` is **not a secret**. It is emitted in
-several authenticated responses (`/auth/verify`, `/auth/passkey/authenticate`,
-etc.) and is published on Arweave as the public `Lk` tag on every entry/
-credential write. Anyone who learns a victim's `dlk` can therefore read that
-account's **encrypted** metadata stream — entry counts, `Eid`s, tags,
-ciphertext, write timing — bounded only by the 1000/hr per-`dlk` read bucket.
-Zero-knowledge still holds (no plaintext is exposed), but it is a broad
-scraping / activity-inference surface, and because the limit is keyed on the
-`dlk`, an attacker scraping a victim's `dlk` shares the victim's own bucket
-(an availability nuisance, not an escalation).
+**Background.** Historically `GET /api/v1/entries?...&key=<dlk>` was
+unauthenticated: the `key` (data_lookup_key) was treated as a read capability,
+and because the data is zero-knowledge encrypted the server never required a
+JWT to serve a read. The problem (tarn#60): the `dlk` is **not a secret**. It
+is emitted in several authenticated responses (`/auth/verify`,
+`/auth/passkey/authenticate`, etc.) and is published on Arweave as the public
+`Lk` tag on every entry/credential write. Anyone who learned a victim's `dlk`
+could therefore read that account's **encrypted** metadata stream — entry
+counts, `Eid`s, tags, ciphertext, write timing — bounded only by the 1000/hr
+read bucket. Zero-knowledge still held (no plaintext), but it was a broad
+scraping / activity-inference surface.
 
-**What is hardened today (non-breaking):** nothing in the `/entries` response
-echoes the `dlk` gratuitously (the only place it appears is the `Lk` Arweave
-tag, which is already public on-chain — trimming it would be security theater
-and risks breaking tag-parsing clients), and the read path remains
-rate-limited per account.
+**Resolution (hard cutover).** The metadata-read path now requires a
+**user-role session JWT whose account (the JWT `sub` / `data_lookup_key`)
+matches the requested `key`**. The dlk is no longer a read bearer-token — it
+names *which* account to read, and the JWT proves the caller is *entitled* to
+read it:
 
-**Why the obvious fixes are deferred (each is breaking):**
+- `GET /api/v1/entries` (list / `?eid=` / `?since=`) → **401** with no/invalid
+  JWT, **403** when the JWT is for a different account or is an app-role token,
+  **200** for a matching user JWT. The cheap key-format regex still runs first,
+  so a malformed key fast-fails with **400** before the verifier/DB/KV are
+  touched (it reveals nothing — the key is attacker-supplied).
+- `GET /api/v1/entries/{txid}?key=<dlk>` → same 401/403 gate. The
+  **`key`-less** txid-only variant stays public: a txid is content-addressed
+  and non-enumerable, and the body is AES-GCM encrypted, so it is not the
+  enumeration vector this issue closes.
+- The rate-limit bucket is unchanged in shape (1000/hr, `read:<dlk>:<hour>`)
+  but is now keyed on the **JWT-proven** account rather than an
+  attacker-supplied URL param — so the cross-account availability nuisance
+  (an attacker spending a victim's bucket) is gone too.
 
-- *Require a JWT for metadata reads.* The live read path (`getEntriesSince`,
-  the list path) deliberately sends **no** `Authorization` header — the SDK's
-  `#fetch` only attaches the JWT when `auth: true` is passed, and the read
-  calls do not. Adding a JWT requirement would break every deployed client's
-  delta-sync immediately. A migration would need the SDK to start sending the
-  JWT on reads first, ship, wait for adoption, then enforce.
-- *Lower the per-account cap.* Heavy initial sync (delta-poll + per-entry blob
-  backfill) legitimately bursts; 1000/hr was the deliberate tarn#31 choice.
-  Lowering it risks throttling legitimate catch-up sync.
-- *Add a per-IP enumeration ceiling.* This re-creates the exact tarn#31
-  failure: CGNAT / carrier-grade NAT puts thousands of distinct mobile users
-  behind one IP, so any per-IP cap on this path would throttle unrelated legit
-  users. Rejected for the same reason reads moved off per-IP in the first
-  place.
+The SDK attaches the session JWT on every read (`getEntries`,
+`getEntriesSince`, `getEntryByEid`, and the per-txid blob fetch). All of these
+run after `#requireAuth()`, so a JWT is always present (refreshed via
+challenge-response if expired, when signing keys are available).
 
-The genuinely complete fix (treat the `dlk` as a bearer secret, or split a
-separate read-capability token from the public `Lk` tag) is a protocol-level
-change with client-migration cost. It is left as a **human decision**, not
-guessed at here.
+**Coordinated deploy / one-time re-login.** This is a breaking change for any
+client that predates it: a client sending no `Authorization` header on reads
+now gets 401. The worker and the SDK bundle must therefore deploy together. A
+session resumed from a pre-cutover blob whose JWT has expired (and that has no
+signing keys — i.e. a passkey-only session) will see a 401 on its next read
+and must re-authenticate; a normal password session silently re-mints a JWT
+via challenge-response, so the only user-visible cost is a one-time re-login
+for sessions that can't self-refresh.
 
 Writes use D1 because the failure mode of an over-cap write (Arweave upload
 funded by Tarn's wallet) is "real money spent." The TOCTOU-immune atomic

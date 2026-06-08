@@ -178,7 +178,10 @@ export default {
         return await handleHealth(env, cors);
       }
 
-      // Entries — reads (public, IP rate-limited)
+      // Entries — reads. The list/metadata path (/api/v1/entries) now
+      // requires a user-role session JWT matching the requested account
+      // (tarn#60); the by-txid path requires it only when a `key` param is
+      // supplied. See routes/entries.js for the full enforcement model.
       if (path === '/api/v1/entries' && method === 'GET') {
         return await handleEntries(url, env, ctx, cors, request);
       }

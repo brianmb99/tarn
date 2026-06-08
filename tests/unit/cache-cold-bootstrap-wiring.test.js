@@ -36,11 +36,31 @@ import assert from 'node:assert/strict';
 import { refreshCache, getResolvedEntries } from '../../api/src/cache.js';
 import { searchEntriesByLookupKey } from '../../api/src/arweave.js';
 import { handleEntries, handleEntryById } from '../../api/src/routes/entries.js';
+import { signJWT } from '../../api/src/auth.js';
 
 const ARWEAVE_GRAPHQL = 'https://arweave.net/graphql';
 const APP = 'bookish';
 const TYPE = 'entry';
 const DLK = 'a'.repeat(64); // valid 64-char hex data_lookup_key
+
+// tarn#60 — the metadata-read path now requires a user-role session JWT whose
+// account matches the requested dlk. These cold-bootstrap tests exercise that
+// path, so we mint a real HS256 JWT for DLK and present it via an
+// Authorization header. We deliberately omit the `sid` claim so requireAuth
+// takes the stateless "pre-7.5 grandfather" branch and never touches a
+// sessions table — keeping these tests focused on the cache wiring.
+const JWT_SECRET = btoa('cold-bootstrap-test-secret');
+
+async function authedRequestFor(dlk = DLK) {
+  const jwt = await signJWT({ sub: dlk, role: 'user' }, JWT_SECRET);
+  return {
+    headers: {
+      get(name) {
+        return name === 'Authorization' ? `Bearer ${jwt}` : null;
+      },
+    },
+  };
+}
 
 const originalFetch = globalThis.fetch;
 function restoreFetch() { globalThis.fetch = originalFetch; }
@@ -257,9 +277,9 @@ describe('tarn#61 — full handleEntries cold-bootstrap reconstruction (latest-w
     return new URL(`https://api.tarn.dev/api/v1/entries?app=${APP}&type=${TYPE}&key=${DLK}${extra}`);
   }
   const cors = {};
-  const request = { headers: { get() { return null; } } };
 
   it('reconstructs live set on cold read: tombstone excluded, superseded (Prev-chain) excluded', async () => {
+    const request = await authedRequestFor();
     const db = makeD1();
     // e1: created (tx1) then updated (tx2 Prev=tx1)         → live = tx2
     // e2: created (tx3) then tombstoned (tx4 Op=tombstone Ref=tx3) → none live
@@ -272,7 +292,7 @@ describe('tarn#61 — full handleEntries cold-bootstrap reconstruction (latest-w
       edge('tx5', { eid: 'e3' }),
     ];
     const calls = interceptFetch({ graphqlEdges: edges });
-    const env = { DB: db, RATE_KV: makeAllowingKV() };
+    const env = { DB: db, RATE_KV: makeAllowingKV(), JWT_SECRET };
 
     const res = await handleEntries(urlList(), env, ctx, cors, request);
     assert.equal(res.status, 200);
@@ -290,6 +310,7 @@ describe('tarn#61 — full handleEntries cold-bootstrap reconstruction (latest-w
   });
 
   it('latest-wins across multiple updates to the same Eid', async () => {
+    const request = await authedRequestFor();
     const db = makeD1();
     const edges = [
       edge('txA', { eid: 'e1', ts: 1700000000 }),
@@ -297,7 +318,7 @@ describe('tarn#61 — full handleEntries cold-bootstrap reconstruction (latest-w
       edge('txC', { eid: 'e1', prev: 'txB', ts: 1700000200 }),
     ];
     interceptFetch({ graphqlEdges: edges });
-    const env = { DB: db, RATE_KV: makeAllowingKV() };
+    const env = { DB: db, RATE_KV: makeAllowingKV(), JWT_SECRET };
 
     const res = await handleEntries(urlList(), env, ctx, cors, request);
     const body = await res.json();
@@ -306,9 +327,10 @@ describe('tarn#61 — full handleEntries cold-bootstrap reconstruction (latest-w
   });
 
   it('empty Arweave history → empty live set (no entries, marker still set)', async () => {
+    const request = await authedRequestFor();
     const db = makeD1();
     interceptFetch({ graphqlEdges: [] });
-    const env = { DB: db, RATE_KV: makeAllowingKV() };
+    const env = { DB: db, RATE_KV: makeAllowingKV(), JWT_SECRET };
     const res = await handleEntries(urlList(), env, ctx, cors, request);
     const body = await res.json();
     assert.equal(res.status, 200);
@@ -321,9 +343,9 @@ describe('tarn#61 — lazy gateway blob hydration (handleEntryById → fetchBlob
   afterEach(restoreFetch);
 
   const cors = {};
-  const request = { headers: { get() { return null; } } };
 
   it('on D1 blob miss, fetches body from the gateway and write-through persists it', async () => {
+    const request = await authedRequestFor();
     const db = makeD1();
     // Seed an entry row with NO blob_data (post-cold-bootstrap state: metadata
     // imported, body not yet hydrated).
@@ -335,7 +357,7 @@ describe('tarn#61 — lazy gateway blob hydration (handleEntryById → fetchBlob
     });
     const PLAINTEXT = 'encrypted-blob-bytes';
     const calls = interceptFetch({ bodies: { 'txid-1': PLAINTEXT } });
-    const env = { DB: db, RATE_KV: makeAllowingKV() };
+    const env = { DB: db, RATE_KV: makeAllowingKV(), JWT_SECRET };
 
     const url = new URL(`https://api.tarn.dev/api/v1/entries/txid-1?key=${DLK}`);
     const res = await handleEntryById('txid-1', url, env, ctx, cors, request);
@@ -352,6 +374,7 @@ describe('tarn#61 — lazy gateway blob hydration (handleEntryById → fetchBlob
   });
 
   it('a tombstone row is never gateway-fetched (no body to hydrate)', async () => {
+    const request = await authedRequestFor();
     const db = makeD1();
     db._entries.set('tomb-1', {
       txid: 'tomb-1', app: APP, type: TYPE, wallet_addr: null, lookup_key: DLK,
@@ -359,7 +382,7 @@ describe('tarn#61 — lazy gateway blob hydration (handleEntryById → fetchBlob
       block_timestamp: 1700000000, tags_json: '[]', cached_at: Date.now(), blob_data: null,
     });
     const calls = interceptFetch({ bodies: {} });
-    const env = { DB: db, RATE_KV: makeAllowingKV() };
+    const env = { DB: db, RATE_KV: makeAllowingKV(), JWT_SECRET };
     const url = new URL(`https://api.tarn.dev/api/v1/entries/tomb-1?key=${DLK}`);
     const res = await handleEntryById('tomb-1', url, env, ctx, cors, request);
     assert.equal(res.status, 200);

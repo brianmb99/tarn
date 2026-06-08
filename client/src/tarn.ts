@@ -3363,7 +3363,11 @@ export class TarnClient {
       let url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&limit=500`;
       if (cursor) url += `&cursor=${cursor}`;
 
-      const res = await this.#fetch(url);
+      // tarn#60 — the metadata-read path now requires a session JWT matching
+      // this account. #requireAuth() above guarantees #jwt is populated, so
+      // auth:true attaches it. (The dlk in the URL is still sent so the server
+      // can verify the JWT's account matches the data being read.)
+      const res = await this.#fetch(url, { auth: true });
 
       if (res.status !== 200) {
         throw new Error(`Get entries failed: ${res.json?.error || res.status}`);
@@ -3504,7 +3508,9 @@ export class TarnClient {
     // advances past every input row.
     for (let safety = 0; safety < 200; safety++) {
       const url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&since=${encodeURIComponent(cursor)}`;
-      const res = await this.#fetch(url);
+      // tarn#60 — authenticated read (see getEntries). #requireAuth() ran at
+      // the top of this method, so #jwt is present.
+      const res = await this.#fetch(url, { auth: true });
       if (res.status !== 200) {
         throw new Error(`getEntriesSince failed: ${res.json?.error || res.status}`);
       }
@@ -3596,7 +3602,9 @@ export class TarnClient {
     await this.#requireAuth();
 
     const url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&eid=${encodeURIComponent(eid)}`;
-    const res = await this.#fetch(url);
+    // tarn#60 — authenticated read (see getEntries). #requireAuth() ran at the
+    // top of this method, so #jwt is present.
+    const res = await this.#fetch(url, { auth: true });
     if (res.status !== 200) {
       throw new Error(`Get entry by eid failed: ${res.json?.error || res.status}`);
     }
@@ -7313,7 +7321,14 @@ export class TarnClient {
 
     const strict = opts.strict === true;
     try {
-      const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET' });
+      // tarn#60 — attach the session JWT when we have one. The by-txid route
+      // does not *require* auth on the key-less blob-fetch path (a txid is
+      // content-addressed and non-enumerable, and the body is encrypted), so
+      // this is defense-in-depth rather than load-bearing: the call still works
+      // for the recovery/advanced paths that may run without a live session.
+      const headers: Record<string, string> = {};
+      if (this.#jwt) headers['Authorization'] = `Bearer ${this.#jwt}`;
+      const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET', headers });
       if (res.status === 200) {
         const text = await res.text();
         try {
