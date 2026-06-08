@@ -3,6 +3,7 @@
 import { jsonResponse } from '../worker.js';
 import { PROTOCOL_VERSION } from '../constants.js';
 import { checkReadiness } from '../observability/scheduled.js';
+import { countOpenMirrorFailures } from '../observability/mirror-failures.js';
 
 const ARWEAVE_GRAPHQL = 'https://arweave.net/graphql';
 
@@ -38,6 +39,16 @@ export async function handleHealth(env, cors) {
   const readiness = await checkReadiness(env);
   checks.signing_key = readiness.signing_key;
   checks.turbo = readiness.turbo;
+
+  // Stuck background mirror uploads (issue #47) — INFORMATIONAL only. This is an
+  // operational backlog (D1 ahead of Arweave for some records), not a
+  // serve-readiness condition, so it is surfaced but does NOT flip the 200/503
+  // readiness verdict (the hourly cron's STUCK_MIRRORS flag is the alerting
+  // path). Best-effort: never throws.
+  try {
+    const open = await countOpenMirrorFailures(env.DB);
+    checks.stuck_mirror_uploads = open.count;
+  } catch {}
 
   const healthy =
     checks.d1?.reachable &&

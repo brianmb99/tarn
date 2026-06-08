@@ -7,8 +7,11 @@
 //      (drift.js).
 //   3. Funding — Turbo wallet balance + runway (funding.js), flag LOW_FUNDING.
 //   4. Cleanup — prune dead aux rows (cleanup.js).
-//   5. Persist — write the report to health_reports.
-//   6. Alert — POST the report to ALERT_WEBHOOK_URL when healthy === false.
+//   5. Mirror failures — self-heal (re-upload) failed background ("waitUntil")
+//      Arweave mirror uploads, then surface the still-open count; flag
+//      STUCK_MIRRORS when > 0 (mirror-failures.js, issue #47).
+//   6. Persist — write the report to health_reports.
+//   7. Alert — POST the report to ALERT_WEBHOOK_URL when healthy === false.
 //
 // All I/O lives here; the pure decision logic lives in drift.js / funding.js /
 // cleanup.js so it can be unit-tested without a live gateway or D1. Every leg
@@ -30,6 +33,12 @@ import {
   DEFAULT_MIN_BALANCE_WINC,
 } from './funding.js';
 import { buildCleanupPlan, runCleanup } from './cleanup.js';
+import {
+  countOpenMirrorFailures,
+  retryMirrorFailures,
+  pruneResolvedMirrorFailures,
+  DEFAULT_RETRY_BATCH,
+} from './mirror-failures.js';
 
 const ARWEAVE_GRAPHQL = 'https://arweave.net/graphql';
 const TURBO_PRICE_URL = 'https://payment.ardrive.io/v1/price/bytes/102400';
@@ -309,6 +318,39 @@ export async function runScheduledChecks(env, opts = {}) {
     } catch (err) {
       report.checks.cleanup = { error: err?.message || 'cleanup_failed' };
     }
+  }
+
+  // 5. Mirror failures (issue #47) — self-heal then surface.
+  //
+  // SELF-HEAL FIRST: re-upload the unresolved+stored-bytes background-mirror
+  // failures (bounded batch), so transient Turbo outages drain automatically
+  // and only genuinely stuck mirrors remain. THEN count the still-open failures
+  // for the report: STUCK_MIRRORS fires only for what retry could NOT fix this
+  // tick, so a flap that healed itself doesn't page. Resolved rows are then
+  // reaped on a short retention. Wrapped so a failure degrades the report
+  // rather than throwing out of the cron.
+  try {
+    const mirror = {};
+    if (!opts.skipMirrorRetry) {
+      const batch = num(env, 'MIRROR_RETRY_BATCH', DEFAULT_RETRY_BATCH);
+      mirror.retry = await retryMirrorFailures(env.DB, {
+        batch,
+        now,
+        uploadImpl: opts.mirrorUploadImpl,
+      });
+      const retentionDays = num(env, 'MIRROR_FAILURE_RETENTION_DAYS', undefined);
+      mirror.pruned = await pruneResolvedMirrorFailures(
+        env.DB,
+        retentionDays !== undefined ? { now, retentionDays } : { now },
+      );
+    }
+    const open = await countOpenMirrorFailures(env.DB);
+    mirror.open = open.count;
+    if (open.error) mirror.error = open.error;
+    report.checks.mirror_failures = mirror;
+    if (open.count > 0) report.flags.push('STUCK_MIRRORS');
+  } catch (err) {
+    report.checks.mirror_failures = { error: err?.message || 'mirror_check_failed' };
   }
 
   // Overall verdict: any flag means unhealthy.

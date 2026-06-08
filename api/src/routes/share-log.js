@@ -20,6 +20,7 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../turbo.js';
 import { checkAndIncrementRateLimit } from '../rate-limit.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 
 // Plaintext is signed JSON (~150 bytes for a typical add) up to a snapshot of
 // the user's full shared library. The client caps plaintext at 256 KB
@@ -160,7 +161,14 @@ export async function handleShareLogPublish(request, env, ctx, cors) {
   // manual reconcile (documented separately).
   ctx.waitUntil((async () => {
     try {
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'share-log',
+        intendedTxid: txid,
+        tags: arweaveTags,
+        signedDataItem,
+      });
       if (!turbo.ok) {
         console.warn(`[tarn-api] share-log Turbo upload failed: ${turbo.status} ${turbo.body}`);
       }

@@ -73,11 +73,20 @@ function makeDB(overrides = {}) {
           if (/MAX\(/.test(this._sql)) return { m: null };
           return null;
         },
+        // Mirror-failures retry select issues .all(); default empty so the
+        // retry leg is a no-op unless a test overrides it.
+        async all() {
+          if (overrides.all) {
+            const r = overrides.all(this._sql, this._params);
+            if (r !== undefined) return r;
+          }
+          return { results: [] };
+        },
         async run() {
           if (/INSERT INTO health_reports/.test(this._sql)) {
             inserted.push({ created_at: this._params[0], healthy: this._params[1], report_json: this._params[2] });
           }
-          // cleanup deletes / prune
+          // cleanup deletes / prune / mirror updates
           return { meta: { changes: 0 } };
         },
       };
@@ -196,6 +205,82 @@ describe('runScheduledChecks — funding', () => {
     const report = await runScheduledChecks(env, { fetchImpl, now: NOW });
     assert.ok(report.flags.includes('LOW_FUNDING'), 'expected LOW_FUNDING: ' + JSON.stringify(report.flags));
     assert.equal(report.checks.funding.low_funding, true);
+  });
+});
+
+describe('runScheduledChecks — mirror failures (issue #47)', () => {
+  it('flags STUCK_MIRRORS and surfaces the open count when failures remain', async () => {
+    // Open mirror-failure count = 3. No retryable rows (.all returns empty), so
+    // retry resolves nothing and STUCK_MIRRORS fires.
+    const env = {
+      APP_SIGNING_KEY: FAKE_SIGNING_KEY,
+      DB: makeDB({
+        first: (sql) => {
+          if (/COUNT\(\*\) AS c FROM arweave_mirror_failures WHERE resolved_at IS NULL/.test(sql)) return { c: 3 };
+          return undefined;
+        },
+      }),
+    };
+    const report = await runScheduledChecks(env, { fetchImpl: makeFetch(), now: NOW });
+    assert.ok(report.flags.includes('STUCK_MIRRORS'), 'expected STUCK_MIRRORS: ' + JSON.stringify(report.flags));
+    assert.equal(report.healthy, false);
+    assert.equal(report.checks.mirror_failures.open, 3);
+    assert.equal(env.DB._inserted[0].healthy, 0);
+  });
+
+  it('does NOT flag STUCK_MIRRORS when the open count is zero', async () => {
+    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB() };
+    const report = await runScheduledChecks(env, { fetchImpl: makeFetch(), now: NOW });
+    assert.ok(!report.flags.includes('STUCK_MIRRORS'));
+    assert.equal(report.checks.mirror_failures.open, 0);
+  });
+
+  it('self-heals: a retryable row that re-uploads OK does not leave STUCK_MIRRORS', async () => {
+    // One retryable row is returned by the retry select; the injected uploader
+    // succeeds, the row is marked resolved, and the post-retry open count is 0.
+    let resolvedId = null;
+    let openCount = 1; // before retry
+    const env = {
+      APP_SIGNING_KEY: FAKE_SIGNING_KEY,
+      DB: makeDB({
+        all: (sql) => {
+          if (/FROM arweave_mirror_failures\s+WHERE resolved_at IS NULL AND signed_data_item IS NOT NULL/.test(sql)) {
+            return { results: [{ id: 42, intended_txid: 't', namespace: 'cred', signed_data_item: new Uint8Array([1]), attempt_count: 1 }] };
+          }
+          return undefined;
+        },
+        first: (sql, params) => {
+          if (/COUNT\(\*\) AS c FROM arweave_mirror_failures WHERE resolved_at IS NULL/.test(sql)) {
+            return { c: openCount };
+          }
+          return undefined;
+        },
+      }),
+    };
+    // Track the resolve UPDATE so we can flip the open count to 0 after retry.
+    const origPrepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = (sql) => {
+      const stmt = origPrepare(sql);
+      const origRun = stmt.run.bind(stmt);
+      stmt.run = async () => {
+        if (/SET resolved_at = \?1, last_attempt_at = \?1 WHERE id = \?2/.test(sql)) {
+          resolvedId = stmt._params[1];
+          openCount = 0;
+        }
+        return origRun();
+      };
+      return stmt;
+    };
+
+    const report = await runScheduledChecks(env, {
+      fetchImpl: makeFetch(),
+      now: NOW,
+      mirrorUploadImpl: async () => ({ ok: true }),
+    });
+    assert.equal(resolvedId, 42, 'the retryable row should have been resolved');
+    assert.equal(report.checks.mirror_failures.retry.resolved, 1);
+    assert.equal(report.checks.mirror_failures.open, 0);
+    assert.ok(!report.flags.includes('STUCK_MIRRORS'), 'self-healed mirror must not flag STUCK_MIRRORS');
   });
 });
 

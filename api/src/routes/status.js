@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { getAddress } from '../ans104.js';
 import { PROTOCOL_VERSION } from '../constants.js';
 import { fetchTurboBalance } from '../observability/funding.js';
+import { countOpenMirrorFailures } from '../observability/mirror-failures.js';
 
 /**
  * GET /api/v1/status
@@ -111,6 +112,16 @@ export async function handleStatus(request, env, ctx, cors) {
   try {
     const pendingTxs = await env.DB.prepare('SELECT COUNT(*) as count FROM pending_txs').first();
     status.pending_txs = pendingTxs?.count ?? 0;
+  } catch {}
+
+  // Stuck background Arweave mirror uploads (issue #47). The open count is the
+  // number of D1-first writes whose background Turbo upload failed and has not
+  // yet been re-mirrored by the cron. > 0 means the cache (D1) is ahead of
+  // permanent storage (Arweave) for those records — a divergence the drift cron
+  // can't otherwise detect. countOpenMirrorFailures never throws.
+  try {
+    const open = await countOpenMirrorFailures(env.DB);
+    status.stuck_mirror_uploads = open.count;
   } catch {}
 
   status.protocol_version = PROTOCOL_VERSION;

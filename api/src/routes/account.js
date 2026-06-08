@@ -29,6 +29,7 @@ import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH, buildCredentialTag
 import { importPublicKey, isValidHex64 } from '../crypto.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 
 async function hashIp(ip) {
   if (!ip) return null;
@@ -120,7 +121,14 @@ function persistCredentialBlobFromRow(ctx, env, row) {
       await upsertWriteThrough(env.DB, txid, tags);
       await markLookupBootstrapped(env.DB, row.credential_lookup_key, 'tarn', 'cred');
       console.log(`[tarn-api] Account-key republish cached: ${txid}`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'account-key-republish',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] Account-key republish uploaded to Turbo: ${txid}`);
       } else {

@@ -26,6 +26,7 @@ import { jsonResponse, errorResponse } from '../worker.js';
 import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem, TURBO_GATEWAY } from '../turbo.js';
 import { checkAndIncrementRateLimit } from '../rate-limit.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 
 // Per the design doc — kept generous on the accept side because a popular
 // user might receive many requests in a burst, each one prompting a 1:1
@@ -184,7 +185,14 @@ export async function handleShareInboxPublish(request, env, ctx, cors) {
   // blob upload in routes/auth.js.)
   ctx.waitUntil((async () => {
     try {
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'share-inbox',
+        intendedTxid: txid,
+        tags: arweaveTags,
+        signedDataItem,
+      });
       if (!turbo.ok) {
         console.warn(`[tarn-api] share-inbox Turbo upload failed: ${turbo.status} ${turbo.body}`);
       }

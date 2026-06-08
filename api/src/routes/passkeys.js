@@ -40,6 +40,7 @@ import { consumeStepUpToken, STEP_UP_SCOPE_ACCOUNT_KEY_FETCH, buildCredentialTag
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
 import { persistPasskeyRegBlob, persistPasskeyRegTombstone } from './passkey-reg.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 import {
   pruneStaleSessions,
   createOrReuseSession,
@@ -183,7 +184,14 @@ function persistCredentialBlobFromRowWithEnvelope(ctx, env, row) {
       await upsertWriteThrough(env.DB, txid, tags);
       await markLookupBootstrapped(env.DB, row.credential_lookup_key, 'tarn', 'cred');
       console.log(`[tarn-api] Passkey republish cached: ${txid}`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'cred-passkey-republish',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] Passkey republish uploaded to Turbo: ${txid}`);
       } else {

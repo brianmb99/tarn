@@ -69,6 +69,7 @@
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough } from '../cache.js';
 import { PROTOCOL_VERSION } from '../constants.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 
 /**
  * Build the Arweave tag set for a passkey-registration blob.
@@ -190,7 +191,14 @@ export function persistPasskeyRegBlob(ctx, env, blobFields) {
       // behaves.
       await upsertWriteThrough(env.DB, txid, tags);
       console.log(`[tarn-api] passkey-reg cached: ${txid} (cred ${blobFields.credentialId.slice(0, 8)})`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'passkey-reg',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] passkey-reg uploaded to Turbo: ${txid}`);
       } else {
@@ -223,7 +231,14 @@ export function persistPasskeyRegTombstone(ctx, env, dataLookupKey, credentialId
       const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
       await upsertWriteThrough(env.DB, txid, tags);
       console.log(`[tarn-api] passkey-reg tombstone cached: ${txid} (cred ${credentialId.slice(0, 8)})`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'passkey-reg-tombstone',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] passkey-reg tombstone uploaded to Turbo: ${txid}`);
       } else {

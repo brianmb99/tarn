@@ -7,6 +7,7 @@ import { importPublicKey, verifySignature, isValidHex64 } from '../crypto.js';
 import { requireAuth } from '../middleware/auth.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { upsertWriteThrough, markLookupBootstrapped } from '../cache.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 import { checkAndIncrementRateLimit } from '../rate-limit.js';
 import {
   validateDeviceLabel,
@@ -114,7 +115,17 @@ function persistCredentialBlob(
       // Tags on credential entries use App='tarn', Type='cred' (see buildCredentialTags).
       await markLookupBootstrapped(env.DB, credentialLookupKey, 'tarn', 'cred');
       console.log(`[tarn-api] Credential blob cached: ${txid}`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      // Background upload, tracked: a Turbo failure here would otherwise be
+      // swallowed (D1 has the row but Arweave never got the mirror). Record it
+      // durably so the cron can re-upload and the health report can flag it.
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'cred',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] Credential blob uploaded to Turbo: ${txid}`);
       } else {
@@ -863,9 +874,18 @@ export async function handleDeleteAccount(request, env, ctx, cors) {
         const { signedDataItem, txid } = await buildSignedDataItem(tombstoneBody, tombstoneTags, signingKey);
         await upsertWriteThrough(env.DB, txid, tombstoneTags);
         console.log(`[tarn-api] Account tombstone cached: ${txid}`);
-        const turbo = await uploadSignedDataItem(signedDataItem);
+        const turbo = await mirrorUploadWithTracking({
+          uploadFn: () => uploadSignedDataItem(signedDataItem),
+          db: env.DB,
+          namespace: 'cred-tombstone',
+          intendedTxid: txid,
+          tags: tombstoneTags,
+          signedDataItem,
+        });
         if (turbo.ok) {
           console.log(`[tarn-api] Account tombstone uploaded to Turbo: ${txid}`);
+        } else {
+          console.warn(`[tarn-api] Account tombstone Turbo upload failed: ${turbo.status} ${turbo.body}`);
         }
       } catch (err) {
         console.error('[tarn-api] Account tombstone upload error:', err.message);

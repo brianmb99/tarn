@@ -8,6 +8,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { upsertWriteThrough } from '../cache.js';
 import { buildSignedDataItem, uploadSignedDataItem } from '../turbo.js';
 import { buildAppRegTags, buildAppRegBody } from '../app-reg.js';
+import { mirrorUploadWithTracking } from '../observability/mirror-failures.js';
 
 import { PROTOCOL_VERSION } from '../constants.js';
 
@@ -97,9 +98,18 @@ export async function handleSetRules(dataLookupKey, request, env, ctx, cors) {
       const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
       await upsertWriteThrough(env.DB, txid, tags);
       console.log(`[tarn-api] App-config cached: ${txid}`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'app-config',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] App-config uploaded to Turbo: ${txid}`);
+      } else {
+        console.warn(`[tarn-api] App-config Turbo upload failed: ${turbo.status} ${turbo.body}`);
       }
     } catch (err) {
       console.error('[tarn-api] App-config upload error:', err.message);
@@ -182,7 +192,14 @@ export async function handleSetInviteTemplate(appId, request, env, ctx, cors) {
       const { signedDataItem, txid } = await buildSignedDataItem(blobBytes, tags, signingKey);
       await upsertWriteThrough(env.DB, txid, tags, blobBytes);
       console.log(`[tarn-api] App-reg cached (invite-template update): ${appId} ${txid}`);
-      const turbo = await uploadSignedDataItem(signedDataItem);
+      const turbo = await mirrorUploadWithTracking({
+        uploadFn: () => uploadSignedDataItem(signedDataItem),
+        db: env.DB,
+        namespace: 'app-reg',
+        intendedTxid: txid,
+        tags,
+        signedDataItem,
+      });
       if (turbo.ok) {
         console.log(`[tarn-api] App-reg uploaded to Turbo: ${appId} ${txid}`);
       } else {
@@ -301,7 +318,14 @@ export async function handleSetSchema(appId, request, env, ctx, cors) {
 
     ctx.waitUntil((async () => {
       try {
-        const turbo = await uploadSignedDataItem(signed.signedDataItem);
+        const turbo = await mirrorUploadWithTracking({
+          uploadFn: () => uploadSignedDataItem(signed.signedDataItem),
+          db: env.DB,
+          namespace: 'app-schema',
+          intendedTxid: txid,
+          tags,
+          signedDataItem: signed.signedDataItem,
+        });
         if (turbo.ok) {
           console.log(`[tarn-api] App-schema uploaded to Turbo: ${appId} v${version} ${txid}`);
         } else {
