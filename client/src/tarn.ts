@@ -2670,19 +2670,21 @@ export class TarnClient {
             FACTOR_PASSKEY_PRF,
             credential_id,
           );
-    } catch (err) {
-      // An AES-KW unwrap failure (wrong KEK) is the migration signature for a
-      // legacy random-salt passkey. A missing-wrapping error (the credential
-      // has no wrapping at some gen) is the stale path the server should have
-      // flagged; re-surface both as a re-registration prompt so the app has a
-      // single, actionable recovery path.
+    } catch (err: any) {
+      // tarn#59 migration signature: a legacy random-salt passkey's wrapping is
+      // PRESENT (matched by credential_id) but unwraps to the wrong key under
+      // PRF(constant), so AES-KW throws a DOMException named 'OperationError'.
+      // Convert ONLY that to a clean re-registration prompt. Any other error
+      // (a genuinely missing wrapping, a parse error, a bug) propagates unchanged
+      // so it is never masked as "re-register".
+      if (err?.name !== 'OperationError') throw err;
       throw new StalePasskeyError({
         credentialId: credential_id,
         message:
           `Passkey ${credential_id.slice(0, 8)}… could not unwrap the account key ` +
-          '(this passkey predates the tarn#59 constant-salt scheme, or its wrapping is ' +
-          'missing). Re-register the passkey from a password-authenticated session to repair: ' +
-          'log in with your password, remove this passkey, then add it again.',
+          '(this passkey predates the tarn#59 constant-salt scheme). Re-register it from a ' +
+          'password-authenticated session to repair: log in with your password, remove this ' +
+          'passkey, then add it again.',
       });
     }
 
