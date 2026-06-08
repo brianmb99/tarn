@@ -155,9 +155,9 @@ async function batchCreate(jwt, dlk, encKey, type, items) {
 }
 
 // Drive one page of the delta endpoint. Returns { events, cursor, hasMore }.
-async function deltaPage(dlk, type, cursor) {
+async function deltaPage(jwt, dlk, type, cursor) {
   const url = `/api/v1/entries?app=${DEFAULT_APP_ID}&type=${type}&key=${dlk}&since=${encodeURIComponent(cursor)}`;
-  const res = await fetchJSON(url);
+  const res = await fetchJSON(url, { headers: { 'Authorization': `Bearer ${jwt}` } });
   assert(res.status === 200, `Delta read failed: ${res.status} ${res.text}`);
   return {
     events: res.json.entries || [],
@@ -168,12 +168,12 @@ async function deltaPage(dlk, type, cursor) {
 
 // Drain the whole delta stream from `startCursor`, collecting every live event.
 // Returns { liveTxids: string[], deletedEids: string[], finalCursor }.
-async function drainDelta(dlk, type, startCursor = '0:') {
+async function drainDelta(jwt, dlk, type, startCursor = '0:') {
   let cursor = startCursor;
   const liveTxids = [];
   const deletedEids = [];
   for (let i = 0; i < 200; i++) {
-    const { events, cursor: next, hasMore } = await deltaPage(dlk, type, cursor);
+    const { events, cursor: next, hasMore } = await deltaPage(jwt, dlk, type, cursor);
     for (const evt of events) {
       if (evt.deleted) deletedEids.push(evt.eid);
       else liveTxids.push(evt.txid);
@@ -208,7 +208,7 @@ await test('Mixed single + batch writes (same-ms cached_at) drain exactly once',
   batch2.forEach(t => expected.add(t));
   await sleep(300);
 
-  const { liveTxids } = await drainDelta(dlk, type);
+  const { liveTxids } = await drainDelta(jwt, dlk, type);
 
   // Exactly once: no duplicates, and every expected txid present.
   const counts = new Map();
@@ -234,12 +234,12 @@ await test('Advance cursor past a window, then write more — catch-up returns t
   await sleep(200);
 
   // Drain to fully advance the cursor past wave 1.
-  const first = await drainDelta(dlk, type);
+  const first = await drainDelta(jwt, dlk, type);
   for (const t of wave1) assert(first.liveTxids.includes(t), `wave-1 txid ${t} missing on first drain`);
   const cursorAfterWave1 = first.finalCursor;
 
   // A re-poll at the advanced cursor must now return NOTHING.
-  const emptyPoll = await drainDelta(dlk, type, cursorAfterWave1);
+  const emptyPoll = await drainDelta(jwt, dlk, type, cursorAfterWave1);
   assert(emptyPoll.liveTxids.length === 0,
     `re-poll at advanced cursor returned ${emptyPoll.liveTxids.length} stale events`);
 
@@ -249,7 +249,7 @@ await test('Advance cursor past a window, then write more — catch-up returns t
   await sleep(200);
 
   // Catch-up from the advanced cursor returns exactly wave 2 — never wave 1.
-  const second = await drainDelta(dlk, type, cursorAfterWave1);
+  const second = await drainDelta(jwt, dlk, type, cursorAfterWave1);
   for (const t of wave2) assert(second.liveTxids.includes(t), `wave-2 txid ${t} skipped after cursor advance`);
   for (const t of wave1) assert(!second.liveTxids.includes(t), `wave-1 txid ${t} replayed`);
   assert(second.liveTxids.length === wave2.size,
@@ -268,7 +268,7 @@ await test('Update resolves to latest version; delete surfaces as deleted:true',
   const keepTxid = await createEntry(jwt, dlk, encKey, type, 'keep', { v: 1 });
   const delTxid = await createEntry(jwt, dlk, encKey, type, 'gone', { v: 1 });
   await sleep(200);
-  const afterCreate = (await drainDelta(dlk, type)).finalCursor;
+  const afterCreate = (await drainDelta(jwt, dlk, type)).finalCursor;
 
   // Update "keep" (Prev-chain).
   const updEnc = await encrypt(encKey, { v: 2 });
@@ -301,7 +301,7 @@ await test('Update resolves to latest version; delete surfaces as deleted:true',
   await sleep(200);
 
   // Catch-up from after the creates: see the updated head once, and a delete.
-  const delta = await drainDelta(dlk, type, afterCreate);
+  const delta = await drainDelta(jwt, dlk, type, afterCreate);
   assert(delta.liveTxids.filter(t => t === newKeepTxid).length === 1,
     'updated entry should appear exactly once as its new head');
   assert(!delta.liveTxids.includes(keepTxid), 'superseded prior version should not appear as live');

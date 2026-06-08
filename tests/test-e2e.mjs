@@ -170,7 +170,7 @@ await test('Create entry and read back from D1 cache', async () => {
   // Small delay for ctx.waitUntil to complete
   await sleep(200);
 
-  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
   assert(readRes.status === 200, `Read failed: ${readRes.status}`);
   assert(readRes.json.entries.length >= 1, `Expected at least 1 entry, got ${readRes.json.entries.length}`);
 
@@ -188,7 +188,7 @@ await test('Create entry and decrypt the blob from gateway URL', async () => {
   await sleep(200);
 
   // Read entry list to get gateway URL
-  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
   const entry = readRes.json.entries.find(e => e.txid === txid);
   assert(entry, 'Entry should be in read results');
   assert(entry.gatewayUrl, 'Entry should have gatewayUrl');
@@ -225,7 +225,7 @@ await test('Create 3 entries, read back all 3', async () => {
   }
   await sleep(300);
 
-  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
   assert(readRes.status === 200, `Read failed: ${readRes.status}`);
 
   // All 3 should be present
@@ -273,7 +273,7 @@ await test('Update entry: old version superseded, new version returned', async (
   await sleep(200);
 
   // Read back — should only see the updated version (original superseded by Prev-chain)
-  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
   const entries = readRes.json.entries;
 
   const hasUpdated = entries.some(e => e.txid === updatedTxid);
@@ -315,7 +315,7 @@ await test('Delete entry: tombstoned entry hidden from reads', async () => {
   await sleep(200);
 
   // Verify it exists
-  let readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  let readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
   assert(readRes.json.entries.some(e => e.txid === txid), 'Entry should exist before deletion');
 
   // Tombstone it
@@ -341,7 +341,7 @@ await test('Delete entry: tombstoned entry hidden from reads', async () => {
   await sleep(200);
 
   // Read back — entry should be hidden
-  readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
   assert(!readRes.json.entries.some(e => e.txid === txid), 'Tombstoned entry should be hidden from reads');
 });
 
@@ -358,7 +358,7 @@ await test('User A cannot see User B entries', async () => {
   await sleep(200);
 
   // User B reads with their own key — should see nothing
-  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${userB.dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${userB.dlk}`, { headers: { 'Authorization': `Bearer ${userB.jwt}` } });
   assert(readRes.status === 200);
   assert(readRes.json.entries.length === 0, `User B should see 0 entries, saw ${readRes.json.entries.length}`);
 });
@@ -556,8 +556,22 @@ await test('Change credentials: existing entries still readable', async () => {
   await client2.login(newUsername, newPassword);
   assert(client2.dataLookupKey === dlk, 'data_lookup_key should be preserved');
 
+  // #60: reads require a session JWT, and changeCredentials revoked the old
+  // session — get a fresh JWT under the NEW credentials for the read.
+  const newKeys = await deriveAllKeys(newUsername, newPassword, DEFAULT_APP_ID);
+  const cRes2 = await fetchJSON('/api/v1/auth/challenge', {
+    method: 'POST',
+    body: JSON.stringify({ credential_lookup_key: newKeys.credentialLookupKey }),
+  });
+  const sig2 = await signChallenge(newKeys.signingKeyPair.privateKey, cRes2.json.nonce);
+  const vRes2 = await fetchJSON('/api/v1/auth/verify', {
+    method: 'POST',
+    body: JSON.stringify({ credential_lookup_key: newKeys.credentialLookupKey, nonce: cRes2.json.nonce, signature: sig2 }),
+  });
+  const jwt2 = vRes2.json.jwt;
+
   // Read entries — should still see them
-  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
+  const readRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt2}` } });
   assert(readRes.json.entries.some(e => e.txid === txid1), 'Entry created with old creds should still be in cache');
 
   // Old credentials should fail
@@ -579,8 +593,8 @@ await test('Entries of different types are isolated by query', async () => {
   await rawCreateEntry(jwt, dlk, dataEncryptionKey, DEFAULT_APP_ID, 'note', { from: 'note' });
   await sleep(200);
 
-  const entryRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`);
-  const noteRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=note&key=${dlk}`);
+  const entryRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=entry&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
+  const noteRes = await fetchJSON(`/api/v1/entries?app=${DEFAULT_APP_ID}&type=note&key=${dlk}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
 
   assert(entryRes.json.entries.length === 1, `entry type should have 1 entry, got ${entryRes.json.entries.length}`);
   assert(noteRes.json.entries.length === 1, `note type should have 1 entry, got ${noteRes.json.entries.length}`);
@@ -611,8 +625,10 @@ await test('Get entry with wrong key param returns 404', async () => {
   await sleep(200);
 
   const wrongKey = 'f'.repeat(64);
-  const res = await fetchJSON(`/api/v1/entries/${txid}?key=${wrongKey}`);
-  assert(res.status === 404, `Expected 404 with wrong key, got ${res.status}`);
+  // #60: a key-scoped by-txid read requires a session JWT matching that key.
+  // A session reading under a key that isn't its account is now 403 (was 404).
+  const res = await fetchJSON(`/api/v1/entries/${txid}?key=${wrongKey}`, { headers: { 'Authorization': `Bearer ${jwt}` } });
+  assert(res.status === 403, `Expected 403 (key param != session account), got ${res.status}`);
 });
 
 // ============ 10. TURBO/ARWEAVE UPLOAD VERIFICATION ============
