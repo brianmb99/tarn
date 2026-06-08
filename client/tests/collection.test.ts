@@ -41,6 +41,8 @@ class MockTarnClient implements ITarnClient {
   getEntriesCalls: string[] = [];
   shareCalls: ShareCall[] = [];
   unshareCalls: UnshareCall[] = [];
+  readShareLogCalls = 0;
+  syncShareLogCalls = 0;
   shareLogStateByConnection = new Map<string, Record<string, { tx_id: string; cek: string }>>();
   connections: ShareConnection[] = [];
   mutedSharePubs = new Set<string>();
@@ -218,6 +220,17 @@ class MockTarnClient implements ITarnClient {
   async readShareLog(
     connection: ShareConnection,
   ): Promise<Record<string, { tx_id: string; cek: string }>> {
+    this.readShareLogCalls++;
+    return this.shareLogStateByConnection.get(connection.share_pub) ?? {};
+  }
+
+  async syncShareLog(
+    connection: ShareConnection,
+  ): Promise<Record<string, { tx_id: string; cek: string }>> {
+    // The real client's syncShareLog always advances forward to the current
+    // log tip; in the mock the state map is the source of truth, so this
+    // mirrors readShareLog but is the method listShared() actually calls.
+    this.syncShareLogCalls++;
     return this.shareLogStateByConnection.get(connection.share_pub) ?? {};
   }
 
@@ -1027,5 +1040,37 @@ describe('Collection.listShared', () => {
 
     const result = await books.listShared(conn1);
     assert.equal(result.length, 0);
+  });
+
+  // Regression (Tarn share-log bug): a connected friend couldn't see shared
+  // content. Apps poll listShared on app-open — the FIRST poll runs before the
+  // peer shares anything. listShared used readShareLog WITHOUT { refresh: true },
+  // which short-circuits on any cached state. That first empty read seeded an
+  // empty cache that every later call returned verbatim, so freshly-shared
+  // content was never surfaced. The fix routes listShared through syncShareLog,
+  // which always advances the cursor forward.
+  it('routes through syncShareLog (not the stale-caching readShareLog)', async () => {
+    await books.listShared(conn1);
+    assert.equal(mock.syncShareLogCalls, 1, 'listShared must call syncShareLog');
+    assert.equal(mock.readShareLogCalls, 0, 'listShared must NOT call readShareLog directly');
+  });
+
+  it('surfaces content shared AFTER an initial empty poll (the regression)', async () => {
+    // First poll: nothing shared yet — returns empty (and, in the real client,
+    // would have seeded an empty read-state cache).
+    const before = await books.listShared(conn1);
+    assert.deepEqual(before, []);
+
+    // Peer shares a book.
+    mock.shareLogStateByConnection.set(conn1.share_pub, {
+      'books:b1': { tx_id: 'tx-friend-1', cek: 'sk-friend-1' },
+    });
+    mock.registerSharedBlob('tx-friend-1', { bookId: 'b1', title: 'Shared Later', isPrivate: false });
+
+    // Second poll must now surface it — not return the stale empty result.
+    const after = await books.listShared(conn1);
+    assert.equal(after.length, 1, 'newly-shared content must be surfaced on the next poll');
+    assert.equal(after[0]!.bookId, 'b1');
+    assert.equal(after[0]!.title, 'Shared Later');
   });
 });

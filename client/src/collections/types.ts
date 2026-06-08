@@ -153,6 +153,17 @@ export interface ITarnClient {
     connection: ShareConnection,
     opts?: { refresh?: boolean },
   ): Promise<Record<string, { tx_id: string; cek: string }>>;
+
+  /**
+   * Incrementally sync a connection's share-log forward from the cached
+   * cursor (cold start performs a full {@link readShareLog} bootstrap) and
+   * return the updated state map. Unlike a plain `readShareLog`, this never
+   * short-circuits on a previously-cached state — it always advances to pick
+   * up entries published since the last read.
+   */
+  syncShareLog(
+    connection: ShareConnection,
+  ): Promise<Record<string, { tx_id: string; cek: string }>>;
 }
 
 /**

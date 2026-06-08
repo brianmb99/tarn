@@ -125,6 +125,9 @@ class VersionMockClient implements ITarnClient {
   async readShareLog(): Promise<Record<string, { tx_id: string; cek: string }>> {
     return {};
   }
+  async syncShareLog(): Promise<Record<string, { tx_id: string; cek: string }>> {
+    return {};
+  }
 }
 
 // Client schema version = 2. Entries can be planted at v1 (older), v2 (same),

@@ -13,6 +13,7 @@
     "test:security": "node --import tsx tests/test-security.mjs",
     "test:share":    "node --import tsx tests/test-share.mjs",
     "test:share-log":"node --import tsx tests/test-share-log.mjs",
+    "test:share-typed":"node --import tsx tests/test-share-typed.mjs",
     "test:handshake":"node --import tsx tests/test-handshake.mjs",
     "test:recovery": "node --import tsx tests/test-recovery.mjs",
     "test:recovery-combos": "node --import tsx tests/test-recovery-combinations.mjs",

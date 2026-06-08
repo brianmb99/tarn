@@ -480,12 +480,21 @@ export class Collection<TRecord extends Record<string, unknown>> {
    * fetches each blob from Tarn, decrypts with the shareKey, and returns the
    * decrypted records.
    *
+   * Uses `syncShareLog` rather than `readShareLog` so a previously-cached
+   * (and possibly empty) read-state is always advanced forward to pick up
+   * entries published since the last call. `readShareLog` short-circuits on
+   * any cached state when called without `{ refresh: true }`; an app that
+   * polls `listShared` (the common case) would seed an empty cache on its
+   * first call — before the peer shares anything — and then return that stale
+   * empty map forever, never surfacing newly-shared content. `syncShareLog`
+   * cold-starts with a full bootstrap and otherwise syncs incrementally.
+   *
    * Records that fail to fetch or decrypt are logged and skipped — partial
    * results are returned rather than aborting the whole call.
    */
   async listShared(connection: ShareConnection): Promise<TRecord[]> {
     this.#assertShareable('listShared');
-    const state = await this.#client.readShareLog(connection);
+    const state = await this.#client.syncShareLog(connection);
     const collectionPrefix = this.#contentIdPrefix();
     const out: TRecord[] = [];
     for (const [contentId, entry] of Object.entries(state)) {

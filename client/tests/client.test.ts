@@ -365,6 +365,9 @@ class StubUnderlying implements IUnderlyingClient {
   async readShareLog(c: ShareConnection) {
     return this.shareLogStateByConnection.get(c.share_pub) ?? {};
   }
+  async syncShareLog(c: ShareConnection) {
+    return this.shareLogStateByConnection.get(c.share_pub) ?? {};
+  }
 
   // ---- Helpers ----
   #nextTxid(): string {
