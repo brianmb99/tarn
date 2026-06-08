@@ -87,6 +87,10 @@ export const schema = defineSchema({
 
 **Field types:** `string`, `number`, `integer`, `boolean`, `date`, `json`. Append `?` for optional (`'string?'`), or use the long form `{ type, required, default, enum }`.
 
+**`date` fields round-trip as `Date`.** A `date` field accepts either a `Date` or an ISO-8601 string on write (both are coerced to a `Date` and validated). On the wire the value is stored as an ISO string (JSON has no Date type), and the SDK **re-hydrates it back to a `Date` on read** — `get()`, `list()`, `getEntriesSince()`, and `listShared()` all return `Date` objects for `date` fields, matching the declared TypeScript type. A stored value that can't be parsed as a date (corrupt/legacy data) is left untouched rather than throwing. If you want a numeric timestamp instead of a `Date`, declare the field as `number` (ms-epoch) — that's stored and returned verbatim with no coercion.
+
+**`default` values are validated at `defineSchema()` time.** A long-form field's `default` is checked against the field's own type and enum when the schema is defined, not lazily at the first `create()` that omits the field — so a malformed default (wrong type, value outside the enum, unparseable date) throws `TarnSchemaError` immediately, pointing at the schema where the mistake lives.
+
 **Reserved names:** `cred`, `connection`, `share-log-state`, `share-inbox`, `recovery-factor`, `app-config`, `app-schema`. Declaring a collection with a reserved name throws at `defineSchema()`.
 
 **Sharing:** only collections with `shareable: true` get `share/shareWithAll/unshare/listShared` methods. The schema is the authoritative answer to "is this thing shareable" — apps can't bypass it.
@@ -106,6 +110,8 @@ Schemas carry a numeric `version`. Bumping it republishes the schema (via `tools
 
 So, today, **only the backward-compatible (additive) changes in the table below are safe by default.** A breaking change requires either a default/deprecation (per the table) or an inline forward-migrator.
 
+> **"Additive" means added-OPTIONAL (or added-required-WITH-a-default).** The read path does **not** re-run strict validation (that would risk throwing on legitimate legacy data), so an older record that's missing a newly-added *required, no-default, no-migrator* field is returned **as-is** rather than rejected — it would otherwise violate the record's declared TypeScript type. To make this visible, the SDK emits a `console.warn` on read when it detects an older record missing such a field (Tarn #57). Treat that warning as "fix your schema": add a `default`, or declare a `migrations[v]` that fills the field. Reads never throw or drop the record on this case — the warning is the contract enforcement.
+
 Three rules cover the common cases:
 
 | Change | Backward-compat? | What you do |
@@ -119,19 +125,41 @@ Three rules cover the common cases:
 | **Tighten an enum** (drop a value) | **no** | Older records carrying the dropped value fail. Don't drop; deprecate. |
 | **Loosen an enum** (add a value) | yes | Older records still satisfy the union. |
 
-**Inline forward-migrators (the read-time seam).** `defineSchema()` accepts an optional `migrations: { [v]: (old) => newRecord }` map: `migrations[v]` transforms a record written under version `v` into the shape of version `v+1`. The SDK chains these in memory on read for any record older than the current `version` — so an older record can be reshaped on the fly without rewriting it on Arweave. The map is validated at `defineSchema()` time (keys must be positive integers strictly below `version`).
+**Inline forward-migrators (the read-time seam).** `defineSchema()` accepts an optional `migrations` map. `migrations[v]` transforms a record written under version `v` into the shape of version `v+1`. The SDK chains these in memory on read for any record older than the current `version` — so an older record can be reshaped on the fly without rewriting it on Arweave. The map is validated at `defineSchema()` time (keys must be positive integers strictly below `version`).
+
+Two shapes are accepted:
 
 ```js
 const schema = defineSchema({
   appId: 'myapp',
   version: 2,
-  collections: { /* ... */ },
+  collections: { profiles: { /* ... */ }, notes: { /* ... */ } },
+
+  // RECOMMENDED — collection-scoped: each migrator runs ONLY against its own
+  // collection's records.
   migrations: {
-    // v1 records had `name`; v2 splits it. Applied on read for v1 entries.
-    1: (old) => ({ ...old, displayName: old.name, name: undefined }),
+    profiles: {
+      // v1 profiles had `name`; v2 splits it. Applied only to profile entries.
+      1: (old) => ({ ...old, displayName: old.name, name: undefined }),
+    },
+    notes: {
+      1: (old) => ({ ...old, body: old.text, text: undefined }),
+    },
   },
 });
 ```
+
+```js
+// LEGACY / single-collection — flat: the SAME migrator runs against EVERY
+// collection's records. Only safe for a single-collection schema, or migrators
+// written to no-op on records that aren't theirs. Multi-collection apps should
+// use the scoped shape above (Tarn #55).
+migrations: {
+  1: (old) => ({ ...old, displayName: old.name, name: undefined }),
+}
+```
+
+The SDK disambiguates the two by their top-level keys: numeric keys = flat; collection-name keys = scoped. In the scoped shape, a key naming an undeclared collection throws at `defineSchema()`. **If a step in the chain has no migrator while the map is otherwise populated** (e.g. you declared `1` and `3` but forgot `2`), the SDK assumes that step was additive and skips it — but emits a `console.warn` so an accidental gap is visible (Tarn #58c). If the step was *not* additive, declare a migrator for it.
 
 This is the lightweight, no-rewrite option — it does not persist anything, so it costs zero Arweave writes. Use it for shape changes you can compute purely from the old record.
 
@@ -201,6 +229,15 @@ await tarn.notes.batchCreate([
 
 Records are addressed by **primary key**, never by Arweave txid. The SDK maps primary keys onto the protocol's `Eid` tag so reads converge across devices.
 
+**`create()` on an existing primary key is last-write-wins by default.** Because a record's `Eid` is derived from its primary key, a second `create()` for the same key writes a new entry that *supersedes* the prior one (the old version stays on Arweave but is no longer the live record) — it does **not** error. This is intentional and matches `update()`'s Eid behavior. If a duplicate create signals a bug (e.g. you mint a fresh id that must be unique), pass `failIfExists` to reject it instead:
+
+```js
+// Throws TarnCollectionError if a live record with this primary key exists.
+await tarn.notes.create({ noteId: 'n1', title: 'New' }, { failIfExists: true });
+```
+
+`failIfExists` costs one extra read (a narrow Eid lookup) before the write, and is **best-effort, not atomic** — two truly-concurrent creates of the same new key can still both pass the check (last-write-wins then reconciles them via the shared Eid). For retry-safety of the *same* logical create, prefer `idempotencyKey` over `failIfExists`. `batchCreate` additionally rejects a batch up front if two items in it share a primary key (an in-batch collision would silently collapse to one record).
+
 `update()` is **partial-merge**. Pass only what's changing; the SDK reads the current record from Arweave, merges, re-validates as a full record, and writes a chained entry. Full-replace is `update(id, { ...current, ...patch })` if you ever want it.
 
 **The primary key is immutable.** A record's identity (`Eid`) is derived from `hash(appId, collection, primaryKey)`, so changing the primary key would mint a brand-new `Eid`, orphan the original record's history, and silently fork the logical record into two. `update()` enforces this: if your patch includes the primary-key field with a value that differs from the existing record's, the call throws a `TarnCollectionError` and nothing is written. Including the primary-key field with its *current* value is a harmless no-op — it's stripped before the merge. If you genuinely need to "rename" a record's key, model it as a delete of the old key plus a create of the new one.
@@ -217,6 +254,7 @@ The listed keys are deleted from the merged record *after* the patch, then the r
 - Unsetting a field that wasn't present is a no-op.
 - If the same field is in both `patch` and `unset`, the unset wins (delete-after-merge).
 - Unsetting a required field throws the standard "required field missing" validation error — required fields can't be cleared.
+- Unsetting an **optional field that has a `default`** truly clears it — it does *not* silently revert to the default. (The re-validation step knows the field was deliberately unset and skips default application for it.)
 - Reading the record back via `get()` returns a record where the cleared key is truly absent (not `null` or `undefined`).
 
 **Bulk imports.** `batchCreate` writes up to 25 records in one request and counts as a single rate-limit hit. Every record is validated against the schema before any wire call — if any record fails, nothing is written and the thrown `TarnCollectionError` lists the failing indexes:

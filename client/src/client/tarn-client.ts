@@ -18,6 +18,7 @@ import type {
   Schema,
   SchemaInput,
 } from '../schema/index.js';
+import { resolveCollectionMigrations } from '../schema/index.js';
 import { Collection, type ITarnClient } from '../collections/index.js';
 import type { TarnStorageAdapter } from '../storage/index.js';
 import type { AnySchema, ClientConfig, CollectionsOf } from './types.js';
@@ -301,11 +302,15 @@ async function buildCollections<S extends AnySchema>(
   const out: Record<string, Collection<Record<string, unknown>>> = {};
   const collections = (schema as unknown as SchemaInput).collections;
   const version = (schema as unknown as SchemaInput).version;
-  // Per-version forward-migrators (optional). Threaded into every Collection so
-  // read-side SchemaV dispatch (Tarn #37) can migrate older entries forward.
-  // The schema layer shares one migrations map across all collections; a
-  // migrator receives + returns a plain record, so collections that don't need
-  // it simply leave the record untouched.
+  // Per-version forward-migrators (optional). Read-side SchemaV dispatch
+  // (Tarn #37) uses these to migrate older entries forward.
+  //
+  // Tarn #55: migrations are resolved PER COLLECTION rather than shared
+  // verbatim. `resolveCollectionMigrations` understands both the legacy flat
+  // shape (`{ [v]: fn }`, applies to all collections) and the scoped shape
+  // (`{ [collectionName]: { [v]: fn } }`, applies only to the named
+  // collection) — so a migrator declared for `books` no longer runs against
+  // `notes` records.
   const migrations = (schema as unknown as SchemaInput).migrations;
 
   for (const [name, def] of Object.entries(collections)) {
@@ -315,7 +320,7 @@ async function buildCollections<S extends AnySchema>(
       name,
       def: def as CollectionDef,
       schemaVersion: version,
-      migrations,
+      migrations: resolveCollectionMigrations(migrations, name),
     });
   }
 

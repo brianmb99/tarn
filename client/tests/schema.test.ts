@@ -239,6 +239,130 @@ describe('defineSchema', () => {
       /not less than current/,
     );
   });
+
+  // ---- Tarn #58b: defaults validated at defineSchema time ----
+
+  it('rejects a default of the wrong type (Tarn #58b)', () => {
+    assert.throws(
+      () => defineSchema({
+        appId: 'x',
+        version: 1,
+        collections: {
+          books: {
+            primaryKey: 'id',
+            fields: {
+              id: 'string',
+              // boolean field with a string default — must fail at definition.
+              isPrivate: { type: 'boolean', default: 'nope' as unknown as boolean },
+            },
+          },
+        },
+      }),
+      /invalid default/,
+    );
+  });
+
+  it('rejects a default outside the field enum (Tarn #58b)', () => {
+    assert.throws(
+      () => defineSchema({
+        appId: 'x',
+        version: 1,
+        collections: {
+          books: {
+            primaryKey: 'id',
+            fields: {
+              id: 'string',
+              status: { type: 'string', enum: ['unread', 'read'] as const, default: 'shelved' },
+            },
+          },
+        },
+      }),
+      /invalid default/,
+    );
+  });
+
+  it('rejects an invalid date default (Tarn #58b)', () => {
+    assert.throws(
+      () => defineSchema({
+        appId: 'x',
+        version: 1,
+        collections: {
+          books: {
+            primaryKey: 'id',
+            fields: {
+              id: 'string',
+              addedAt: { type: 'date', required: false, default: 'not a date' },
+            },
+          },
+        },
+      }),
+      /invalid default/,
+    );
+  });
+
+  it('accepts a valid default (Tarn #58b — no false positive)', () => {
+    const s = defineSchema({
+      appId: 'x',
+      version: 1,
+      collections: {
+        books: {
+          primaryKey: 'id',
+          fields: {
+            id: 'string',
+            isPrivate: { type: 'boolean', default: false },
+            status: { type: 'string', enum: ['unread', 'read'] as const, default: 'unread' },
+            count: { type: 'integer', required: false, default: 0 },
+          },
+        },
+      },
+    });
+    assert.ok(s);
+  });
+
+  // ---- Tarn #55: collection-scoped migrations validation ----
+
+  it('accepts collection-scoped migrations (Tarn #55)', () => {
+    type R = Record<string, unknown>;
+    const s = defineSchema({
+      appId: 'x',
+      version: 2,
+      collections: {
+        books: { primaryKey: 'id', fields: { id: 'string' } },
+        notes: { primaryKey: 'nid', fields: { nid: 'string' } },
+      },
+      migrations: {
+        books: { 1: (r: R) => ({ ...r, fromBooksV1: true }) },
+        notes: { 1: (r: R) => ({ ...r, fromNotesV1: true }) },
+      },
+    });
+    assert.ok(s.migrations);
+  });
+
+  it('rejects scoped migrations naming an unknown collection (Tarn #55)', () => {
+    type R = Record<string, unknown>;
+    assert.throws(
+      () => defineSchema({
+        appId: 'x',
+        version: 2,
+        collections: { books: { primaryKey: 'id', fields: { id: 'string' } } },
+        migrations: { widgets: { 1: (r: R) => r } },
+      }),
+      /unknown collection 'widgets'/,
+    );
+  });
+
+  it('rejects scoped migration for current/future version (Tarn #55)', () => {
+    type R = Record<string, unknown>;
+    assert.throws(
+      () => defineSchema({
+        appId: 'x',
+        version: 2,
+        collections: { books: { primaryKey: 'id', fields: { id: 'string' } } },
+        migrations: { books: { 2: (r: R) => r } },
+      }),
+      /not less than current/,
+    );
+  });
 });
 
 // ============ validateRecordForCreate ============

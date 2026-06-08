@@ -31,7 +31,8 @@
  *     the current client.)
  */
 
-import type { Migration } from '../schema/index.js';
+import type { CollectionDef, Migration } from '../schema/index.js';
+import { normalizeField } from '../schema/index.js';
 import type { Tag } from './types.js';
 
 /**
@@ -107,6 +108,14 @@ export function readSchemaVTag(tags: Tag[] | undefined): number | null {
  *                      when the app declares none. Today this is the migration
  *                      seam: present so forward-migration can be wired up
  *                      later without another read-path landmine.
+ * @param def          optional collection definition. When supplied, an older
+ *                      entry that is STILL missing a required field after
+ *                      migration triggers a `console.warn` (Tarn #57) — the
+ *                      "added a required field without a default or migrator"
+ *                      landmine. The record is returned as-is (non-breaking: we
+ *                      warn, we do not throw or drop), so apps can detect the
+ *                      contract violation in dev without legacy reads suddenly
+ *                      failing in production.
  * @param txid         optional txid for error/diagnostic context
  */
 export function dispatchSchemaVersion(args: {
@@ -114,9 +123,10 @@ export function dispatchSchemaVersion(args: {
   tags: Tag[] | undefined;
   clientVersion: number;
   migrations?: Record<number, Migration> | undefined;
+  def?: CollectionDef | undefined;
   txid?: string | null | undefined;
 }): Record<string, unknown> {
-  const { record, tags, clientVersion, migrations, txid } = args;
+  const { record, tags, clientVersion, migrations, def, txid } = args;
   const entryVersion = readSchemaVTag(tags) ?? OLDEST_SCHEMA_VERSION;
 
   // Case: future entry the current client can't understand. Never validate.
@@ -133,12 +143,81 @@ export function dispatchSchemaVersion(args: {
   // documented "additive change" contract — and the seam stays inert.
   let migrated = record;
   if (migrations) {
+    // Tarn #58c: a gap in the migration chain (a step in the walked range with
+    // no declared migrator) used to be a SILENT no-op for that step. That's the
+    // documented "this step was additive" contract when the app declares NO
+    // migrations at all — but once an app DOES declare migrations, a missing
+    // step is far more likely an authoring mistake (e.g. declaring `2` and `4`
+    // but forgetting `3`) that silently skips a needed transform. We still
+    // tolerate it (skipping is the safe runtime choice — the additive contract
+    // may genuinely hold for that step), but warn so the gap is visible.
+    const declaredAny = Object.keys(migrations).length > 0;
+    const missing: number[] = [];
     for (let v = entryVersion; v < clientVersion; v++) {
       const migrate = migrations[v];
       if (typeof migrate === 'function') {
         migrated = migrate(migrated);
+      } else if (declaredAny) {
+        missing.push(v);
       }
     }
+    if (missing.length > 0) {
+      console.warn(
+        `[TarnClient] schema-version dispatch: migration chain gap — no migrator ` +
+        `declared for version(s) ${missing.join(', ')} while migrating an entry ` +
+        `from v${entryVersion} toward v${clientVersion}` +
+        (txid ? ` (txid: ${txid})` : '') +
+        `. That step is being skipped (assumed additive / backward-compatible). ` +
+        `If the step was NOT additive, declare migrations[v] for it.`,
+      );
+    }
   }
+
+  // Tarn #57: an older entry that is STILL missing a required field after any
+  // migration is the "added a required field without a default or migrator"
+  // landmine — the additive-evolution contract only safely covers added
+  // OPTIONAL fields (or required fields with a default). We do NOT throw or
+  // drop (that would break apps reading legacy data); we warn so the contract
+  // violation is visible in dev. The strict create-time validator still
+  // enforces requiredness on writes; this is purely a read-path heads-up.
+  warnIfMissingRequired(migrated, def, entryVersion, clientVersion, txid);
+
   return migrated;
+}
+
+/**
+ * Emit a `console.warn` if `record` is missing any field the collection
+ * declares as required (Tarn #57). No-op when no `def` is supplied or every
+ * required field is present. Never throws — read-path defensive posture.
+ */
+function warnIfMissingRequired(
+  record: Record<string, unknown>,
+  def: CollectionDef | undefined,
+  entryVersion: number,
+  clientVersion: number,
+  txid: string | null | undefined,
+): void {
+  if (!def) return;
+  const missingRequired: string[] = [];
+  for (const [fieldName, fieldDef] of Object.entries(def.fields)) {
+    const norm = normalizeField(fieldDef);
+    // A required field with a declared default is never "missing" — the
+    // create-time validator fills it. Only flag required fields with neither a
+    // value nor a default.
+    if (norm.required && !norm.hasDefault && record[fieldName] === undefined) {
+      missingRequired.push(fieldName);
+    }
+  }
+  if (missingRequired.length > 0) {
+    console.warn(
+      `[TarnClient] schema-version dispatch: entry written under schema v${entryVersion} ` +
+      `is missing required field(s) [${missingRequired.join(', ')}] under current ` +
+      `schema v${clientVersion}` +
+      (txid ? ` (txid: ${txid})` : '') +
+      `. This is the "added a required field without a default or migrator" case: ` +
+      `the additive-evolution contract only covers added OPTIONAL fields (or ` +
+      `required fields WITH a default). Add a default, or declare a migrations[${entryVersion}] ` +
+      `migrator that fills the field. The record is returned unchanged (this is a warning, not an error).`,
+    );
+  }
 }

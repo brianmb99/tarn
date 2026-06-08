@@ -7,7 +7,16 @@
  */
 
 import { RESERVED_TYPE_NAMES } from './reserved.js';
-import type { CollectionDef, FieldDef, FieldTypeName, Schema, SchemaInput } from './types.js';
+import { validateFieldDefault } from './validate.js';
+import { isScopedMigrations, isPositiveIntKey } from './migrations.js';
+import type {
+  CollectionDef,
+  FieldDef,
+  FieldTypeName,
+  Schema,
+  SchemaInput,
+  SchemaMigrations,
+} from './types.js';
 
 export class TarnSchemaError extends Error {
   override readonly name = 'TarnSchemaError';
@@ -73,7 +82,7 @@ function validateSchemaInput(input: SchemaInput): void {
   }
 
   if (input.migrations !== undefined) {
-    validateMigrations(input.migrations, input.version);
+    validateMigrations(input.migrations, input.version, collectionNames);
   }
 }
 
@@ -146,22 +155,69 @@ function validateFieldDef(collection: string, field: string, def: FieldDef): voi
       );
     }
   }
+  // Tarn #58b: validate the declared default against this field's own type +
+  // enum NOW, at schema-definition time — not lazily at the first create that
+  // omits the field. A bad default is a schema bug; fail where it lives.
+  validateFieldDefault(collection, field, def);
 }
 
-function validateMigrations(migs: Record<number, unknown>, currentVersion: number): void {
-  for (const key of Object.keys(migs)) {
-    const v = Number(key);
-    if (!Number.isInteger(v) || v < 1) {
-      throw new TarnSchemaError(`Migration version key '${key}' must be a positive integer`);
+/**
+ * Validate the `migrations` block. Accepts both the flat (legacy) shape
+ * `{ [version]: fn }` and the collection-scoped shape
+ * `{ [collectionName]: { [version]: fn } }` (Tarn #55), disambiguated by
+ * `isScopedMigrations`. Scoped keys must name declared collections so a typo'd
+ * collection name fails at definition time rather than silently never running.
+ */
+function validateMigrations(
+  migs: SchemaMigrations,
+  currentVersion: number,
+  collectionNames: string[],
+): void {
+  if (typeof migs !== 'object' || migs === null) {
+    throw new TarnSchemaError('Schema.migrations must be an object');
+  }
+  if (isScopedMigrations(migs)) {
+    const known = new Set(collectionNames);
+    for (const collName of Object.keys(migs)) {
+      if (!known.has(collName)) {
+        throw new TarnSchemaError(
+          `Schema.migrations references unknown collection '${collName}' ` +
+          `(declared collections: ${collectionNames.join(', ')})`,
+        );
+      }
+      const perColl = (migs as Record<string, unknown>)[collName];
+      if (typeof perColl !== 'object' || perColl === null) {
+        throw new TarnSchemaError(
+          `Schema.migrations['${collName}'] must be an object of { [version]: fn }`,
+        );
+      }
+      validateVersionMap(perColl as Record<string, unknown>, currentVersion, `migrations['${collName}']`);
     }
+    return;
+  }
+  // Flat / legacy shape: { [version]: fn } applied to every collection.
+  validateVersionMap(migs as Record<string, unknown>, currentVersion, 'migrations');
+}
+
+/** Validate a single `{ [version]: fn }` map (shared by both migration shapes). */
+function validateVersionMap(
+  map: Record<string, unknown>,
+  currentVersion: number,
+  label: string,
+): void {
+  for (const key of Object.keys(map)) {
+    if (!isPositiveIntKey(key)) {
+      throw new TarnSchemaError(`${label}: version key '${key}' must be a positive integer`);
+    }
+    const v = Number(key);
     if (v >= currentVersion) {
       throw new TarnSchemaError(
-        `Migration for version ${v} is not less than current schema.version ${currentVersion}; ` +
-        `migrations apply only to entries written under PRIOR versions`,
+        `${label}: migration for version ${v} is not less than current schema.version ` +
+        `${currentVersion}; migrations apply only to entries written under PRIOR versions`,
       );
     }
-    if (typeof migs[v] !== 'function') {
-      throw new TarnSchemaError(`Migration for version ${v} must be a function`);
+    if (typeof map[key] !== 'function') {
+      throw new TarnSchemaError(`${label}: migration for version ${v} must be a function`);
     }
   }
 }

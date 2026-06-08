@@ -22,7 +22,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { defineSchema } from '../src/schema/index.js';
+import { defineSchema, resolveCollectionMigrations, isScopedMigrations } from '../src/schema/index.js';
 import type { CollectionDef } from '../src/schema/index.js';
 import {
   Collection,
@@ -398,5 +398,239 @@ describe('Collection.get — SchemaV dispatch', () => {
     const eid = await deriveEid('bookish', 'books', 'b1');
     mock.plant({ type: 'books', eid, data: { bookId: 'b1', title: 'Future' }, schemaV: 42 });
     await assert.rejects(() => books.update('b1', { title: 'Patched' }), TarnSchemaVersionError);
+  });
+});
+
+// ============ Tarn #55: migration shape resolution + scoping ============
+
+/** Capture console.warn calls for the duration of `fn`, then restore. */
+async function captureWarns(fn: () => void | Promise<void>): Promise<string[]> {
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warns.push(args.map((a) => (typeof a === 'string' ? a : String(a))).join(' '));
+  };
+  try {
+    await fn();
+  } finally {
+    console.warn = orig;
+  }
+  return warns;
+}
+
+describe('migration shape resolution (Tarn #55)', () => {
+  type R = Record<string, unknown>;
+
+  it('isScopedMigrations: numeric keys → flat; collection-name keys → scoped', () => {
+    assert.equal(isScopedMigrations({ 1: (r: R) => r }), false);
+    assert.equal(isScopedMigrations({ books: { 1: (r: R) => r } }), true);
+    // Empty → treated as flat (no migrators either way).
+    assert.equal(isScopedMigrations({}), false);
+  });
+
+  it('flat shape resolves to the same map for every collection (legacy)', () => {
+    const flat = { 1: (r: R) => ({ ...r, touched: true }) };
+    const forBooks = resolveCollectionMigrations(flat, 'books');
+    const forNotes = resolveCollectionMigrations(flat, 'notes');
+    assert.equal(forBooks, flat);
+    assert.equal(forNotes, flat);
+  });
+
+  it('scoped shape resolves ONLY the named collection (the fix)', () => {
+    const booksMig = { 1: (r: R) => ({ ...r, fromBooks: true }) };
+    const scoped = { books: booksMig };
+    assert.equal(resolveCollectionMigrations(scoped, 'books'), booksMig);
+    // notes has no scoped entry → undefined → the migrator never runs on notes.
+    assert.equal(resolveCollectionMigrations(scoped, 'notes'), undefined);
+  });
+
+  it('undefined migrations → undefined for any collection', () => {
+    assert.equal(resolveCollectionMigrations(undefined, 'books'), undefined);
+  });
+
+  it('end-to-end: a scoped books-only migrator does NOT touch notes records', async () => {
+    // Two collections, client at v2. Plant a v1 record in each. Only books has
+    // a declared v1 migrator. notes' v1 record must pass through untouched.
+    const booksMock = new VersionMockClient();
+    const notesMock = new VersionMockClient();
+
+    const booksMig = resolveCollectionMigrations(
+      { books: { 1: (r: R) => ({ ...r, migrated: true }) } },
+      'books',
+    );
+    const notesMig = resolveCollectionMigrations(
+      { books: { 1: (r: R) => ({ ...r, migrated: true }) } },
+      'notes',
+    );
+
+    const books = createCollection<{ bookId: string; title: string; migrated?: boolean }>({
+      client: booksMock,
+      appId: 'bookish',
+      name: 'books',
+      def: { primaryKey: 'bookId', fields: { bookId: 'string', title: 'string' } },
+      schemaVersion: 2,
+      migrations: booksMig,
+    });
+    const notes = createCollection<{ noteId: string; body: string; migrated?: boolean }>({
+      client: notesMock,
+      appId: 'bookish',
+      name: 'notes',
+      def: { primaryKey: 'noteId', fields: { noteId: 'string', body: 'string' } },
+      schemaVersion: 2,
+      migrations: notesMig,
+    });
+
+    booksMock.plant({ type: 'books', eid: 'be1', data: { bookId: 'b1', title: 'B' }, schemaV: 1 });
+    notesMock.plant({ type: 'notes', eid: 'ne1', data: { noteId: 'n1', body: 'N' }, schemaV: 1 });
+
+    const bookList = await books.list();
+    const noteList = await notes.list();
+
+    assert.equal(bookList[0]!.migrated, true, 'books migrator should run on books');
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(noteList[0]!, 'migrated'),
+      false,
+      'books migrator must NOT have touched notes (Tarn #55)',
+    );
+  });
+});
+
+// ============ Tarn #58c: migration chain gap warning ============
+
+describe('migration chain gap warning (Tarn #58c)', () => {
+  type R = Record<string, unknown>;
+
+  it('warns when a declared-migrations chain has a gap on the walked range', async () => {
+    // Client v3, entry v1. Migrators declared for 1 and... nothing for 2.
+    // Because migrations IS declared, the missing step 2 should warn.
+    const warns = await captureWarns(() => {
+      dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'T' },
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 3,
+        migrations: { 1: (r: R) => r }, // step 2 missing → gap
+        txid: 'tx-gap',
+      });
+    });
+    assert.equal(warns.length, 1, 'exactly one gap warning expected');
+    assert.match(warns[0]!, /migration chain gap/);
+    assert.match(warns[0]!, /version\(s\) 2/);
+  });
+
+  it('does NOT warn when NO migrations are declared (all-additive contract)', async () => {
+    const warns = await captureWarns(() => {
+      dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'T' },
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 3,
+        // no migrations at all → additive contract, stays silent.
+      });
+    });
+    assert.equal(warns.length, 0);
+  });
+
+  it('does NOT warn when the chain is complete', async () => {
+    const warns = await captureWarns(() => {
+      dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'T' },
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 3,
+        migrations: { 1: (r: R) => r, 2: (r: R) => r }, // complete
+      });
+    });
+    assert.equal(warns.length, 0);
+  });
+});
+
+// ============ Tarn #57: missing-required-field read warning ============
+
+describe('missing-required-field read warning (Tarn #57)', () => {
+  const defWithRequired: CollectionDef = {
+    primaryKey: 'bookId',
+    fields: {
+      bookId: 'string',
+      title: 'string',
+      // v2 added this REQUIRED field with no default and no migrator — the
+      // landmine. A v1 record lacks it.
+      isbn: 'string',
+    },
+  };
+
+  it('warns when an older record is missing a required field after dispatch', async () => {
+    const warns = await captureWarns(() => {
+      dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'Old' }, // no isbn
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 2,
+        def: defWithRequired,
+        txid: 'tx-missing',
+      });
+    });
+    assert.equal(warns.length, 1);
+    assert.match(warns[0]!, /missing required field\(s\) \[isbn\]/);
+    assert.match(warns[0]!, /returned unchanged/);
+  });
+
+  it('returns the record UNCHANGED (non-breaking: warn, never throw/drop)', async () => {
+    const rec = { bookId: 'b1', title: 'Old' };
+    let out: Record<string, unknown> = {};
+    // Wrap in captureWarns purely to keep the expected warning out of test
+    // output — the assertion here is about the RETURN value, not the warn.
+    await captureWarns(() => {
+      out = dispatchSchemaVersion({
+        record: rec,
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 2,
+        def: defWithRequired,
+      });
+    });
+    assert.deepEqual(out, rec, 'record must pass through; no fields added or removed');
+  });
+
+  it('does NOT warn when a migrator fills the required field', async () => {
+    const warns = await captureWarns(() => {
+      const out = dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'Old' },
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 2,
+        def: defWithRequired,
+        migrations: { 1: (r) => ({ ...r, isbn: '000' }) },
+      });
+      assert.equal((out as Record<string, unknown>)['isbn'], '000');
+    });
+    assert.equal(warns.length, 0, 'a migrator that fills the field must suppress the warning');
+  });
+
+  it('does NOT warn when the required field has a default', async () => {
+    const defWithDefault: CollectionDef = {
+      primaryKey: 'bookId',
+      fields: {
+        bookId: 'string',
+        title: 'string',
+        // required, but with a default — the validator fills it on create.
+        flag: { type: 'boolean', default: false },
+      },
+    };
+    const warns = await captureWarns(() => {
+      dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'Old' },
+        tags: [{ name: 'SchemaV', value: '1' }],
+        clientVersion: 2,
+        def: defWithDefault,
+      });
+    });
+    assert.equal(warns.length, 0);
+  });
+
+  it('does NOT warn for same-version reads (hot path untouched)', async () => {
+    const warns = await captureWarns(() => {
+      dispatchSchemaVersion({
+        record: { bookId: 'b1', title: 'T' }, // missing isbn but same version
+        tags: [{ name: 'SchemaV', value: '2' }],
+        clientVersion: 2,
+        def: defWithRequired,
+      });
+    });
+    assert.equal(warns.length, 0, 'same-version reads return early, no required-field scan');
   });
 });

@@ -42,13 +42,49 @@ export type CollectionDef = {
 
 export type Migration = (old: Record<string, unknown>) => Record<string, unknown>;
 
+/**
+ * A per-version migrator map for a SINGLE collection: `migrations[v]` migrates a
+ * record written under version `v` to the shape of version `v+1`. This is the
+ * unit the read-side dispatcher (`schema-version.ts`) consumes.
+ */
+export type CollectionMigrations = Record<number, Migration>;
+
+/**
+ * Collection-scoped migrations (Tarn #55): `migrations[collectionName][v]`
+ * applies ONLY to records of `collectionName`. This is the recommended shape
+ * for any multi-collection app, since a flat (collection-agnostic) map runs
+ * every declared migrator against every collection's records.
+ */
+export type ScopedMigrations = Record<string, CollectionMigrations>;
+
+/**
+ * Schema-level migrations. Two shapes are accepted:
+ *
+ *   - **Collection-scoped** (recommended): `{ [collectionName]: { [v]: fn } }`.
+ *     Each migrator runs only against its own collection's records.
+ *   - **Flat / legacy**: `{ [v]: fn }`. The migrator runs against EVERY
+ *     collection (the original behavior — kept for backward compatibility).
+ *     Safe only for single-collection apps, or migrators written to no-op on
+ *     records that aren't theirs. Multi-collection apps should prefer the
+ *     scoped shape.
+ *
+ * The two are disambiguated structurally at runtime: numeric top-level keys =
+ * flat; non-numeric (collection-name) top-level keys = scoped.
+ */
+export type SchemaMigrations = CollectionMigrations | ScopedMigrations;
+
 export type SchemaInput = {
   appId: string;
   /** Bumped on shape changes; drives migrations on read. */
   version: number;
   collections: Record<string, CollectionDef>;
-  /** Per-version migrators applied on read for entries written under older schema versions. */
-  migrations?: Record<number, Migration>;
+  /**
+   * Per-version migrators applied on read for entries written under older
+   * schema versions. Either flat (`{ [v]: fn }`, applies to all collections —
+   * legacy) or collection-scoped (`{ [name]: { [v]: fn } }`, recommended).
+   * See {@link SchemaMigrations}.
+   */
+  migrations?: SchemaMigrations;
 };
 
 /** Branded schema — only produced by `defineSchema()`. */

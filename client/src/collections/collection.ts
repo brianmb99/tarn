@@ -16,7 +16,7 @@
  */
 
 import type { CollectionDef, CollectionRecord, Migration } from '../schema/index.js';
-import { validateRecordForCreate, validateRecordForUpdate } from '../schema/index.js';
+import { validateRecordForCreate, validateRecordForUpdate, coerceDatesForRead } from '../schema/index.js';
 import { deriveEid } from './eid.js';
 import { TarnCollectionError } from './types.js';
 import type { DecryptedEntry, ITarnClient, ShareConnection, Tag } from './types.js';
@@ -79,12 +79,48 @@ export class Collection<TRecord extends Record<string, unknown>> {
    * The key must be stable across attempts to dedup; derive it from the
    * record's persistent identity (e.g. its primaryKey), not per-call randomness.
    * See tarn #8 / bookish#225 (seam S-2).
+   *
+   * DEFAULT behavior on a primaryKey that already has a live record is
+   * **last-write-wins**: the new entry shares the existing record's Eid, so it
+   * supersedes the prior one (the prior version stays on Arweave but is no
+   * longer the live record). This is intentional and unchanged — `create()` and
+   * `update()` produce the same Eid for a given key.
+   *
+   * Pass `opts.failIfExists: true` (Tarn #56) to instead REJECT a create whose
+   * primaryKey already has a live record, throwing `TarnCollectionError`
+   * without writing. Use it when a duplicate create signals an app bug (e.g.
+   * minting a fresh id that must be unique) rather than an intended overwrite.
+   * Note it costs one extra read (an Eid lookup) before the write, and it is
+   * best-effort: it is not an atomic check-and-set, so two concurrent creates
+   * of the same new key can still race past the check (last-write-wins
+   * reconciles them via the shared Eid). For idempotent retry-safety of the
+   * SAME logical create, prefer `idempotencyKey` over `failIfExists`.
    */
-  async create(record: TRecord, opts?: { idempotencyKey?: string }): Promise<TRecord> {
+  async create(
+    record: TRecord,
+    opts?: { idempotencyKey?: string; failIfExists?: boolean },
+  ): Promise<TRecord> {
     const validated = validateRecordForCreate(this.#name, this.#def, record);
     const pk = this.#extractPrimaryKey(validated);
     const eid = await deriveEid(this.#appId, this.#name, pk);
-    await this.#client.createEntry(this.#name, validated, this.#protocolTags(eid), opts);
+    if (opts?.failIfExists) {
+      // Best-effort existence guard (not atomic — see doc comment). One narrow
+      // Eid lookup; throws before any write if a live record already exists.
+      const existing = await this.#client.getEntryByEid(this.#name, eid);
+      if (existing) {
+        throw new TarnCollectionError(
+          `Collection '${this.#name}': create({ failIfExists: true }) — a record ` +
+          `with primaryKey '${pk}' already exists. Use update() to modify it, or ` +
+          `omit failIfExists for last-write-wins.`,
+        );
+      }
+    }
+    // `createEntry` accepts only `{ idempotencyKey }`; failIfExists is a typed-
+    // layer concern and must not leak to the wire call.
+    const createOpts = opts?.idempotencyKey !== undefined
+      ? { idempotencyKey: opts.idempotencyKey }
+      : undefined;
+    await this.#client.createEntry(this.#name, validated, this.#protocolTags(eid), createOpts);
     return validated as TRecord;
   }
 
@@ -149,11 +185,29 @@ export class Collection<TRecord extends Record<string, unknown>> {
     // extraction can still throw (empty/non-string primaryKey); that path
     // is rare since validateRecordForCreate already enforces field types,
     // but it's per-record, so wrap it the same way.
+    //
+    // Tarn #56: also reject intra-batch duplicate primaryKeys. Two items in one
+    // batch sharing a pk would derive the SAME Eid and silently collapse to a
+    // single live record (last one wins) — almost always a caller bug, so we
+    // fail the whole batch (atomic, no wire call) and name the colliding index.
     const extraTagsPerItem: Tag[][] = [];
+    const firstIndexByPk = new Map<string, number>();
     for (let i = 0; i < validated.length; i++) {
       const v = validated[i] as TRecord;
       try {
         const pk = this.#extractPrimaryKey(v as Record<string, unknown>);
+        const firstIndex = firstIndexByPk.get(pk);
+        if (firstIndex !== undefined) {
+          failures.push({
+            index: i,
+            error: `duplicate primaryKey '${pk}' (already used at index ${firstIndex})`,
+          });
+          // Still push a placeholder so extraTagsPerItem stays index-aligned;
+          // the batch aborts below regardless.
+          extraTagsPerItem.push([]);
+          continue;
+        }
+        firstIndexByPk.set(pk, i);
         const eid = await deriveEid(this.#appId, this.#name, pk);
         extraTagsPerItem.push(this.#protocolTags(eid));
       } catch (err) {
@@ -161,6 +215,7 @@ export class Collection<TRecord extends Record<string, unknown>> {
           index: i,
           error: err instanceof Error ? err.message : String(err),
         });
+        extraTagsPerItem.push([]);
       }
     }
     if (failures.length > 0) {
@@ -251,7 +306,12 @@ export class Collection<TRecord extends Record<string, unknown>> {
       // ends up cleared. Deleting an absent key is a no-op (standard JS).
       delete merged[key];
     }
-    const revalidated = validateRecordForCreate(this.#name, this.#def, merged);
+    // Pass the unset keys through so re-validation does NOT re-apply a field's
+    // default to a deliberately-cleared field (Tarn #58a). Without this, unset
+    // on a defaulted field silently reverts to the default. A required field in
+    // the unset list still fails the required check — unchanged behavior.
+    const unsetKeys = unsetList.length > 0 ? new Set<string>(unsetList) : undefined;
+    const revalidated = validateRecordForCreate(this.#name, this.#def, merged, { unsetKeys });
 
     const eid = await deriveEid(this.#appId, this.#name, primaryKey);
     await this.#client.updateEntry(entry.txid, this.#name, revalidated, this.#protocolTags(eid));
@@ -332,13 +392,16 @@ export class Collection<TRecord extends Record<string, unknown>> {
         // Read-side SchemaV dispatch (Tarn #37): migrate older entries
         // forward; SKIP-WITH-WARNING a future-version entry so one newer
         // record can't break a whole sync (same posture as orphan drops).
-        const record = dispatchSchemaVersion({
+        const dispatched = dispatchSchemaVersion({
           record: e.data,
           tags: e.tags,
           clientVersion: this.#schemaVersion,
           migrations: this.#migrations,
+          def: this.#def,
           txid: e.txid,
-        }) as TRecord;
+        });
+        // Tarn #54: re-hydrate `date` fields to Date on the delta-sync path too.
+        const record = coerceDatesForRead(this.#def, dispatched) as TRecord;
         entries.push({ record, eid: e.eid });
       } catch (err) {
         if (err instanceof TarnSchemaVersionError) {
@@ -508,7 +571,9 @@ export class Collection<TRecord extends Record<string, unknown>> {
           continue;
         }
         const plaintext = await this.#client.decryptSharedBlob(blob, entry.cek);
-        out.push(plaintext as TRecord);
+        // Tarn #54: re-hydrate `date` fields on shared records too, so the
+        // read contract is uniform across own and shared reads.
+        out.push(coerceDatesForRead(this.#def, plaintext) as TRecord);
       } catch (err) {
         console.warn(
           `[TarnClient] Collection.listShared: decrypt failed for ${entry.tx_id}: `,
@@ -544,13 +609,17 @@ export class Collection<TRecord extends Record<string, unknown>> {
    * `get` / `#findCurrent`) or skip-with-warning (`list` / `getEntriesSince`).
    */
   #applySchemaVersion(entry: DecryptedEntry): Record<string, unknown> {
-    return dispatchSchemaVersion({
+    const dispatched = dispatchSchemaVersion({
       record: entry.data,
       tags: entry.tags,
       clientVersion: this.#schemaVersion,
       migrations: this.#migrations,
+      def: this.#def,
       txid: entry.txid,
     });
+    // Tarn #54: re-hydrate `date` fields (ISO string on the wire) back to Date
+    // so the runtime value matches the declared TS type. Lenient + in-place.
+    return coerceDatesForRead(this.#def, dispatched);
   }
 
   /**

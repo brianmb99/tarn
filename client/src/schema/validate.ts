@@ -54,11 +54,20 @@ export function normalizeField(def: FieldDef): NormalizedField {
 /**
  * Validate a payload for a `create` call. Applies defaults for absent fields
  * with declared defaults. Rejects unknown fields and missing requireds.
+ *
+ * `opts.unsetKeys` (Tarn #58a) names fields the caller is deliberately CLEARING
+ * — the update path uses this when re-validating a post-unset merged record.
+ * For a key in this set, the declared default is NOT re-applied (so unsetting a
+ * defaulted optional field actually clears it instead of silently reverting to
+ * the default). A required field in this set still fails the required check, so
+ * required fields remain un-clearable. No effect on the normal create path,
+ * which passes no `unsetKeys`.
  */
 export function validateRecordForCreate(
   collectionName: string,
   collection: CollectionDef,
   payload: unknown,
+  opts?: { unsetKeys?: ReadonlySet<string> | undefined },
 ): Record<string, unknown> {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     throw new TarnSchemaError(
@@ -79,6 +88,7 @@ export function validateRecordForCreate(
     }
   }
 
+  const unsetKeys = opts?.unsetKeys;
   const out: Record<string, unknown> = {};
   for (const fieldName of fieldNames) {
     const fdef = fieldDefs[fieldName];
@@ -86,7 +96,12 @@ export function validateRecordForCreate(
     const norm = normalizeField(fdef);
     let value = obj[fieldName];
 
-    if (value === undefined && norm.hasDefault) {
+    // Re-apply the declared default for an absent field — UNLESS the caller is
+    // deliberately clearing this field via update({ unset }). Skipping the
+    // default there is what makes unset actually clear a defaulted field
+    // instead of reverting it (Tarn #58a). A required field still trips the
+    // required check below, so it can't be cleared.
+    if (value === undefined && norm.hasDefault && !(unsetKeys?.has(fieldName))) {
       value = norm.default;
     }
 
@@ -220,6 +235,94 @@ function coerceAndValidate(
       }
       return value;
   }
+}
+
+/**
+ * Validate a long-form field's declared `default` against its own type + enum
+ * at schema-definition time (Tarn #58b). Without this, a malformed default
+ * (wrong type, or a value outside the field's enum) sails through
+ * `defineSchema()` and only blows up at the first `create()` that omits the
+ * field — far from where the mistake actually lives.
+ *
+ * Runs the default through the exact same `coerceAndValidate` path that a
+ * supplied field value would hit on create, so the type/enum rules can never
+ * drift between "validating a default" and "validating a real value". The
+ * coerced result is discarded — this is a check, not a mutation of the schema
+ * (the default is re-coerced normally on each create). Throws `TarnSchemaError`
+ * on a bad default; no-op for fields without a default.
+ */
+export function validateFieldDefault(
+  collectionName: string,
+  fieldName: string,
+  def: FieldDef,
+): void {
+  // Shorthand fields ('string', 'date?', …) can't carry a default — nothing to check.
+  if (typeof def === 'string') return;
+  if (!('default' in def) || def.default === undefined) return;
+  const norm = normalizeField(def);
+  // Reuse the create-time validator so a default is held to the identical
+  // type + enum contract a real value would be. Any failure is rethrown with
+  // a "default" prefix so the message points at the schema, not a phantom create.
+  try {
+    coerceAndValidate(collectionName, fieldName, norm, norm.default);
+  } catch (err) {
+    throw new TarnSchemaError(
+      `Collection '${collectionName}', field '${fieldName}': invalid default — ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Re-hydrate `date`-typed fields on READ (Tarn #54).
+ *
+ * The write path coerces a `date` field to a `Date`, but the wire format is
+ * JSON: `JSON.stringify` turns the `Date` into an ISO string, and the read path
+ * does `JSON.parse`, so the field comes back as a **string** — contradicting the
+ * declared TS type (`ScalarTypeOf<'date'> === Date`). An app that read the field
+ * and called `.getTime()` would throw at runtime despite a clean compile.
+ *
+ * This function walks the collection's declared fields and converts each
+ * present `date` field from an ISO string back to a `Date`, so the runtime
+ * value matches the type the schema promises. Conversion is LENIENT and
+ * non-destructive:
+ *   - a value already a `Date` is left as-is;
+ *   - a string that parses to a valid date becomes a `Date`;
+ *   - a string that does NOT parse (corrupt / legacy junk), or any non-string
+ *     non-Date value, is left UNCHANGED — read-path code must never throw on a
+ *     single bad field. (The strict create-time validator already guards
+ *     writes; a bad value on read is logged elsewhere, not crashed here.)
+ *
+ * Returns the SAME object reference, mutated in place for the date keys only —
+ * the record came fresh from `JSON.parse` / version dispatch, so in-place
+ * mutation is safe and avoids an extra copy on the hot read path.
+ *
+ * Bookish impact: Bookish declares NO `date`-typed fields (its date-like
+ * fields — dateRead, readingStartedAt, createdAt, modifiedAt — are all
+ * `number?` ms-epoch), so this path is inert for the live app. See the issue
+ * notes for the full audit.
+ */
+export function coerceDatesForRead(
+  collection: CollectionDef,
+  record: Record<string, unknown>,
+): Record<string, unknown> {
+  for (const [fieldName, fieldDef] of Object.entries(collection.fields)) {
+    const norm = normalizeField(fieldDef);
+    if (norm.type !== 'date') continue;
+    const value = record[fieldName];
+    if (value === undefined || value === null) continue;
+    if (value instanceof Date) continue;
+    if (typeof value === 'string') {
+      const d = new Date(value);
+      if (!Number.isNaN(d.getTime())) {
+        record[fieldName] = d;
+      }
+      // else: leave the malformed string untouched — never throw on read.
+    }
+    // Non-string, non-Date (e.g. a number someone wrote via the escape hatch):
+    // leave untouched. The typed write path can't produce this.
+  }
+  return record;
 }
 
 function fieldTypeError(

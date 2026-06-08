@@ -14,8 +14,9 @@
  */
 
 export { defineSchema, TarnSchemaError } from './define.js';
-export { validateRecordForCreate, validateRecordForUpdate, normalizeField } from './validate.js';
+export { validateRecordForCreate, validateRecordForUpdate, normalizeField, validateFieldDefault, coerceDatesForRead } from './validate.js';
 export { RESERVED_TYPE_NAMES } from './reserved.js';
+export { resolveCollectionMigrations, isScopedMigrations } from './migrations.js';
 
 export type {
   // DSL
@@ -25,6 +26,9 @@ export type {
   FieldDef,
   CollectionDef,
   Migration,
+  CollectionMigrations,
+  ScopedMigrations,
+  SchemaMigrations,
   SchemaInput,
   Schema,
   // Type derivation

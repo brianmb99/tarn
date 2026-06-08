@@ -1074,3 +1074,260 @@ describe('Collection.listShared', () => {
     assert.equal(after[0]!.title, 'Shared Later');
   });
 });
+
+// ============ Tarn #54: date fields re-hydrate to Date on read ============
+//
+// The wire format is JSON: write coerces a `date` field to a Date, JSON.stringify
+// turns it into an ISO string, and read does JSON.parse — so without read-side
+// coercion the field comes back as a string, contradicting the declared TS type
+// (Date). These tests lock in that reads return a Date (round-trip).
+
+type EventRecord = { eventId: string; title: string; happenedAt?: Date };
+
+function makeEvents(client: MockTarnClient): Collection<EventRecord> {
+  return createCollection<EventRecord>({
+    client,
+    appId: 'bookish',
+    name: 'events',
+    def: {
+      primaryKey: 'eventId',
+      fields: { eventId: 'string', title: 'string', happenedAt: 'date?' },
+    },
+    schemaVersion: 1,
+  });
+}
+
+/**
+ * The shared MockTarnClient stores `data: { ...plaintext }` directly (objects in
+ * memory), so a Date written by create() would stay a Date and mask the bug.
+ * To faithfully simulate the JSON wire round-trip, re-serialize the stored
+ * entries through JSON before reads — exactly what the real client does
+ * (JSON.stringify on write, JSON.parse on read).
+ */
+function jsonRoundTripEntries(mock: MockTarnClient): void {
+  mock.entries = mock.entries.map((e) => ({
+    ...e,
+    data: JSON.parse(JSON.stringify(e.data)) as Record<string, unknown>,
+  }));
+}
+
+describe('Collection date fields (Tarn #54)', () => {
+  let mock: MockTarnClient;
+  let events: Collection<EventRecord>;
+
+  beforeEach(() => {
+    mock = new MockTarnClient();
+    events = makeEvents(mock);
+  });
+
+  it('get() returns a date field as a Date after a JSON wire round-trip', async () => {
+    await events.create({ eventId: 'e1', title: 'Launch', happenedAt: new Date('2026-05-01T12:00:00Z') });
+    jsonRoundTripEntries(mock); // simulate wire: Date -> ISO string on disk
+
+    const r = await events.get('e1');
+    assert.ok(r);
+    assert.ok(r.happenedAt instanceof Date, `expected Date, got ${typeof r.happenedAt}`);
+    assert.equal(r.happenedAt.getUTCFullYear(), 2026);
+    // The whole point of #54: this would throw if happenedAt were a string.
+    assert.equal(typeof r.happenedAt.getTime(), 'number');
+  });
+
+  it('list() returns date fields as Date', async () => {
+    await events.create({ eventId: 'e1', title: 'A', happenedAt: new Date('2026-01-02T00:00:00Z') });
+    await events.create({ eventId: 'e2', title: 'B' }); // no date
+    jsonRoundTripEntries(mock);
+
+    const all = await events.list();
+    const e1 = all.find((e) => e.eventId === 'e1')!;
+    const e2 = all.find((e) => e.eventId === 'e2')!;
+    assert.ok(e1.happenedAt instanceof Date);
+    assert.equal(e2.happenedAt, undefined, 'absent date stays absent');
+  });
+
+  it('getEntriesSince() returns date fields as Date', async () => {
+    mock.getEntriesSinceResponse = {
+      entries: [
+        {
+          eid: 'eid-e1',
+          txid: 'tx-1',
+          data: { eventId: 'e1', title: 'Delta', happenedAt: '2026-03-04T05:06:07Z' }, // ISO string on wire
+          tags: [],
+        },
+      ],
+      deleted: [],
+    };
+    const { entries } = await events.getEntriesSince();
+    assert.equal(entries.length, 1);
+    assert.ok(entries[0]!.record.happenedAt instanceof Date);
+  });
+
+  it('a malformed date string on read is left untouched (never throws)', async () => {
+    mock.getEntriesSinceResponse = {
+      entries: [
+        { eid: 'eid-e1', txid: 'tx-1', data: { eventId: 'e1', title: 'Bad', happenedAt: 'garbage' }, tags: [] },
+      ],
+      deleted: [],
+    };
+    const { entries } = await events.getEntriesSince();
+    assert.equal(entries.length, 1);
+    // Lenient: junk passes through as the original string, not a crash.
+    assert.equal(entries[0]!.record.happenedAt as unknown, 'garbage');
+  });
+});
+
+// ============ Tarn #56: create({ failIfExists }) + intra-batch dup pks ============
+
+describe('Collection.create failIfExists (Tarn #56)', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(() => {
+    mock = new MockTarnClient();
+    books = makeBooks(mock);
+  });
+
+  it('default create on an existing pk does NOT throw (documented LWW)', async () => {
+    await books.create({ bookId: 'b1', title: 'First', isPrivate: false });
+    // Second create with no guard must succeed — the default is last-write-wins,
+    // not an error. (Which version is "live" is resolved by Eid-supersession on
+    // the real API; the in-memory mock doesn't model that, so we only assert the
+    // write was issued and no error was thrown — mirroring the existing
+    // "two creates with the same primaryKey produce the same Eid" test.)
+    await books.create({ bookId: 'b1', title: 'Second', isPrivate: false });
+    assert.equal(mock.createCalls.length, 2, 'both creates are issued — no guard');
+    const eidA = mock.createCalls[0]!.extraTags.find((t) => t.name === 'Eid')!.value;
+    const eidB = mock.createCalls[1]!.extraTags.find((t) => t.name === 'Eid')!.value;
+    assert.equal(eidA, eidB, 'same pk → same Eid → second supersedes first on the wire');
+  });
+
+  it('create({ failIfExists: true }) throws on an existing pk, no second write', async () => {
+    await books.create({ bookId: 'b1', title: 'First', isPrivate: false });
+    await assert.rejects(
+      () => books.create({ bookId: 'b1', title: 'Dup', isPrivate: false }, { failIfExists: true }),
+      (err: unknown) => {
+        assert.ok(err instanceof TarnCollectionError);
+        assert.match(err.message, /already exists/);
+        return true;
+      },
+    );
+    assert.equal(mock.createCalls.length, 1, 'no second wire write on rejection');
+    assert.equal((await books.get('b1'))!.title, 'First', 'original record untouched');
+  });
+
+  it('create({ failIfExists: true }) succeeds for a brand-new pk', async () => {
+    await books.create({ bookId: 'b1', title: 'New', isPrivate: false }, { failIfExists: true });
+    assert.equal(mock.createCalls.length, 1);
+  });
+
+  it('failIfExists does not leak to the wire create opts', async () => {
+    // createEntry only accepts { idempotencyKey }. Spy on the opts arg.
+    const seenOpts: Array<unknown> = [];
+    const orig = mock.createEntry.bind(mock);
+    mock.createEntry = async (
+      type: string,
+      plaintext: Record<string, unknown>,
+      extraTags?: Tag[],
+      opts?: { idempotencyKey?: string },
+    ): Promise<{ txid: string; shareKey: string | null }> => {
+      seenOpts.push(opts);
+      return orig(type, plaintext, extraTags);
+    };
+    await books.create({ bookId: 'b1', title: 'X', isPrivate: false }, { failIfExists: true });
+    // No idempotencyKey was passed, so opts must be undefined (failIfExists stripped).
+    assert.equal(seenOpts[0], undefined);
+  });
+});
+
+describe('Collection.batchCreate intra-batch duplicate pks (Tarn #56)', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(() => {
+    mock = new MockTarnClient();
+    books = makeBooks(mock);
+  });
+
+  it('rejects a batch with two items sharing a primaryKey — no wire call', async () => {
+    const items: BookRecord[] = [
+      { bookId: 'b1', title: 'A', isPrivate: false },
+      { bookId: 'b1', title: 'B', isPrivate: false }, // dup pk
+    ];
+    await assert.rejects(
+      () => books.batchCreate(items),
+      (err: unknown) => {
+        assert.ok(err instanceof TarnCollectionError);
+        assert.match(err.message, /duplicate primaryKey 'b1'/);
+        assert.match(err.message, /index 0/);
+        return true;
+      },
+    );
+    assert.equal(mock.batchCreateCalls.length, 0, 'no wire call when a dup pk is present');
+  });
+
+  it('accepts a batch with all-distinct primaryKeys', async () => {
+    const items: BookRecord[] = [
+      { bookId: 'b1', title: 'A', isPrivate: false },
+      { bookId: 'b2', title: 'B', isPrivate: false },
+    ];
+    await books.batchCreate(items);
+    assert.equal(mock.batchCreateCalls.length, 1);
+  });
+});
+
+// ============ Tarn #58a: unset on a defaulted field actually clears ============
+
+type PrefRecord = { prefId: string; theme: string };
+
+function makePrefs(client: MockTarnClient): Collection<PrefRecord> {
+  return createCollection<PrefRecord>({
+    client,
+    appId: 'bookish',
+    name: 'prefs',
+    def: {
+      primaryKey: 'prefId',
+      // theme is OPTIONAL but has a default. Pre-fix, unset reverted to default.
+      fields: { prefId: 'string', theme: { type: 'string', required: false, default: 'light' } },
+    },
+    schemaVersion: 1,
+  });
+}
+
+describe('Collection.update unset + default (Tarn #58a)', () => {
+  let mock: MockTarnClient;
+  let prefs: Collection<PrefRecord>;
+
+  beforeEach(async () => {
+    mock = new MockTarnClient();
+    prefs = makePrefs(mock);
+    await prefs.create({ prefId: 'p1', theme: 'dark' });
+  });
+
+  it('unset on a defaulted optional field CLEARS it (does not revert to default)', async () => {
+    const returned = await prefs.update('p1', {}, { unset: ['theme'] });
+    // Pre-fix bug: theme would come back as 'light' (the default). Fixed: absent.
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(returned, 'theme'),
+      `expected 'theme' cleared, not reverted to default; got ${JSON.stringify(returned)}`,
+    );
+
+    const readBack = await prefs.get('p1');
+    assert.ok(readBack);
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(readBack, 'theme'),
+      `expected 'theme' absent on read-back; got ${JSON.stringify(readBack)}`,
+    );
+  });
+
+  it('a normal create still applies the default for an absent defaulted field', async () => {
+    // Guard against over-reach: the unset path must not disable defaults globally.
+    await prefs.create({ prefId: 'p2' } as PrefRecord);
+    const r = await prefs.get('p2');
+    assert.equal(r!.theme, 'light', 'default still applies on plain create');
+  });
+
+  it('an update that does NOT unset the field leaves the default-eligible value intact', async () => {
+    // p1 was created with theme:'dark'; updating an unrelated-ish field keeps it.
+    const returned = await prefs.update('p1', { theme: 'sepia' });
+    assert.equal(returned.theme, 'sepia');
+  });
+});
