@@ -291,6 +291,103 @@ export class TarnNotAuthenticatedError extends Error {
   }
 }
 
+/**
+ * Thrown by `getEntries()` (and therefore `Collection.list()`) when one or
+ * more per-entry blob fetches failed for a *transient* reason — a rate limit
+ * (HTTP 429), a 5xx that survived the retry budget, or a network error — as
+ * opposed to the entry being genuinely absent (HTTP 404). See tarn#51.
+ *
+ * Without this, a mid-list rate-limit or network blip silently collapsed to
+ * "entry absent", so `list()` returned a partial library that *looked*
+ * complete. This error makes incompleteness visible: the caller knows the
+ * result is missing records and can retry rather than rendering a truncated
+ * view as authoritative.
+ *
+ * Carries:
+ *   - `entries`: the records that DID decrypt successfully (so a caller that
+ *     wants best-effort UX can still show what it has).
+ *   - `failedTxids`: the txids whose blob fetch failed transiently.
+ *   - `cause`: the first underlying error (often a `TarnRateLimitError`);
+ *     `retryAfterSeconds` is hoisted to the top level when the cause is a
+ *     rate-limit so callers can schedule a retry without unwrapping.
+ *
+ * Recommended app behavior: treat the list as incomplete. If
+ * `retryAfterSeconds` is set, schedule a retry past it; otherwise back off and
+ * retry. Do NOT persist the partial `entries` as the authoritative full set.
+ */
+export class TarnPartialListError extends Error {
+  readonly entries: any[];
+  readonly failedTxids: string[];
+  readonly retryAfterSeconds: number | null;
+  override readonly cause?: unknown;
+  constructor(args: {
+    entries: any[];
+    failedTxids: string[];
+    cause?: unknown;
+  }) {
+    const n = args.failedTxids.length;
+    const ra =
+      args.cause instanceof TarnRateLimitError ? args.cause.retryAfterSeconds : null;
+    const raSuffix = ra != null ? ` (Retry-After: ${ra}s)` : '';
+    super(
+      `list incomplete: ${n} of ${args.entries.length + n} ` +
+      `record${n === 1 ? '' : 's'} could not be fetched (transient failure)${raSuffix}`,
+    );
+    this.name = 'TarnPartialListError';
+    this.entries = args.entries;
+    this.failedTxids = args.failedTxids;
+    this.retryAfterSeconds = ra;
+    if (args.cause !== undefined) this.cause = args.cause;
+  }
+}
+
+/**
+ * Thrown by the share-log publish path (`_publishShareLogEntry` and the
+ * methods that drive it — `shareContent`, `updateShareContent`,
+ * `unshareContent`, `snapshotShareLog`, etc.) when a multi-device write race
+ * on the same connection's outbound log exhausts the bounded 409-conflict
+ * retry budget. See tarn#52 and §13.1.
+ *
+ * The protocol assigns one entry per (connection, seq) slot; two devices
+ * writing concurrently both target seq_max+1, one wins, the loser gets a 409
+ * (`SHARE_LOG_TAG_CONFLICT`), re-discovers the new highest seq, and retries
+ * with backoff. A genuine "conflict storm" (many devices, or a hot log) can
+ * still burn the whole budget — this typed error lets a caller distinguish
+ * that recoverable, retryable condition from a hard failure (auth, network,
+ * malformed op) so it can surface "another device is syncing — try again"
+ * and safely retry the SAME publish later (no seq is reused; the local
+ * counter has already advanced past every slot we lost).
+ *
+ * Carries `attempts` (how many retries were spent), `operationType`, and the
+ * `lastConflictSeq` for diagnostics.
+ */
+export class TarnShareLogConflictError extends Error {
+  readonly attempts: number;
+  readonly operationType: string;
+  readonly lastConflictSeq: number | null;
+  readonly connectionFingerprint: string;
+  constructor(args: {
+    attempts: number;
+    operationType: string;
+    lastConflictSeq: number | null;
+    connectionFingerprint: string;
+    lastWinnerTxid?: string | null;
+  }) {
+    super(
+      `share-log publish for ${args.operationType} to ${args.connectionFingerprint} ` +
+      `lost a multi-device write race: exhausted ${args.attempts} retries ` +
+      `(last conflict at seq=${args.lastConflictSeq ?? 'unknown'}, ` +
+      `winner txid=${args.lastWinnerTxid ?? 'unknown'}). ` +
+      `Safe to retry — no sequence number was reused.`,
+    );
+    this.name = 'TarnShareLogConflictError';
+    this.attempts = args.attempts;
+    this.operationType = args.operationType;
+    this.lastConflictSeq = args.lastConflictSeq;
+    this.connectionFingerprint = args.connectionFingerprint;
+  }
+}
+
 export class TarnClient {
   #apiBase: string;
   #appId: string;
@@ -864,18 +961,28 @@ export class TarnClient {
     // outbound log under the new pair keys. Only meaningful if we ran
     // rotation announce (we need to have known the OLD log existed +
     // captured outbound state).
+    // tarn#53: capture unreached connections so the caller can re-announce
+    // (the failed set is surfaced in the return value + retryable via
+    // `reannounceRotationToConnections()`).
+    const snapshotFailures = new Map<string, string>(); // share_pub -> reason
     if (canAnnounce) {
       for (const connection of oldConnectionsState.record.connections) {
         const state = outboundStateByConnection.get(connection.share_pub) ?? {};
         try {
           await this._publishInitialSnapshot(connection, { state });
         } catch (err: any) {
+          snapshotFailures.set(connection.share_pub, err?.message ?? String(err));
           console.warn(
             `[TarnClient] recoverAccount: NEW-log seq=0 snapshot publish failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
         }
       }
     }
+    const failedConnections = this.#collectRotationFailures(
+      oldConnectionsState.record.connections,
+      rotationAnnouncements,
+      snapshotFailures,
+    );
 
     // Phase 4 — optional account-key rotation piggybacked on recovery.
     // The user is performing a forgot-password flow but ALSO suspects
@@ -903,7 +1010,7 @@ export class TarnClient {
       }
     }
 
-    const result: any = { dataLookupKey: this.#dataLookupKey, rotationAnnouncements };
+    const result: any = { dataLookupKey: this.#dataLookupKey, rotationAnnouncements, failedConnections };
     if (newAccountKey !== undefined) result.accountKey = newAccountKey;
     return result;
   }
@@ -1311,12 +1418,19 @@ export class TarnClient {
     // expected state. Best-effort: a per-connection failure is logged and the
     // method still returns success — the connection can re-bootstrap once we
     // publish later operations.
+    //
+    // tarn#53: track which connections we could NOT reach so the caller can
+    // act on the gap (a stranded connection keeps the rotator's STALE pubkey
+    // until it's re-announced). The failed set is surfaced in the return value
+    // and is re-tryable via `reannounceRotationToConnections()`.
+    const snapshotFailures = new Map<string, string>(); // share_pub -> reason
     if (!skipRotationAnnounce) {
       for (const connection of oldConnectionsState.record.connections) {
         const state = outboundStateByConnection.get(connection.share_pub) ?? {};
         try {
           await this._publishInitialSnapshot(connection, { state });
         } catch (err: any) {
+          snapshotFailures.set(connection.share_pub, err?.message ?? String(err));
           console.warn(
             `[TarnClient] changeCredentials: NEW-log seq=0 snapshot publish failed for ${connection.share_pub.slice(0, 8)}...: ${err.message}`,
           );
@@ -1324,7 +1438,13 @@ export class TarnClient {
       }
     }
 
-    return { rotationAnnouncements };
+    const failedConnections = this.#collectRotationFailures(
+      oldConnectionsState.record.connections,
+      rotationAnnouncements,
+      snapshotFailures,
+    );
+
+    return { rotationAnnouncements, failedConnections };
   }
 
   /**
@@ -3001,23 +3121,63 @@ export class TarnClient {
     // recently-written and cold-bootstrap entries.
     const entries = [];
     const CONCURRENCY = 20;
+    // tarn#51: a *transient* blob-fetch failure (rate limit / 5xx / network)
+    // must NOT silently collapse to "record absent". Strict-mode #fetchBlob
+    // throws on transient failure (returns null only on a genuine 404 /
+    // malformed-200), so we can tell the two apart here. We collect the
+    // transient failures and, if any occurred, throw a typed
+    // TarnPartialListError AFTER attempting the whole list — so the error
+    // carries both the records that succeeded and the txids that didn't.
+    const failedTxids: string[] = [];
+    let firstFetchError: unknown = undefined;
 
     for (let i = 0; i < allRawEntries.length; i += CONCURRENCY) {
       const batch = allRawEntries.slice(i, i + CONCURRENCY);
       const results = await Promise.allSettled(batch.map(async (entry) => {
-        const blobBytes = await this.#fetchBlob(entry.txid);
+        const blobBytes = await this.#fetchBlob(entry.txid, { strict: true });
+        // null here means a genuine 404 / malformed blob — legitimately
+        // absent, so skip it (consistent with the prior behavior for the
+        // not-found case). A transient failure would have THROWN above and
+        // lands in the `rejected` branch below.
         if (!blobBytes) return null;
         const data = await this.#decryptBlob(blobBytes, entry.tags);
         return { txid: entry.txid, data, tags: entry.tags };
       }));
 
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) {
-          entries.push(result.value);
-        } else if (result.status === 'rejected') {
-          console.warn(`Failed to decrypt entry:`, result.reason?.message);
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j]!;
+        if (result.status === 'fulfilled') {
+          if (result.value) entries.push(result.value);
+          continue;
+        }
+        // Rejected. A TarnRateLimitError (or any error originating in the
+        // strict blob fetch) means we could NOT determine whether the record
+        // exists — that's a partial list, not a missing record. A decrypt
+        // failure on a successfully-fetched blob is a genuinely corrupt entry
+        // (legacy/buggy writer) and is logged-and-skipped as before.
+        const reason: any = result.reason;
+        const isFetchFailure =
+          reason instanceof TarnRateLimitError
+          || /^blob fetch for /.test(reason?.message ?? '')
+          || reason?.name === 'TypeError'      // network error (fetch threw)
+          || reason?.code === 'ECONNRESET'
+          || reason?.code === 'ENOTFOUND';
+        if (isFetchFailure) {
+          const txid = batch[j]?.txid;
+          if (txid) failedTxids.push(txid);
+          if (firstFetchError === undefined) firstFetchError = reason;
+        } else {
+          console.warn(`Failed to decrypt entry:`, reason?.message);
         }
       }
+    }
+
+    if (failedTxids.length > 0) {
+      throw new TarnPartialListError({
+        entries,
+        failedTxids,
+        cause: firstFetchError,
+      });
     }
 
     return entries;
@@ -4463,14 +4623,20 @@ export class TarnClient {
    *
    * 5c retry semantics (§13.1, multi-device): when `opts.retryOn409` is
    * `true`, a 409 from a sibling-device concurrent publish triggers up to
-   * `opts.maxRetries` (default 5) re-attempts. Each retry re-runs outbound
+   * `opts.maxRetries` (default 8) re-attempts. Each retry re-runs outbound
    * highest-seq discovery (§9.2), advances the counter past the winner's
    * seq, **re-signs** the operation under the new seq (since `seq` is in
-   * `sig_input` per §8.1), and re-encrypts under a fresh IV before
-   * republishing. If the 409's `existing_txid` is one this session has
+   * `sig_input` per §8.1), re-encrypts under a fresh IV, and waits a
+   * bounded exponential backoff with full jitter (tarn#52) before
+   * republishing — so concurrent writers de-synchronize instead of retrying
+   * in lockstep. If the 409's `existing_txid` is one this session has
    * already published, the publish is treated as already-done — defends
    * against the network-hiccup-then-retry case where we won the race but
-   * never observed the response.
+   * never observed the response. On genuine budget exhaustion (a conflict
+   * storm) this throws a typed `TarnShareLogConflictError` so callers can
+   * distinguish a recoverable race from a hard failure and safely retry the
+   * same publish (no seq is reused — §13.1 is improved, not eliminated).
+   * `opts._sleep` (test-only) injects the backoff timer.
    *
    * @param {Object} connection - connections-record entry (has share_pub, signing_pub)
    * @param {{type: string, [key: string]: any}} operationFields - omit `seq`
@@ -4510,12 +4676,26 @@ export class TarnClient {
     const pair = await this.#getPairKeysFor(connection.share_pub);
     const counters = this.#getOrInitCounters(connection.share_pub);
     const retryOn409 = opts.retryOn409 === true;
+    // tarn#52: the 409-retry budget is the number of CONFLICT re-attempts we
+    // make before declaring a conflict storm. Default raised from 5 → 8: with
+    // bounded backoff between attempts (added below) the colliding writers
+    // de-sync quickly, so a few extra cheap retries materially shrink the
+    // odds of a spurious terminal error on a 2–3 device race, while the
+    // backoff cap keeps total wall-clock bounded (~worst case a handful of
+    // seconds). Still configurable per-call via opts.maxRetries.
     const maxRetries = Number.isInteger(opts.maxRetries) && opts.maxRetries > 0
       ? opts.maxRetries
-      : 5;
+      : 8;
+    // Injectable for deterministic tests; defaults to the real timer-backed
+    // sleep. The backoff DURATION is still computed by shareLogConflictBackoffMs
+    // so a test can assert the curve via the values passed to the spy.
+    const sleepFn: (ms: number) => Promise<void> =
+      typeof opts._sleep === 'function' ? opts._sleep : sleep;
 
     let attempts = 0;
     let alreadyPublished = false;
+    let lastConflictSeq: number | null = null;
+    let lastWinnerTxid: string | null = null;
     let seq;
     let tag;
     let txid;
@@ -4553,13 +4733,23 @@ export class TarnClient {
           break;
         }
 
+        lastConflictSeq = seq;
+        lastWinnerTxid = err.existingTxid ?? null;
         attempts += 1;
         if (attempts > maxRetries) {
-          throw new Error(
-            `_publishShareLogEntry: exceeded ${maxRetries} retries for ${operation.type} ` +
-            `to ${connection.share_pub.slice(0, 8)}... — last conflict at seq=${seq} ` +
-            `(winner txid=${err.existingTxid ?? 'unknown'})`,
-          );
+          // tarn#52: genuine exhaustion — a conflict storm we couldn't win
+          // within the budget. Throw a TYPED error so the caller can tell a
+          // (recoverable, retryable) write race apart from a hard failure
+          // (auth, network, malformed op). The local counter has already
+          // advanced past every lost slot, so retrying the same publish later
+          // reuses no seq.
+          throw new TarnShareLogConflictError({
+            attempts: maxRetries,
+            operationType: operation.type,
+            lastConflictSeq,
+            lastWinnerTxid,
+            connectionFingerprint: `${connection.share_pub.slice(0, 8)}...`,
+          });
         }
 
         // §13.1: another writer won this seq slot. Re-discover the current
@@ -4572,6 +4762,14 @@ export class TarnClient {
         });
         const newNext = Math.max(seq + 1, probedHighest + 1);
         counters.nextOutboundSeq = newNext;
+
+        // tarn#52: bounded exponential backoff + full jitter before retrying.
+        // A bare tight loop made N concurrent writers retry in lockstep and
+        // re-collide, burning the budget on what is a benign contention race.
+        // Pausing a jittered interval lets the winner's entry settle so the
+        // re-discover probe sees it, and decorrelates the colliding writers.
+        const waitMs = shareLogConflictBackoffMs(attempts - 1);
+        await sleepFn(waitMs);
         // Loop continues — top of loop will pick up the new seq.
       }
     }
@@ -5306,6 +5504,120 @@ export class TarnClient {
     }
 
     return { newCekBase64Url, announcements, skipped };
+  }
+
+  /**
+   * tarn#53: fold the per-connection rotation-announce results and the NEW-log
+   * seq=0 snapshot failures into a single, caller-actionable `failedConnections`
+   * list. A connection is "failed" if EITHER the OLD-log `rotate_identity`
+   * announce errored OR the NEW-log bootstrap snapshot errored — in both cases
+   * the connection may still hold our stale pubkey / lack a NEW-log bootstrap.
+   *
+   * Each entry: `{ share_pub, label, reasons: string[] }`. The shape is built
+   * to feed straight back into {@link reannounceRotationToConnections}.
+   */
+  #collectRotationFailures(
+    connections: any[],
+    rotationAnnouncements: any[],
+    snapshotFailures: Map<string, string>,
+  ): Array<{ share_pub: string; label: string | null; reasons: string[] }> {
+    const bySharePub = new Map<string, { share_pub: string; label: string | null; reasons: string[] }>();
+    const ensure = (sharePub: string) => {
+      let e = bySharePub.get(sharePub);
+      if (!e) {
+        const conn = connections.find((c) => c?.share_pub === sharePub);
+        e = { share_pub: sharePub, label: conn?.label ?? null, reasons: [] };
+        bySharePub.set(sharePub, e);
+      }
+      return e;
+    };
+    for (const ann of rotationAnnouncements ?? []) {
+      if (ann?.error) ensure(ann.connectionSharePub).reasons.push(`announce: ${ann.error}`);
+    }
+    for (const [sharePub, reason] of snapshotFailures) {
+      ensure(sharePub).reasons.push(`snapshot: ${reason}`);
+    }
+    return Array.from(bySharePub.values());
+  }
+
+  /**
+   * tarn#53: re-announce a completed credential/identity rotation to
+   * connections that were unreached during `changeCredentials` /
+   * `recoverAccount`. Pass the `failedConnections` array those methods return
+   * (or any list of `{ share_pub }` objects).
+   *
+   * What it does: re-publishes the NEW-log seq=0 bootstrap snapshot under the
+   * CURRENT (post-rotation) pair keys for each connection. This is the part of
+   * the rotation that is safely re-runnable from a normal authenticated
+   * session — it needs only the connection's `share_pub` plus the current
+   * sharing key, both of which the live client holds.
+   *
+   * IMPORTANT scope (§13.5): the OLD-log `rotate_identity` announce — the entry
+   * encrypted/signed under the OLD pair keys — is NOT re-emitted here, because
+   * the OLD private keys are intentionally gone after a rotation completes. The
+   * protocol's eventual-consistency path covers that gap: once this NEW-log
+   * snapshot lands (and as the rotator publishes further content under the new
+   * identity), a recipient who re-fetches the rotator's blob observes the NEW
+   * pubkeys (the durable rotation-in-flight indicator) and resyncs against the
+   * NEW log. So this helper heals the stranded-connection case without needing
+   * the old key material.
+   *
+   * Idempotent and best-effort: a connection that already has a NEW-log seq=0
+   * entry will surface a `SHARE_LOG_TAG_CONFLICT` for its own prior snapshot,
+   * which is treated as success (already bootstrapped). Per-connection failures
+   * are collected and returned rather than thrown, so one unreachable
+   * connection doesn't abort the rest.
+   *
+   * @param connections array of `{ share_pub, label?, state? }`
+   * @returns `{ succeeded: string[], failed: Array<{ share_pub, label, reason }> }`
+   */
+  async reannounceRotationToConnections(
+    connections: Array<{ share_pub: string; label?: string | null; state?: any }>,
+  ): Promise<{
+    succeeded: string[];
+    failed: Array<{ share_pub: string; label: string | null; reason: string }>;
+  }> {
+    await this.#requireAuth();
+    if (!this.#sharingKeyPair || !this.#signingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'reannounceRotationToConnections: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
+    if (!Array.isArray(connections)) {
+      throw new Error('reannounceRotationToConnections: connections must be an array');
+    }
+
+    const succeeded: string[] = [];
+    const failed: Array<{ share_pub: string; label: string | null; reason: string }> = [];
+
+    for (const conn of connections) {
+      if (!conn || typeof conn.share_pub !== 'string') {
+        failed.push({ share_pub: String(conn?.share_pub ?? ''), label: null, reason: 'missing share_pub' });
+        continue;
+      }
+      // Resolve the full connection record (we need signing_pub etc. for the
+      // pair-key derivation the publish path performs).
+      const record = await this.#findConnectionBySharePub(conn.share_pub);
+      const target = record ?? conn;
+      try {
+        await this._publishInitialSnapshot(target, { state: conn.state ?? {} });
+        succeeded.push(conn.share_pub);
+      } catch (err: any) {
+        // A conflict on OUR own already-published seq=0 snapshot means the
+        // bootstrap is already in place — count it as reached.
+        if (err?.code === 'SHARE_LOG_TAG_CONFLICT') {
+          succeeded.push(conn.share_pub);
+          continue;
+        }
+        failed.push({
+          share_pub: conn.share_pub,
+          label: conn.label ?? record?.label ?? null,
+          reason: err?.message ?? String(err),
+        });
+      }
+    }
+
+    return { succeeded, failed };
   }
 
   // ============ IDENTITY ROTATION (issue #17, Section 5d, sharing §13.5) ============
@@ -6699,7 +7011,32 @@ export class TarnClient {
     }
   }
 
-  async #fetchBlob(txid: string): Promise<Uint8Array | null> {
+  /**
+   * Fetch the encrypted blob bytes for a single txid via Tarn's per-entry
+   * endpoint.
+   *
+   * Default (lenient) mode returns `null` on ANY failure — absent (404),
+   * transient (429 / 5xx / network), or malformed. This is the contract the
+   * public `fetchBlob()` and the share-key recovery path rely on, where the
+   * caller only ever wants "the bytes, or nothing".
+   *
+   * Strict mode (`{ strict: true }`, used by the multi-blob `getEntries`
+   * fan-out — tarn#51) preserves the distinction that lenient mode destroys:
+   *   - genuine absence (HTTP 404, or a 200 with no/`malformed` data) → `null`
+   *   - transient failure (429 → `TarnRateLimitError`; 5xx that survived the
+   *     retry budget; a network error) → THROWN, not swallowed.
+   * Swallowing a transient failure as `null` made a rate-limited mid-list
+   * read look like "this record doesn't exist", so `list()` returned a
+   * partial library that looked complete. Strict mode makes that visible.
+   *
+   * No client-side gateway fallback by design: the SDK already cannot
+   * function without Tarn (the list of live entries lives there exclusively),
+   * so a partial fallback for blobs only would mask Tarn outages without
+   * delivering availability. A separate, deliberate "always access your
+   * data" recovery path — direct GraphQL + gateway reads with no Tarn
+   * dependency — belongs in its own artifact, not here.
+   */
+  async #fetchBlob(txid: string, opts: { strict?: boolean } = {}): Promise<Uint8Array | null> {
     // Cache check first. Txids are Arweave content hashes — blob bytes are
     // immutable forever — so a cache hit needs no validation. This collapses
     // warm-list reads from N network round trips to zero, which is the
@@ -6710,17 +7047,7 @@ export class TarnClient {
       if (cached) return cached;
     }
 
-    // Single source of truth: Tarn's per-entry endpoint. Tarn serves
-    // blob_data from D1 (populated via write-through on writes, lazy-loaded
-    // from a public Arweave gateway on cold-bootstrap reads), so it covers
-    // both pending and confirmed entries with one round trip per blob.
-    //
-    // No client-side gateway fallback by design: the SDK already cannot
-    // function without Tarn (the list of live entries lives there exclusively),
-    // so a partial fallback for blobs only would mask Tarn outages without
-    // delivering availability. A separate, deliberate "always access your
-    // data" recovery path — direct GraphQL + gateway reads with no Tarn
-    // dependency — belongs in its own artifact, not here.
+    const strict = opts.strict === true;
     try {
       const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET' });
       if (res.status === 200) {
@@ -6735,8 +7062,25 @@ export class TarnClient {
             return bytes;
           }
         } catch {}
+        // 200 but no usable `data` (or malformed JSON): treat as absent in
+        // both modes — there is nothing transient to retry here.
+        return null;
       }
-    } catch {}
+      // 404 is the one status that genuinely means "absent" — null in both
+      // modes. Anything else (5xx that exhausted the retry budget, an
+      // unexpected status) is a fetch failure: in strict mode surface it so
+      // the list can't masquerade a transient gap as a missing record.
+      if (res.status === 404) return null;
+      if (strict) {
+        throw new Error(`blob fetch for ${txid} failed: HTTP ${res.status}`);
+      }
+    } catch (err) {
+      // In strict mode, transient failures (TarnRateLimitError on 429, a
+      // network error that survived the retry budget, or the explicit throw
+      // above) must propagate so getEntries can aggregate them. Lenient mode
+      // keeps the historical "null on anything" contract.
+      if (strict) throw err;
+    }
     return null;
   }
 
@@ -6899,6 +7243,33 @@ function backoffMs(attempt: number): number {
   const base = 500 * Math.pow(3, attempt);
   const jitter = base * (Math.random() * 0.5 - 0.25);
   return base + jitter;
+}
+
+/**
+ * Backoff for the share-log multi-device write race (tarn#52, §13.1).
+ *
+ * Separate from `backoffMs` (the HTTP transient-retry curve) because the
+ * conflict here is a CONTENTION race, not a server outage: two devices both
+ * grabbed seq_max+1 and one lost. The right move is a short, jittered pause so
+ * the colliding writers de-synchronize and the re-discover-highest-seq probe
+ * sees the winner's entry before we retry. A long backoff would just make a
+ * benign two-device race feel like a hang.
+ *
+ * Curve: ~`SHARE_LOG_CONFLICT_BASE_MS` * 2^attempt, capped at
+ * `SHARE_LOG_CONFLICT_MAX_MS`, with full jitter in [0, computed] (the
+ * "FullJitter" variant) so N contending writers spread out instead of
+ * retrying in lockstep. attempt 0 → 0–150ms, 1 → 0–300ms, 2 → 0–600ms,
+ * 3 → 0–1200ms, 4 → 0–2400ms, then capped.
+ */
+const SHARE_LOG_CONFLICT_BASE_MS = 150;
+const SHARE_LOG_CONFLICT_MAX_MS = 3000;
+function shareLogConflictBackoffMs(attempt: number): number {
+  const ceil = Math.min(
+    SHARE_LOG_CONFLICT_MAX_MS,
+    SHARE_LOG_CONFLICT_BASE_MS * Math.pow(2, attempt),
+  );
+  // Full jitter: pick uniformly in [0, ceil]. Decorrelates lockstep retries.
+  return Math.random() * ceil;
 }
 
 /**

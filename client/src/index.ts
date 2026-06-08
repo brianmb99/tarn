@@ -49,6 +49,8 @@ export {
   TarnRateLimitError,
   TarnPasskeyOnlyError,
   TarnNotAuthenticatedError,
+  TarnPartialListError,
+  TarnShareLogConflictError,
 } from './tarn.js';
 
 export type {
