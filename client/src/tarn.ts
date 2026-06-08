@@ -1770,10 +1770,12 @@ export class TarnClient {
     // challenge specifically for re-wrapping ceremonies.
     //
     // Repair the PRF extension buffers before handing the options to
-    // the browser. The server sends `extensions.prf.evalByCredential[*]
-    // .first` as `Uint8Array` but @simplewebauthn/server doesn't
-    // serialize it, so it arrives as `{"0":n,"1":n,...}` on the wire;
-    // the browser then rejects it. See client/src/passkeys/prf.ts.
+    // the browser. tarn#59 — the server sends the single constant salt as
+    // `extensions.prf.eval.first` (a `Uint8Array`), but @simplewebauthn
+    // doesn't serialize it, so it arrives as `{"0":n,"1":n,...}` on the
+    // wire; the browser then rejects it. repairPrfExtensionBuffers handles
+    // both the `eval.first` and (legacy) `evalByCredential` shapes. See
+    // client/src/passkeys/prf.ts.
     repairPrfExtensionBuffers(pkOptions?.extensions);
     const { startAuthentication } = await import('@simplewebauthn/browser');
     const credential = await startAuthentication({ optionsJSON: pkOptions });
@@ -2390,7 +2392,14 @@ export class TarnClient {
    * and the new envelope atomically.
    *
    * Flow:
-   *   1. POST /auth/passkey/register-options → { options, prf_salt }
+   *   1. POST /auth/passkey/register-options → { options, prf_salt }.
+   *      tarn#59 — `prf_salt` (and `options.extensions.prf.eval.first`) is
+   *      the app-wide CONSTANT salt, not a per-credential random one. The
+   *      authenticator computes PRF(constant), which is still unique to THIS
+   *      credential (PRF is keyed by the authenticator's per-credential
+   *      secret). Wrapping under PRF(constant) is exactly what the
+   *      discoverable auth-options flow reproduces at sign-in, so no
+   *      per-credential salt lookup is ever needed.
    *   2. navigator.credentials.create(options) — user authenticates via
    *      Touch ID / Face ID / Windows Hello / etc. The PRF extension
    *      yields a 32-byte deterministic secret bound to (passkey, salt).
@@ -2527,16 +2536,28 @@ export class TarnClient {
    *
    * Flow:
    *   1. POST /auth/passkey/authentication-options → { options, rp_id }.
-   *      The per-credential PRF salts ride inside
-   *      `options.extensions.prf.evalByCredential` (keyed by credential_id);
-   *      we read the salt from there, never from a top-level list. (tarn#59
-   *      removed the redundant `allow_credentials` echo; the discoverable
-   *      flow leaves `options.allowCredentials` empty.)
+   *      The single app-wide CONSTANT PRF salt rides in
+   *      `options.extensions.prf.eval.first` (tarn#59 — no per-credential
+   *      `evalByCredential` map, no top-level dump). The discoverable flow
+   *      leaves `options.allowCredentials` empty so the authenticator
+   *      self-presents its resident credentials; the account-identified flow
+   *      narrows it to one credential. We pass `options.extensions` straight
+   *      to the browser, so the authenticator evaluates PRF(constant) for
+   *      whichever credential the user selects.
    *   2. navigator.credentials.get(options) — user authenticates.
    *   3. Extract the PRF output for the credential the user picked.
    *   4. POST /auth/passkey/authenticate → { jwt, wrapped_data_key, ... }
-   *   5. Derive the passkey wrapping key from the PRF output, unwrap
-   *      the DEK chain, install session state.
+   *   5. Derive the passkey wrapping key from the PRF output, then select the
+   *      `passkey_prf` wrapping matching the assertion's `credential_id` in the
+   *      envelope and unwrap the DEK chain. Install session state.
+   *
+   * Re-registration note (tarn#59): a passkey registered BEFORE the
+   * constant-salt switch was wrapped under a per-credential RANDOM salt, so
+   * PRF(constant) will NOT reproduce its wrapping key and no matching wrapping
+   * will unwrap. The SDK surfaces this as a clear error (see step 5 / the
+   * unwrap failure path) telling the user to re-register the passkey from a
+   * password-authenticated session. Password and recovery factors are
+   * unaffected — only the passkey wrapping derivation changed.
    */
   async authenticateWithPasskey(opts: {
     deviceLabel?: string;
@@ -2627,14 +2648,43 @@ export class TarnClient {
     //    gen needs the password-side repair below. Everything is funnelled
     //    through #unwrapPasskeyChainPartial so the call site does not
     //    need to discriminate.
-    const unwrapped = stale_credential
-      ? await this.#unwrapPasskeyChainPartial(wrapped_data_key, passkeyKEK, credential_id)
-      : await unwrapDataKeyChain(
-          wrapped_data_key,
-          passkeyKEK,
-          FACTOR_PASSKEY_PRF,
-          credential_id,
-        );
+    //
+    //    tarn#59 MIGRATION SAFETY: a passkey registered BEFORE the
+    //    constant-salt switch was wrapped under a per-credential RANDOM salt.
+    //    Its `passkey_prf` wrapping still EXISTS in the envelope (matched by
+    //    credential_id), but PRF(constant) yields a different KEK than the
+    //    PRF(random) the wrap was made under, so `crypto.subtle.unwrapKey`
+    //    throws an opaque AES-KW integrity error. Catch that and surface a
+    //    clear "re-register your passkey" StalePasskeyError instead of letting
+    //    the OperationError bubble up as a crash. The password and recovery
+    //    factors are untouched (separate wrappings, separate KEKs) — the user
+    //    logs in with their password and re-registers the passkey, which
+    //    re-wraps under PRF(constant). No data is lost.
+    let unwrapped;
+    try {
+      unwrapped = stale_credential
+        ? await this.#unwrapPasskeyChainPartial(wrapped_data_key, passkeyKEK, credential_id)
+        : await unwrapDataKeyChain(
+            wrapped_data_key,
+            passkeyKEK,
+            FACTOR_PASSKEY_PRF,
+            credential_id,
+          );
+    } catch (err) {
+      // An AES-KW unwrap failure (wrong KEK) is the migration signature for a
+      // legacy random-salt passkey. A missing-wrapping error (the credential
+      // has no wrapping at some gen) is the stale path the server should have
+      // flagged; re-surface both as a re-registration prompt so the app has a
+      // single, actionable recovery path.
+      throw new StalePasskeyError({
+        credentialId: credential_id,
+        message:
+          `Passkey ${credential_id.slice(0, 8)}… could not unwrap the account key ` +
+          '(this passkey predates the tarn#59 constant-salt scheme, or its wrapping is ' +
+          'missing). Re-register the passkey from a password-authenticated session to repair: ' +
+          'log in with your password, remove this passkey, then add it again.',
+      });
+    }
 
     // 5. Install session state. Mirrors the tail of login() — same fields
     //    populated, same caches reset (they were already empty on a fresh

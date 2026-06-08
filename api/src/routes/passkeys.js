@@ -53,6 +53,55 @@ import {
 const WEBAUTHN_CHALLENGE_TTL_SECONDS = 60;
 const RP_NAME = 'Tarn';
 
+// ============ APP-WIDE CONSTANT PRF SALT (tarn#59) ============
+//
+// A single, fixed 32-byte PRF salt used for EVERY Tarn passkey, at both
+// register time and authentication time. This closes the per-credential
+// enumeration in the public authentication-options endpoint: with a constant
+// salt the server returns ONE value via `options.extensions.prf.eval.first`
+// and NO per-credential `evalByCredential` map, so the discoverable
+// (usernameless) flow no longer has to read & echo the entire
+// passkey_credentials table on an unauthenticated call.
+//
+// WHY THIS IS CRYPTOGRAPHICALLY SAFE (verify against WebAuthn PRF mechanics):
+//   The WebAuthn PRF extension is HMAC keyed by a per-CREDENTIAL secret that
+//   the authenticator generates at registration time and never exports. The
+//   RP-supplied salt is only the HMAC *message*. So PRF(constant_salt) is
+//   still UNIQUE per credential — two different passkeys fed the SAME salt
+//   produce DIFFERENT 32-byte outputs (different authenticator secret), hence
+//   different `passkey_KEK`s, hence per-credential-unique AES-KW wrappings.
+//   The salt was never a secret anyway — it was previously returned in the
+//   clear on a public endpoint. A constant salt removes a server-side lookup
+//   without weakening the derivation.
+//
+// WHY PER-ACCOUNT SALT CANNOT WORK FOR THE DISCOVERABLE FLOW:
+//   At authentication-options time the server does NOT know which account is
+//   signing in (the whole point of usernameless / resident-credential login).
+//   Returning a per-account salt would require first resolving the account —
+//   i.e. re-introducing exactly the enumeration we are removing. The PRF salt
+//   must therefore be a value the server can return WITHOUT knowing the
+//   account: a single app-wide constant is the only shape that satisfies that.
+//
+// The value is derived deterministically from a fixed domain string so it is
+// self-documenting and reproducible, and lives SERVER-SIDE only — both
+// register-options and authentication-options return the SAME constant, so the
+// SDK never hardcodes it: it simply uses whatever salt the server provides at
+// register (to wrap) and at auth (to unwrap). See PASSKEY_PRF_SALT_DOMAIN.
+const PASSKEY_PRF_SALT_DOMAIN = 'tarn-passkey-prf-constant-salt-v1';
+
+// SHA-256 of the domain string → a fixed 32-byte salt. Computed once at module
+// load. Synchronous derivation is impossible in the Workers runtime (only
+// crypto.subtle is available, which is async), so we lazily memoize the digest
+// the first time a handler needs it.
+let _constantPrfSalt = null;
+async function getConstantPrfSalt() {
+  if (_constantPrfSalt) return _constantPrfSalt;
+  const data = new TextEncoder().encode(PASSKEY_PRF_SALT_DOMAIN);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  _constantPrfSalt = new Uint8Array(digest); // 32 bytes
+  return _constantPrfSalt;
+}
+
 // Abuse cap for the public, unauthenticated passkey authentication-options
 // endpoint (tarn#59). Keyed per-IP, mirroring the other public endpoints
 // (register / lookup / share-lookup / inbox-fetch). Each options call mints a
@@ -335,10 +384,14 @@ export async function handlePasskeyRegisterOptions(request, env, ctx, cors) {
     transports: undefined,
   }));
 
-  // Generate a fresh PRF salt for this passkey. The salt is what binds the
-  // PRF-derived secret to this credential — same salt + same passkey →
-  // same wrapping key, deterministically.
-  const prfSalt = generateChallengeBytes();
+  // tarn#59 — use the APP-WIDE CONSTANT PRF salt (not a per-credential
+  // random one). The PRF output is still unique per credential because the
+  // authenticator keys it on a per-credential secret; the salt is only the
+  // HMAC message. Registering under the constant means the credential's
+  // wrapping is derived from PRF(constant), which is exactly what the
+  // discoverable auth-options flow will hand back at sign-in — so the same
+  // wrapping key is reproduced without the server ever enumerating salts.
+  const prfSalt = await getConstantPrfSalt();
   const prfSaltB64Url = bytesToBase64Url(prfSalt);
 
   const options = await generateRegistrationOptions({
@@ -510,6 +563,15 @@ export async function handlePasskeyRegister(request, env, ctx, cors) {
 
   // Step 2: insert the credential row. The CAS already committed.
   //
+  // tarn#59 — the `prf_salt` column is now VESTIGIAL. With the app-wide
+  // constant salt (getConstantPrfSalt), every new row stores that same
+  // constant (register-options handed it to the SDK, which echoes it back
+  // here), and the authentication-options path no longer reads the column at
+  // all — it returns the constant directly. We keep storing it (rather than
+  // dropping the column) so the row shape and the Arweave `Type=passkey-reg`
+  // mirror stay unchanged (no migration, no rebuild-tool churn); the value is
+  // simply ignored on read. The column may be dropped in a future migration.
+  //
   // Residual window (CAS committed, INSERT fails): the envelope now carries a
   // passkey_prf wrapping for `credentialId` with no passkey_credentials row.
   // This is HARMLESS and self-correcting: the orphan wrapping is dead weight
@@ -582,9 +644,8 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
     return errorResponse('Origin not allowed for passkey operations', 400, cors);
   }
 
-  // tarn#59 — this endpoint is public and (in the discoverable flow) reads the
-  // credential table, so it must be rate-limited to blunt bulk enumeration and
-  // challenge-row write amplification. Per-IP, hourly, fails open.
+  // tarn#59 — this endpoint is public, so it is rate-limited to blunt bulk
+  // probing and challenge-row write amplification. Per-IP, hourly, fails open.
   const { allowed } = await checkPasskeyAuthOptionsRateLimit(env, request);
   if (!allowed) {
     return errorResponse('Rate limit exceeded', 429, { ...cors, 'Retry-After': '3600' });
@@ -598,40 +659,27 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
   }
   const credentialIdHint = typeof body?.credential_id === 'string' ? body.credential_id : null;
 
-  // tarn#59 — two flows, two postures:
+  // tarn#59 — ENUMERATION CLOSED. The PRF salt is now an app-wide CONSTANT
+  // (see getConstantPrfSalt), so neither flow needs to read the
+  // passkey_credentials table to build the PRF eval. We return the single
+  // constant via `options.extensions.prf.eval.first` and NO per-credential
+  // `evalByCredential` map.
+  //
+  // Two flows, two postures for `allowCredentials`:
   //
   //   credential_id supplied (account-identified re-tap, e.g. the SDK's
-  //   re-wrap ceremony): narrow to exactly that credential. We return it in
-  //   `allowCredentials` so the authenticator is steered to the right key,
-  //   and supply its single salt via the PRF map. Scoped — no other account's
-  //   credential is touched.
+  //   re-wrap ceremony): steer the authenticator to exactly that one
+  //   credential. We trust the caller-supplied ID directly — no DB read is
+  //   needed because the salt is constant and a wrong/unknown ID simply means
+  //   the authenticator finds nothing to assert with (it is re-verified at the
+  //   /authenticate step regardless). Scoped — no other credential is touched.
   //
   //   no credential_id (usernameless / discoverable sign-in, what Bookish
-  //   does): use a STANDARD discoverable flow — `allowCredentials` is left
-  //   empty so the authenticator presents its own resident credentials rather
-  //   than us enumerating the table into the allow-list. We no longer dump the
-  //   table into a top-level `allow_credentials` array either (no client reads
-  //   it — verified against the live Bookish bundle).
-  //
-  //   Residual (deferred, see issue): the discoverable flow STILL has to put
-  //   every credential_id → prf_salt into `options.extensions.prf
-  //   .evalByCredential`, because the PRF salt is per-credential and the
-  //   client must be able to evaluate it for whichever resident credential the
-  //   user picks in this single round trip. Removing that enumeration requires
-  //   a breaking protocol change (a global salt, or a second round trip after
-  //   credential selection) and is left as a human decision.
-  let credentials;
-  if (credentialIdHint) {
-    const rows = await env.DB.prepare(
-      'SELECT credential_id, prf_salt FROM passkey_credentials WHERE credential_id = ?1'
-    ).bind(credentialIdHint).all();
-    credentials = rows.results || [];
-  } else {
-    const rows = await env.DB.prepare(
-      'SELECT credential_id, prf_salt FROM passkey_credentials'
-    ).all();
-    credentials = rows.results || [];
-  }
+  //   does): STANDARD discoverable flow — `allowCredentials` is left empty so
+  //   the authenticator self-presents its resident credentials. NO table read,
+  //   NO per-credential salt map, NO top-level dump → the enumeration that
+  //   tarn#59 set out to remove is gone.
+  const prfSalt = await getConstantPrfSalt();
 
   const challenge = generateChallengeBytes();
 
@@ -640,20 +688,20 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
     timeout: 60_000,
     // Discoverable flow → empty allow-list (authenticator self-presents its
     // resident credentials). Account-identified re-tap → steer to the one
-    // credential the caller named.
+    // credential the caller named (trusted directly; re-verified at
+    // /authenticate). No credential-table SELECT in either path.
     allowCredentials: credentialIdHint
-      ? credentials.map(r => ({ id: r.credential_id }))
+      ? [{ id: credentialIdHint }]
       : [],
     userVerification: 'preferred',
     challenge,
     extensions: {
-      // PRF eval at auth time uses the SAME salt that was bound at register
-      // time. Because the authenticator selects ONE credential at auth, we
-      // need to hand it a per-credential map so it picks the right salt.
+      // tarn#59 — single constant PRF salt for the whole RP. Every Tarn
+      // passkey was wrapped (at register) under PRF(constant), so the same
+      // salt unwraps whichever resident credential the user selects. No
+      // per-credential `evalByCredential` map → no enumeration.
       prf: {
-        evalByCredential: Object.fromEntries(
-          credentials.map(r => [r.credential_id, { first: base64UrlToBytes(r.prf_salt) }]),
-        ),
+        eval: { first: prfSalt },
       },
     },
   });
@@ -666,10 +714,9 @@ export async function handlePasskeyAuthOptions(request, env, ctx, cors) {
     'INSERT INTO webauthn_challenges (challenge, data_lookup_key, purpose, issued_at, expires_at, consumed_at) VALUES (?1, NULL, ?2, ?3, ?4, NULL)'
   ).bind(options.challenge, 'authenticate', issuedAt, expiresAt).run();
 
-  // tarn#59 — the salts the client needs are already carried in
-  // `options.extensions.prf.evalByCredential`; we no longer echo a separate
-  // top-level `allow_credentials` array (it was a redundant second copy of the
-  // credential→salt map that no client consumes).
+  // tarn#59 — the single constant salt rides in
+  // `options.extensions.prf.eval.first`. No top-level dump, no per-credential
+  // map.
   return jsonResponse({
     options,
     rp_id: rp.rpId,

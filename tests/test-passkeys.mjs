@@ -29,10 +29,11 @@ import { VirtualAuthenticator, installPasskeyTestEnv } from './helpers/virtual-a
 
 const API_BASE = process.argv[2] || 'http://localhost:8787';
 
-// tarn#59 — auth-options now carries PRF salts only inside
-// options.extensions.prf.evalByCredential, where simplewebauthn serializes the
-// Uint8Array salt as a numeric-keyed object ({"0":n,"1":n,...}). Rebuild the
-// bytes and re-encode as base64url (the shape the virtual authenticator wants).
+// tarn#59 (full close) — auth-options now carries a SINGLE app-wide CONSTANT
+// PRF salt in options.extensions.prf.eval.first (no per-credential
+// evalByCredential map), where simplewebauthn serializes the Uint8Array salt
+// as a numeric-keyed object ({"0":n,"1":n,...}). Rebuild the bytes and
+// re-encode as base64url (the shape the virtual authenticator wants).
 function numericObjectToB64u(obj) {
   const keys = Object.keys(obj).map(Number).filter(k => Number.isInteger(k) && k >= 0);
   const max = Math.max(...keys);
@@ -654,13 +655,13 @@ await test('reused authentication challenge rejected', async () => {
   assert(optsRes.status === 200, `options ${optsRes.status}`);
   const optsJson = await optsRes.json();
   const challenge = optsJson.options.challenge;
-  // tarn#59 — the per-credential PRF salt is now carried in
-  // options.extensions.prf.evalByCredential (keyed by credential_id), not in a
-  // top-level allow_credentials echo. simplewebauthn serializes the salt
-  // Uint8Array as a numeric-keyed object ({"0":n,...}) on the wire, so rebuild
-  // the bytes and re-encode as the base64url string the virtual authenticator
-  // expects.
-  const saltObj = optsJson.options.extensions.prf.evalByCredential[auth.credentialIdB64Url].first;
+  // tarn#59 (full close) — the PRF salt is now the single app-wide CONSTANT
+  // carried in options.extensions.prf.eval.first (no per-credential
+  // evalByCredential map, no top-level allow_credentials echo). simplewebauthn
+  // serializes the salt Uint8Array as a numeric-keyed object ({"0":n,...}) on
+  // the wire, so rebuild the bytes and re-encode as the base64url string the
+  // virtual authenticator expects.
+  const saltObj = optsJson.options.extensions.prf.eval.first;
   const saltBytes = numericObjectToB64u(saltObj);
   const prfSalt = saltBytes;
 

@@ -396,21 +396,14 @@ export function installPasskeyTestEnv({ origin = 'http://localhost:3000', rpId =
           const id = bytesToBase64Url(new Uint8Array(a.id));
           if (registry.has(id)) { pickedB64 = id; break; }
         }
-        // tarn#59 — discoverable flow: the server now leaves allowCredentials
+        // tarn#59 — discoverable flow: the server leaves allowCredentials
         // empty (the standard usernameless shape), so a real platform
         // authenticator self-selects from its resident credentials. Simulate
-        // that by picking a registered credential the RP knows about — i.e.
-        // one named in the PRF evalByCredential map (which still enumerates
-        // the RP's credentials). Falls back to any registered credential so
-        // single-passkey tests "just work" without an explicit pin.
+        // that by picking any registered credential the RP knows about. (With
+        // the constant-salt scheme there is no per-credential map to consult;
+        // a real authenticator just shows the user their resident keys.)
         if (!pickedB64 && allowed.length === 0) {
-          const ebcKeys = Object.keys(publicKey.extensions?.prf?.evalByCredential || {});
-          for (const id of ebcKeys) {
-            if (registry.has(id)) { pickedB64 = id; break; }
-          }
-          if (!pickedB64) {
-            for (const id of registry.keys()) { pickedB64 = id; break; }
-          }
+          for (const id of registry.keys()) { pickedB64 = id; break; }
         }
       }
       if (!pickedB64) throw new Error('virtual authenticator: no allowed credential found in registry');
@@ -418,9 +411,13 @@ export function installPasskeyTestEnv({ origin = 'http://localhost:3000', rpId =
       const auth = registry.get(pickedB64);
       if (!auth) throw new Error(`virtual authenticator: unknown credentialId ${pickedB64}`);
 
-      // PRF salt is in evalByCredential keyed by base64url credentialId.
-      const evalMap = publicKey.extensions?.prf?.evalByCredential || {};
-      const saltSrc = evalMap[pickedB64]?.first;
+      // tarn#59 — the PRF salt is now the single app-wide CONSTANT carried in
+      // extensions.prf.eval.first. Prefer it; fall back to the deprecated
+      // per-credential evalByCredential[credId].first for backward compat with
+      // any pre-tarn#59 wire shape.
+      const prf = publicKey.extensions?.prf || {};
+      let saltSrc = prf.eval?.first;
+      if (!saltSrc) saltSrc = prf.evalByCredential?.[pickedB64]?.first;
       if (!saltSrc) throw new Error(`virtual authenticator: no PRF salt for ${pickedB64}`);
       const prfSaltB64 = bytesToBase64Url(new Uint8Array(saltSrc));
 
