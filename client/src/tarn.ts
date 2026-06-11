@@ -56,8 +56,8 @@ import {
   getOrCreateWrappingKey,
   clearWrappingKey,
 } from './session-persistence.js';
-import { getCachedBlob, setCachedBlob } from './blob-cache.js';
-import { getCursor, setCursor } from './sync-cursor.js';
+import { getCachedBlob, setCachedBlob, clearBlobsForScope } from './blob-cache.js';
+import { getCursor, setCursor, clearCursorsForScope } from './sync-cursor.js';
 import {
   deriveInboxTag,
   recentInboxWindows,
@@ -944,7 +944,13 @@ export class TarnClient {
     // un-resumable. Wipe the IndexedDB wrapping key so prior blobs become
     // unreadable on this origin. Best-effort — IndexedDB failure must not
     // fail the credential operation.
-    try { await this.clearSession(); } catch {}
+    //
+    // Deliberately clearWrappingKey() and NOT clearSession(): the dlk is
+    // stable across credential rotation, so the per-account caches that
+    // clearSession() wipes (delta cursors, ciphertext blobs — issue #71)
+    // remain VALID here. Wiping them would only force a needless full
+    // resync. See #wipeLocalState.
+    try { await clearWrappingKey(); } catch {}
 
     // Announce the rotation to connections BEFORE swapping local key state, so
     // we can sign with the OLD signing_priv and encrypt under OLD K_AB.
@@ -1406,7 +1412,13 @@ export class TarnClient {
     // un-resumable. Wipe the IndexedDB wrapping key so prior blobs become
     // unreadable on this origin. Best-effort — IndexedDB failure must not
     // fail the credential operation.
-    try { await this.clearSession(); } catch {}
+    //
+    // Deliberately clearWrappingKey() and NOT clearSession(): the dlk is
+    // stable across credential rotation, so the per-account caches that
+    // clearSession() wipes (delta cursors, ciphertext blobs — issue #71)
+    // remain VALID here. Wiping them would only force a needless full
+    // resync. See #wipeLocalState.
+    try { await clearWrappingKey(); } catch {}
 
     // §13.5 step 4: with the new credential blob published (durable
     // indicator of rotation in flight), publish a `rotate_identity`
@@ -3213,6 +3225,11 @@ export class TarnClient {
     // §7 invalidation: rotate the IndexedDB wrapping key so any persisted
     // session blob on this origin becomes unreadable. Best-effort — IndexedDB
     // failure must not fail the credential operation.
+    //
+    // clearSession() also wipes the per-account local caches (delta cursors
+    // + ciphertext blobs, issue #71) — correct for a permanent deletion, and
+    // it must run HERE, before the field-nulling below drops
+    // #dataLookupKey (the wipe needs the dlk to scope its keys).
     try { await this.clearSession(); } catch {}
 
     this.#jwt = null;
@@ -6967,16 +6984,61 @@ export class TarnClient {
   }
 
   /**
-   * Delete the IndexedDB wrapping key. Renders all previously-emitted session
-   * blobs unreadable on this origin. Does not affect the in-memory client
-   * state — the caller can keep using the live client until it's
-   * garbage-collected. Side-effected from changeCredentials / recoverAccount /
-   * deleteAccount so persisted blobs invalidate on key rotation.
+   * Forget this account's local state on this origin (issue #71):
+   *
+   *   1. Wipe the per-account IndexedDB caches for the current (appId, dlk)
+   *      scope — delta-sync cursors (`tarn-sync-cursors`) and ciphertext
+   *      blobs (`tarn-blob-cache`). A surviving cursor makes the next delta
+   *      sync silently skip history after the app wipes its own cache, and
+   *      a previous account's ciphertext shouldn't linger on shared devices.
+   *      Best-effort: a wipe failure never breaks logout. Other accounts'
+   *      entries in the same databases are left untouched.
+   *   2. Delete the IndexedDB wrapping key, rendering all previously-emitted
+   *      session blobs unreadable on this origin.
+   *
+   * Does not affect the in-memory client state — the caller can keep using
+   * the live client until it's garbage-collected. Side-effected from
+   * deleteAccount and revokeAllSessions (both are full sign-outs).
+   * changeCredentials / recoverAccount deliberately do NOT route through
+   * here — they only need the wrapping-key invalidation (see #wipeLocalState
+   * for why the caches must survive credential rotation).
    *
    * @returns {Promise<void>}
    */
   async clearSession() {
+    // Wipe first, while #dataLookupKey is still whatever the caller had —
+    // clearSession never nulls fields, but ordering it before the wrapping-
+    // key delete costs nothing and keeps the wipe independent of any
+    // failure below. #wipeLocalState never throws.
+    await this.#wipeLocalState();
     await clearWrappingKey();
+  }
+
+  /**
+   * Best-effort wipe of the SDK's per-account IndexedDB state for the
+   * CURRENT (appId, dlk). No-op when the client never learned its dlk
+   * (never logged in on this instance). Never throws.
+   *
+   * Deliberately NOT called from changeCredentials / recoverAccount: the
+   * data_lookup_key is stable for the lifetime of the account (the server's
+   * PUT /api/v1/auth re-inserts the row under the SAME dlk), the server-
+   * issued delta cursor remains valid, and cached ciphertext remains
+   * decryptable via the re-wrapped DEK chain — wiping there would only
+   * force a needless full resync.
+   */
+  async #wipeLocalState(): Promise<void> {
+    try {
+      const appId = this.#appId;
+      const dlk = this.#dataLookupKey;
+      if (!appId || !dlk) return;
+      await Promise.all([
+        clearCursorsForScope(appId, dlk),
+        clearBlobsForScope(appId, dlk),
+      ]);
+    } catch {
+      // Both helpers swallow internally; this is belt-and-braces so the
+      // wipe can never break logout.
+    }
   }
 
   /**
@@ -7073,7 +7135,9 @@ export class TarnClient {
    * as a sign-out and prompt re-auth.
    *
    * Also wipes the persisted session blob on this origin (clearSession) so a
-   * subsequent resumeSession returns null.
+   * subsequent resumeSession returns null — and, via clearSession, the
+   * per-account local caches (delta cursors + ciphertext blobs, issue #71),
+   * since this is a full sign-out.
    *
    * @returns {Promise<void>}
    */

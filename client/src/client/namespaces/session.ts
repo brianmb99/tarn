@@ -44,6 +44,13 @@ export class SessionNamespace {
    * Forget the local session — clears the persisted blob and any in-process
    * key material. After this, `isLoggedIn()` returns false and the user
    * must re-authenticate via `tarn.login()` or `tarn.register()`.
+   *
+   * Also wipes the SDK's per-account IndexedDB caches for the current
+   * account (delta-sync cursors + ciphertext blob cache, issue #71), so
+   * apps do NOT need to delete `tarn-sync-cursors` / `tarn-blob-cache`
+   * themselves on logout (doing so anyway is harmless). The wipe is
+   * best-effort and scoped to the signed-out account — other accounts'
+   * cached state on the same origin is untouched.
    */
   async clear(): Promise<void> {
     await this.#client.clearSession();

@@ -658,7 +658,7 @@ await tarn.account.delete();
 
 // Local session.
 tarn.session.isLoggedIn();          // boolean — whether keys are loaded
-await tarn.session.clear();         // forget local session; user must re-auth
+await tarn.session.clear();         // log out: forget local session + wipe per-account caches
 
 // Server-side session management (one row per device).
 const devices = await tarn.session.listDevices();
@@ -668,6 +668,8 @@ await tarn.session.revokeDevice(devices[1].sid);   // log one device out
 await tarn.session.revokeAllOthers();              // "log out everywhere else"
 await tarn.session.revokeAll();                    // log out everywhere including here
 ```
+
+**Logout wipes the SDK's per-account local caches.** `tarn.session.clear()` (and the other full sign-outs: `tarn.session.revokeAll()`, `tarn.account.delete()`) deletes, in addition to the persisted session blob, the SDK's per-account IndexedDB state for the account being signed out: the delta-sync cursors in `tarn-sync-cursors` and the ciphertext blobs in `tarn-blob-cache`. Apps do **not** need to delete those databases in their own logout handlers — and shouldn't have to know they exist. (Deleting them anyway is harmless; the SDK rebuilds both lazily.) The wipe is best-effort — a storage failure never breaks logout — and scoped to the current account, so other accounts that have used the same browser keep their caches and skip a full resync on their next login. Credential changes and account recovery do **not** wipe these caches: the account's `data_lookup_key` is stable across credential rotation, so the cursor and cached blobs remain valid, and wiping them would only force a needless resync.
 
 Apps **should** attach a device label at login time — `tarn.login(username, password, { deviceLabel: 'Chrome on MacBook' })` — so users can identify their sessions in `listDevices()`. If omitted, `deviceLabel` is `null` and users only see the opaque `sid` and timestamps. Pick something the user will recognize: a User-Agent summary, a hostname, or a name the user typed at signup.
 

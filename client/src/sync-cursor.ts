@@ -48,6 +48,38 @@ function dbPut(db: IDBDatabase, key: string, value: string): Promise<void> {
   });
 }
 
+function dbGetAllKeys(db: IDBDatabase): Promise<IDBValidKey[]> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).getAllKeys();
+    req.onsuccess = () => resolve(req.result ?? []);
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB getAllKeys failed'));
+  });
+}
+
+// Issue all deletes synchronously on ONE readwrite transaction (awaiting
+// between requests risks auto-commit closing the transaction in real
+// IndexedDB), resolve when the last succeeds.
+function dbDeleteKeys(db: IDBDatabase, keys: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (keys.length === 0) {
+      resolve();
+      return;
+    }
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    let remaining = keys.length;
+    for (const key of keys) {
+      const req = store.delete(key);
+      req.onsuccess = () => {
+        remaining -= 1;
+        if (remaining === 0) resolve();
+      };
+      req.onerror = () => reject(req.error ?? new Error('IndexedDB delete failed'));
+    }
+  });
+}
+
 function cursorKey(appId: string, dlk: string, type: string): string {
   return `${appId}:${dlk}:${type}`;
 }
@@ -98,5 +130,38 @@ export async function setCursor(
     }
   } catch {
     // Swallow — see header doc.
+  }
+}
+
+/**
+ * Delete every cursor stored for this (appId, dlk) scope — all types
+ * (issue #71). Invoked from clearSession() so logout forgets the account's
+ * delta position: a cursor that outlives the app's own cache makes the next
+ * delta sync silently skip history ("missing data" after re-login).
+ *
+ * Per-key deletion (prefix filter over getAllKeys) rather than
+ * deleteDatabase: whole-DB deletion blocks while another tab holds a
+ * connection, and would needlessly drop other accounts' cursors, which are
+ * harmless and save those accounts a full resync.
+ *
+ * Entirely best-effort: any failure is swallowed — a wipe failure must
+ * never break logout.
+ */
+export async function clearCursorsForScope(appId: string, dlk: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  try {
+    const db = await openDb();
+    try {
+      const prefix = `${appId}:${dlk}:`;
+      const keys = await dbGetAllKeys(db);
+      const mine = keys.filter(
+        (k): k is string => typeof k === 'string' && k.startsWith(prefix),
+      );
+      await dbDeleteKeys(db, mine);
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Swallow — see doc above.
   }
 }

@@ -70,11 +70,46 @@ function dbPut(db: IDBDatabase, key: string, value: Uint8Array): Promise<void> {
 }
 
 // Compose the cache key. Scoping by (appId, dlk) gives us multi-app and
-// multi-account isolation on the same origin. After a credential change the
-// dlk rotates, so blobs cached under the prior dlk become orphans — fine,
-// they're ciphertext and undecryptable without the matching DEK chain.
+// multi-account isolation on the same origin. The dlk is stable for the
+// lifetime of the account — credential change / recovery rotate the
+// credential_lookup_key and re-wrap the DEK chain but keep the same
+// data_lookup_key (the server's PUT /api/v1/auth re-inserts the account row
+// under the SAME dlk) — so cached blobs stay addressable and decryptable
+// across credential rotation.
 function cacheKey(appId: string, dlk: string, txid: string): string {
   return `${appId}:${dlk}:${txid}`;
+}
+
+function dbGetAllKeys(db: IDBDatabase): Promise<IDBValidKey[]> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).getAllKeys();
+    req.onsuccess = () => resolve(req.result ?? []);
+    req.onerror = () => reject(req.error ?? new Error('IndexedDB getAllKeys failed'));
+  });
+}
+
+// Issue all deletes synchronously on ONE readwrite transaction (awaiting
+// between requests risks auto-commit closing the transaction in real
+// IndexedDB), resolve when the last succeeds.
+function dbDeleteKeys(db: IDBDatabase, keys: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (keys.length === 0) {
+      resolve();
+      return;
+    }
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    let remaining = keys.length;
+    for (const key of keys) {
+      const req = store.delete(key);
+      req.onsuccess = () => {
+        remaining -= 1;
+        if (remaining === 0) resolve();
+      };
+      req.onerror = () => reject(req.error ?? new Error('IndexedDB delete failed'));
+    }
+  });
 }
 
 /**
@@ -123,5 +158,38 @@ export async function setCachedBlob(
     }
   } catch {
     // Swallow — see header doc.
+  }
+}
+
+/**
+ * Delete every cached blob for this (appId, dlk) scope (issue #71). Invoked
+ * from clearSession() so the previous account's ciphertext doesn't linger
+ * on shared devices after logout. The blobs are undecryptable without the
+ * DEK chain, so this is hygiene rather than confidentiality — but local
+ * state for an account the device has signed out of shouldn't persist.
+ *
+ * Per-key deletion (prefix filter over getAllKeys) rather than
+ * deleteDatabase: whole-DB deletion blocks while another tab holds a
+ * connection, and would needlessly drop other accounts' cached blobs.
+ *
+ * Entirely best-effort: any failure is swallowed — a wipe failure must
+ * never break logout.
+ */
+export async function clearBlobsForScope(appId: string, dlk: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  try {
+    const db = await openDb();
+    try {
+      const prefix = `${appId}:${dlk}:`;
+      const keys = await dbGetAllKeys(db);
+      const mine = keys.filter(
+        (k): k is string => typeof k === 'string' && k.startsWith(prefix),
+      );
+      await dbDeleteKeys(db, mine);
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Swallow — see doc above.
   }
 }

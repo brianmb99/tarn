@@ -1,8 +1,9 @@
 // Minimal in-memory IndexedDB shim for the Section 7 session-persistence path.
 // Node has no IndexedDB; the production runtime is the browser. We polyfill
-// just the surface client/src/session-persistence.js touches: open +
-// objectStore + readonly/readwrite get/put/delete on a single store. This is
-// a test-time shim, not a runtime dep — the production code path is browser.
+// just the surface the client persistence modules (session-persistence,
+// sync-cursor, blob-cache) touch: open + objectStore + readonly/readwrite
+// get/put/delete/getAllKeys on a single store. This is a test-time shim, not
+// a runtime dep — the production code path is browser.
 //
 // Loaded as a side-effect import (no exports). Idempotent: if a real or prior
 // IndexedDB is already on globalThis, leaves it alone.
@@ -35,6 +36,7 @@ if (typeof globalThis.indexedDB === 'undefined') {
                   get: (id) => makeReq(() => store.get(id)),
                   put: (value, id) => makeReq(() => { store.set(id, value); return undefined; }),
                   delete: (id) => makeReq(() => { store.delete(id); return undefined; }),
+                  getAllKeys: () => makeReq(() => Array.from(store.keys())),
                 };
               },
             };
