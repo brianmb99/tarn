@@ -8,10 +8,16 @@
  *   node tools/set-rules.mjs --api <url> --app <app_id> --key <private_key_hex> --dlk <data_lookup_key> --rules '<json>'
  *
  * Plans (shortcuts):
- *   free     — max_entries=5, max_bytes=102400
+ *   free     — max_entries=5 (app-wide, resolved live entries), max_bytes=102400
  *   annual   — max_entries=1000, max_bytes=102400, expires=+1 year from now
  *   clear    — [] (empty rules = unrestricted)
  *   deny     — null-like (sets a single unknown rule that fails closed)
+ *
+ * Note (tarn#65): plans no longer carry `entry_type: 'entry'` — that value was
+ * pre-redesign residue. The schema-first SDK writes Type=<collection name>, so
+ * the old filter matched nothing and the caps never bound. Plans now count all
+ * of the app's entries; pass --rules with an explicit entry_type to scope a
+ * cap to one collection.
  *
  * Examples:
  *   node tools/set-rules.mjs --api http://localhost:8787 --app bookish --key abc123... --dlk def456... --plan free
@@ -49,7 +55,7 @@ if (rulesRaw) {
   switch (plan) {
     case 'free':
       rules = [
-        { type: 'max_entries', limit: 5, app, entry_type: 'entry' },
+        { type: 'max_entries', limit: 5, app },
         { type: 'max_bytes', limit: 102400 },
       ];
       break;
@@ -57,7 +63,7 @@ if (rulesRaw) {
       const expires = new Date(now);
       expires.setFullYear(expires.getFullYear() + 1);
       rules = [
-        { type: 'max_entries', limit: 1000, app, entry_type: 'entry' },
+        { type: 'max_entries', limit: 1000, app },
         { type: 'max_bytes', limit: 102400 },
         { type: 'expires', at: expires.toISOString() },
       ];

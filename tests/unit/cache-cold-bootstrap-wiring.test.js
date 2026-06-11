@@ -13,15 +13,14 @@
 // globalThis.fetch (Arweave GraphQL + gateway bodies) and backing env.DB with
 // an in-memory D1 shim that honours the SQL the production code actually issues.
 //
-// SCOPE / TRUTH NOTES (verified against the source, 2026-06-07):
-//   * refreshCache() calls searchEntriesByLookupKey(), which issues a SINGLE
-//     GraphQL query (first:10, sort:HEIGHT_DESC, NO cursor pagination loop).
-//     The #61 issue text mentions "pages GraphQL" for the cold-bootstrap read
-//     path — that is NOT what the list/refreshCache path does today. The
-//     multi-page GraphQL pagination loop lives in the rebuild TOOL
-//     (tools/rebuild-from-arweave.mjs gqlPage), exercised by the companion
-//     test rebuild-cli-mock-multipage.test.js. We assert the real single-query
-//     behaviour here and document the discrepancy rather than fake a loop.
+// SCOPE / TRUTH NOTES (updated 2026-06-11 for tarn#64):
+//   * refreshCache() calls fetchAllPagesByLookupKey(), which pages the
+//     GraphQL query (first:100, sort:HEIGHT_DESC, cursor loop, MAX_PAGES=20)
+//     until hasNextPage is false. The bootstrap marker latches ONLY when the
+//     scan ran to completion — a MAX_PAGES-truncated scan (or GraphQL error)
+//     leaves the tuple un-latched so the next read resumes the ingest.
+//     (Before tarn#64 this path was a single first:10 query that silently
+//     truncated rebuilds of collections with >10 live entries.)
 //   * refreshCache() does METADATA-ONLY bootstrap — it does NOT fetch blob
 //     bodies from the gateway. Bodies are hydrated lazily by handleEntryById /
 //     the ?eid= / ?since= fast paths via fetchBlobFromGateway → persistBlob.
@@ -88,6 +87,10 @@ function makeD1() {
         if (/FROM cache_meta WHERE key = \?1/.test(sql)) {
           return cacheMeta.has(args[0]) ? { 1: 1 } : null;
         }
+        if (/SELECT cached_at, txid FROM entries WHERE txid = \?1/.test(sql)) {
+          const r = entries.get(args[0]);
+          return r ? { cached_at: r.cached_at, txid: r.txid } : null;
+        }
         if (/SELECT \* FROM entries WHERE txid = \?1/.test(sql)) {
           return entries.get(args[0]) ?? null;
         }
@@ -108,12 +111,25 @@ function makeD1() {
         return { success: true };
       },
       async all() {
-        if (/FROM entries WHERE app = \?1 AND type = \?2 AND lookup_key = \?3/.test(sql)) {
+        // tarn#70 SQL-windowed live query: emulate the scope filter, the
+        // live-filter (tombstone / tombstoned-target / superseded exclusion),
+        // the (cached_at, txid) ordering, the cursor predicate, and LIMIT —
+        // the same semantics SQLite applies to the real statement.
+        if (/FROM entries e\s+WHERE e\.app = \?1 AND e\.type = \?2 AND e\.lookup_key = \?3/.test(sql)) {
           const [app, type, lk] = args;
-          const results = [...entries.values()].filter(
+          const scope = [...entries.values()].filter(
             (r) => r.app === app && r.type === type && r.lookup_key === lk,
           );
-          return { results };
+          const tombRefs = new Set(scope.filter((r) => r.is_tombstone && r.tombstone_ref).map((r) => r.tombstone_ref));
+          const superseded = new Set(scope.filter((r) => r.prev_txid).map((r) => r.prev_txid));
+          let live = scope.filter((r) => !r.is_tombstone && !tombRefs.has(r.txid) && !superseded.has(r.txid));
+          live.sort((a, b) => (a.cached_at - b.cached_at) || (a.txid < b.txid ? -1 : a.txid > b.txid ? 1 : 0));
+          if (args.length === 6) {
+            const [, , , ca, ctx2] = args;
+            live = live.filter((r) => r.cached_at > ca || (r.cached_at === ca && r.txid > ctx2));
+          }
+          const limit = args[args.length - 1];
+          return { results: live.slice(0, limit) };
         }
         return { results: [] };
       },
@@ -177,7 +193,12 @@ function edge(id, { eid = null, prev = null, op = null, ref = null, ts = 1700000
 
 // Intercept fetch: route GraphQL to a fixture, gateway GETs to a body map.
 // Records every GraphQL request body so we can assert the REAL query shape.
-function interceptFetch({ graphqlEdges = [], graphqlError = null, bodies = {} } = {}) {
+//
+// graphqlEdges: single-page fixture (hasNextPage omitted → false, loop stops).
+// graphqlPages: multi-page fixture — array of { edges, hasNextPage } served in
+//               request order (tarn#64 pagination tests); the last page repeats
+//               if the code requests more pages than provided.
+function interceptFetch({ graphqlEdges = [], graphqlPages = null, graphqlError = null, bodies = {} } = {}) {
   const calls = { graphql: [], gateway: [] };
   globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);
@@ -186,11 +207,14 @@ function interceptFetch({ graphqlEdges = [], graphqlError = null, bodies = {} } 
       if (graphqlError) {
         return { ok: false, status: 500, async text() { return 'boom'; }, async json() { return {}; } };
       }
+      const page = graphqlPages
+        ? graphqlPages[Math.min(calls.graphql.length - 1, graphqlPages.length - 1)]
+        : { edges: graphqlEdges, hasNextPage: false };
       return {
         ok: true,
         status: 200,
         async json() {
-          return { data: { transactions: { edges: graphqlEdges } } };
+          return { data: { transactions: { pageInfo: { hasNextPage: !!page.hasNextPage }, edges: page.edges } } };
         },
       };
     }
@@ -212,23 +236,62 @@ const ctx = { waitUntil() {} };
 describe('tarn#61 — cold-bootstrap GraphQL→D1 wiring (refreshCache / arweave.js)', () => {
   afterEach(restoreFetch);
 
-  it('searchEntriesByLookupKey issues the real single-query GraphQL request (App+Type+Lk filter, first:10, no cursor)', async () => {
+  it('searchEntriesByLookupKey issues the real paginated GraphQL request (App+Type+Lk filter, first:100, cursor variable) — tarn#64', async () => {
     const calls = interceptFetch({ graphqlEdges: [edge('tx-1', { eid: 'e1' })] });
-    const { edges, error } = await searchEntriesByLookupKey(DLK, { app: APP, type: TYPE });
+    const { edges, hasNextPage, error } = await searchEntriesByLookupKey(DLK, { app: APP, type: TYPE });
     assert.equal(error, null);
+    assert.equal(hasNextPage, false);
     assert.equal(edges.length, 1);
     assert.equal(edges[0].node.id, 'tx-1');
 
-    // Verify the ACTUAL wire request, not a re-mock: exactly one GraphQL POST,
-    // carrying the App/Type/Lk tag filter and first:10 (this path does NOT
-    // paginate — there is no `after` variable in the query).
+    // Verify the ACTUAL wire request, not a re-mock: one GraphQL POST carrying
+    // the App/Type/Lk tag filter, a page size of 100, a cursor variable
+    // (null on the first page), and pageInfo{hasNextPage} in the selection.
     assert.equal(calls.graphql.length, 1);
     const req = calls.graphql[0];
-    assert.equal(req.variables.first, 10);
-    assert.equal(req.variables.after, undefined, 'cold-bootstrap query is single-shot; no cursor variable');
+    assert.equal(req.variables.first, 100);
+    assert.equal(req.variables.after, null, 'first page carries a null cursor');
     const filters = Object.fromEntries(req.variables.tags.map((t) => [t.name, t.values[0]]));
     assert.deepEqual(filters, { App: APP, Type: TYPE, Lk: DLK });
     assert.match(req.query, /sort:HEIGHT_DESC/);
+    assert.match(req.query, /pageInfo\{hasNextPage\}/);
+  });
+
+  it('multi-page cold bootstrap ingests ALL pages before latching the marker (tarn#64)', async () => {
+    const db = makeD1();
+    const calls = interceptFetch({
+      graphqlPages: [
+        { edges: [edge('tx-p1a', { eid: 'e1' }), edge('tx-p1b', { eid: 'e2' })], hasNextPage: true },
+        { edges: [edge('tx-p2a', { eid: 'e3' }), edge('tx-p2b', { eid: 'e4' })], hasNextPage: true },
+        { edges: [edge('tx-p3a', { eid: 'e5' })], hasNextPage: false },
+      ],
+    });
+    const env = { DB: db };
+
+    const r = await refreshCache(env, ctx, APP, TYPE, DLK);
+    assert.equal(r.bootstrapped, true);
+    assert.equal(calls.graphql.length, 3, 'pages until hasNextPage=false');
+    assert.equal(db._entries.size, 5, 'every page upserted into D1');
+    assert.equal(db._cacheMeta.size, 1, 'marker latched after the COMPLETE scan');
+    // Cursor threading: page 2 resumes from the last edge of page 1.
+    assert.equal(calls.graphql[1].variables.after, 'tx-p1b');
+    assert.equal(calls.graphql[2].variables.after, 'tx-p2b');
+  });
+
+  it('a MAX_PAGES-truncated scan ingests what it saw but does NOT latch the marker (tarn#64)', async () => {
+    const db = makeD1();
+    // Serve hasNextPage:true forever — the loop must stop at MAX_PAGES (20)
+    // and report not-bootstrapped so the next read resumes the ingest.
+    const calls = interceptFetch({
+      graphqlPages: [{ edges: [edge('tx-loop', { eid: 'e1' })], hasNextPage: true }],
+    });
+    const env = { DB: db };
+
+    const r = await refreshCache(env, ctx, APP, TYPE, DLK);
+    assert.equal(r.bootstrapped, false, 'truncated scan reports not-bootstrapped');
+    assert.equal(calls.graphql.length, 20, 'scan stops at MAX_PAGES');
+    assert.equal(db._cacheMeta.size, 0, 'no marker latched on truncation');
+    assert.ok(db._entries.size >= 1, 'pages that WERE fetched are still ingested');
   });
 
   it('cold (dlk,app,type) read triggers refreshCache: GraphQL → upsert D1 → set bootstrap marker', async () => {

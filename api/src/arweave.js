@@ -54,28 +54,72 @@ export async function searchEntriesByAddr(addr, { app, type, cursor = null, limi
 
 /**
  * Search entries by lookup key (App + Type + Lk tags).
- * Used for credential mappings and account metadata.
+ * Used for credential mappings, account metadata, and data-entry cold
+ * bootstrap. Single page; use fetchAllPagesByLookupKey for a full scan.
  */
-export async function searchEntriesByLookupKey(lookupKey, { app, type } = {}) {
+export async function searchEntriesByLookupKey(lookupKey, { app, type, cursor = null, limit = 100 } = {}) {
   const tags = [
     { name: 'App', values: [app] },
     { name: 'Type', values: [type] },
     { name: 'Lk', values: [lookupKey] },
   ];
 
-  const q = `query($first:Int,$tags:[TagFilter!]){
-    transactions(first:$first,sort:HEIGHT_DESC,tags:$tags){
-      edges{node{id tags{name value}block{timestamp height}}}
+  const q = `query($after:String,$first:Int,$tags:[TagFilter!]){
+    transactions(after:$after,first:$first,sort:HEIGHT_DESC,tags:$tags){
+      pageInfo{hasNextPage}
+      edges{cursor node{id tags{name value}block{timestamp height}}}
     }
   }`;
 
-  const { data, error } = await queryGraphQL(q, { first: 10, tags });
-  if (error) return { edges: [], error };
+  const { data, error } = await queryGraphQL(q, { after: cursor, first: limit, tags });
+  if (error) return { edges: [], hasNextPage: false, error };
 
+  const txns = data?.transactions;
   return {
-    edges: data?.transactions?.edges || [],
+    edges: txns?.edges || [],
+    hasNextPage: !!txns?.pageInfo?.hasNextPage,
     error: null,
   };
+}
+
+/**
+ * Fetch all pages of entries for a lookup key (tarn#64).
+ *
+ * Cold bootstrap must ingest the COMPLETE live set before the cache layer
+ * latches its "D1 is authoritative" marker — a single 10-entry page silently
+ * truncated rebuilds of any collection with more live entries.
+ *
+ * MAX_PAGES bounds Worker resource use; `truncated: true` tells the caller
+ * the scan stopped with pages remaining (the caller must NOT latch its
+ * bootstrap marker in that case, so the next read resumes the ingest).
+ *
+ * @returns {Promise<{edges: Array, error: string|null, truncated: boolean}>}
+ */
+export async function fetchAllPagesByLookupKey(lookupKey, { app, type } = {}) {
+  const allEdges = [];
+  let cursor = null;
+  let pages = 0;
+  const MAX_PAGES = 20;
+
+  while (pages < MAX_PAGES) {
+    const { edges, hasNextPage, error } = await searchEntriesByLookupKey(lookupKey, { app, type, cursor, limit: 100 });
+
+    if (error) {
+      console.warn('[tarn-api] Arweave lookup-key query error on page', pages, ':', error);
+      return { edges: allEdges, error, truncated: false };
+    }
+
+    allEdges.push(...edges);
+
+    if (!hasNextPage || edges.length === 0) {
+      return { edges: allEdges, error: null, truncated: false };
+    }
+    cursor = edges[edges.length - 1].cursor;
+    pages++;
+  }
+
+  console.warn('[tarn-api] Lookup-key scan hit MAX_PAGES with pages remaining — bootstrap marker must not latch', { app, type });
+  return { edges: allEdges, error: null, truncated: true };
 }
 
 /**

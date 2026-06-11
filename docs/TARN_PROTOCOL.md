@@ -901,7 +901,7 @@ API:
   3. Check Lk tag matches jwt.sub (data_lookup_key)
   4. Evaluate write authorization rules -> 403 if denied
   5. Build + sign DataItem, cache in D1, upload to Turbo in background
-  6. Return: { txid, status: 'pending' }
+  6. Return: { id, gateway, status: 'pending' }   // `id` is the DataItem txid
 ```
 
 #### Turbo upload is a single point of failure on writes (20s timeout, no retry, no fallback)
@@ -1219,7 +1219,7 @@ POST /api/v1/entries
   Headers: Authorization: Bearer <jwt>, X-Arweave-Tags: [...]
   Body: <encrypted blob bytes>
   Auth: JWT
-  Returns: { txid, status: 'pending' }
+  Returns: { id, gateway, status: 'pending' }   // `id` is the DataItem txid
   Errors: 401, 403 (Lk/App mismatch or rules deny), 413
 
 POST /api/v1/entries/batch
@@ -1227,8 +1227,12 @@ POST /api/v1/entries/batch
   Auth: JWT
   Returns: { entries: [{ txid, gateway }], count, status: 'pending' }
   Errors: 401, 403, 413
-  Max 100 entries per batch. Counts as 1 rate-limit hit.
+  Max 25 entries per batch (Worker subrequest headroom). Counts as 1 rate-limit hit.
   Rules evaluated once for the entire batch (max_entries checks count + batchSize).
+  Partial failure: returns { entries: <landed>, failedAt, status: 'partial' } and,
+  when an X-Idempotency-Key was supplied, persists progress under it — a retry
+  with the same key RESUMES at failedAt instead of re-uploading landed entries
+  (tarn#67).
 
 GET /api/v1/entries?app={app}&type={type}&key={data_lookup_key}[&eid={eid}|&since={cursor}]
   Headers: Authorization: Bearer <session JWT>
@@ -1274,6 +1278,7 @@ endpoint has an account identity available. The 429 response always includes
 | Class | Identifier | Cap | Store | Used by |
 |---|---|---|---|---|
 | Authenticated writes | `data_lookup_key` | 100/hr | D1 (atomic INSERT ... ON CONFLICT) | `POST/PUT/DELETE /entries`, `POST /entries/batch` (one batch = one hit) |
+| Share publishes | `data_lookup_key` | share-log 2000/hr (tarn#66); share-inbox per-type caps | D1 (same atomic counter) | `POST /share/log/publish` (counted only past the 409 uniqueness check — replays spend no wallet money), `POST /share/inbox/publish` |
 | Authenticated reads | `data_lookup_key` (JWT-proven) | 1000/hr | KV | `GET /entries` (always — now JWT-gated, tarn#60), `GET /entries/{txid}?key=…` |
 | Unauthenticated reads | IP-hash | 1000/hr | KV | `GET /entries/{txid}` without `key` (txid-only, body encrypted) |
 | Unauthenticated other | IP-hash | endpoint-specific | KV | `POST /auth/register`, share lookup, invite preview, share-inbox/log fetches, **`POST /auth/passkey/authentication-options` (60/hr; tarn#59)** |
@@ -1378,8 +1383,8 @@ Write endpoints check `App` tag against `jwt.app`. The JWT's `app` claim is set 
 ### Why default rules are DENY
 New accounts have `rules_json = NULL`, which means DENY. The app must explicitly set rules after user creation (e.g., free tier: `max_entries=5`). This prevents orphaned accounts from writing unlimited data on the app's Arweave wallet.
 
-### Why reads are unauthenticated
-Data is on Arweave permanently (encrypted). Auth on reads only protects the cache layer. A permanent, auditable, API-independent data export page must be possible.
+### Why reads were originally unauthenticated (superseded by tarn#60)
+The original rationale: data is on Arweave permanently (encrypted), auth on reads only protects the cache layer, and a permanent, API-independent data export page must be possible. The first two points still hold, but tarn#60 closed the metadata-enumeration surface: `GET /entries?key=<dlk>` now requires a user-role session JWT matching the dlk (see the rate-limiting section above). The txid-only fetch (`GET /entries/{txid}` without `key`) remains public — content-addressed, non-enumerable, body encrypted — and the API-independent export property is preserved by `@tarn/recover`, which reads from Arweave gateways directly and never needed the Tarn API.
 
 ### Why a fresh random DEK at registration
 Earlier versions of Tarn self-wrapped the credential_encryption_key as the DEK at registration, redundantly but uniformly. Issue #11 replaced this with a fresh `crypto.getRandomValues(32)` DEK at gen 1. This is a prerequisite for forward-secret DEK rotation (different gens must be independent random keys, not derived from credentials) and for the planned recovery-phrase factor (different KDFs must be able to wrap the *same* DEK independently).

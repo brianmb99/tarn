@@ -353,6 +353,22 @@ export async function runScheduledChecks(env, opts = {}) {
     report.checks.mirror_failures = { error: err?.message || 'mirror_check_failed' };
   }
 
+  // 6. Operability config (tarn#68). Unattended operation requires a working
+  // alert channel, a dead-man heartbeat, and a funding floor — without them
+  // every other check here degrades to a logbook nobody reads (an unhealthy
+  // report with no webhook is just a console.warn). Their absence is itself
+  // an unhealthy condition, surfaced as flags so the operator is nudged until
+  // the three vars are set. See docs/OPERATIONS.md for setup.
+  const config = {
+    alert_webhook_configured: !!env.ALERT_WEBHOOK_URL,
+    heartbeat_configured: !!env.HEARTBEAT_URL,
+    funding_floor_configured: minBalanceWinc > 0,
+  };
+  report.checks.config = config;
+  if (!config.alert_webhook_configured) report.flags.push('ALERTING_UNCONFIGURED');
+  if (!config.heartbeat_configured) report.flags.push('HEARTBEAT_UNCONFIGURED');
+  if (!config.funding_floor_configured) report.flags.push('FUNDING_FLOOR_UNSET');
+
   // Overall verdict: any flag means unhealthy.
   report.healthy = report.flags.length === 0;
 
@@ -366,9 +382,22 @@ export async function runScheduledChecks(env, opts = {}) {
     }
   }
 
-  // 6. Alert webhook (only when unhealthy)
+  // 7. Alert webhook (only when unhealthy)
   if (!report.healthy) {
     await maybeAlert(env, report, { fetchImpl });
+  }
+
+  // 8. Dead-man heartbeat (tarn#68) — ping on EVERY tick, healthy or not, so
+  // the heartbeat monitor (healthchecks.io / UptimeRobot style) alerts on
+  // SILENCE: a dead worker, a stopped cron, or a mis-deploy can't report
+  // itself, but a missed heartbeat can page. Best-effort; a ping failure must
+  // never break the cron.
+  if (env.HEARTBEAT_URL) {
+    try {
+      await fetchImpl(env.HEARTBEAT_URL, { method: 'GET', signal: AbortSignal.timeout(5000) });
+    } catch (err) {
+      console.error('[tarn-api][observability] heartbeat ping failed:', err?.message);
+    }
   }
 
   return report;

@@ -31,18 +31,38 @@ import { TarnClient, TarnPartialListError } from '../../client/src/tarn.js';
 
 // ============ LAYER 1: server getResolvedEntries pagination ============
 
-// Minimal D1 shim whose entries SELECT returns a fixed row array (the handler
-// filters by app/type/lookup_key, which we pre-satisfy by tagging every row).
+// D1 shim that emulates the tarn#70 SQL-windowed live query: scope filter,
+// live-filter (tombstone / tombstoned-target / superseded exclusion), the
+// (cached_at, txid) ordering, the start-after-cursor predicate, and LIMIT.
+// Honours the cursor-row lookup via .first() too.
 function makeRowsDb(rows) {
   return {
     prepare(sql) {
       let args = [];
       return {
         bind(...a) { args = a; return this; },
+        async first() {
+          if (/SELECT cached_at, txid FROM entries WHERE txid = \?1/.test(sql)) {
+            const r = rows.find((x) => x.txid === args[0]);
+            return r ? { cached_at: r.cached_at, txid: r.txid } : null;
+          }
+          return null;
+        },
         async all() {
-          if (/FROM entries WHERE app = \?1 AND type = \?2 AND lookup_key = \?3/.test(sql)) {
+          if (/FROM entries e\s+WHERE e\.app = \?1 AND e\.type = \?2 AND e\.lookup_key = \?3/.test(sql)) {
             const [app, type, lk] = args;
-            return { results: rows.filter((r) => r.app === app && r.type === type && r.lookup_key === lk) };
+            const scope = rows.filter((r) => r.app === app && r.type === type && r.lookup_key === lk);
+            const tombRefs = new Set(scope.filter((r) => r.is_tombstone && r.tombstone_ref).map((r) => r.tombstone_ref));
+            const superseded = new Set(scope.filter((r) => r.prev_txid).map((r) => r.prev_txid));
+            let live = scope.filter((r) => !r.is_tombstone && !tombRefs.has(r.txid) && !superseded.has(r.txid));
+            live.sort((a, b) => (a.cached_at - b.cached_at) || (a.txid < b.txid ? -1 : a.txid > b.txid ? 1 : 0));
+            // 6 binds = cursor variant (app, type, lk, cached_at, txid, limit).
+            if (args.length === 6) {
+              const [, , , ca, ctx] = args;
+              live = live.filter((r) => r.cached_at > ca || (r.cached_at === ca && r.txid > ctx));
+            }
+            const limit = args[args.length - 1];
+            return { results: live.slice(0, limit) };
           }
           return { results: [] };
         },
@@ -71,18 +91,18 @@ describe('tarn#62 scale — server getResolvedEntries pagination over thousands 
     let pages = 0;
     let totalSeen = 0;
     const LIMIT = 500;
-    // Loop until a short page (fewer than LIMIT) signals the end.
+    // Loop on the hasMore/nextCursor contract (tarn#70).
     for (;;) {
-      const { entries, total } = await getResolvedEntries(db, 'bookish', 'entry', 'k', { limit: LIMIT, cursor });
-      assert.equal(total, N, 'total must reflect the full live set on every page');
+      const { entries, hasMore, nextCursor } = await getResolvedEntries(db, 'bookish', 'entry', 'k', { limit: LIMIT, cursor });
       for (const e of entries) {
         assert.ok(!seen.has(e.txid), `duplicate txid across pages: ${e.txid}`);
         seen.add(e.txid);
       }
       totalSeen += entries.length;
       pages += 1;
-      if (entries.length < LIMIT) break;
-      cursor = entries[entries.length - 1].txid;
+      if (!hasMore) break;
+      assert.ok(nextCursor, 'hasMore pages carry a cursor');
+      cursor = nextCursor;
       assert.ok(pages <= N / LIMIT + 2, 'pagination did not terminate');
     }
 

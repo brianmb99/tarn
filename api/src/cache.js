@@ -10,7 +10,7 @@
 // one-shot operation per tuple (usually zero, since the write path sets the
 // bootstrap marker directly).
 
-import { searchEntriesByLookupKey } from './arweave.js';
+import { fetchAllPagesByLookupKey } from './arweave.js';
 
 // ============ TAG HELPERS ============
 
@@ -70,37 +70,68 @@ export async function upsertEntries(db, edges) {
 // ============ RESOLUTION ============
 
 /**
- * Get resolved (live) entries for a data_lookup_key+app+type.
+ * Get resolved (live) entries for a data_lookup_key+app+type, page-bounded.
  * Filters tombstones, superseded Prev-chain entries, and Eid duplicates.
  *
  * Deliberately excludes the blob_data column — clients fetch blobs separately
- * via /api/v1/entries/{txid}. With ~200 entries and ~10 MB of cumulative blob
- * data, loading them all into a single Worker invocation pushes us past the
- * 128 MB per-request memory limit and CF returns error 1102 (resource limits
- * exceeded). Metadata-only keeps this query O(rows) in memory regardless of
- * blob size.
+ * via /api/v1/entries/{txid}; metadata-only keeps memory independent of blob
+ * size (CF error 1102 history — see git blame).
+ *
+ * tarn#70: tombstone + Prev-chain resolution happens IN SQL so each request
+ * touches only one page of rows. The old implementation loaded the entire
+ * scope (including all edit history) into the Worker and resolved in JS —
+ * per-request CPU/memory grew with collection size and didn't shrink with
+ * pagination. The NOT EXISTS probes are served by the partial indexes from
+ * migration 0024. Eid dedup (a safety net for malformed duplicates — the
+ * Prev-chain handles well-formed data) runs in JS WITHIN the page via
+ * resolveEntries; a cross-page Eid duplicate can slip through here, and the
+ * SDK's client-side Eid dedup collapses it.
+ *
+ * Ordering is (cached_at, txid) — deterministic, ≈ insertion order — and is
+ * the basis of the `cursor` (start-after-txid) contract. Pagination
+ * (`hasMore`/`nextCursor`) is computed from the RAW page so an in-page Eid
+ * dedup can never truncate the walk.
  */
 export async function getResolvedEntries(db, app, type, dataLookupKey, { limit = 100, cursor = null } = {}) {
-  // Fetch all entry metadata for this scope (including tombstones and superseded).
-  // blob_data is intentionally omitted — see header comment.
-  const all = await db.prepare(
-    `SELECT txid, app, type, wallet_addr, lookup_key, eid, prev_txid,
-            is_tombstone, tombstone_ref, block_timestamp, tags_json, cached_at
-     FROM entries WHERE app = ?1 AND type = ?2 AND lookup_key = ?3`
-  ).bind(app, type, dataLookupKey).all();
-
-  const rows = all.results || [];
-  const live = resolveEntries(rows);
-
-  // Apply cursor-based pagination (cursor = txid to start after)
-  let start = 0;
+  // Resolve the cursor txid to its ordering tuple. Unknown/stale cursor
+  // (e.g. the row was superseded since) falls back to a from-start walk —
+  // parity with the old findIndex(-1) behavior.
+  let cursorRow = null;
   if (cursor) {
-    const idx = live.findIndex(e => e.txid === cursor);
-    if (idx >= 0) start = idx + 1;
+    cursorRow = await db.prepare(
+      'SELECT cached_at, txid FROM entries WHERE txid = ?1'
+    ).bind(cursor).first();
   }
 
-  const page = live.slice(start, start + limit);
-  return { entries: page, total: live.length };
+  let sql =
+    `SELECT e.txid, e.app, e.type, e.wallet_addr, e.lookup_key, e.eid, e.prev_txid,
+            e.is_tombstone, e.tombstone_ref, e.block_timestamp, e.tags_json, e.cached_at
+     FROM entries e
+     WHERE e.app = ?1 AND e.type = ?2 AND e.lookup_key = ?3
+       AND e.is_tombstone = 0
+       AND NOT EXISTS (SELECT 1 FROM entries t WHERE t.lookup_key = e.lookup_key AND t.is_tombstone = 1 AND t.tombstone_ref = e.txid)
+       AND NOT EXISTS (SELECT 1 FROM entries s WHERE s.lookup_key = e.lookup_key AND s.prev_txid = e.txid)`;
+  const bindings = [app, type, dataLookupKey];
+
+  if (cursorRow) {
+    sql += ` AND (e.cached_at > ?4 OR (e.cached_at = ?4 AND e.txid > ?5))`;
+    bindings.push(cursorRow.cached_at, cursorRow.txid);
+  }
+
+  sql += ` ORDER BY e.cached_at, e.txid LIMIT ?${bindings.length + 1}`;
+  bindings.push(limit);
+
+  const page = (await db.prepare(sql).bind(...bindings).all()).results || [];
+
+  // In-page Eid dedup. The page contains no tombstones / superseded rows
+  // (SQL excluded them), so resolveEntries here only collapses duplicates.
+  const entries = resolveEntries(page);
+
+  return {
+    entries,
+    hasMore: page.length === limit,
+    nextCursor: page.length === limit ? page[page.length - 1].txid : null,
+  };
 }
 
 /**
@@ -360,9 +391,9 @@ export async function markLookupBootstrapped(db, lookupKey, app, type) {
  * Blob bytes are NOT fetched here. They warm into D1 lazily as clients request
  * specific txids via /api/v1/entries/{txid} (handleEntryById fills blob_data
  * from the gateway on miss). This keeps the cold-bootstrap path on the list
- * endpoint cheap and predictable: one GraphQL query + one D1 batch upsert,
- * regardless of how many entries the user has — no chains of sequential
- * gateway fetches that risk tripping CF Worker resource limits.
+ * endpoint cheap and predictable: a bounded metadata page-scan + one D1 batch
+ * upsert — no chains of sequential gateway fetches that risk tripping CF
+ * Worker resource limits.
  */
 export async function refreshCache(env, ctx, app, type, dataLookupKey) {
   const cacheKey = DATA_BOOTSTRAP_KEY(dataLookupKey, app, type);
@@ -371,18 +402,20 @@ export async function refreshCache(env, ctx, app, type, dataLookupKey) {
     return { bootstrapped: true };
   }
 
-  const { edges, error } = await searchEntriesByLookupKey(dataLookupKey, { app, type });
+  const { edges, error, truncated } = await fetchAllPagesByLookupKey(dataLookupKey, { app, type });
   if (edges.length > 0) {
     await upsertEntries(env.DB, edges);
   }
 
-  // Only set the marker if GraphQL succeeded — a transient Arweave error should
-  // not latch us into a "D1 is authoritative" state for a scope we never queried.
-  if (!error) {
+  // Only set the marker if GraphQL succeeded AND the scan ran to completion —
+  // a transient Arweave error must not latch us into a "D1 is authoritative"
+  // state for a scope we never queried, and a MAX_PAGES-truncated scan must
+  // not latch with entries still un-ingested on Arweave (tarn#64).
+  if (!error && !truncated) {
     await setBootstrap(env.DB, cacheKey);
   }
 
-  return { bootstrapped: !error };
+  return { bootstrapped: !error && !truncated };
 }
 
 /**
@@ -396,12 +429,12 @@ export async function refreshLookupCache(env, ctx, app, type, lookupKey) {
     return;
   }
 
-  const { edges, error } = await searchEntriesByLookupKey(lookupKey, { app, type });
+  const { edges, error, truncated } = await fetchAllPagesByLookupKey(lookupKey, { app, type });
   if (edges.length > 0) {
     await upsertEntries(env.DB, edges);
   }
 
-  if (!error) {
+  if (!error && !truncated) {
     await setBootstrap(env.DB, cacheKey);
   }
 }

@@ -218,8 +218,9 @@ export async function handleEntries(url, env, ctx, cors, request) {
   // set (here or on first write), subsequent reads skip Arweave entirely.
   await refreshCache(env, ctx, app, type, key);
 
-  // Resolve live entries (tombstone + Prev-chain + Eid filtering)
-  const { entries, total } = await getResolvedEntries(env.DB, app, type, key, { limit, cursor });
+  // Resolve live entries (tombstone + Prev-chain + Eid filtering) —
+  // page-bounded in SQL (tarn#70); pagination comes from the raw page.
+  const { entries, hasMore, nextCursor } = await getResolvedEntries(env.DB, app, type, key, { limit, cursor });
 
   // Metadata-only response. Blob bytes are NOT returned here — clients fetch
   // each blob via GET /api/v1/entries/{txid} (or directly from a public Arweave
@@ -239,8 +240,8 @@ export async function handleEntries(url, env, ctx, cors, request) {
     })),
     pagination: {
       count: entries.length,
-      hasMore: entries.length === limit,
-      cursor: entries.length === limit ? entries[entries.length - 1].txid : null,
+      hasMore,
+      cursor: nextCursor,
     },
   }, 200, cors);
 }

@@ -69,7 +69,10 @@ export async function lookupIdempotentResponse(db, dataLookupKey, clientKey) {
  *
  * Returns one of:
  *   - { error: 'message' } — header was present but malformed. Handler should return 400.
- *   - { cached: { status, body } } — a prior response exists and should be returned verbatim.
+ *   - { cached: { status, body }, key: 'k' } — a prior response exists. Most
+ *     handlers return it verbatim; the batch handler inspects it for a
+ *     partial-progress record (tarn#67) and resumes, which is why the key is
+ *     included alongside.
  *   - { key: null } — no header; proceed without idempotency.
  *   - { key: 'k' } — header valid, no prior response. Proceed; on success, call
  *     storeIdempotentResponse with this key.
@@ -79,7 +82,7 @@ export async function resolveIdempotency(request, db, dataLookupKey) {
   if (error) return { error };
   if (!key) return { key: null };
   const cached = await lookupIdempotentResponse(db, dataLookupKey, key);
-  if (cached) return { cached };
+  if (cached) return { cached, key };
   return { key };
 }
 

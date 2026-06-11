@@ -194,11 +194,24 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     );
   }
 
-  // Idempotency short-circuit — one key for the whole batch. Server stores the
-  // full response (list of txids) against it; retry returns the same list.
+  // Idempotency — one key for the whole batch. On full success the server
+  // stores the final response (list of txids) and a retry returns it verbatim.
+  // On a MID-BATCH failure it stores a partial-progress record instead
+  // (tarn#67): a retry with the same key resumes at the first un-landed entry
+  // rather than re-uploading entries that already hit Arweave — re-processing
+  // from index 0 minted duplicate permanent DataItems on every retry of a
+  // flaky batch. The idempotency contract requires the retry to carry the
+  // SAME entries array; results are resumed by index.
   const idem = await resolveIdempotency(request, env.DB, auth.data_lookup_key);
   if (idem.error) return errorResponse(idem.error, 400, cors);
-  if (idem.cached) return jsonResponse(idem.cached.body, idem.cached.status, cors);
+  let priorResults = [];
+  if (idem.cached) {
+    if (idem.cached.body?.__batchProgress) {
+      priorResults = Array.isArray(idem.cached.body.entries) ? idem.cached.body.entries : [];
+    } else {
+      return jsonResponse(idem.cached.body, idem.cached.status, cors);
+    }
+  }
 
   // Parse JSON body
   let body;
@@ -256,7 +269,13 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     entry._dataBytes = dataBytes;
   }
 
-  // Evaluate rules with batch size
+  // Resume point: entries[0..startIndex) already landed on a prior attempt
+  // under this idempotency key (tarn#67).
+  const startIndex = Math.min(priorResults.length, entries.length);
+
+  // Evaluate rules with batch size. Only the entries still to be written count
+  // against the quota — already-landed entries from a prior partial attempt
+  // are in the entries table and counted on that side.
   const firstEntry = entries[0];
   const app = tagValue(firstEntry.tags, 'App') || '';
   const type = tagValue(firstEntry.tags, 'Type') || '';
@@ -267,7 +286,7 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     app,
     type,
     payloadBytes: Math.max(...entries.map(e => e._dataBytes.length)),
-    batchSize: entries.length,
+    batchSize: entries.length - startIndex,
   });
 
   if (!ruleResult.allowed) {
@@ -283,23 +302,39 @@ export async function handleBatchCreate(request, env, ctx, cors) {
     return errorResponse('Server signing key not configured', 500, cors);
   }
 
-  // Process all entries: sign, upload to Turbo synchronously, then cache
-  const results = [];
+  // Process remaining entries: sign, upload to Turbo synchronously, then cache.
+  // results starts from any prior partial attempt's landed entries (tarn#67).
+  const results = [...priorResults];
 
-  for (const entry of entries) {
+  // On mid-batch failure: persist progress under the idempotency key so a
+  // retry resumes at failedAt instead of re-uploading landed entries, then
+  // return the partial response. The __batchProgress marker distinguishes a
+  // progress record from a final cached response; a full success overwrites
+  // it via the same ON CONFLICT upsert.
+  const partialResponse = async (status, error) => {
+    if (idem.key) {
+      await storeIdempotentResponse(env.DB, auth.data_lookup_key, idem.key, status, {
+        __batchProgress: true,
+        entries: results,
+      });
+    }
+    return jsonResponse({
+      error,
+      entries: results,
+      failedAt: results.length,
+      count: results.length,
+      status: 'partial',
+    }, status, cors);
+  };
+
+  for (let i = startIndex; i < entries.length; i++) {
+    const entry = entries[i];
     const { signedDataItem, txid } = await buildSignedDataItem(entry._dataBytes, entry.tags, signingKey);
 
     // Upload to Turbo SYNCHRONOUSLY — must succeed before we confirm to client
     const turboResult = await uploadSignedDataItem(signedDataItem);
     if (!turboResult.ok) {
-      // Return partial results — tell client which succeeded and where it stopped
-      return jsonResponse({
-        error: `Arweave upload failed at entry ${results.length}: ${turboResult.body || turboResult.status}`,
-        entries: results,
-        failedAt: results.length,
-        count: results.length,
-        status: 'partial',
-      }, 502, cors);
+      return await partialResponse(502, `Arweave upload failed at entry ${results.length}: ${turboResult.body || turboResult.status}`);
     }
 
     const entryApp = tagValue(entry.tags, 'App') || '';
@@ -310,13 +345,7 @@ export async function handleBatchCreate(request, env, ctx, cors) {
       await upsertWriteThrough(env.DB, txid, entry.tags, entry._dataBytes);
     } catch (err) {
       console.error('[tarn-api] D1 write-through failed after Turbo accept (batch):', txid, err.message);
-      return jsonResponse({
-        error: `Arweave upload succeeded but D1 cache failed at entry ${results.length}: ${err.message}`,
-        entries: results,
-        failedAt: results.length,
-        count: results.length,
-        status: 'partial',
-      }, 500, cors);
+      return await partialResponse(500, `Arweave upload succeeded but D1 cache failed at entry ${results.length}: ${err.message}`);
     }
 
     await markDataBootstrapped(env.DB, auth.data_lookup_key, entryApp, entryType);

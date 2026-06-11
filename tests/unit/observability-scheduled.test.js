@@ -122,9 +122,17 @@ describe('checkReadiness', () => {
   });
 });
 
+// Operability config a fully-set-up deployment carries (tarn#68): missing any
+// of these is itself an unhealthy condition, so "nominal" envs include them.
+const OPERABILITY_ENV = {
+  ALERT_WEBHOOK_URL: 'https://hooks.example/tarn',
+  HEARTBEAT_URL: 'https://hc.example/ping/tarn',
+  TURBO_MIN_BALANCE_WINC: '1000000',
+};
+
 describe('runScheduledChecks — healthy path', () => {
   it('produces a healthy report when everything is nominal and persists it', async () => {
-    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB() };
+    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB(), ...OPERABILITY_ENV };
     const report = await runScheduledChecks(env, { fetchImpl: makeFetch(), now: NOW });
 
     assert.equal(report.healthy, true, JSON.stringify(report.flags));
@@ -135,6 +143,56 @@ describe('runScheduledChecks — healthy path', () => {
     // Persisted exactly one row, marked healthy=1.
     assert.equal(env.DB._inserted.length, 1);
     assert.equal(env.DB._inserted[0].healthy, 1);
+  });
+});
+
+describe('runScheduledChecks — operability config + heartbeat (tarn#68)', () => {
+  it('flags ALERTING_UNCONFIGURED / HEARTBEAT_UNCONFIGURED / FUNDING_FLOOR_UNSET when the vars are missing', async () => {
+    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB() };
+    const report = await runScheduledChecks(env, { fetchImpl: makeFetch(), now: NOW });
+
+    assert.ok(report.flags.includes('ALERTING_UNCONFIGURED'), JSON.stringify(report.flags));
+    assert.ok(report.flags.includes('HEARTBEAT_UNCONFIGURED'), JSON.stringify(report.flags));
+    assert.ok(report.flags.includes('FUNDING_FLOOR_UNSET'), JSON.stringify(report.flags));
+    assert.equal(report.healthy, false);
+    assert.equal(report.checks.config.alert_webhook_configured, false);
+    assert.equal(report.checks.config.heartbeat_configured, false);
+    assert.equal(report.checks.config.funding_floor_configured, false);
+  });
+
+  it('pings the heartbeat URL on a healthy tick (dead-man switch fires on silence, not on failure)', async () => {
+    const fetchImpl = makeFetch();
+    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB(), ...OPERABILITY_ENV };
+    const report = await runScheduledChecks(env, { fetchImpl, now: NOW });
+
+    assert.equal(report.healthy, true);
+    const heartbeatCalls = fetchImpl.calls.filter(c => c.url === OPERABILITY_ENV.HEARTBEAT_URL);
+    assert.equal(heartbeatCalls.length, 1, 'exactly one heartbeat ping per tick');
+  });
+
+  it('pings the heartbeat on UNHEALTHY ticks too — the cron being alive is what the heartbeat reports', async () => {
+    // Break readiness (Turbo price down) so the report is unhealthy.
+    const fetchImpl = makeFetch({ price: () => ({ ok: false, status: 503, json: async () => ({}) }) });
+    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB(), ...OPERABILITY_ENV };
+    const report = await runScheduledChecks(env, { fetchImpl, now: NOW });
+
+    assert.equal(report.healthy, false);
+    const heartbeatCalls = fetchImpl.calls.filter(c => c.url === OPERABILITY_ENV.HEARTBEAT_URL);
+    assert.equal(heartbeatCalls.length, 1, 'heartbeat still pings when unhealthy');
+  });
+
+  it('a heartbeat ping failure never breaks the cron', async () => {
+    const fetchImpl = makeFetch();
+    const inner = fetchImpl;
+    const failing = async (url, opts) => {
+      if (url === OPERABILITY_ENV.HEARTBEAT_URL) throw new Error('heartbeat host down');
+      return inner(url, opts);
+    };
+    failing.calls = inner.calls;
+    const env = { APP_SIGNING_KEY: FAKE_SIGNING_KEY, DB: makeDB(), ...OPERABILITY_ENV };
+    const report = await runScheduledChecks(env, { fetchImpl: failing, now: NOW });
+    assert.equal(report.healthy, true, 'report unaffected by heartbeat failure');
+    assert.equal(env.DB._inserted.length, 1, 'report still persisted');
   });
 });
 

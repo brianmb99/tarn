@@ -773,8 +773,8 @@ node tools/set-rules.mjs \
 
 | Plan / type | Effect |
 |-------------|--------|
-| `free` | 5 entries, 100KB max per entry |
-| `annual` | 1000 entries, expires in 1 year |
+| `free` | 5 entries (app-wide), 100KB max per entry |
+| `annual` | 1000 entries (app-wide), expires in 1 year |
 | `clear` | Empty rules (allow all) |
 | `deny` | Deny all writes |
 | `max_entries` | `{ limit, since?, app?, entry_type? }` |
@@ -782,6 +782,13 @@ node tools/set-rules.mjs \
 | `expires` | `{ at }` ISO 8601 |
 
 Rules are AND logic; unknown rule types fail closed.
+
+`max_entries` counts **resolved live entries** — what the user actually sees
+(tarn#65): superseded edit versions and deleted (tombstoned) entries don't
+count, and deleting an entry frees quota. The optional `entry_type` filter
+matches the entry's `Type` tag, which for schema-first SDK writes is the
+**collection name** (e.g. `books`) — the canned plans apply app-wide and
+don't set it.
 
 ### 4. Publish the schema
 
@@ -806,7 +813,7 @@ Four progressive examples live in [`../examples/`](../examples/):
 - `01-hello-world` — register, write one record, list it.
 - `02-crud` — full CRUD on two collections.
 - `03-sharing` — invite-token handshake + share-with-all flow.
-- `04-recovery` — register, export the account-key PDF, simulate password loss + recoverAccount.
+- `04-recovery` — register, capture the account-key string, simulate password loss + recoverAccount.
 
 Each example is a standalone npm package linking to this client via `file:../../client`. See `examples/README.md` for setup.
 

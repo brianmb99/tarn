@@ -125,6 +125,61 @@ describe('evaluateRules — max_entries', () => {
   });
 });
 
+// ============ max_entries — resolved-count SQL shape (tarn#65) ============
+//
+// The quota must count what the user actually sees: edits are Prev-chained
+// appends and deletes are separate tombstone rows, so a raw COUNT(*) grows
+// with edit history and never shrinks on delete. These tests pin the REAL
+// SQL the evaluator issues (semantics are exercised against real SQLite by
+// the local D1 integration flow).
+
+function createSqlCapturingDB(count = 0) {
+  const captured = { sql: null, bindings: null };
+  const db = {
+    captured,
+    prepare(sql) {
+      captured.sql = sql;
+      return {
+        bind(...args) {
+          captured.bindings = args;
+          return { async first() { return { count }; } };
+        },
+      };
+    },
+  };
+  return db;
+}
+
+describe('evaluateRules — max_entries resolved-count SQL (tarn#65)', () => {
+  it('counts DISTINCT live entries, excluding superseded and tombstoned rows', async () => {
+    const db = createSqlCapturingDB(0);
+    const rules = JSON.stringify([{ type: 'max_entries', limit: 10 }]);
+    await evaluateRules(db, rules, baseContext);
+
+    assert.match(db.captured.sql, /COUNT\(DISTINCT COALESCE\(e\.eid, e\.txid\)\)/, 'Eid duplicates collapse to one');
+    assert.match(db.captured.sql, /NOT EXISTS \(SELECT 1 FROM entries t WHERE t\.lookup_key = e\.lookup_key AND t\.is_tombstone = 1 AND t\.tombstone_ref = e\.txid\)/, 'tombstoned targets excluded');
+    assert.match(db.captured.sql, /NOT EXISTS \(SELECT 1 FROM entries s WHERE s\.lookup_key = e\.lookup_key AND s\.prev_txid = e\.txid\)/, 'superseded versions excluded');
+    assert.match(db.captured.sql, /e\.is_tombstone = 0/, 'tombstone rows themselves excluded');
+    assert.deepEqual(db.captured.bindings, [baseContext.data_lookup_key]);
+  });
+
+  it('appends app / entry_type / since filters with their bindings', async () => {
+    const db = createSqlCapturingDB(0);
+    const rules = JSON.stringify([{ type: 'max_entries', limit: 10, app: 'bookish', entry_type: 'books', since: '2026-01-01T00:00:00Z' }]);
+    await evaluateRules(db, rules, baseContext);
+
+    assert.match(db.captured.sql, /AND e\.app = \?2/);
+    assert.match(db.captured.sql, /AND e\.type = \?3/);
+    assert.match(db.captured.sql, /AND e\.cached_at > \?4/);
+    assert.deepEqual(db.captured.bindings, [
+      baseContext.data_lookup_key,
+      'bookish',
+      'books',
+      new Date('2026-01-01T00:00:00Z').getTime(),
+    ]);
+  });
+});
+
 // ============ max_bytes ============
 
 describe('evaluateRules — max_bytes', () => {

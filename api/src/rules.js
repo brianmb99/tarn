@@ -62,8 +62,16 @@ async function evaluateRule(db, rule, context) {
 }
 
 /**
- * max_entries: user has fewer than N entries matching optional filters.
- * Optional filters: app, entry_type, since
+ * max_entries: user has fewer than N RESOLVED live entries matching optional
+ * filters (app, entry_type, since).
+ *
+ * "Resolved" mirrors cache.js resolveEntries (tarn#65): edits are Prev-chained
+ * appends and deletes are separate tombstone rows, so a raw is_tombstone=0
+ * row count grows with every edit and never shrinks on delete. This count
+ * excludes superseded versions (another row's prev_txid points at them) and
+ * tombstoned targets (a tombstone row's tombstone_ref points at them), and
+ * collapses Eid duplicates — i.e. it counts what the user actually sees.
+ * The NOT EXISTS probes are served by the partial indexes from migration 0024.
  */
 async function evaluateMaxEntries(db, rule, context) {
   if (typeof rule.limit !== 'number' || rule.limit < 0) {
@@ -71,18 +79,21 @@ async function evaluateMaxEntries(db, rule, context) {
   }
 
   // Build query with optional filters
-  let sql = 'SELECT COUNT(*) as count FROM entries WHERE lookup_key = ?1 AND is_tombstone = 0';
+  let sql = 'SELECT COUNT(DISTINCT COALESCE(e.eid, e.txid)) as count FROM entries e'
+    + ' WHERE e.lookup_key = ?1 AND e.is_tombstone = 0'
+    + ' AND NOT EXISTS (SELECT 1 FROM entries t WHERE t.lookup_key = e.lookup_key AND t.is_tombstone = 1 AND t.tombstone_ref = e.txid)'
+    + ' AND NOT EXISTS (SELECT 1 FROM entries s WHERE s.lookup_key = e.lookup_key AND s.prev_txid = e.txid)';
   const bindings = [context.data_lookup_key];
   let bindIndex = 2;
 
   if (rule.app) {
-    sql += ` AND app = ?${bindIndex}`;
+    sql += ` AND e.app = ?${bindIndex}`;
     bindings.push(rule.app);
     bindIndex++;
   }
 
   if (rule.entry_type) {
-    sql += ` AND type = ?${bindIndex}`;
+    sql += ` AND e.type = ?${bindIndex}`;
     bindings.push(rule.entry_type);
     bindIndex++;
   }
@@ -92,7 +103,7 @@ async function evaluateMaxEntries(db, rule, context) {
     if (isNaN(sinceMs)) {
       return { allowed: false, failedRule: 'max_entries: invalid since timestamp' };
     }
-    sql += ` AND cached_at > ?${bindIndex}`;
+    sql += ` AND e.cached_at > ?${bindIndex}`;
     bindings.push(sinceMs);
     bindIndex++;
   }

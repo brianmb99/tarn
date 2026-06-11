@@ -36,6 +36,10 @@ const MAX_LOG_BLOB_BYTES = 384 * 1024;
 // share_inbox fetch budget — both are cache reads with the same blast radius.
 const MAX_LOG_FETCHES_PER_HOUR = 1800;
 
+// Per-account publish budget (tarn#66) — see the derivation comment at the
+// rate-limit check in handleShareLogPublish.
+const MAX_LOG_PUBLISHES_PER_HOUR = 2000;
+
 // Recognized blob types. Future protocol versions get their own values;
 // share-log-v1 is the only one for 5b.
 const VALID_BLOB_TYPES = new Set(['share-log-v1']);
@@ -104,6 +108,30 @@ export async function handleShareLogPublish(request, env, ctx, cors) {
       error: 'tag already published',
       existing_txid: existing.txid,
     }, 409, cors);
+  }
+
+  // Per-account publish rate limit (tarn#66). Every publish past this point is
+  // an Arweave upload spending the app wallet, so it gets the same D1 atomic
+  // counter treatment as data writes and inbox publishes. Placed AFTER the
+  // uniqueness check on purpose: reconcile loops legitimately re-publish
+  // existing tags and take the 409 (SDK backs off on it) — those replays
+  // spend no wallet money and must not consume the budget. Ceiling derivation:
+  // entry writes are capped at 100/hr and each shared write fans out one log
+  // publish per connection, so 2,000/hr covers ~20 connections at full write
+  // throughput while still bounding an abusive session.
+  const hour = new Date().toISOString().slice(0, 13);
+  const rateKey = `share-log-publish:${auth.data_lookup_key}:${hour}`;
+  const rateRow = await env.DB.prepare(`
+    INSERT INTO write_rate_limits (key, count, expires_at)
+    VALUES (?1, 1, ?2)
+    ON CONFLICT(key) DO UPDATE SET count = count + 1
+    RETURNING count
+  `).bind(rateKey, Date.now() + 3600_000).first();
+  if ((rateRow?.count ?? 1) > MAX_LOG_PUBLISHES_PER_HOUR) {
+    return errorResponse(
+      'Share-log publish rate limit exceeded',
+      429, { ...cors, 'Retry-After': '3600' },
+    );
   }
 
   // Sign + upload to Arweave. Same Turbo path as share-inbox + entries —
