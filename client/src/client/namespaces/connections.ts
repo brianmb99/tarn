@@ -38,6 +38,7 @@ interface UnderlyingInvitePreview {
   app_id: string;
   issued_at: number;
   expires_at: number;
+  recipient_metadata: Record<string, unknown> | null;
 }
 
 interface UnderlyingIssuedInvite {
@@ -52,6 +53,7 @@ interface UnderlyingIssuedInvite {
 interface UnderlyingRedeemedInvite {
   requestNonce: string;
   recipientSharePubBase64Url: string;
+  recipientMetadata: Record<string, unknown> | null;
 }
 
 interface UnderlyingIncomingRequest {
@@ -195,6 +197,7 @@ export class ConnectionsNamespace {
       app_id: raw.app_id,
       issued_at: raw.issued_at,
       expires_at: raw.expires_at,
+      recipient_metadata: raw.recipient_metadata ?? null,
     };
   }
 
@@ -204,6 +207,7 @@ export class ConnectionsNamespace {
     return {
       request_nonce: raw.requestNonce,
       recipient_share_pub: raw.recipientSharePubBase64Url,
+      recipient_metadata: raw.recipientMetadata ?? null,
     };
   }
 

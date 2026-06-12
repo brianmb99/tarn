@@ -35,6 +35,8 @@ import {
 import {
   buildConnectionRequestPayload,
   validateConnectionRequestPayload,
+  normalizeRecipientMetadata,
+  MAX_RECIPIENT_METADATA_BYTES,
 } from '../../client/src/sharing.js';
 
 // ============ Mock D1 ============
@@ -322,6 +324,34 @@ describe('AES-256-GCM payload round-trip', () => {
     assert.deepEqual(parsed, plaintext);
   });
 
+  it('round-trips app-defined recipient_metadata inside the payload', async () => {
+    const keyBytes = crypto.getRandomValues(new Uint8Array(32));
+    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+
+    const plaintext = {
+      inviter_share_pub: bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+      inviter_signing_pub: 'spki-base64-stub',
+      app_id: 'test-app',
+      issued_at: NOW,
+      recipient_metadata: { display_name: 'Maya', avatar_seed: 42 },
+    };
+
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = new TextEncoder().encode(JSON.stringify(plaintext));
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data));
+    const wire = new Uint8Array(iv.length + ciphertext.length);
+    wire.set(iv, 0);
+    wire.set(ciphertext, iv.length);
+
+    const back = base64ToBytes(bytesToBase64(wire));
+    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: back.slice(0, 12) }, key, back.slice(12));
+    const parsed = JSON.parse(new TextDecoder().decode(decrypted));
+    assert.deepEqual(parsed.recipient_metadata, { display_name: 'Maya', avatar_seed: 42 });
+    // Pre-metadata payload shape stays decodable by the same path: absent key
+    // reads as undefined, which the SDK surfaces as null.
+    assert.equal(parsed.nonexistent_field ?? null, null);
+  });
+
   it('rejects decrypt with wrong key', async () => {
     const keyAbytes = crypto.getRandomValues(new Uint8Array(32));
     const keyBbytes = crypto.getRandomValues(new Uint8Array(32));
@@ -332,6 +362,42 @@ describe('AES-256-GCM payload round-trip', () => {
     let threw = false;
     try { await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keyB, ct); } catch { threw = true; }
     assert.equal(threw, true);
+  });
+});
+
+// ============ recipient_metadata validation ============
+
+describe('normalizeRecipientMetadata', () => {
+  it('accepts a plain object and returns a JSON-round-tripped copy', () => {
+    const input = { display_name: 'Maya', tags: ['a', 'b'], n: 1, dropped: undefined };
+    const out = normalizeRecipientMetadata(input);
+    assert.deepEqual(out, { display_name: 'Maya', tags: ['a', 'b'], n: 1 });
+    assert.notEqual(out, input); // copy, not the caller's object
+  });
+
+  it('rejects non-objects', () => {
+    for (const bad of [null, undefined, 'Maya', 42, true, ['a']]) {
+      assert.throws(() => normalizeRecipientMetadata(bad), /must be a plain object/);
+    }
+  });
+
+  it('rejects circular references', () => {
+    const cyc = {};
+    cyc.self = cyc;
+    assert.throws(() => normalizeRecipientMetadata(cyc), /JSON-serializable/);
+  });
+
+  it('enforces the serialized byte cap, counting UTF-8 bytes not chars', () => {
+    assert.doesNotThrow(() => normalizeRecipientMetadata({ d: 'x'.repeat(MAX_RECIPIENT_METADATA_BYTES - 10) }));
+    assert.throws(
+      () => normalizeRecipientMetadata({ d: 'x'.repeat(MAX_RECIPIENT_METADATA_BYTES) }),
+      /exceeds 2048 bytes/,
+    );
+    // 700 × '€' is 700 chars but 2100 UTF-8 bytes — must exceed the cap.
+    assert.throws(
+      () => normalizeRecipientMetadata({ d: '€'.repeat(700) }),
+      /exceeds 2048 bytes/,
+    );
   });
 });
 

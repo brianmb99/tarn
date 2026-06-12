@@ -86,7 +86,11 @@ await test('3. happy path: invite → preview → redeem → auto-accept (both c
   const inviterEmail = randomEmail();
   await registerWithRules(inviter, inviterEmail, 'pw-' + Date.now());
 
-  const created = await inviter.createInviteToken({ label: 'Maya', expiry_days: 7 });
+  const created = await inviter.createInviteToken({
+    label: 'Maya',
+    expiry_days: 7,
+    recipient_metadata: { display_name: 'Maya' },
+  });
   assert(typeof created.token_id === 'string', 'token_id must be string');
   assert(created.token_id.length === 43, `token_id must be 43 chars, got ${created.token_id.length}`);
   assert(created.invite_url.includes(created.token_id), 'invite_url must include token_id');
@@ -107,18 +111,26 @@ await test('3. happy path: invite → preview → redeem → auto-accept (both c
   const previewBody = await previewRes.json();
   assert(previewBody.app_id === INVITE_APP_ID, 'preview app_id mismatch');
 
-  // Recipient client decrypts the preview via the SDK helper. The preview
-  // does NOT carry an inviter name — that's an app-layer concern handled at
-  // delivery time. Only the fingerprint + scope/timestamps round-trip.
+  // Recipient client decrypts the preview via the SDK helper. Tarn carries
+  // no first-class inviter name — recipient-facing context travels as
+  // app-defined recipient_metadata inside the encrypted payload.
   const recipientPreview = await recipient.previewInviteToken(created.token_id, fragment);
   assert(recipientPreview != null, 'previewInviteToken should return non-null on active invite');
-  assert(!('inviter_display_name' in recipientPreview), 'preview must not carry an inviter display name');
+  assert(!('inviter_display_name' in recipientPreview), 'preview must not carry a first-class inviter display name');
   assert(typeof recipientPreview.inviter_share_pub_fingerprint === 'string', 'fingerprint must be present');
   assert(/^[0-9a-f:]+$/.test(recipientPreview.inviter_share_pub_fingerprint), 'fingerprint must be hex+colons');
+  assert(recipientPreview.recipient_metadata?.display_name === 'Maya',
+    `preview must decrypt recipient_metadata, got ${JSON.stringify(recipientPreview.recipient_metadata)}`);
+  // The server-visible preview body must NOT leak the metadata — it lives
+  // inside the opaque ciphertext only.
+  assert(!JSON.stringify(previewBody).includes('Maya'),
+    'unauthenticated preview body must not contain recipient_metadata plaintext');
 
   // Redeem.
   const redeemed = await recipient.redeemInviteToken(created.token_id, fragment);
   assert(typeof redeemed.requestNonce === 'string', 'redeem must return requestNonce');
+  assert(redeemed.recipientMetadata?.display_name === 'Maya',
+    `redeem must surface recipient_metadata, got ${JSON.stringify(redeemed.recipientMetadata)}`);
 
   // Inviter polls. Auto-accept should kick in: the invite token matches an
   // entry in tarn-issued-invites-v1, so the request never surfaces to the user.

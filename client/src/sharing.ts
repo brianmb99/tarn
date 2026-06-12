@@ -860,3 +860,40 @@ export function removeIssuedInvite(record: IssuedInvitesRecord, tokenId: string)
   }
   return { ...record, invites: record.invites.filter((i: IssuedInviteEntry) => i.token_id !== tokenId) };
 }
+
+// App-defined recipient-visible invite metadata (Section 8). Travels inside
+// the AES-256-GCM invite payload — encrypted under the payload_key (URL
+// fragment, never server-visible) and integrity-bound by the GCM tag, so a
+// link-forwarder can't alter it the way they could a bare URL parameter.
+// Tarn never interprets the contents; the shape is the app's contract with
+// itself. Capped well under the server's 4096-byte encrypted-payload limit
+// so the fixed fields (inviter keys) always fit.
+export const MAX_RECIPIENT_METADATA_BYTES = 2048;
+
+/**
+ * Validate + normalize app-defined recipient metadata for embedding in an
+ * invite payload. Accepts a JSON-serializable plain object; returns a
+ * JSON-round-tripped copy (drops `undefined` members, functions, prototype
+ * baggage) so exactly what was validated is what gets encrypted.
+ *
+ * Throws on non-objects, non-serializable values (circular refs), and
+ * serialized size over {@link MAX_RECIPIENT_METADATA_BYTES}.
+ */
+export function normalizeRecipientMetadata(value: unknown): Record<string, unknown> {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('recipient_metadata must be a plain object');
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error('recipient_metadata must be JSON-serializable');
+  }
+  const byteLength = TEXT_ENCODER.encode(serialized).byteLength;
+  if (byteLength > MAX_RECIPIENT_METADATA_BYTES) {
+    throw new Error(
+      `recipient_metadata exceeds ${MAX_RECIPIENT_METADATA_BYTES} bytes serialized (got ${byteLength})`,
+    );
+  }
+  return JSON.parse(serialized);
+}

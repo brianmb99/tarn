@@ -1804,7 +1804,8 @@ plaintext = JSON({
   inviter_share_pub:    <base64url 32 bytes>,
   inviter_signing_pub:  <base64url SPKI>,
   app_id:               <string>,
-  issued_at:            <unix seconds>
+  issued_at:            <unix seconds>,
+  recipient_metadata:   <JSON object>          # OPTIONAL, app-defined, ≤ 2048 bytes serialized
 })
 ciphertext = IV(12) || AES-256-GCM(plaintext, payload_key, IV) + tag
 on-wire    = base64(ciphertext)        # what `payload` field carries
@@ -1812,7 +1813,13 @@ url        = <apps.invite_url_template, with {token_id}> # base64url(payload_key
                                                           # see "App-side URL template" below
 ```
 
-The payload carries only the inviter's public-key material plus scope/timestamp metadata. There is no display-name slot on the wire — Tarn has no concept of a user-facing name in its identity model, so the protocol does not pretend to provide one. Apps that want to render "X invited you" UI pass that name through their own delivery channel (e.g., the message accompanying the invite link).
+The fixed fields carry only the inviter's public-key material plus scope/timestamp metadata. Tarn still has no concept of a user-facing name in its identity model — but the optional `recipient_metadata` slot lets the **app** attach recipient-visible context (a display name, an avatar reference, whatever the app defines) without Tarn interpreting it. Properties:
+
+- **Opaque to Tarn.** The SDK encrypts it inside the payload and returns it decrypted from `previewInviteToken` / `redeemInviteToken`; neither the protocol nor the server assigns it any meaning. Omitted entirely (not null) when the app supplies none, so pre-metadata invites parse identically.
+- **Server-invisible.** It lives inside the AES-GCM payload under `payload_key`, which never reaches the API.
+- **Integrity-bound.** The GCM tag covers it together with the inviter's keys, so a link-forwarder cannot swap in a different name the way they could with URL-parameter side channels (e.g. a `&from=<name>` appended to the fragment — readable, but trivially editable in transit).
+- **Not confidential from link-holders, and not verified.** Anyone with the full invite URL can decrypt it, and Tarn does not attest that its contents are true. Apps MUST NOT put secrets in it and SHOULD render it as inviter-asserted context, not authenticated identity.
+- **Size-capped.** ≤ 2048 bytes serialized (SDK-enforced), keeping the total payload comfortably under the server's 4 KiB wire cap.
 
 The server stores `(token_id, payload, ...metadata)` and never learns the contents of `payload` — `inviter_share_pub` and `inviter_signing_pub` are not visible to the API. This is the consistent zero-knowledge story across the rest of the protocol.
 
@@ -1830,7 +1837,7 @@ Set at app onboarding. The SDK calls `GET /api/v1/apps/:app_id/invite-template` 
 
 The app's web handler at that URL is responsible for:
 - Reading `token_id` from the path and `payload_key` from `window.location.hash.slice(1)`.
-- Calling `tarn.previewInviteToken(token_id, payloadKey)` to confirm the invite is still valid (returns scope + fingerprint + timestamps; no inviter name — apps render "Maya invited you" UI from whatever the inviter put in the message accompanying the link).
+- Calling `tarn.previewInviteToken(token_id, payloadKey)` to confirm the invite is still valid (returns scope + fingerprint + timestamps + the decrypted `recipient_metadata`, from which apps render "Maya invited you" UI).
 - Calling `tarn.redeemInviteToken(token_id, payloadKey)` once the recipient is authenticated (signing up first if needed).
 - Server-side rendering the page with `<meta property="og:title">` etc. for messenger-preview unfurls — the app can fetch the unauthenticated preview server-side to populate them.
 - Universal Links / App Links handling for native apps.

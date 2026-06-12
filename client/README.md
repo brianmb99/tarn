@@ -337,6 +337,7 @@ For consumer apps where the inviter doesn't know the recipient's username (or th
 const { token_id, invite_url, expires_at } = await tarn.connections.createInvite({
   label:       'Maya',  // local-only: labels the connection that forms when this redeems
   expiry_days: 7,       // default 7, server max 30
+  recipient_metadata: { display_name: 'Maya' },  // app-defined, shown to the recipient
 });
 // invite_url is something like:
 //   https://app.example.com/invite/<token_id>#<base64url payload_key>
@@ -345,13 +346,23 @@ const { token_id, invite_url, expires_at } = await tarn.connections.createInvite
 // Recipient — extract token_id from path, payload_key from URL fragment.
 const tokenId    = new URL(location.href).pathname.split('/').pop();
 const payloadKey = location.hash.slice(1);
+
+// Pre-redemption landing page: non-consuming peek.
+const preview = await tarn.connections.previewInvite(tokenId, payloadKey);
+// preview.recipient_metadata → { display_name: 'Maya' } — render "Maya invited you".
+// null preview means expired / already used / not found / wrong key.
+
 await tarn.connections.redeemInvite(tokenId, payloadKey);
 // The inviter's SDK auto-accepts the resulting connection request on next poll.
 ```
 
 The URL fragment (`#`) is never transmitted to the API — the payload key stays on the recipient's device. Tarn stores opaque ciphertext keyed on `token_id` and never sees the inviter's identity.
 
-`label` is local: it's stored only in the inviter's encrypted `tarn-issued-invites-v1` record, surfaced in `listIssuedInvites()`, and used to seed `Connection.label` when the matching redemption auto-accepts. The recipient never sees it. If your app wants to show the recipient who's reaching out (e.g. "Maya invited you"), pass that name through your delivery channel — the message body of the email/SMS/QR-page that carries the invite URL.
+`label` is local: it's stored only in the inviter's encrypted `tarn-issued-invites-v1` record, surfaced in `listIssuedInvites()`, and used to seed `Connection.label` when the matching redemption auto-accepts. The recipient never sees it.
+
+`recipient_metadata` is the recipient-facing counterpart: an app-defined object (≤ 2048 bytes serialized) encrypted into the invite payload and returned — decrypted — by both `previewInvite()` and `redeemInvite()`. Tarn never interprets it and the server never sees it. Two caveats: anyone holding the full invite URL can decrypt it, so put no secrets in it; and it's inviter-asserted, not Tarn-verified, so render it as context ("Maya invited you") rather than authenticated identity.
+
+Options objects across the connections surface are strict: an unknown key (say, `display_name` where the SDK expects `label` or `recipient_metadata`) throws immediately rather than being silently ignored.
 
 ---
 

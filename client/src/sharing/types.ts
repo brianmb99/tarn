@@ -96,12 +96,22 @@ export type CreateInviteOpts = {
    * Optional local label for the connection-to-be (≤ 64 chars). Stored only
    * in the inviter's encrypted issued-invites record; surfaced in
    * `listIssuedInvites()` and used to seed `Connection.label` when the
-   * matching redemption auto-accepts. Never sent to the recipient — Tarn
-   * has no concept of a user-facing display name on the wire.
+   * matching redemption auto-accepts. Never sent to the recipient — for
+   * recipient-facing context, use `recipient_metadata`.
    */
   label?: string;
   /** 1–30; defaults to 7. */
   expiry_days?: number;
+  /**
+   * Optional app-defined object encrypted into the invite payload and
+   * surfaced (decrypted) by `previewInvite()` / `redeemInvite()`. Lets apps
+   * render recipient-facing context ("<name> invited you") before
+   * redemption; Tarn never interprets the contents and the server never
+   * sees them. Anyone holding the full invite URL can decrypt it — put no
+   * secrets in it — and it is inviter-asserted, not Tarn-verified identity.
+   * Serialized size capped at 2048 bytes.
+   */
+  recipient_metadata?: Record<string, unknown>;
 };
 
 /**
@@ -109,10 +119,10 @@ export type CreateInviteOpts = {
  * an invite token. Returns null on any recoverable failure (expired, used,
  * not found, wrong payload key); never throws on those.
  *
- * Tarn does not carry a name for the inviter on the wire — the encrypted
- * payload contains only their public keys. Apps that want to show "X
- * invited you" UI should pass the inviter's name through their own
- * delivery channel (e.g., the message accompanying the link).
+ * Tarn itself carries no name for the inviter — the payload's fixed fields
+ * are public keys. Apps that want "X invited you" UI attach the name (or
+ * any other context) via `CreateInviteOpts.recipient_metadata`, which comes
+ * back here decrypted.
  */
 export type InvitePreview = {
   /**
@@ -126,6 +136,13 @@ export type InvitePreview = {
   issued_at: number;
   /** Unix seconds. */
   expires_at: number;
+  /**
+   * The app-defined object the inviter passed as
+   * `CreateInviteOpts.recipient_metadata`, decrypted from the invite
+   * payload; null for invites issued without one. Inviter-asserted —
+   * render as context, not as verified identity.
+   */
+  recipient_metadata: Record<string, unknown> | null;
 };
 
 /**
@@ -160,6 +177,12 @@ export type RedeemedInvite = {
   request_nonce: string;
   /** Inviter's share_pub, base64url. */
   recipient_share_pub: string;
+  /**
+   * Same app-defined object `previewInvite()` surfaces (see
+   * `InvitePreview.recipient_metadata`) — returned here too so post-redeem
+   * UI doesn't need a second call. Null when the invite carried none.
+   */
+  recipient_metadata: Record<string, unknown> | null;
 };
 
 /**

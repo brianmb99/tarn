@@ -225,6 +225,7 @@ class StubUnderlying implements IUnderlyingClient {
     app_id: string;
     issued_at: number;
     expires_at: number;
+    recipient_metadata: Record<string, unknown> | null;
   } | null = null;
   issuedInvites: Array<{
     token_id: string;
@@ -252,7 +253,11 @@ class StubUnderlying implements IUnderlyingClient {
   }
   async redeemInviteToken(_t: string, _k: string) {
     this.redeemInviteTokenCalls++;
-    return { requestNonce: 'stub-nonce', recipientSharePubBase64Url: 'stub-share-pub' };
+    return {
+      requestNonce: 'stub-nonce',
+      recipientSharePubBase64Url: 'stub-share-pub',
+      recipientMetadata: { display_name: 'Stub Inviter' } as Record<string, unknown> | null,
+    };
   }
   async previewInviteToken(_t: string, _k: string) {
     this.previewInviteCalls++;
@@ -815,6 +820,7 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
       app_id: 'bookish',
       issued_at: 1714000000,
       expires_at: 1714600000,
+      recipient_metadata: { display_name: 'Maya' },
     };
     const out = await tarn.connections.previewInvite('tok', 'key');
     assert.deepEqual(out, {
@@ -822,17 +828,32 @@ describe('TarnClient — lifecycle namespaces wire to the underlying client', ()
       app_id: 'bookish',
       issued_at: 1714000000,
       expires_at: 1714600000,
+      recipient_metadata: { display_name: 'Maya' },
     });
+  });
+
+  it('connections.previewInvite surfaces recipient_metadata as null when absent', async () => {
+    stub.invitePreviewResult = {
+      inviter_share_pub_fingerprint: '0123abcd',
+      app_id: 'bookish',
+      issued_at: 1714000000,
+      expires_at: 1714600000,
+      recipient_metadata: null,
+    };
+    const out = await tarn.connections.previewInvite('tok', 'key');
+    assert.equal(out?.recipient_metadata, null);
   });
 
   it('connections.redeemInvite renames camelCase fields to snake_case', async () => {
     const out = await tarn.connections.redeemInvite('tok', 'key');
     assert.equal(out.request_nonce, 'stub-nonce');
     assert.equal(out.recipient_share_pub, 'stub-share-pub');
+    assert.deepEqual(out.recipient_metadata, { display_name: 'Stub Inviter' });
     // Verify we don't leak the underlying camelCase keys.
     const o = out as unknown as Record<string, unknown>;
     assert.equal(o['requestNonce'], undefined);
     assert.equal(o['recipientSharePubBase64Url'], undefined);
+    assert.equal(o['recipientMetadata'], undefined);
   });
 
   it('connections.listIssuedInvites returns IssuedInvite[]', async () => {

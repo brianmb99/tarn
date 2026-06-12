@@ -67,3 +67,7 @@ export type {
   ShareLogEntry,
   ShareWithAllResult,
 } from './sharing/index.js';
+
+// Serialized-size cap on `CreateInviteOpts.recipient_metadata` — exported so
+// apps can pre-validate before calling `tarn.connections.createInvite()`.
+export { MAX_RECIPIENT_METADATA_BYTES } from './sharing.js';
