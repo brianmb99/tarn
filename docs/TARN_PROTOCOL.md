@@ -117,6 +117,12 @@ The API stores `wrapped_data_key` as opaque text. The string is a self-describin
     "kdf_params": { "m_kib": 65536, "t": 3, "p": 1 },
     "salt": "<base64 16-byte per-account random salt>"
   },
+  "sharing_keys": {
+    "v": 1,
+    "gen": 1,
+    "iv": "<base64 12-byte AES-GCM IV>",
+    "ct": "<base64 AES-GCM ciphertext>"
+  },
   "dek_chain": [
     { "gen": 1, "wrappings": [
       { "factor": "password",        "wrapped": "<base64 AES-KW ciphertext (40 bytes)>" },
@@ -130,6 +136,17 @@ The API stores `wrapped_data_key` as opaque text. The string is a self-describin
   ]
 }
 ```
+
+**`sharing_keys` — envelope-carried sharing identity (tarn#73).** Optional block (absent on pre-#73 accounts until the one-shot migration runs). `ct` is AES-256-GCM ciphertext under the GCM key of the DEK generation named by `gen` (which must exist in `dek_chain`), with AAD `"tarn-sharing-keys-v1"`. The plaintext is JSON: `{ share_priv, share_pub, share_sign_priv, share_sign_pub }` — the X25519 sharing keypair (raw 32-byte keys, base64) and a dedicated P-256 **share-signing** keypair (PKCS#8 / SPKI, base64) that signs share-log operations and connection-handshake payloads.
+
+Consequences of the carried identity:
+
+- **Random, not derived.** Both keypairs are generated randomly at registration. The legacy derivation of the X25519 keypair from `master_key` (`HKDF(master_key, "share", app_id)`) exists only in the migration tool.
+- **Any DEK factor hydrates the full sharing identity.** Password, recovery phrase, and passkey PRF sessions are all cryptographically complete for the sharing layer — sharing §8 operations work in passkey-only sessions. The *single* remaining passkey-session asymmetry is credential mutation (`changeCredentials`, account-key view/rotate), which still requires a primary factor; this is a deliberate lockout-protection boundary, not a key-availability gap (see #32).
+- **The share-signing key is deliberately distinct from the auth-signing key.** The password-derived P-256 key that answers `/auth/challenge` is never placed in the envelope: enveloping it would hand passkey sessions a durable password-equivalent credential.
+- **Credential changes no longer rotate the sharing identity.** `changeCredentials` and `recoverAccount` carry the blob forward (re-encrypted under the new current gen, or verbatim when no gen is added), so `share_pub` and the share-signing key are stable — no §13.5 rotation, no friend-side churn. Explicit §13.5 rotation remains available for compromise response.
+- **Envelope mutators preserve the block verbatim** (passkey add/remove, stale-credential refresh, account-key rotation), exactly like passkey wrappings.
+- **Migration.** Pre-#73 accounts fail password login with `TarnSharingKeysMissingError`. The one-shot migration (`tools/migrate-sharing-keys.mjs`) performs a same-credentials `changeCredentials()`, which detects the missing block, mints the random identity, runs the full §13.5 rotation from the legacy derived keys, and writes the upgraded envelope.
 
 - Each `dek_chain` entry's `wrappings` array carries the same DEK wrapped under each factor's KEK. AES-KW is deterministic, so the same (DEK, KEK) pair always produces the same ciphertext bytes — preserving register-retry idempotency.
 - `passkey_prf` wrappings carry an additional `credential_id` field (base64url-encoded WebAuthn credential ID) so the SDK can pick the right wrapping when more than one passkey is registered. Within a single `wrappings` array, `(factor, credential_id)` must be unique — duplicate `passkey_prf` entries with the same credential ID are rejected at parse time. `password` and `recovery_phrase` carry no credential ID and may appear at most once per gen.

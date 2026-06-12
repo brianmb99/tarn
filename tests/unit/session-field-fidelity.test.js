@@ -103,6 +103,13 @@ const EXPECTED_PAYLOAD_KEYS = [
   'signingPublicKey',
   'sharingPrivateKey',
   'sharingPublicKey',
+  // tarn#73 — envelope-carried sharing identity: the share-signing keypair
+  // must persist (passkey AND password sessions publish share-log entries
+  // with it), and the envelope blob snapshot must persist so envelope
+  // mutations on a resumed session preserve it verbatim.
+  'shareSigningPrivateKey',
+  'shareSigningPublicKey',
+  'sharingKeysBlob',
   'recoveryFactorMeta',
   'credentialEncryptionKey',
 ].sort();

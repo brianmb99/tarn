@@ -60,11 +60,17 @@ await test('register() publishes share_pub by default', async () => {
   await aliceClient.register(aliceUsername, alicePassword, {
     recoveryAcknowledged: true,
   });
-  // Re-derive offline to assert the published value matches what the SDK
-  // computed locally.
-  const keys = await deriveAllKeys(aliceUsername, alicePassword, DEFAULT_APP_ID);
-  aliceExpectedSharePub = encodeSharePub(keys.sharingKeyPair.publicKey);
-  assert(aliceExpectedSharePub.length === 43, `share_pub length ${aliceExpectedSharePub.length}`);
+  // tarn#73 — share_pub is a RANDOM envelope-carried identity, no longer
+  // derivable from username+password. Capture the published value via the
+  // server lookup, and assert it is NOT the legacy derived value (the
+  // decoupling is the point of #73).
+  const lookup = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(aliceUsername);
+  aliceExpectedSharePub = lookup.sharePubBase64Url;
+  assert(aliceExpectedSharePub && aliceExpectedSharePub.length === 43,
+    `share_pub length ${aliceExpectedSharePub?.length}`);
+  const legacyKeys = await deriveAllKeys(aliceUsername, alicePassword, DEFAULT_APP_ID);
+  assert(aliceExpectedSharePub !== encodeSharePub(legacyKeys.sharingKeyPair.publicKey),
+    'share_pub must be decoupled from the password-derived keypair (tarn#73)');
 });
 
 await test('share_lookup_key is derivable from username + app alone', async () => {
@@ -168,7 +174,7 @@ await test('cross-app probe: share_lookup_key from app A does not match account 
 
 console.log('\n=== 5. changeCredentials republishes share_pub ===');
 
-await test('changeCredentials() rotates share_pub (master_key change)', async () => {
+await test('changeCredentials() keeps share_pub STABLE on password change (tarn#73)', async () => {
   // Use a fresh account so we don't disturb Alice's other tests.
   const dUsername = randomUsername();
   const dPassword = 'pw-d-' + Date.now();
@@ -181,18 +187,13 @@ await test('changeCredentials() rotates share_pub (master_key change)', async ()
   const newPassword = dPassword + '-rotated';
   await d.changeCredentials(dUsername, newPassword, { phrase: dReg.accountKey });
 
-  // Same username => same share_lookup_key, so the lookup still finds the
-  // account, but with a fresh share_pub (because master_key changed).
+  // tarn#73 — the sharing identity is envelope-carried: a password change
+  // rewraps ACCESS, it does not change who you are to your friends. Same
+  // username => same share_lookup_key, and now also the SAME share_pub.
   const after = await new TarnClient(BASE_URL, DEFAULT_APP_ID).getRecipientShareKey(dUsername);
   assert(after.sharePubBase64Url, 'no share_pub after credential change');
-  assert(after.sharePubBase64Url !== before.sharePubBase64Url,
-    'share_pub should rotate when password changes');
-
-  // Cross-check: re-derive the new share_pub locally and assert match.
-  const newKeys = await deriveAllKeys(dUsername, newPassword, DEFAULT_APP_ID);
-  const expectedNew = encodeSharePub(newKeys.sharingKeyPair.publicKey);
-  assert(after.sharePubBase64Url === expectedNew,
-    `share_pub mismatch after change:\n  got:  ${after.sharePubBase64Url}\n  want: ${expectedNew}`);
+  assert(after.sharePubBase64Url === before.sharePubBase64Url,
+    'share_pub must be STABLE across a password change (tarn#73)');
 });
 
 await test('changeCredentials() rotates share_lookup_key on username change', async () => {

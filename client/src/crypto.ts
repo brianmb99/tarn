@@ -495,6 +495,130 @@ export async function deriveSharingKeyPair(masterKey: Uint8Array, appId: string)
   return { privateKey: seed, publicKey };
 }
 
+// ============ ENVELOPE-CARRIED SHARING IDENTITY (issue #73) ============
+//
+// The sharing identity (X25519 pair-key seed + a dedicated P-256
+// share-signing keypair) is RANDOM at registration and carried inside the
+// credential envelope, encrypted under a DEK generation. Any factor that can
+// unwrap that gen's DEK — password, recovery phrase, or passkey PRF — can
+// hydrate the full sharing identity, making passkey sessions
+// cryptographically complete for the sharing layer.
+//
+// The share-signing keypair is deliberately DISTINCT from the
+// password-derived auth-signing keypair (`deriveSigningKeyPair`): the auth
+// key answers login challenges and step-up dances, and enveloping it would
+// hand passkey sessions a durable password-equivalent credential. Splitting
+// the keys keeps credential mutation gated on a primary factor — the single
+// documented capability asymmetry of passkey sessions (issue #32).
+
+/** Wire format of the envelope's optional `sharing_keys` block. */
+export type SharingKeysBlob = {
+  v: 1;
+  /** DEK generation the ciphertext is encrypted under. */
+  gen: number;
+  /** base64 12-byte AES-GCM IV */
+  iv: string;
+  /** base64 AES-GCM ciphertext of the plaintext JSON */
+  ct: string;
+};
+
+export type SharingIdentityKeys = {
+  sharingKeyPair: SharingKeyPair;
+  shareSigningKeyPair: SigningKeyPair;
+};
+
+const SHARING_KEYS_AAD = 'tarn-sharing-keys-v1';
+
+function sharingKeysAad(): BufferSource {
+  return bs(new TextEncoder().encode(SHARING_KEYS_AAD));
+}
+
+/** Generate a RANDOM X25519 sharing keypair (issue #73). */
+export function generateSharingKeyPair(): SharingKeyPair {
+  const privateKey = crypto.getRandomValues(new Uint8Array(X25519_KEY_LEN));
+  const publicKey = x25519.getPublicKey(privateKey);
+  return { privateKey, publicKey };
+}
+
+/** Generate a RANDOM P-256 share-signing keypair (issue #73). */
+export async function generateShareSigningKeyPair(): Promise<SigningKeyPair> {
+  // Rejection-sample into the valid scalar range — same bound as the derived
+  // path; odds of even one retry are ~2^-224.
+  for (let i = 0; i < 3; i++) {
+    const seed = crypto.getRandomValues(new Uint8Array(32));
+    const scalar = bytesToBigInt(seed);
+    if (scalar > 0n && scalar < P256_ORDER) return importP256KeyPair(seed);
+  }
+  throw new Error('Failed to generate valid P-256 private key (extremely unlikely)');
+}
+
+/**
+ * Encrypt the sharing identity under a DEK generation's GCM key for storage
+ * in the credential envelope's `sharing_keys` block.
+ */
+export async function encryptSharingKeys(
+  keys: SharingIdentityKeys,
+  dekGcmKey: CryptoKey,
+  gen: number,
+): Promise<SharingKeysBlob> {
+  const shareSignPkcs8 = new Uint8Array(
+    await crypto.subtle.exportKey('pkcs8', keys.shareSigningKeyPair.privateKey),
+  );
+  const shareSignSpki = new Uint8Array(
+    await crypto.subtle.exportKey('spki', keys.shareSigningKeyPair.publicKey),
+  );
+  const plaintext = new TextEncoder().encode(JSON.stringify({
+    share_priv: bytesToBase64Raw(keys.sharingKeyPair.privateKey),
+    share_pub: bytesToBase64Raw(keys.sharingKeyPair.publicKey),
+    share_sign_priv: bytesToBase64Raw(shareSignPkcs8),
+    share_sign_pub: bytesToBase64Raw(shareSignSpki),
+  }));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: bs(iv), additionalData: sharingKeysAad() },
+    dekGcmKey,
+    bs(plaintext),
+  ));
+  return { v: 1, gen, iv: bytesToBase64Raw(iv), ct: bytesToBase64Raw(ct) };
+}
+
+/** Decrypt and import the sharing identity from an envelope blob. */
+export async function decryptSharingKeys(
+  blob: SharingKeysBlob,
+  dekGcmKey: CryptoKey,
+): Promise<SharingIdentityKeys> {
+  const pt = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: bs(base64ToBytesRaw(blob.iv)), additionalData: sharingKeysAad() },
+    dekGcmKey,
+    bs(base64ToBytesRaw(blob.ct)),
+  ));
+  const json = JSON.parse(new TextDecoder().decode(pt)) as Record<string, string>;
+  for (const field of ['share_priv', 'share_pub', 'share_sign_priv', 'share_sign_pub']) {
+    if (typeof json[field] !== 'string' || json[field]!.length === 0) {
+      throw new Error(`sharing_keys plaintext missing field: ${field}`);
+    }
+  }
+  const sharePriv = base64ToBytesRaw(json['share_priv']!);
+  const sharePub = base64ToBytesRaw(json['share_pub']!);
+  if (sharePriv.length !== X25519_KEY_LEN || sharePub.length !== X25519_KEY_LEN) {
+    throw new Error('sharing_keys plaintext has malformed X25519 key material');
+  }
+  const [privateKey, publicKey] = await Promise.all([
+    crypto.subtle.importKey(
+      'pkcs8', bs(base64ToBytesRaw(json['share_sign_priv']!)),
+      { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign'],
+    ),
+    crypto.subtle.importKey(
+      'spki', bs(base64ToBytesRaw(json['share_sign_pub']!)),
+      { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify'],
+    ),
+  ]);
+  return {
+    sharingKeyPair: { privateKey: sharePriv, publicKey: sharePub },
+    shareSigningKeyPair: { privateKey, publicKey },
+  };
+}
+
 /**
  * Encode an X25519 public key (32 raw bytes) for transport in a credential
  * blob's `share_pub` field. Base64url, no padding (sharing design notation `B(...)`).
@@ -858,6 +982,10 @@ export type ParsedWrappedDataKey = {
   wrappedBase64: string;
   kdfParams: Argon2idParams;
   recovery: RecoveryMetadata;
+  /** Issue #73 — envelope-carried sharing identity. Optional: absent on
+   * accounts that predate the migration. Opaque passthrough for envelope
+   * mutators; decrypted only by the auth paths via decryptSharingKeys(). */
+  sharingKeys: SharingKeysBlob | null;
 };
 
 /**
@@ -1007,12 +1135,38 @@ export function parseWrappedDataKey(wireValue: string): ParsedWrappedDataKey {
     p: ARGON2ID_PARALLELISM,
   };
 
+  // Issue #73 — optional envelope-carried sharing identity blob. Strictly
+  // validated when present; absent on pre-migration accounts.
+  let sharingKeys: SharingKeysBlob | null = null;
+  const skRaw = parsed['sharing_keys'];
+  if (skRaw != null) {
+    const sk = skRaw as Record<string, unknown>;
+    if (
+      typeof sk !== 'object' ||
+      sk['v'] !== 1 ||
+      typeof sk['gen'] !== 'number' ||
+      !Number.isInteger(sk['gen']) ||
+      (sk['gen'] as number) < 1 ||
+      typeof sk['iv'] !== 'string' ||
+      typeof sk['ct'] !== 'string' ||
+      (sk['iv'] as string).length === 0 ||
+      (sk['ct'] as string).length === 0
+    ) {
+      throw new Error('wrapped_data_key envelope has malformed sharing_keys block');
+    }
+    if (!chain.some(e => e.gen === sk['gen'])) {
+      throw new Error(`wrapped_data_key envelope: sharing_keys.gen ${String(sk['gen'])} has no matching dek_chain entry`);
+    }
+    sharingKeys = { v: 1, gen: sk['gen'] as number, iv: sk['iv'] as string, ct: sk['ct'] as string };
+  }
+
   return {
     envelopeVersion: 1,
     dekChain: chain,
     wrappedBase64: pw.wrappedBase64,
     kdfParams,
     recovery,
+    sharingKeys,
   };
 }
 
@@ -1100,6 +1254,7 @@ export type Recovery = { salt: Uint8Array; kdfParams?: Argon2idParams };
 export function buildEnvelope(
   chain: ReadonlyArray<ChainEntry>,
   recovery: Recovery,
+  sharingKeys?: SharingKeysBlob | null,
 ): WrappedDataKeyEnvelope {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
@@ -1120,6 +1275,13 @@ export function buildEnvelope(
     throw new Error(`recovery.salt must be a Uint8Array of length ${RECOVERY_SALT_LEN}`);
   }
   const sorted: ChainEntry[] = chain.slice().sort((a, b) => a.gen - b.gen);
+  if (sharingKeys != null) {
+    // Issue #73 — the blob must reference a gen that exists in this chain,
+    // or no session could ever decrypt it.
+    if (!sorted.some(e => e.gen === sharingKeys.gen)) {
+      throw new Error(`buildEnvelope: sharing_keys.gen ${sharingKeys.gen} has no matching chain entry`);
+    }
+  }
 
   return asEnvelope(JSON.stringify({
     v: ENVELOPE_VERSION,
@@ -1134,6 +1296,9 @@ export function buildEnvelope(
       },
       salt: bytesToBase64Raw(recovery.salt),
     },
+    ...(sharingKeys != null
+      ? { sharing_keys: { v: 1, gen: sharingKeys.gen, iv: sharingKeys.iv, ct: sharingKeys.ct } }
+      : {}),
     dek_chain: sorted.map((e: ChainEntry) => ({
       gen: e.gen,
       wrappings: e.wrappings.map((w: ChainWrapping) => {
@@ -1169,6 +1334,7 @@ export async function wrapDataKeyChainEnvelope(
   factors: ReadonlyArray<FactorInput>,
   recovery: Recovery,
   extraWrappingsByGen?: ReadonlyMap<number, ReadonlyArray<ChainWrapping>>,
+  sharingKeys?: SharingKeysBlob | null,
 ): Promise<WrappedDataKeyEnvelope> {
   if (!Array.isArray(chain) || chain.length === 0) {
     throw new Error('chain must be a non-empty array');
@@ -1207,7 +1373,7 @@ export async function wrapDataKeyChainEnvelope(
     }
     wrappedChain.push({ gen: entry.gen, wrappings });
   }
-  return buildEnvelope(wrappedChain, recovery);
+  return buildEnvelope(wrappedChain, recovery, sharingKeys);
 }
 
 // ============ CHALLENGE SIGNING ============

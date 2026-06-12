@@ -815,34 +815,35 @@ await test('Ivan reads pre-rotation state', async () => {
   assert(state['rotate-target-1'], 'Ivan should see rotate-target-1 before rotation');
 });
 
-await test('Helen rotates credentials (username + password change)', async () => {
+// tarn#73 — the sharing identity is envelope-carried and STABLE across
+// credential changes. A password/username change rewraps ACCESS; it no
+// longer rotates who Helen is to Ivan, so there is no §13.5 announce, no
+// new logs, and Ivan's connection record is untouched. (Explicit rotation
+// remains available; the §13.5 machinery is exercised end-to-end by the
+// one-shot migration of pre-#73 accounts — tools/migrate-sharing-keys.mjs.)
+await test('Helen changes credentials — sharing identity is STABLE (tarn#73)', async () => {
   const newUsername = `rotated-${Date.now()}@test.com`;
   const result = await helen.changeCredentials(newUsername, 'new-pw-' + Date.now(), {
     phrase: helenPhrase,
   });
   assert(Array.isArray(result.rotationAnnouncements), 'should return rotationAnnouncements');
-  assert(result.rotationAnnouncements.length === 1, 'expected 1 connection rotated');
-  const ann = result.rotationAnnouncements[0];
-  assert(ann.connectionSharePub === ivanConnectionOfHelen.share_pub);
-  assert(typeof ann.txid === 'string', 'rotation announcement should have a txid');
-  assert(typeof ann.seq === 'number', 'rotation announcement should have a seq');
+  assert(result.rotationAnnouncements.length === 0,
+    'expected NO rotation announcements — identity is envelope-carried and stable');
+  const helenConnections = await helen.listConnections();
+  assert(helenConnections[0], 'Helen still has her connection record');
 });
 
-await test('Ivan syncs: detects rotate_identity, updates connection record, switches to new keys', async () => {
+await test('Ivan syncs: connection record untouched, entries still verify (tarn#73)', async () => {
   await sleep(300);
   const stateAfter = await ivan.syncShareLog(helenConnectionOfIvan);
-  // After rotation, the connection record now holds Helen's NEW share_pub. The
-  // returned state should reflect the seq=0 NEW-log snapshot Helen published
-  // with her pre-rotation outbound state.
-  assert(stateAfter['rotate-target-1'], 'Ivan should still see rotate-target-1 after rotation');
+  assert(stateAfter['rotate-target-1'], 'Ivan should still see rotate-target-1 after the credential change');
 
   const ivanConnections = await ivan.listConnections();
   const updatedConnection = ivanConnections[0];
-  assert(updatedConnection.share_pub !== helenSharePubBeforeRotate,
-    'Ivan\'s connection record should hold the NEW share_pub');
-  assert(typeof updatedConnection.rotated_at === 'number', 'Ivan should record rotated_at');
-  assert(updatedConnection.prior_share_pub === helenSharePubBeforeRotate,
-    'Ivan should record the pre-rotation share_pub for audit');
+  assert(updatedConnection.share_pub === helenSharePubBeforeRotate,
+    'Ivan\'s connection record keeps the SAME share_pub — no identity rotation happened');
+  assert(updatedConnection.rotated_at == null,
+    'no rotated_at — nothing rotated');
 });
 
 await test('Helen publishes a new share post-rotation; Ivan picks it up via sync', async () => {

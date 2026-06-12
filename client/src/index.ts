@@ -48,6 +48,7 @@ export {
   AccountKeyPinningError,
   TarnRateLimitError,
   TarnPasskeyOnlyError,
+  TarnSharingKeysMissingError,
   TarnNotAuthenticatedError,
   TarnPartialListError,
   TarnShareLogConflictError,

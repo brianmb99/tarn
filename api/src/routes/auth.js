@@ -705,10 +705,13 @@ export async function handleCredentialChange(request, env, ctx, cors) {
     return errorResponse('new_share_discoverable must be a boolean', 400, cors);
   }
 
-  // Check new_credential_lookup_key not already in use
+  // Check new_credential_lookup_key not already in use by ANOTHER account.
+  // The caller's own row is excluded (tarn#73): a same-credentials change is
+  // a legal no-op credential rotation used by the sharing-keys migration to
+  // rewrite the envelope + share fields without touching the password.
   const conflict = await env.DB.prepare(
-    'SELECT 1 FROM accounts WHERE credential_lookup_key = ?1'
-  ).bind(new_credential_lookup_key).first();
+    'SELECT 1 FROM accounts WHERE credential_lookup_key = ?1 AND data_lookup_key != ?2'
+  ).bind(new_credential_lookup_key, auth.data_lookup_key).first();
   if (conflict) {
     return errorResponse('new_credential_lookup_key already in use', 409, cors);
   }

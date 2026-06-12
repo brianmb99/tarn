@@ -44,6 +44,12 @@ import {
   FACTOR_RECOVERY_PHRASE,
   FACTOR_PASSKEY_PRF,
   derivePasskeyWrappingKey,
+  generateSharingKeyPair,
+  generateShareSigningKeyPair,
+  encryptSharingKeys,
+  decryptSharingKeys,
+  type SharingKeysBlob,
+  type SharingIdentityKeys,
 } from './crypto.js';
 import {
   generateAccountKey,
@@ -94,7 +100,9 @@ import {
   emptyIssuedInvitesRecord,
   addIssuedInvite,
   removeIssuedInvite,
+  normalizeRecipientMetadata,
 } from './sharing.js';
+import { assertKnownOpts } from './opts.js';
 import {
   deriveSharedSecret,
   derivePairKeys,
@@ -234,6 +242,27 @@ export class TarnPasskeyOnlyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'TarnPasskeyOnlyError';
+  }
+}
+
+/**
+ * Issue #73 — thrown by login() when the account's credential envelope does
+ * not carry the sharing identity (`sharing_keys` block). Accounts registered
+ * before the envelope-carried-sharing-keys change must run the one-shot
+ * migration (tools/migrate-sharing-keys.mjs), which performs a same-credential
+ * changeCredentials() that mints the random sharing identity, announces the
+ * rotation to every connection (§13.5), and writes the upgraded envelope.
+ */
+export class TarnSharingKeysMissingError extends Error {
+  constructor(message?: string) {
+    super(
+      message ??
+        'This account predates envelope-carried sharing keys (tarn#73). ' +
+        'Run the one-shot migration: tools/migrate-sharing-keys.mjs ' +
+        '(or pass { allowUnmigratedSharing: true } to login() for a session ' +
+        'without the sharing layer).',
+    );
+    this.name = 'TarnSharingKeysMissingError';
   }
 }
 
@@ -449,6 +478,16 @@ export class TarnClient {
   // master_key on every call. share_priv NEVER leaves the device.
   #username: string | null = null;
   #sharingKeyPair: SharingKeyPair | null = null;
+  // Issue #73 — dedicated share-signing keypair, carried in the credential
+  // envelope (encrypted under a DEK gen) rather than derived from the
+  // password. Signs share-log operations and connection-handshake payloads.
+  // Distinct from #signingKeyPair (the password-derived auth-challenge key)
+  // so passkey sessions never hold a password-equivalent auth credential.
+  #shareSigningKeyPair: SigningKeyPair | null = null;
+  // Issue #73 — the envelope's sharing_keys blob as last seen, preserved
+  // verbatim across envelope mutations (passkey add/remove, credential
+  // change) the same way passkey wrappings are.
+  #sharingKeysBlob: SharingKeysBlob | null = null;
   #replayNonceCache: ReplayNonceCache = makeReplayNonceCache();
 
   // Per-connection share-log state (issue #15, Section 5b). Map keyed on the
@@ -641,22 +680,32 @@ export class TarnClient {
     const phraseEntropy = accountKeyToEntropy(phrase);
     const recoverySalt = generateRecoverySalt();
 
-    const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair, shareLookupKey] = await Promise.all([
+    const [keys, recoveryKEK, recoveryLookupKey, recoverySigningKeyPair, shareLookupKey, shareSigningKeyPair] = await Promise.all([
       deriveAllKeys(username, password, this.#appId),
       deriveRecoveryKey(phrase, recoverySalt),
       deriveRecoveryLookupKey(phraseEntropy, this.#appId),
       deriveRecoverySigningKeyPair(phraseEntropy, this.#appId),
       deriveShareLookupKey(username, this.#appId),
+      generateShareSigningKeyPair(),
     ]);
+    // Issue #73 — the sharing identity is RANDOM (not password-derived) and
+    // travels in the envelope, encrypted under the DEK, so every factor that
+    // unwraps the DEK (password / recovery phrase / passkey PRF) hydrates it.
+    const sharingKeyPair = generateSharingKeyPair();
 
     const [publicKeyBase64, recoveryPublicKeyBase64] = await Promise.all([
       exportPublicKey(keys.signingKeyPair.publicKey),
       exportPublicKey(recoverySigningKeyPair.publicKey),
     ]);
-    const sharePub = encodeSharePub(keys.sharingKeyPair.publicKey);
+    const sharePub = encodeSharePub(sharingKeyPair.publicKey);
 
     // Random DEK at generation 1. Wrap under both password + recovery factors.
     const dek = await generateRandomDataKey();
+    const sharingKeysBlob = await encryptSharingKeys(
+      { sharingKeyPair, shareSigningKeyPair },
+      dek.gcmKey,
+      1,
+    );
     const wrappedDataKey = await wrapDataKeyChainEnvelope(
       [{ gen: 1, key: dek.gcmKey }],
       [
@@ -664,6 +713,8 @@ export class TarnClient {
         { name: FACTOR_RECOVERY_PHRASE, wrappingKey: recoveryKEK.kwKey },
       ],
       { salt: recoverySalt },
+      undefined,
+      sharingKeysBlob,
     );
 
     // Phase 3 — Model B: encrypt the account-key UTF-8 under the gen-1 DEK.
@@ -703,7 +754,9 @@ export class TarnClient {
     this.#dekByGen = new Map([[1, { gcmKey: dek.gcmKey, kwKey: dek.kwKey }]]);
     this.#currentGen = 1;
     this.#username = username;
-    this.#sharingKeyPair = keys.sharingKeyPair;
+    this.#sharingKeyPair = sharingKeyPair;
+    this.#shareSigningKeyPair = shareSigningKeyPair;
+    this.#sharingKeysBlob = sharingKeysBlob;
     // Snapshot the recovery wrapping bytes for the freshly-registered chain
     // so a subsequent changeCredentials() can preserve them without needing
     // the phrase. Re-parse the envelope (cheap — local JSON) to capture the
@@ -833,7 +886,39 @@ export class TarnClient {
       deriveShareLookupKey(newUsername, this.#appId),
     ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-    const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
+
+    // Issue #73 — recovery RESTORES the sharing identity when the envelope
+    // carries it: the recovery factor unwrapped the DEK chain, which decrypts
+    // the sharing_keys blob, so friendships survive a forgot-password flow
+    // intact (no rotation, no friend-side churn). Pre-migration envelopes
+    // fall back to minting a random identity + the §13.5 announce — the same
+    // upgrade changeCredentials performs.
+    let recSharingKeyPair: SharingKeyPair;
+    let recShareSigningKeyPair: SigningKeyPair;
+    let recSharingKeysBlob: SharingKeysBlob;
+    const recoveredIdentity = parsed.sharingKeys != null;
+    if (parsed.sharingKeys) {
+      const dekForBlob = unwrapped.dekByGen.get(parsed.sharingKeys.gen);
+      if (!dekForBlob) {
+        throw new Error(
+          `recoverAccount(): sharing_keys blob references DEK gen ${parsed.sharingKeys.gen}, which the recovery factor could not unwrap`,
+        );
+      }
+      const identity = await decryptSharingKeys(parsed.sharingKeys, dekForBlob.gcmKey);
+      recSharingKeyPair = identity.sharingKeyPair;
+      recShareSigningKeyPair = identity.shareSigningKeyPair;
+      // No gens change during recovery — the blob passes through verbatim.
+      recSharingKeysBlob = parsed.sharingKeys;
+    } else {
+      recSharingKeyPair = generateSharingKeyPair();
+      recShareSigningKeyPair = await generateShareSigningKeyPair();
+      recSharingKeysBlob = await encryptSharingKeys(
+        { sharingKeyPair: recSharingKeyPair, shareSigningKeyPair: recShareSigningKeyPair },
+        unwrapped.dekByGen.get(unwrapped.currentGen)!.gcmKey,
+        unwrapped.currentGen,
+      );
+    }
+    const newSharePub = encodeSharePub(recSharingKeyPair.publicKey);
 
     const chain = [];
     for (const [gen, pair] of unwrapped.dekByGen) {
@@ -868,6 +953,7 @@ export class TarnClient {
       ],
       { salt: parsed.recovery.salt, kdfParams: parsed.recovery.kdfParams },
       passkeyExtras,
+      recSharingKeysBlob,
     );
 
     // recovery_lookup_key + recovery_public_key are derived purely from the
@@ -894,7 +980,8 @@ export class TarnClient {
     //     and DEK chain are in memory → we can announce.
     const oldSharingKeyPair = this.#sharingKeyPair;
     const oldSigningKeyPair = this.#signingKeyPair;
-    const skipRotationAnnounce = opts?.skipRotationAnnounce === true;
+    // Issue #73: a restored identity is unchanged — nothing to announce.
+    const skipRotationAnnounce = opts?.skipRotationAnnounce === true || recoveredIdentity;
     const canAnnounce = !skipRotationAnnounce
       && !!oldSharingKeyPair?.privateKey
       && !!oldSigningKeyPair?.privateKey
@@ -961,8 +1048,8 @@ export class TarnClient {
           oldSharingKeyPair,
           oldSigningKeyPair,
           oldConnectionsRecord: oldConnectionsState.record,
-          newSharingPublicKey: newKeys.sharingKeyPair.publicKey,
-          newSigningPublicKey: newKeys.signingKeyPair.publicKey,
+          newSharingPublicKey: recSharingKeyPair.publicKey,
+          newSigningPublicKey: recShareSigningKeyPair.publicKey,
           newCredentialLookupKey: newKeys.credentialLookupKey,
           rotatedAt: Math.floor(Date.now() / 1000),
         });
@@ -978,7 +1065,9 @@ export class TarnClient {
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
     this.#username = newUsername;
-    this.#sharingKeyPair = newKeys.sharingKeyPair;
+    this.#sharingKeyPair = recSharingKeyPair;
+    this.#shareSigningKeyPair = recShareSigningKeyPair;
+    this.#sharingKeysBlob = recSharingKeysBlob;
     // Repopulate recovery-factor metadata so a subsequent
     // changeCredentials / rotateAccountKey on this client preserves the
     // existing recovery wrappings (or rotates them) without needing the
@@ -999,14 +1088,18 @@ export class TarnClient {
       this.#capturePasskeyWrappings(reparsed);
     }
     this.#recoveryLookupKey = recoveryLookupKey;
-    // Pair-key cache is derived from share_priv; recovery rotates it.
-    this.#pairKeyCache.clear();
-    this.#shareLogCounters.clear();
-    this.#readStateCache.clear();
-    this.#outboundStateCache.clear();
-    this.#publishedTxidsByConnection.clear();
-    this.#mutedConnectionsState = null;
-    this.#issuedInvitesState = null;
+    if (!recoveredIdentity) {
+      // Pair-key cache is derived from share_priv; the minted-identity
+      // (pre-#73 migration) branch rotates it. A restored identity keeps
+      // every cache warm — friendships are untouched by recovery.
+      this.#pairKeyCache.clear();
+      this.#shareLogCounters.clear();
+      this.#readStateCache.clear();
+      this.#outboundStateCache.clear();
+      this.#publishedTxidsByConnection.clear();
+      this.#mutedConnectionsState = null;
+      this.#issuedInvitesState = null;
+    }
     this.#jwt = null; // force re-auth under the new credentials
     await this.#authenticate();
 
@@ -1111,7 +1204,21 @@ export class TarnClient {
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
     this.#username = username;
-    this.#sharingKeyPair = keys.sharingKeyPair;
+    // Issue #73 — hydrate the sharing identity from the envelope. The
+    // password-derived sharing keypair is GONE from the login path: identity
+    // lives in the envelope so passkey sessions get the same keys. Accounts
+    // that predate the change throw unless the caller is the migration tool.
+    await this.#hydrateSharingKeysFromEnvelope(challengeRes.json.wrapped_data_key, {
+      requireForPasswordSession: opts.allowUnmigratedSharing !== true,
+    });
+    if (!this.#sharingKeyPair && opts.allowUnmigratedSharing === true) {
+      // Migration-only: the LEGACY password-derived X25519 keypair, needed so
+      // the upcoming changeCredentials() can hydrate the old outbound logs
+      // and sign the §13.5 rotation announcement under the keys friends hold.
+      // #shareSigningKeyPair deliberately stays null — new-style sharing
+      // operations are unavailable until the migration completes.
+      this.#sharingKeyPair = keys.sharingKeyPair;
+    }
     // Capture the recovery-factor metadata so a subsequent changeCredentials()
     // can preserve existing recovery wrappings without requiring the user to
     // re-enter the phrase. Login does NOT reveal the recovery_lookup_key (the
@@ -1233,11 +1340,31 @@ export class TarnClient {
       deriveShareLookupKey(newUsername, this.#appId),
     ]);
     const newPublicKey = await exportPublicKey(newKeys.signingKeyPair.publicKey);
-    // Sharing keypair rotates with master_key (depends on both username and
-    // password). The discoverability flag is preserved by the API when
-    // omitted; let `opts.shareDiscoverable` override it for callers that also
-    // want to flip it as part of the credential change.
-    const newSharePub = encodeSharePub(newKeys.sharingKeyPair.publicKey);
+
+    // Issue #73 — the sharing identity is envelope-carried and STABLE across
+    // credential changes: a password change rewraps access, it does not
+    // rotate who you are to your friends (explicit rotation remains a
+    // separate §13.5 operation). The legacy branch below is the one-shot
+    // migration path: an account whose envelope predates #73 has no carried
+    // identity, so we mint a random one here and run the full §13.5
+    // rotation from the old password-derived keys — exactly what a
+    // credential change did before #73. Migration = changeCredentials with
+    // the same username+password.
+    const migrated = !!(this.#sharingKeyPair && this.#shareSigningKeyPair && this.#sharingKeysBlob);
+    const rotateSharingIdentity = !migrated;
+    let nextSharingKeyPair: SharingKeyPair;
+    let nextShareSigningKeyPair: SigningKeyPair;
+    if (migrated) {
+      nextSharingKeyPair = this.#sharingKeyPair!;
+      nextShareSigningKeyPair = this.#shareSigningKeyPair!;
+    } else {
+      nextSharingKeyPair = generateSharingKeyPair();
+      nextShareSigningKeyPair = await generateShareSigningKeyPair();
+    }
+    // The discoverability flag is preserved by the API when omitted; let
+    // `opts.shareDiscoverable` override it for callers that also want to
+    // flip it as part of the credential change.
+    const newSharePub = encodeSharePub(nextSharingKeyPair.publicKey);
 
     if (!this.#recoveryFactorMeta) {
       // SDK-10: a session that reached this point has signing keys, a
@@ -1335,9 +1462,18 @@ export class TarnClient {
       return { gen, wrappings };
     });
 
+    // Issue #73 — (re-)encrypt the sharing identity under the fresh gen so
+    // the new envelope carries it. For the migration branch this is the
+    // first time the blob exists.
+    const newSharingKeysBlob = await encryptSharingKeys(
+      { sharingKeyPair: nextSharingKeyPair, shareSigningKeyPair: nextShareSigningKeyPair },
+      newDek.gcmKey,
+      nextGen,
+    );
     const newWrappedDataKey: string = buildEnvelope(
       wireChain,
       { salt: this.#recoveryFactorMeta.salt, kdfParams: this.#recoveryFactorMeta.kdfParams },
+      newSharingKeysBlob,
     );
 
     const newDekByGen = new Map(this.#dekByGen!);
@@ -1357,8 +1493,14 @@ export class TarnClient {
     // rotation announce + new-log snapshots run inline before the method
     // returns control to the caller.
     const oldSharingKeyPair = this.#sharingKeyPair;
+    // For the migration branch the peers' cached signing_pub is the OLD
+    // password-derived dual-use key; a migrated account never announces
+    // from here (identity is stable), so the share-signing key is never
+    // needed as "old" in this method.
     const oldSigningKeyPair = this.#signingKeyPair;
-    const skipRotationAnnounce = opts.skipRotationAnnounce === true;
+    // Issue #73: no identity change → no announce, no snapshot republish,
+    // no cache invalidation. Credential change becomes invisible to friends.
+    const skipRotationAnnounce = opts.skipRotationAnnounce === true || !rotateSharingIdentity;
 
     // Hydrate outbound state per connection BEFORE the swap so we can publish
     // meaningful seq=0 snapshots to the NEW logs after rotation. Hydration
@@ -1432,8 +1574,8 @@ export class TarnClient {
           oldSharingKeyPair,
           oldSigningKeyPair,
           oldConnectionsRecord: oldConnectionsState.record,
-          newSharingPublicKey: newKeys.sharingKeyPair.publicKey,
-          newSigningPublicKey: newKeys.signingKeyPair.publicKey,
+          newSharingPublicKey: nextSharingKeyPair.publicKey,
+          newSigningPublicKey: nextShareSigningKeyPair.publicKey,
           newCredentialLookupKey: newKeys.credentialLookupKey,
           rotatedAt: Math.floor(Date.now() / 1000),
         });
@@ -1460,17 +1602,23 @@ export class TarnClient {
       this.#passkeyWrappingsByGen = new Map();
     }
     this.#username = newUsername;
-    this.#sharingKeyPair = newKeys.sharingKeyPair;
-    // Per-pair S_AB is derived from share_priv, which just rotated — every
-    // cached entry is stale. The NEW pair keys are derived lazily on first
-    // use via #getPairKeysFor (post-rotation).
-    this.#pairKeyCache.clear();
-    this.#shareLogCounters.clear();
-    this.#readStateCache.clear();
-    this.#outboundStateCache.clear();
-    this.#publishedTxidsByConnection.clear();
-    this.#mutedConnectionsState = null;
-    this.#issuedInvitesState = null;
+    this.#sharingKeyPair = nextSharingKeyPair;
+    this.#shareSigningKeyPair = nextShareSigningKeyPair;
+    this.#sharingKeysBlob = newSharingKeysBlob;
+    if (rotateSharingIdentity) {
+      // Per-pair S_AB is derived from share_priv, which just rotated — every
+      // cached entry is stale. The NEW pair keys are derived lazily on first
+      // use via #getPairKeysFor (post-rotation). (Issue #73: a migrated
+      // account's identity is stable across credential changes, so these
+      // caches stay warm and friends notice nothing.)
+      this.#pairKeyCache.clear();
+      this.#shareLogCounters.clear();
+      this.#readStateCache.clear();
+      this.#outboundStateCache.clear();
+      this.#publishedTxidsByConnection.clear();
+      this.#mutedConnectionsState = null;
+      this.#issuedInvitesState = null;
+    }
 
     await this.#authenticate();
 
@@ -2249,6 +2397,7 @@ export class TarnClient {
         ],
         { salt: newRecoverySalt },
         passkeyExtras,
+        this.#sharingKeysBlob, // issue #73 — preserved verbatim; DEKs unchanged
       );
     };
 
@@ -2705,16 +2854,23 @@ export class TarnClient {
     //    client). Note we don't have a username here (passkey login is
     //    discoverable / username-less), so #username remains null until
     //    the user explicitly sets one via subsequent operations. This
-    //    means certain follow-up operations that require the username
-    //    (changeCredentials, viewAccountKey, enable/disable/rotate
-    //    account-key, sharing handshake) will fail; passkey-only sessions
-    //    are intended for read access and entry CRUD that doesn't need
-    //    the master_key.
+    //    means follow-up operations that require the username or the
+    //    password-derived auth key (changeCredentials, viewAccountKey,
+    //    enable/disable/rotate account-key) will fail — the documented
+    //    capability asymmetry of passkey sessions (#32). The SHARING layer
+    //    is symmetric since #73: the sharing identity rides in the envelope
+    //    and is hydrated below, so share-log reads/publishes work here.
     this.#jwt = jwt;
     this.#sid = this.#extractSidFromJwt(jwt);
     this.#dataLookupKey = data_lookup_key;
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
+    // Issue #73 — hydrate the sharing identity from the envelope. Absent on
+    // pre-migration accounts: sharing slots stay null and sharing operations
+    // throw their typed errors (same as before #73 — no regression).
+    await this.#hydrateSharingKeysFromEnvelope(wrapped_data_key, {
+      requireForPasswordSession: false,
+    });
     this.#accountKeyStored =
       typeof account_key_stored === 'boolean' ? account_key_stored : null;
     // Snapshot recovery wrapping bytes so a future write that DOES have the
@@ -2851,6 +3007,42 @@ export class TarnClient {
    * and the unwrap will fail anyway. We accept whatever the handler
    * returns; the password unwrap is the truth check.
    */
+  /**
+   * Issue #73 — decrypt the envelope's `sharing_keys` blob (if present) with
+   * the already-unwrapped DEK chain and install the sharing identity. Call
+   * AFTER `#dekByGen` is populated.
+   *
+   * Absent blob: pre-migration account. Password sessions throw
+   * `TarnSharingKeysMissingError` (loud and actionable — silent sharing
+   * no-ops are worse) unless `requireForPasswordSession` is false, which the
+   * migration tool and passkey path use; the sharing slots stay null and
+   * sharing operations fail with their own typed errors.
+   */
+  async #hydrateSharingKeysFromEnvelope(
+    wrappedDataKey: string,
+    opts: { requireForPasswordSession: boolean },
+  ): Promise<void> {
+    const parsed = parseWrappedDataKey(wrappedDataKey);
+    this.#sharingKeysBlob = parsed.sharingKeys;
+    if (!parsed.sharingKeys) {
+      this.#sharingKeyPair = null;
+      this.#shareSigningKeyPair = null;
+      if (opts.requireForPasswordSession) {
+        throw new TarnSharingKeysMissingError();
+      }
+      return;
+    }
+    const dek = this.#dekByGen?.get(parsed.sharingKeys.gen);
+    if (!dek) {
+      throw new Error(
+        `sharing_keys blob references DEK gen ${parsed.sharingKeys.gen}, which this session could not unwrap`,
+      );
+    }
+    const identity = await decryptSharingKeys(parsed.sharingKeys, dek.gcmKey);
+    this.#sharingKeyPair = identity.sharingKeyPair;
+    this.#shareSigningKeyPair = identity.shareSigningKeyPair;
+  }
+
   async #repairStaleCredential(args: {
     credentialId: string;
     username: string;
@@ -2931,7 +3123,8 @@ export class TarnClient {
         }
         return { gen: entry.gen, wrappings };
       });
-      return buildEnvelope(wireChain, { salt: p.recovery.salt, kdfParams: p.recovery.kdfParams });
+      // Issue #73 — preserve the envelope-carried sharing identity verbatim.
+      return buildEnvelope(wireChain, { salt: p.recovery.salt, kdfParams: p.recovery.kdfParams }, p.sharingKeys);
     };
 
     // The base envelope evolves across CAS retries. Start with the one returned
@@ -3165,7 +3358,7 @@ export class TarnClient {
     return buildEnvelope(wireChain, {
       salt: this.#recoveryFactorMeta.salt,
       kdfParams: this.#recoveryFactorMeta.kdfParams,
-    });
+    }, this.#sharingKeysBlob);
   }
 
   /**
@@ -3207,7 +3400,7 @@ export class TarnClient {
     return buildEnvelope(wireChain, {
       salt: this.#recoveryFactorMeta.salt,
       kdfParams: this.#recoveryFactorMeta.kdfParams,
-    });
+    }, this.#sharingKeysBlob);
   }
 
   /**
@@ -3245,6 +3438,8 @@ export class TarnClient {
     this.#passkeyWrappingsByGen = new Map();
     this.#username = null;
     this.#sharingKeyPair = null;
+    this.#shareSigningKeyPair = null;
+    this.#sharingKeysBlob = null;
     this.#replayNonceCache = makeReplayNonceCache();
     this.#pairKeyCache.clear();
     this.#shareLogCounters.clear();
@@ -3976,10 +4171,11 @@ export class TarnClient {
    * }>}
    */
   async sendConnectionRequest(recipientUsername: string, opts: any = {}): Promise<any> {
+    assertKnownOpts('sendConnectionRequest', opts, ['message']);
     await this.#requireAuth();
     // Issue #27: sharing handshake depends on master_key-derived sharing +
     // signing keys; passkey-only sessions never derived either.
-    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+    if (!this.#sharingKeyPair || !this.#username || !this.#shareSigningKeyPair) {
       throw new TarnPasskeyOnlyError(
         'sendConnectionRequest(): requires a password-authenticated session — sign in with username + password first.',
       );
@@ -3996,7 +4192,7 @@ export class TarnClient {
       throw err;
     }
 
-    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
+    const senderSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
     const payload = buildConnectionRequestPayload({
       senderUsername: this.#username!,
       senderSharePub: this.#sharingKeyPair.publicKey,
@@ -4078,6 +4274,7 @@ export class TarnClient {
    * }>>}
    */
   async listIncomingRequests(opts: any = {}): Promise<any> {
+    assertKnownOpts('listIncomingRequests', opts, ['windows']);
     await this.#requireAuth();
     // Issue #27: incoming requests are HPKE-decrypted under the user's
     // master_key-derived sharing private key; passkey-only sessions don't
@@ -4264,10 +4461,11 @@ export class TarnClient {
    * @returns {Promise<{ txid: string }>}
    */
   async acceptConnectionRequest(requestNonce: string, opts: any = {}): Promise<any> {
+    assertKnownOpts('acceptConnectionRequest', opts, ['label']);
     await this.#requireAuth();
     // Issue #27: sharing handshake depends on master_key-derived sharing +
     // signing keys.
-    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+    if (!this.#sharingKeyPair || !this.#username || !this.#shareSigningKeyPair) {
       throw new TarnPasskeyOnlyError(
         'acceptConnectionRequest(): requires a password-authenticated session — sign in with username + password first.',
       );
@@ -4290,7 +4488,7 @@ export class TarnClient {
       throw new Error(`acceptConnectionRequest(): inbound sender_share_pub is invalid: ${err.message}`);
     }
 
-    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
+    const senderSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
     const payload = buildConnectionAcceptPayload({
       senderUsername: this.#username!,
       senderSharePub: this.#sharingKeyPair.publicKey,
@@ -4545,14 +4743,25 @@ export class TarnClient {
    *
    * Default expiry is 7 days; server enforces a 30-day cap.
    *
-   * @param {{ label?: string, expiry_days?: number }} [opts]
+   * `opts.recipient_metadata` — optional app-defined object encrypted into
+   * the invite payload and surfaced (decrypted) by previewInviteToken /
+   * redeemInviteToken. Lets apps show recipient-facing context ("<name>
+   * invited you") before redemption without Tarn owning any notion of a
+   * display name — the contents are opaque to Tarn and never visible to the
+   * server. Anyone holding the full invite URL can decrypt it, so apps must
+   * not put secrets in it, and should treat it as inviter-asserted (not
+   * Tarn-verified) when rendering. Serialized size is capped at
+   * MAX_RECIPIENT_METADATA_BYTES (2048).
+   *
+   * @param {{ label?: string, expiry_days?: number, recipient_metadata?: Record<string, unknown> }} [opts]
    * @returns {Promise<{ token_id: string, invite_url: string, expires_at: number }>}
    */
   async createInviteToken(opts: any = {}): Promise<any> {
+    assertKnownOpts('createInviteToken', opts, ['label', 'expiry_days', 'recipient_metadata']);
     await this.#requireAuth();
     // Issue #27: invite tokens embed the inviter's signing pub + share_pub;
     // both are master_key-derived and absent on passkey-only sessions.
-    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+    if (!this.#sharingKeyPair || !this.#username || !this.#shareSigningKeyPair) {
       throw new TarnPasskeyOnlyError(
         'createInviteToken(): requires a password-authenticated session — sign in with username + password first.',
       );
@@ -4569,6 +4778,16 @@ export class TarnClient {
     if (expiryDays < 1 || expiryDays > 30) {
       throw new Error('createInviteToken(): expiry_days must be in [1, 30]');
     }
+    // App-defined recipient-visible metadata. Validated + JSON-round-tripped
+    // here so exactly what was checked is what gets encrypted below.
+    let recipientMetadata: Record<string, unknown> | null = null;
+    if (opts.recipient_metadata != null) {
+      try {
+        recipientMetadata = normalizeRecipientMetadata(opts.recipient_metadata);
+      } catch (err: any) {
+        throw new Error(`createInviteToken(): ${err.message}`);
+      }
+    }
 
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = now + expiryDays * 86400;
@@ -4582,7 +4801,7 @@ export class TarnClient {
       'raw', bs(payloadKeyBytes), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt'],
     );
 
-    const inviterSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
+    const inviterSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
     const inviterSharePubBase64Url = bytesToBase64Url(this.#sharingKeyPair.publicKey);
 
     const plaintext = {
@@ -4590,6 +4809,9 @@ export class TarnClient {
       inviter_signing_pub: inviterSigningPubBase64,
       app_id: this.#appId,
       issued_at: now,
+      // Optional and omitted (not null) when absent — pre-metadata invites
+      // and metadata-free invites are byte-identical in shape.
+      ...(recipientMetadata != null ? { recipient_metadata: recipientMetadata } : {}),
     };
     // encrypt() returns IV(12) || ciphertext+tag, the wire format the server
     // expects under base64. The payload_key never appears in this body.
@@ -4654,9 +4876,13 @@ export class TarnClient {
    * any 4xx (expired, used, not_found) — never throws on the recoverable
    * failure modes.
    *
+   * `recipient_metadata` is the app-defined object the inviter attached at
+   * createInviteToken time (decrypted from the payload), or null for
+   * invites issued without one. Inviter-asserted, not Tarn-verified.
+   *
    * @param {string} tokenId
    * @param {string} payloadKeyB64Url - base64url of the 32-byte AES key
-   * @returns {Promise<{ inviter_share_pub_fingerprint: string, app_id: string, issued_at: number, expires_at: number } | null>}
+   * @returns {Promise<{ inviter_share_pub_fingerprint: string, app_id: string, issued_at: number, expires_at: number, recipient_metadata: Record<string, unknown> | null } | null>}
    */
   async previewInviteToken(tokenId: string, payloadKeyB64Url: string): Promise<any> {
     if (typeof tokenId !== 'string' || tokenId.length === 0) {
@@ -4702,6 +4928,7 @@ export class TarnClient {
       app_id,
       issued_at,
       expires_at,
+      recipient_metadata: plaintext.recipient_metadata ?? null,
     };
   }
 
@@ -4717,13 +4944,13 @@ export class TarnClient {
    *
    * @param {string} tokenId
    * @param {string} payloadKeyB64Url
-   * @returns {Promise<{ requestNonce: string, recipientSharePubBase64Url: string }>}
+   * @returns {Promise<{ requestNonce: string, recipientSharePubBase64Url: string, recipientMetadata: Record<string, unknown> | null }>}
    */
   async redeemInviteToken(tokenId: string, payloadKeyB64Url: string): Promise<any> {
     await this.#requireAuth();
     // Issue #27: redeeming an invite sends a connection-request payload
     // signed with the redeemer's master_key-derived signing key.
-    if (!this.#sharingKeyPair || !this.#username || !this.#signingKeyPair) {
+    if (!this.#sharingKeyPair || !this.#username || !this.#shareSigningKeyPair) {
       throw new TarnPasskeyOnlyError(
         'redeemInviteToken(): requires a password-authenticated session — sign in with username + password first.',
       );
@@ -4782,7 +5009,7 @@ export class TarnClient {
     // inviter's share_pub from the decrypted payload (we never knew their
     // username) and tagged with via_invite_token so the inviter's auto-accept
     // path matches it.
-    const senderSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
+    const senderSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
     const reqPayload = buildConnectionRequestPayload({
       senderUsername: this.#username!,
       senderSharePub: this.#sharingKeyPair.publicKey,
@@ -4826,6 +5053,9 @@ export class TarnClient {
     return {
       requestNonce: reqPayload.nonce,
       recipientSharePubBase64Url: inviterSharePubBase64Url,
+      // Same app-defined object previewInviteToken surfaces — the post-redeem
+      // "you're now connected with <name>" UI wants it without a second fetch.
+      recipientMetadata: plaintext.recipient_metadata ?? null,
     };
   }
 
@@ -5008,7 +5238,7 @@ export class TarnClient {
     // master_key-derived ECDSA signing key. Passkey-only sessions never
     // derived one. Throws the typed error so the public callers' guards
     // and this one surface identically to apps.
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         '_publishShareLogEntry: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5044,7 +5274,7 @@ export class TarnClient {
     while (true) {
       seq = counters.nextOutboundSeq;
       const operation = buildOperationUnsigned({ ...operationFields, seq });
-      const signed = await signOperation(operation, this.#signingKeyPair!.privateKey);
+      const signed = await signOperation(operation, this.#shareSigningKeyPair!.privateKey);
       const blob = await encryptShareLogEntry(signed, pair.outboundKey);
       tag = await deriveLogTag(pair.outboundTagSeed, seq);
 
@@ -5320,6 +5550,7 @@ export class TarnClient {
    * @returns {Promise<Object>} state map: `{ [content_id]: { tx_id, cek } }`
    */
   async readShareLog(connection: any, opts: any = {}): Promise<any> {
+    assertKnownOpts('readShareLog', opts, ['refresh']);
     await this.#requireAuth();
     // Issue #32 / D2: the guard for this lives buried in `#getPairKeysFor`.
     // Mirror it at the public entry so the typed `TarnPasskeyOnlyError` is
@@ -5548,7 +5779,7 @@ export class TarnClient {
     // `_publishShareLogEntry` both have their own guards, but rejecting
     // here at the public entry surfaces the typed error before any
     // unrelated argument validation or cache lookups run.
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'shareContent: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5573,7 +5804,7 @@ export class TarnClient {
    * retry semantics as {@link shareContent}.
    */
   async updateShareContent(connection: any, contentId: string, newTxId: string): Promise<any> {
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'updateShareContent: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5600,7 +5831,7 @@ export class TarnClient {
    * For cryptographic revocation, use a `rotate` (5d) instead.
    */
   async unshareContent(connection: any, contentId: string): Promise<any> {
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'unshareContent: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5632,7 +5863,7 @@ export class TarnClient {
    * @returns {Promise<{ seq: number, tag: string, txid: string }>}
    */
   async snapshotShareLog(connection: any, state?: any): Promise<any> {
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'snapshotShareLog: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5683,6 +5914,7 @@ export class TarnClient {
    * }>}
    */
   async removeConnection(connection: any, opts: any = {}): Promise<any> {
+    assertKnownOpts('removeConnection', opts, ['notify']);
     await this.#requireAuth();
     // Issue #32: removeConnection mutates the persisted connections record
     // (a sharing primitive) and — when `notify: true` — publishes to the
@@ -5690,7 +5922,7 @@ export class TarnClient {
     // Both paths need master_key-derived state. Reject passkey-only sessions
     // up front rather than letting the inner guard fire after the
     // connections-record load.
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'removeConnection: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5784,11 +6016,12 @@ export class TarnClient {
    * }>}
    */
   async revokeContentFromConnections(contentId: string, opts: any = {}): Promise<any> {
+    assertKnownOpts('revokeContentFromConnections', opts, ['connections']);
     await this.#requireAuth();
     // Issue #32: revokeContentFromConnections fans out signed rotate
     // operations to each connection's outbound share-log. Same master_key
     // dependency as the rest of the share-log surface.
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'revokeContentFromConnections: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -5919,7 +6152,7 @@ export class TarnClient {
     failed: Array<{ share_pub: string; label: string | null; reason: string }>;
   }> {
     await this.#requireAuth();
-    if (!this.#sharingKeyPair || !this.#signingKeyPair) {
+    if (!this.#sharingKeyPair || !this.#shareSigningKeyPair) {
       throw new TarnPasskeyOnlyError(
         'reannounceRotationToConnections: requires a password-authenticated session — sign in with username + password first.',
       );
@@ -6232,7 +6465,12 @@ export class TarnClient {
     // fail later inside `#getPairKeysFor`). Reject with a typed error so
     // apps can render a clear "requires a password-authenticated session"
     // affordance instead of catching a generic TypeError.
-    if (!this.#signingKeyPair || !this.#sharingKeyPair) {
+    // Issue #73: own-entry verification falls back to the auth-signing key —
+    // a pre-migration session's outbound entries were signed with the legacy
+    // dual-use key, and changeCredentials hydrates them through here while
+    // migrating. Migrated sessions always have #shareSigningKeyPair.
+    const ownSigningKeyPair = this.#shareSigningKeyPair ?? this.#signingKeyPair;
+    if (!ownSigningKeyPair || !this.#sharingKeyPair) {
       throw new TarnPasskeyOnlyError(
         'Sharing operations require a password-authenticated session — ' +
         'sign in with username + password first.',
@@ -6243,7 +6481,7 @@ export class TarnClient {
     if (existing?.hydrated) return;
 
     const pair = await this.#getPairKeysFor(connection.share_pub);
-    const ownSigningPubBase64 = await exportPublicKey(this.#signingKeyPair!.publicKey);
+    const ownSigningPubBase64 = await exportPublicKey(ownSigningKeyPair.publicKey);
 
     const { highestSeq } = await discoverHighestSeq({
       probe: (seq) => this.#probeOutboundTagExists(pair, seq),
@@ -6693,6 +6931,19 @@ export class TarnClient {
       signingPublicKeyB64 = bytesToBase64(new Uint8Array(spki));
     }
 
+    // Issue #73 — envelope-carried share-signing key. Present whenever the
+    // account is migrated, on BOTH password and passkey sessions.
+    let shareSigningPrivateKeyB64: string | null = null;
+    let shareSigningPublicKeyB64: string | null = null;
+    if (this.#shareSigningKeyPair) {
+      const [pkcs8, spki] = await Promise.all([
+        crypto.subtle.exportKey('pkcs8', this.#shareSigningKeyPair.privateKey),
+        crypto.subtle.exportKey('spki', this.#shareSigningKeyPair.publicKey),
+      ]);
+      shareSigningPrivateKeyB64 = bytesToBase64(new Uint8Array(pkcs8));
+      shareSigningPublicKeyB64 = bytesToBase64(new Uint8Array(spki));
+    }
+
     const dekByGen = [];
     for (const [gen, pair] of this.#dekByGen!) {
       const raw = await crypto.subtle.exportKey('raw', pair.gcmKey);
@@ -6768,6 +7019,12 @@ export class TarnClient {
       sharingPublicKey: this.#sharingKeyPair
         ? bytesToBase64(this.#sharingKeyPair.publicKey)
         : null,
+      // Issue #73 — share-signing key + the envelope blob (preserved so
+      // envelope mutations on a resumed session keep it verbatim). All
+      // optional; resumeSession tolerates absence (pre-#73 blobs).
+      shareSigningPrivateKey: shareSigningPrivateKeyB64,
+      shareSigningPublicKey: shareSigningPublicKeyB64,
+      sharingKeysBlob: this.#sharingKeysBlob,
       recoveryFactorMeta,
       // Issue #25: read by resumeSession to rehydrate #credentialEncryptionKey
       // so passkey register/remove flows succeed post-page-reload. Omitted (null)
@@ -6885,6 +7142,29 @@ export class TarnClient {
           ['verify'],
         );
       }
+      // Issue #73 — share-signing key, optional (pre-#73 blobs and
+      // unmigrated accounts lack it).
+      let shareSigningPrivateKey: CryptoKey | null = null;
+      let shareSigningPublicKey: CryptoKey | null = null;
+      if (
+        typeof payload.shareSigningPrivateKey === 'string' &&
+        typeof payload.shareSigningPublicKey === 'string'
+      ) {
+        shareSigningPrivateKey = await crypto.subtle.importKey(
+          'pkcs8',
+          bs(base64ToBytes(payload.shareSigningPrivateKey)),
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          true,
+          ['sign'],
+        );
+        shareSigningPublicKey = await crypto.subtle.importKey(
+          'spki',
+          bs(base64ToBytes(payload.shareSigningPublicKey)),
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          true,
+          ['verify'],
+        );
+      }
       const dekByGen = new Map();
       for (const { gen, rawBytes } of payload.dekByGen) {
         if (typeof gen !== 'number' || typeof rawBytes !== 'string') return null;
@@ -6966,6 +7246,27 @@ export class TarnClient {
         client.#sharingKeyPair = {
           privateKey: base64ToBytes(payload.sharingPrivateKey),
           publicKey: base64ToBytes(payload.sharingPublicKey),
+        };
+      }
+      // Issue #73 — restore the share-signing key + envelope blob snapshot.
+      if (shareSigningPrivateKey && shareSigningPublicKey) {
+        client.#shareSigningKeyPair = {
+          privateKey: shareSigningPrivateKey,
+          publicKey: shareSigningPublicKey,
+        };
+      }
+      if (
+        payload.sharingKeysBlob &&
+        payload.sharingKeysBlob.v === 1 &&
+        typeof payload.sharingKeysBlob.gen === 'number' &&
+        typeof payload.sharingKeysBlob.iv === 'string' &&
+        typeof payload.sharingKeysBlob.ct === 'string'
+      ) {
+        client.#sharingKeysBlob = {
+          v: 1,
+          gen: payload.sharingKeysBlob.gen,
+          iv: payload.sharingKeysBlob.iv,
+          ct: payload.sharingKeysBlob.ct,
         };
       }
       client.#recoveryFactorMeta = recoveryFactorMeta;

@@ -571,11 +571,11 @@ The contract is "downstream symmetry, asymmetric initial auth". After the user i
 **Throws `TarnPasskeyOnlyError` on a passkey-only session** (sign in with username + password first):
 
 - Credential and account-key management — `changeCredentials`, `viewAccountKey`, `rotateAccountKey`, `enableKeyStorage`, `disableKeyStorage`, `tarn.passkeys.register`, `tarn.passkeys.remove`
-- Connection handshake — `sendConnectionRequest`, `acceptConnectionRequest`, `createInviteToken`, `redeemInviteToken`, `listIncomingRequests`
-- Share-log writes — `Collection.share`, `Collection.shareWithAll`, `Collection.unshare`, the underlying `shareContent` / `updateShareContent` / `unshareContent` / `snapshotShareLog` on the protocol layer, plus `removeConnection` and `revokeContentFromConnections`
-- Share-log reads (pair-keyed) — `Collection.listShared`, the underlying `readShareLog` / `syncShareLog`. These derive a per-connection pair key from the user's `sharing_priv`, which passkey-only sessions don't carry.
+- Connection handshake — `sendConnectionRequest`, `acceptConnectionRequest`, `createInviteToken`, `redeemInviteToken`, `listIncomingRequests` (these embed the username, which passkey sessions don't carry)
 
-Apps that need any of the asymmetric operations should catch `TarnPasskeyOnlyError` and route the user through a password sign-in (`tarn.login(username, password)`) before retrying. The error message contains "requires a password-authenticated session" so a generic message-substring check works too, but the typed error is the stable contract.
+**Sharing works in passkey sessions since tarn#73.** The sharing identity (X25519 pair key + a dedicated share-signing keypair) is carried inside the credential envelope, encrypted under the DEK — so any factor that unwraps the DEK (password, recovery phrase, or passkey PRF) hydrates it. Share-log reads (`Collection.listShared`, `readShareLog`, `syncShareLog`) and writes (`Collection.share` / `shareWithAll` / `unshare`, `shareContent` / `updateShareContent` / `unshareContent`, `removeConnection`, `revokeContentFromConnections`) all work on passkey-only sessions for migrated accounts. On a PRE-migration account these operations still throw `TarnPasskeyOnlyError` (the envelope carries no sharing identity for the PRF factor to unlock); password login on such an account throws `TarnSharingKeysMissingError` pointing at the one-shot migration (`tools/migrate-sharing-keys.mjs`).
+
+The remaining asymmetric set above is the deliberate security boundary (lockout protection — credential mutation requires a primary factor), not a key-availability gap. Apps that hit it should catch `TarnPasskeyOnlyError` and route the user through a password sign-in (`tarn.login(username, password)`) before retrying. The error message contains "requires a password-authenticated session" so a generic message-substring check works too, but the typed error is the stable contract.
 
 ```js
 import { TarnPasskeyOnlyError } from '@tarn/sdk';
