@@ -80,7 +80,7 @@ import schema from './my-app-schema.js'; // defineSchema() output
 const reader = await recover({
   appId: 'my-app',
   schema,
-  arweaveGateways: ['https://arweave.net', 'https://g8way.io'],
+  arweaveGateways: ['https://arweave.net', 'https://permagate.io'],
   credentials: {
     type: 'accountKey',
     accountKey: 'word1 word2 ... word24',
@@ -107,7 +107,7 @@ import schema from './my-app-schema.js';
 const reader = await recover({
   appId: 'my-app',
   schema,
-  arweaveGateways: ['https://arweave.net', 'https://g8way.io'],
+  arweaveGateways: ['https://arweave.net', 'https://permagate.io'],
   credentials: {
     type: 'password',
     username: 'alice',

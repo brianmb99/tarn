@@ -84,7 +84,7 @@ const reader = await recover({
   schema: bookishSchema,       // app's defineSchema() output
   arweaveGateways: [           // ordered fallback list
     'https://arweave.net',
-    'https://g8way.io',
+    'https://permagate.io',
   ],
 
   // Provide ONE of the following auth blocks:

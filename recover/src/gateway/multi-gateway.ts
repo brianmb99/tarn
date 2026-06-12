@@ -173,7 +173,7 @@ export class MultiGatewayClient {
 
 /**
  * Convenience: build a {@link MultiGatewayClient} from an array of base
- * URLs (e.g. `['https://arweave.net', 'https://g8way.io']`).
+ * URLs (e.g. `['https://arweave.net', 'https://permagate.io']`).
  */
 export function makeMultiGatewayClient(
   gateways: string[],

@@ -8,7 +8,7 @@
  *   const reader = await recover({
  *     appId: 'bookish',
  *     schema: bookishSchema,
- *     arweaveGateways: ['https://arweave.net', 'https://g8way.io'],
+ *     arweaveGateways: ['https://arweave.net', 'https://permagate.io'],
  *     credentials: { type: 'password', username, password },
  *     // OR: credentials: { type: 'accountKey', accountKey },
  *     onProgress: (stage, info) => { ... },

@@ -14,7 +14,7 @@
  *   const reader = await recover({
  *     appId: 'bookish',
  *     schema: bookishSchema,
- *     arweaveGateways: ['https://arweave.net', 'https://g8way.io'],
+ *     arweaveGateways: ['https://arweave.net', 'https://permagate.io'],
  *     credentials: { type: 'password', username, password },
  *     // OR: credentials: { type: 'accountKey', accountKey },
  *     onProgress: (stage, info) => console.log(stage, info),
@@ -76,7 +76,7 @@ export interface RecoverOptions {
   schema: ReaderSchema;
   /**
    * Ordered list of Arweave gateway base URLs (e.g.
-   * `['https://arweave.net', 'https://g8way.io']`). Tried in order; on
+   * `['https://arweave.net', 'https://permagate.io']`). Tried in order; on
    * any retryable failure the next gateway is consulted.
    */
   arweaveGateways: string[];
