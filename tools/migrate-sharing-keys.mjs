@@ -78,19 +78,13 @@ console.log(`\n[1/4] Signing in to ${apiBase} (app: ${appId})…`);
 const client = new TarnClient(apiBase, appId);
 await client.login(username, password, { allowUnmigratedSharing: true });
 
-// Detect migration state via the session blob shape: a migrated session has
-// the share-signing key hydrated from the envelope.
-const probe = await client.serializeSession();
-// serializeSession output is opaque; use the documented public signal instead:
-// an unmigrated session under the migration flag has NO share-signing key, so
-// a sharing op would throw. We avoid touching share logs for the probe and
-// instead re-login WITHOUT the flag in check mode.
+// Detect migration state via the documented public signal: login WITHOUT
+// the migration flag succeeds only on migrated envelopes.
 let migrated = false;
 try {
   const probeClient = new TarnClient(apiBase, appId);
   await probeClient.login(username, password);
-  migrated = true; // login without the flag succeeds only on migrated envelopes
-  await probeClient.logout?.().catch?.(() => {});
+  migrated = true;
 } catch (err) {
   if (err?.name === 'TarnSharingKeysMissingError') {
     migrated = false;
@@ -98,7 +92,6 @@ try {
     throw err;
   }
 }
-void probe;
 
 if (migrated) {
   console.log('[done] Account is already migrated — envelope carries the sharing identity. Nothing to do.');
