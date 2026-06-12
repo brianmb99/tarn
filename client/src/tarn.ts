@@ -658,6 +658,7 @@ export class TarnClient {
    *   }>}
    */
   async register(username: string, password: string, opts: any = {}): Promise<any> {
+    assertKnownOpts('register', opts, ['recoveryAcknowledged', 'storeAccountKey', 'shareDiscoverable', 'deviceLabel']);
     if (!opts || opts.recoveryAcknowledged !== true) {
       throw new Error('register(): recoveryAcknowledged: true is required (issue #12)');
     }
@@ -810,6 +811,7 @@ export class TarnClient {
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async recoverAccount(args: any = {}): Promise<any> {
+    assertKnownOpts('recoverAccount', args, ['phrase', 'newUsername', 'newPassword', 'deviceLabel', 'skipRotationAnnounce', 'rotatePhrase']);
     const { phrase, newUsername, newPassword, ...opts } = args;
     const validation = validateAccountKey(phrase);
     if (!validation.valid) {
@@ -1169,6 +1171,7 @@ export class TarnClient {
    * @returns {Promise<{dataLookupKey: string}>}
    */
   async login(username: string, password: string, opts: any = {}): Promise<any> {
+    assertKnownOpts('login', opts, ['deviceLabel', 'allowUnmigratedSharing']);
     // Section 7.5 (issue #20): one-shot device label, consumed by the next
     // /auth/verify call inside #verifyChallenge below.
     if (opts && opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
@@ -1312,6 +1315,7 @@ export class TarnClient {
    *     unset (default false).
    */
   async changeCredentials(newUsername: string, newPassword: string, opts: any = {}): Promise<any> {
+    assertKnownOpts('changeCredentials', opts, ['phrase', 'acceptRecoveryGap', 'shareDiscoverable', 'passkeyTapHandler', 'skipRotationAnnounce']);
     await this.#requireAuth();
 
     // Issue #27: passkey-only sessions never derived the master_key, so they
@@ -1978,6 +1982,7 @@ export class TarnClient {
    *   network failure, or AES-GCM decryption failure.
    */
   async viewAccountKey(opts: { password: string }): Promise<{ accountKey: string }> {
+    assertKnownOpts('viewAccountKey', opts, ['password']);
     await this.#requireAuth();
     if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('viewAccountKey(): password is required');
@@ -2159,6 +2164,7 @@ export class TarnClient {
    *   match what derives from the supplied phrase).
    */
   async enableKeyStorage(opts: { password: string; accountKey: string }): Promise<{ stored: true }> {
+    assertKnownOpts('enableKeyStorage', opts, ['password', 'accountKey']);
     await this.#requireAuth();
     if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('enableKeyStorage(): password is required');
@@ -2242,6 +2248,7 @@ export class TarnClient {
    * @throws Error on wrong password (step-up fails) or 4xx/5xx response.
    */
   async disableKeyStorage(opts: { password: string }): Promise<{ stored: false; alreadyDisabled?: boolean }> {
+    assertKnownOpts('disableKeyStorage', opts, ['password']);
     await this.#requireAuth();
     if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('disableKeyStorage(): password is required');
@@ -2315,6 +2322,7 @@ export class TarnClient {
    *   the existing chain), 409 on lookup-key conflict, or 4xx/5xx response.
    */
   async rotateAccountKey(opts: { password: string }): Promise<{ accountKey: string }> {
+    assertKnownOpts('rotateAccountKey', opts, ['password']);
     await this.#requireAuth();
     if (!opts || typeof opts.password !== 'string' || opts.password.length === 0) {
       throw new Error('rotateAccountKey(): password is required');
@@ -2581,6 +2589,7 @@ export class TarnClient {
    *   registration.
    */
   async registerPasskey(opts: { deviceLabel?: string } = {}): Promise<{ credentialId: string; deviceLabel: string | null }> {
+    assertKnownOpts('registerPasskey', opts, ['deviceLabel']);
     await this.#requireAuth();
     if (!this.#dekByGen || this.#dekByGen.size === 0) {
       throw new Error('registerPasskey(): DEK chain unavailable (corrupt session?)');
@@ -2745,6 +2754,7 @@ export class TarnClient {
      */
     stalePasskeyHandler?: () => Promise<{ username: string; password: string } | null>;
   } = {}): Promise<{ dataLookupKey: string }> {
+    assertKnownOpts('authenticateWithPasskey', opts, ['deviceLabel', 'credentialId', 'stalePasskeyHandler']);
     if (opts.deviceLabel != null) this.#pendingDeviceLabel = opts.deviceLabel;
 
     // 1. Auth options.
@@ -3215,6 +3225,7 @@ export class TarnClient {
    * @throws on wrong password, unknown credentialId, or network failure.
    */
   async removePasskey(opts: { credentialId: string; password: string }): Promise<void> {
+    assertKnownOpts('removePasskey', opts, ['credentialId', 'password']);
     await this.#requireAuth();
     if (!opts || typeof opts.credentialId !== 'string' || opts.credentialId.length === 0) {
       throw new Error('removePasskey(): credentialId is required');
@@ -7056,6 +7067,7 @@ export class TarnClient {
    * @returns {Promise<TarnClient | null>}
    */
   static async resumeSession(apiBase: string, appId: string, blob: string, opts: any = {}): Promise<TarnClient | null> {
+    assertKnownOpts('resumeSession', opts, ['_nowSeconds']);
     if (!apiBase) throw new Error('resumeSession(): apiBase is required');
     if (!appId) throw new Error('resumeSession(): appId is required');
     if (typeof blob !== 'string' || blob.length === 0) {

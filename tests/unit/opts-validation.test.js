@@ -62,6 +62,66 @@ describe('SDK methods reject unknown options before auth checks', () => {
     );
   });
 
+  it('auth-surface methods reject unknown options', async () => {
+    await assert.rejects(
+      client.register('u@example.com', 'pw', { recoveryAck: true }),
+      /register\(\): unknown option "recoveryAck" — supported options: recoveryAcknowledged, storeAccountKey, shareDiscoverable, deviceLabel/,
+    );
+    await assert.rejects(
+      client.login('u@example.com', 'pw', { device_label: 'Laptop' }),
+      /login\(\): unknown option "device_label"/,
+    );
+    // The #73-era option must be in login's allowlist.
+    await assert.rejects(
+      client.login('u@example.com', 'pw', { allowUnmigratedSharing: true, bogus: 1 }),
+      /login\(\): unknown option "bogus"/,
+    );
+    await assert.rejects(
+      client.changeCredentials('u@example.com', 'pw', { accountKey: 'x' }),
+      /changeCredentials\(\): unknown option "accountKey"/,
+    );
+    await assert.rejects(
+      client.recoverAccount({ phrase: 'a b c', newUsername: 'u', newPassword: 'p', resetCursors: true }),
+      /recoverAccount\(\): unknown option "resetCursors"/,
+    );
+    await assert.rejects(
+      client.viewAccountKey({ password: 'pw', export: true }),
+      /viewAccountKey\(\): unknown option "export"/,
+    );
+    await assert.rejects(
+      client.enableKeyStorage({ password: 'pw', account_key: 'x' }),
+      /enableKeyStorage\(\): unknown option "account_key"/,
+    );
+    await assert.rejects(
+      client.disableKeyStorage({ password: 'pw', force: true }),
+      /disableKeyStorage\(\): unknown option "force"/,
+    );
+    await assert.rejects(
+      client.rotateAccountKey({ password: 'pw', announce: false }),
+      /rotateAccountKey\(\): unknown option "announce"/,
+    );
+    await assert.rejects(
+      client.registerPasskey({ label: 'Phone' }),
+      /registerPasskey\(\): unknown option "label"/,
+    );
+    await assert.rejects(
+      client.authenticateWithPasskey({ credential: 'abc' }),
+      /authenticateWithPasskey\(\): unknown option "credential"/,
+    );
+    await assert.rejects(
+      client.removePasskey({ credentialId: 'abc', password: 'pw', revokeSessions: true }),
+      /removePasskey\(\): unknown option "revokeSessions"/,
+    );
+  });
+
+  it('static resumeSession rejects unknown options', async () => {
+    const { TarnClient: TC } = await import('../../client/src/tarn.js');
+    await assert.rejects(
+      TC.resumeSession('http://stub', 'test-app', 'blob', { nowSeconds: 123 }),
+      /resumeSession\(\): unknown option "nowSeconds"/,
+    );
+  });
+
   it('connection-surface methods reject unknown options', async () => {
     await assert.rejects(
       client.sendConnectionRequest('peer@example.com', { greeting: 'hi' }),
