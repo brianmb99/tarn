@@ -54,12 +54,19 @@ function prompt(question, { mask = false } = {}) {
   });
 }
 
-const [apiBase, appId, username, flag] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const flags = args.filter(a => a.startsWith('--'));
+const [apiBase, appId, username] = args.filter(a => !a.startsWith('--'));
 if (!apiBase || !appId || !username) {
-  console.error('Usage: node --import tsx tools/migrate-sharing-keys.mjs <apiBase> <appId> <username> [--check]');
+  console.error('Usage: node --import tsx tools/migrate-sharing-keys.mjs <apiBase> <appId> <username> [--check] [--accept-recovery-gap]');
   process.exit(1);
 }
-const checkOnly = flag === '--check';
+const checkOnly = flags.includes('--check');
+// Throwaway/test accounts whose 24-word key was never kept can migrate with
+// --accept-recovery-gap: the new DEK generation gets no recovery wrapping
+// (same semantics as changeCredentials' acceptRecoveryGap). NEVER use this
+// for a real account.
+const acceptRecoveryGap = flags.includes('--accept-recovery-gap');
 
 const password = await prompt(`Password for ${username}: `, { mask: true });
 if (!password) {
@@ -104,14 +111,21 @@ if (checkOnly) {
   process.exit(2);
 }
 
-const phrase = await prompt('24-word account key (needed so the new DEK generation stays recoverable): ');
-if (!phrase || phrase.trim().split(/\s+/).length !== 24) {
-  console.error('A 24-word account key is required. (Settings → Account & Security → View account key)');
-  process.exit(1);
+let ccOpts;
+if (acceptRecoveryGap) {
+  console.warn('      --accept-recovery-gap: the new DEK generation will have NO account-key wrapping.');
+  ccOpts = { acceptRecoveryGap: true };
+} else {
+  const phrase = await prompt('24-word account key (needed so the new DEK generation stays recoverable): ');
+  if (!phrase || phrase.trim().split(/\s+/).length !== 24) {
+    console.error('A 24-word account key is required. (Settings → Account & Security → View account key)');
+    process.exit(1);
+  }
+  ccOpts = { phrase: phrase.trim() };
 }
 
 console.log('[3/4] Migrating: minting sharing identity, announcing §13.5 rotation to connections…');
-const result = await client.changeCredentials(username, password, { phrase: phrase.trim() });
+const result = await client.changeCredentials(username, password, ccOpts);
 
 const announced = result.rotationAnnouncements?.length ?? 0;
 const failed = result.failedConnections ?? [];

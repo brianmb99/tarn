@@ -824,13 +824,18 @@ await test('Status endpoint returns operational data', async () => {
 console.log('\n=== 7. Sharing keypair lookup ===');
 
 await test('getRecipientShareKey returns the published share_pub', async () => {
-  const expected = encodeSharePub(
+  // tarn#73 — share_pub is a RANDOM envelope-carried identity; assert it
+  // exists, decodes, and is DECOUPLED from the legacy password derivation.
+  const legacy = encodeSharePub(
     (await deriveAllKeys(testUsername, testPassword, APP_ID)).sharingKeyPair.publicKey,
   );
   const stranger = new TarnClient(API_BASE, APP_ID);
   const { sharePubBase64Url, discoverable, sharePub } = await stranger.getRecipientShareKey(testUsername);
   assert(discoverable === true, `expected discoverable=true, got ${discoverable}`);
-  assert(sharePubBase64Url === expected, `share_pub mismatch:\n  got:  ${sharePubBase64Url}\n  want: ${expected}`);
+  assert(typeof sharePubBase64Url === 'string' && sharePubBase64Url.length === 43,
+    `share_pub shape: ${sharePubBase64Url}`);
+  assert(sharePubBase64Url !== legacy,
+    'share_pub must be decoupled from the password-derived keypair (tarn#73)');
   assert(sharePub instanceof Uint8Array && sharePub.length === 32, 'sharePub should decode to 32 raw bytes');
 });
 
@@ -1166,28 +1171,26 @@ await test('Pat shares a content item with Quinn', async () => {
   assert(state['rot-target-1'], 'Quinn should see rot-target-1 before rotation');
 });
 
-await test('Pat changes credentials → publishes rotate_identity to Quinn (deployed API)', async () => {
+// tarn#73 — credential changes no longer rotate the sharing identity: it is
+// envelope-carried and stable. No §13.5 announce, no friend-side churn.
+await test('Pat changes credentials → sharing identity STABLE, no rotation (tarn#73, deployed API)', async () => {
   const newUsername = `tarn-pat-rotated-${Date.now()}@test.com`;
   const result = await pat.changeCredentials(newUsername, 'new-pw-' + Date.now(), {
     phrase: patPhrase,
   });
   assert(Array.isArray(result.rotationAnnouncements), 'expected rotationAnnouncements');
-  assert(result.rotationAnnouncements.length === 1, 'expected exactly one rotation announcement');
-  const ann = result.rotationAnnouncements[0];
-  assert(ann.connectionSharePub === quinnConnectionOfPat.share_pub, 'rotation targets the right connection');
-  assert(typeof ann.txid === 'string', 'rotation announcement should have a txid');
+  assert(result.rotationAnnouncements.length === 0,
+    'expected NO rotation announcements — identity is envelope-carried and stable');
 });
 
-await test('Quinn syncs against deployed API: rotate_identity processed, connection record updated', async () => {
+await test('Quinn syncs against deployed API: connection record untouched, entries still verify (tarn#73)', async () => {
   await sleep(800);
   const stateAfter = await quinn.syncShareLog(patConnectionOfQuinn);
-  assert(stateAfter['rot-target-1'], 'Quinn still sees rot-target-1 after rotation (NEW-log seq=0 snapshot)');
+  assert(stateAfter['rot-target-1'], 'Quinn still sees rot-target-1 after the credential change');
 
   const updatedConnection = (await quinn.listConnections())[0];
-  assert(updatedConnection.share_pub !== patSharePubBeforeRotate,
-    'Quinn\'s connection record holds Pat\'s NEW share_pub');
-  assert(updatedConnection.prior_share_pub === patSharePubBeforeRotate,
-    'Quinn records the pre-rotation share_pub');
+  assert(updatedConnection.share_pub === patSharePubBeforeRotate,
+    'Quinn\'s connection record keeps the SAME share_pub — nothing rotated');
 });
 
 await test('Pat publishes a post-rotation share; Quinn picks it up via NEW-log keys', async () => {
