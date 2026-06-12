@@ -106,3 +106,30 @@ count as a backup:
 
 Never set `TARN_SKIP_TURBO` outside `api/.dev.vars` (production hosts refuse it and
 log critically — see `api/src/turbo.js`).
+
+## Operator publish key (`TARN_OPERATOR_WALLET`)
+
+The key that signs recovery-page publishes (`recover/scripts/publish-forever.mjs`:
+forever-pages, their "latest" pointers, and per-app bootstrap pages). Same shape as
+`APP_SIGNING_KEY` (32-byte secp256k1 hex), **deliberately not in the table above** —
+it must never be a Worker secret and must never exist on any server:
+
+- **It is the recovery-page update channel.** Bootstrap pages pin their discovery
+  queries to this key's owner address; whoever holds the key decides which page every
+  bootstrap user is forwarded to — a page users type their account key into. The API
+  worker holds `APP_SIGNING_KEY` hot by necessity; a worker compromise must not also
+  hand over this channel. That is the whole reason it is a separate key.
+- **Rotation strands bookmarks.** The owner address is baked into every published
+  bootstrap (immutable). A new key means publishing new bootstraps and re-papering
+  every kit/doc that names the old URL — old bootstraps keep working but stop seeing
+  pages signed by the new key. Treat the key like `APP_SIGNING_KEY`: effectively
+  permanent, cold storage, backed up in exactly one durable place outside any machine
+  (password manager / printed escrow).
+- **Usage pattern:** the key leaves cold storage only for the minutes a publish run
+  takes, on an operator machine, passed via the `TARN_OPERATOR_WALLET` env var or
+  `--signing-key`. Publishes are rare, manual, operator-initiated events.
+- **Funding:** uploads bill this wallet's Turbo balance (top up at
+  https://turbo-topup.com against the address the publish script prints).
+- **Generate:** `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` —
+  then run a publish dry-run with the key to confirm it parses and to record the
+  derived owner address.

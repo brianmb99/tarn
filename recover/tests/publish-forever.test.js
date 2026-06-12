@@ -32,11 +32,15 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
+import { secp256k1 } from '@noble/curves/secp256k1';
+
 import {
   parseArgs,
   preflightCheck,
   buildForeverPageTags,
   buildPointerTags,
+  buildBootstrapPageTags,
+  deriveOwnerAddress,
   verifyPublished,
   run,
 } from '../scripts/publish-forever.mjs';
@@ -78,12 +82,22 @@ function makeCapturingLogger() {
 describe('parseArgs', () => {
   test('default flags', () => {
     const flags = parseArgs([]);
+    assert.equal(flags.appId, null);
     assert.equal(flags.signingKey, null);
     assert.equal(flags.file, null);
     assert.equal(flags.confirm, false);
+    assert.equal(flags.bootstrap, false);
     assert.equal(flags.skipPointer, false);
     assert.equal(flags.skipVerify, false);
     assert.deepEqual(flags.gateways, ['https://arweave.net']);
+  });
+
+  test('--app-id consumes next arg', () => {
+    assert.equal(parseArgs(['--app-id', 'example-app']).appId, 'example-app');
+  });
+
+  test('--bootstrap sets bootstrap true', () => {
+    assert.equal(parseArgs(['--bootstrap']).bootstrap, true);
   });
 
   test('--confirm sets confirm true', () => {
@@ -185,39 +199,96 @@ describe('buildForeverPageTags', () => {
   const goodSha = 'a'.repeat(64);
 
   test('produces tag set in expected order', () => {
-    const tags = buildForeverPageTags({ version: '1.2.3', sha256: goodSha });
+    const tags = buildForeverPageTags({ version: '1.2.3', sha256: goodSha, appId: 'example-app' });
     const names = tags.map(t => t.name);
-    assert.deepEqual(names, ['Content-Type', 'App', 'Type', 'Version', 'Sha256']);
+    assert.deepEqual(names, ['Content-Type', 'App', 'Type', 'App-Id', 'Version', 'Sha256']);
     const byName = Object.fromEntries(tags.map(t => [t.name, t.value]));
     assert.equal(byName['Content-Type'], 'text/html');
     assert.equal(byName['App'], 'tarn-recover');
     assert.equal(byName['Type'], 'forever-page');
+    assert.equal(byName['App-Id'], 'example-app');
     assert.equal(byName['Version'], '1.2.3');
     assert.equal(byName['Sha256'], goodSha);
   });
 
   test('rejects empty version', () => {
-    assert.throws(() => buildForeverPageTags({ version: '', sha256: goodSha }), /version/);
+    assert.throws(() => buildForeverPageTags({ version: '', sha256: goodSha, appId: 'x' }), /version/);
   });
 
   test('rejects malformed sha256', () => {
-    assert.throws(() => buildForeverPageTags({ version: '1', sha256: 'short' }), /sha256/);
-    assert.throws(() => buildForeverPageTags({ version: '1', sha256: 'g'.repeat(64) }), /sha256/);
+    assert.throws(() => buildForeverPageTags({ version: '1', sha256: 'short', appId: 'x' }), /sha256/);
+    assert.throws(() => buildForeverPageTags({ version: '1', sha256: 'g'.repeat(64), appId: 'x' }), /sha256/);
+  });
+
+  test('rejects missing or malformed appId', () => {
+    assert.throws(() => buildForeverPageTags({ version: '1', sha256: goodSha }), /appId/);
+    assert.throws(() => buildForeverPageTags({ version: '1', sha256: goodSha, appId: 'Bad_App' }), /appId/);
   });
 });
 
 describe('buildPointerTags', () => {
-  test('produces tag set with correct App + Type', () => {
-    const tags = buildPointerTags({ version: '0.1.0' });
+  test('produces tag set with correct App + Type + App-Id', () => {
+    const tags = buildPointerTags({ version: '0.1.0', appId: 'example-app' });
     const byName = Object.fromEntries(tags.map(t => [t.name, t.value]));
     assert.equal(byName['App'], 'tarn-recover');
     assert.equal(byName['Type'], 'forever-page-pointer');
+    assert.equal(byName['App-Id'], 'example-app');
     assert.equal(byName['Version'], '0.1.0');
     assert.equal(byName['Content-Type'], 'text/plain');
   });
 
   test('rejects empty version', () => {
-    assert.throws(() => buildPointerTags({ version: '' }), /version/);
+    assert.throws(() => buildPointerTags({ version: '', appId: 'x' }), /version/);
+  });
+
+  test('rejects missing appId', () => {
+    assert.throws(() => buildPointerTags({ version: '0.1.0' }), /appId/);
+  });
+});
+
+describe('buildBootstrapPageTags', () => {
+  const goodSha = 'b'.repeat(64);
+
+  test('produces forever-bootstrap tag set', () => {
+    const tags = buildBootstrapPageTags({ version: '0.1.0', sha256: goodSha, appId: 'example-app' });
+    const byName = Object.fromEntries(tags.map(t => [t.name, t.value]));
+    assert.equal(byName['App'], 'tarn-recover');
+    assert.equal(byName['Type'], 'forever-bootstrap');
+    assert.equal(byName['App-Id'], 'example-app');
+    assert.equal(byName['Version'], '0.1.0');
+    assert.equal(byName['Sha256'], goodSha);
+    assert.equal(byName['Content-Type'], 'text/html');
+  });
+
+  test('rejects missing appId / version / sha256', () => {
+    assert.throws(() => buildBootstrapPageTags({ version: '1', sha256: goodSha }), /appId/);
+    assert.throws(() => buildBootstrapPageTags({ version: '', sha256: goodSha, appId: 'x' }), /version/);
+    assert.throws(() => buildBootstrapPageTags({ version: '1', sha256: 'nope', appId: 'x' }), /sha256/);
+  });
+});
+
+describe('deriveOwnerAddress', () => {
+  // Any valid secp256k1 scalar works as a test key; what matters is the
+  // derivation rule (uncompressed pubkey → sha256 → base64url), which was
+  // validated against live arweave.net GraphQL owner.address values.
+  const testKey = '7f'.repeat(32);
+
+  test('derives base64url(sha256(uncompressed pubkey))', () => {
+    const addr = deriveOwnerAddress(testKey);
+    const pubkey = secp256k1.getPublicKey(testKey, false);
+    assert.equal(pubkey.length, 65);
+    const expected = createHash('sha256').update(pubkey).digest('base64url');
+    assert.equal(addr, expected);
+    assert.match(addr, /^[A-Za-z0-9_-]{43}$/);
+  });
+
+  test('tolerates 0x prefix', () => {
+    assert.equal(deriveOwnerAddress('0x' + testKey), deriveOwnerAddress(testKey));
+  });
+
+  test('rejects malformed keys', () => {
+    assert.throws(() => deriveOwnerAddress('abc'), /32 bytes of hex/);
+    assert.throws(() => deriveOwnerAddress('zz'.repeat(32)), /32 bytes of hex/);
   });
 });
 
@@ -344,9 +415,25 @@ describe('run() — dry-run', () => {
     }
   });
 
-  test('dry-run prints intent and reports the would-publish hash', async () => {
+  test('missing --app-id fails with usage error', async () => {
     const cap = makeCapturingLogger();
     const result = await run([], { logger: cap.logger });
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 1);
+    assert.match(cap.text(), /Missing --app-id/);
+  });
+
+  test('malformed --app-id fails with usage error', async () => {
+    const cap = makeCapturingLogger();
+    const result = await run(['--app-id', 'Not_A_Slug'], { logger: cap.logger });
+    assert.equal(result.ok, false);
+    assert.equal(result.exitCode, 1);
+    assert.match(cap.text(), /--app-id must be a lowercase slug/);
+  });
+
+  test('dry-run prints intent and reports the would-publish hash', async () => {
+    const cap = makeCapturingLogger();
+    const result = await run(['--app-id', 'example-app'], { logger: cap.logger });
     assert.equal(result.ok, true);
     assert.equal(result.exitCode, 0);
     assert.equal(result.dryRun, true);
@@ -358,11 +445,22 @@ describe('run() — dry-run', () => {
     assert.match(text, /Re-run with --confirm to publish for real\./);
     assert.match(text, /forever-page-pointer/);
     assert.match(text, /Would also publish/);
+    // The App-Id tag must be in the printed tag set.
+    assert.match(text, /App-Id = example-app/);
+  });
+
+  test('dry-run with a signing key prints the owner address', async () => {
+    const cap = makeCapturingLogger();
+    const key = '7f'.repeat(32);
+    const result = await run(['--app-id', 'example-app', '--signing-key', key], { logger: cap.logger });
+    assert.equal(result.ok, true);
+    assert.equal(result.dryRun, true);
+    assert.match(cap.text(), /Owner address: {3}[A-Za-z0-9_-]{43}/);
   });
 
   test('dry-run with --skip-pointer omits the pointer-publish promise', async () => {
     const cap = makeCapturingLogger();
-    const result = await run(['--skip-pointer'], { logger: cap.logger });
+    const result = await run(['--app-id', 'example-app', '--skip-pointer'], { logger: cap.logger });
     assert.equal(result.ok, true);
     assert.equal(result.dryRun, true);
     const text = cap.text();
@@ -372,7 +470,7 @@ describe('run() — dry-run', () => {
 
   test('dry-run rejects bogus --file path', async () => {
     const cap = makeCapturingLogger();
-    const result = await run(['--file', '/no/such/path.html'], { logger: cap.logger });
+    const result = await run(['--app-id', 'example-app', '--file', '/no/such/path.html'], { logger: cap.logger });
     assert.equal(result.ok, false);
     assert.equal(result.exitCode, 1);
     assert.match(cap.text(), /not found/);
@@ -385,7 +483,7 @@ describe('run() — dry-run', () => {
     await writeFile(path, body);
     const cap = makeCapturingLogger();
     try {
-      const result = await run(['--file', path], { logger: cap.logger });
+      const result = await run(['--app-id', 'example-app', '--file', path], { logger: cap.logger });
       assert.equal(result.ok, true);
       assert.equal(result.dryRun, true);
       assert.equal(result.size, body.length);
@@ -396,12 +494,12 @@ describe('run() — dry-run', () => {
     }
   });
 
-  test('dry-run never prints "Publishing forever-page" headers', async () => {
+  test('dry-run never prints "Publishing" headers', async () => {
     // Defensive sentinel: real publish writes "=== Publishing
     // forever-page ===". Dry-run must never print that. If this check
     // ever flips, the script accidentally took the real-publish path.
     const cap = makeCapturingLogger();
-    await run([], { logger: cap.logger });
+    await run(['--app-id', 'example-app'], { logger: cap.logger });
     assert.equal(/=== Publishing forever-page ===/.test(cap.text()), false);
     assert.equal(/=== Verifying published page ===/.test(cap.text()), false);
   });
@@ -414,12 +512,69 @@ describe('run() — dry-run', () => {
     delete process.env.TARN_OPERATOR_WALLET;
     const cap = makeCapturingLogger();
     try {
-      const result = await run(['--confirm'], { logger: cap.logger });
+      const result = await run(['--app-id', 'example-app', '--confirm'], { logger: cap.logger });
       assert.equal(result.ok, false);
       assert.equal(result.exitCode, 1);
       assert.match(cap.text(), /Missing operator signing key/);
     } finally {
       if (orig !== undefined) process.env.TARN_OPERATOR_WALLET = orig;
+    }
+  });
+});
+
+// ============ run() — bootstrap mode ============
+
+describe('run() — --bootstrap dry-run', () => {
+  // The bootstrap is tiny; makeValidPage(8) lands ~8KB, inside the
+  // [2KB, 256KB] bootstrap bounds but under the 50KB forever-page floor.
+  test('accepts a small artifact and stamps Type=forever-bootstrap', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'publish-bootstrap-run-'));
+    const path = join(tmp, 'bootstrap.html');
+    await writeFile(path, makeValidPage(8));
+    const cap = makeCapturingLogger();
+    try {
+      const result = await run(['--app-id', 'example-app', '--bootstrap', '--file', path], { logger: cap.logger });
+      assert.equal(result.ok, true);
+      assert.equal(result.dryRun, true);
+      const byName = Object.fromEntries(result.tags.map(t => [t.name, t.value]));
+      assert.equal(byName['Type'], 'forever-bootstrap');
+      assert.equal(byName['App-Id'], 'example-app');
+      const text = cap.text();
+      // No pointer in bootstrap mode — the bootstrap txid IS the stable URL.
+      assert.equal(/Would also publish/.test(text), false);
+      assert.match(text, /no pointer blob/);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a forever-page-sized artifact check inversion (too small for page, fine for bootstrap)', async () => {
+    // Same 8KB file WITHOUT --bootstrap must fail the 50KB page floor —
+    // guards against the two artifact kinds' bounds being merged.
+    const tmp = await mkdtemp(join(tmpdir(), 'publish-bootstrap-run2-'));
+    const path = join(tmp, 'bootstrap.html');
+    await writeFile(path, makeValidPage(8));
+    const cap = makeCapturingLogger();
+    try {
+      const result = await run(['--app-id', 'example-app', '--file', path], { logger: cap.logger });
+      assert.equal(result.ok, false);
+      assert.match(cap.text(), /suspiciously small/);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a sub-2KB bootstrap artifact', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'publish-bootstrap-run3-'));
+    const path = join(tmp, 'bootstrap.html');
+    await writeFile(path, '<!DOCTYPE html>\n<html><body>tiny</body></html>\n');
+    const cap = makeCapturingLogger();
+    try {
+      const result = await run(['--app-id', 'example-app', '--bootstrap', '--file', path], { logger: cap.logger });
+      assert.equal(result.ok, false);
+      assert.match(cap.text(), /suspiciously small/);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
     }
   });
 });

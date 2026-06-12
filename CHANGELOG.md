@@ -73,6 +73,36 @@ Format roughly follows [Keep a Changelog](https://keepachangelog.com). The
 
 ### Added
 
+- **Recover:** Per-app page publishing + the forever-bootstrap (permanent
+  recovery URL).
+  - `publish-forever.mjs` now **requires `--app-id`** and stamps an `App-Id`
+    tag on forever-pages and their pointers, giving each app its own pointer
+    chain (previously two apps publishing through the script would fight
+    over one "latest" slot). The script also prints the operator wallet's
+    normalized owner address (`base64url(sha256(pubkey))`) on every run
+    with a signing key.
+  - The documented "latest" discovery query is now **owner-pinned**
+    (`owners: [<operator address>]`). The unpinned form was hijackable:
+    Arweave tags are permissionless, so anyone could publish a
+    newer-tagged pointer and capture the "latest" slot — a phishing
+    vector for pages users type credentials into. No published pages
+    predate this change, so there is no backfill.
+  - New artifact: the **forever-bootstrap** (`recover/examples/bootstrap/`,
+    built per app via `scripts/build-bootstrap.mjs`, published via
+    `publish-forever.mjs --bootstrap`). A tiny (~19 KB) dependency-free
+    page whose txid is the one permanent URL an app's users bookmark: it
+    runs the owner-pinned pointer query, verifies the target is an
+    owner-signed forever-page for the app, and forwards the user with one
+    click (no auto-redirect) — plus an all-versions list and a baked-in
+    static fallback txid for when every gateway lookup fails. Takes no
+    credentials and has no input fields, enforced by
+    `tests/bootstrap-page.test.ts`.
+  - Ops: recovery-page publishes must be signed by a **dedicated cold
+    key** (`TARN_OPERATOR_WALLET`), never the API's `APP_SIGNING_KEY` —
+    the bootstrap pins it as the update-channel root of trust and it
+    cannot be rotated without stranding bookmarked bootstraps. See
+    `docs/OPERATIONS.md` § "Operator publish key".
+
 - **SDK:** `tarn.<collection>.batchCreate(items)` — typed bulk create.
   Validates every item against the schema, derives Eid per item, stamps
   Eid + SchemaV on every wire-level entry. One rate-limit hit for up to

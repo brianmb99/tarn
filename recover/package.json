@@ -29,6 +29,7 @@
     "clean": "node -e \"import('node:fs/promises').then(fs => fs.rm('dist', {recursive:true,force:true}))\"",
     "build": "node scripts/build.mjs && node scripts/build-forever.mjs",
     "build:forever": "node scripts/build-forever.mjs",
+    "build:bootstrap": "node scripts/build-bootstrap.mjs",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {

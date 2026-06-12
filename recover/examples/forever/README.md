@@ -82,8 +82,12 @@ The publish script (`recover/scripts/publish-forever.mjs`) is the last step in t
 ```sh
 cd recover
 npm run build:forever
-node scripts/publish-forever.mjs           # DRY RUN by default
+node scripts/publish-forever.mjs --app-id <your app id>   # DRY RUN by default
 ```
+
+`--app-id` is required: it stamps the `App-Id` tag on the page and its
+pointer, giving each app its own pointer chain. Without it, two apps
+publishing through this script would fight over the same "latest" slot.
 
 The dry-run prints the size, sha256, and the Arweave tag set that
 would be applied. It makes no network calls and does not sign anything.
@@ -94,12 +98,14 @@ one you actually built.
 
 ```sh
 TARN_OPERATOR_WALLET=<hex-secp256k1-key> \
-  node scripts/publish-forever.mjs --confirm
+  node scripts/publish-forever.mjs --app-id <your app id> --confirm
 ```
 
 (Or `--signing-key <hex>` if you'd rather pass the key on the command
-line. The key is the same shape as `APP_SIGNING_KEY` in
-`api/.dev.vars` — the operator's Arweave-billable wallet.)
+line. The key is the same *shape* as `APP_SIGNING_KEY` in `api/.dev.vars`
+but must be a **different, dedicated key** — it is the root of trust for
+the recovery-page update channel. See `docs/OPERATIONS.md` § "Operator
+publish key".)
 
 The script:
 
@@ -124,15 +130,16 @@ Every published forever-page carries:
 | `Content-Type` | `text/html`                            |
 | `App`          | `tarn-recover`                         |
 | `Type`         | `forever-page`                         |
+| `App-Id`       | `<app id from --app-id>`               |
 | `Version`      | `<version from recover/package.json>`  |
 | `Sha256`       | `<sha256 of the published bytes, hex>` |
 
-`App=tarn-recover,Type=forever-page` enumerates every published
-reference page across history. `Sha256=<hex>` answers "has this exact
-byte-blob ever been published before?" — useful for spotting
-re-publishes of unchanged content (Arweave gives them new txids
-because data-item signatures embed a timestamp, but the Sha256 tag
-matches).
+`App=tarn-recover,Type=forever-page,App-Id=<id>` (owner-pinned — see
+below) enumerates every page published for one app across history.
+`Sha256=<hex>` answers "has this exact byte-blob ever been published
+before?" — useful for spotting re-publishes of unchanged content
+(Arweave gives them new txids because data-item signatures embed a
+timestamp, but the Sha256 tag matches).
 
 ### Discovery (the "latest" pointer)
 
@@ -143,14 +150,16 @@ published forever-page.
 
 Each publish writes an additional tiny `Type=forever-page-pointer`
 blob whose body is the just-published forever-page txid. Discovery is
-a single GraphQL query:
+a single GraphQL query — and it **must be owner-pinned**:
 
 ```
 {
   transactions(
+    owners: ["<operator owner address>"]
     tags: [
-      { name: "App",  values: ["tarn-recover"] }
-      { name: "Type", values: ["forever-page-pointer"] }
+      { name: "App",    values: ["tarn-recover"] }
+      { name: "Type",   values: ["forever-page-pointer"] }
+      { name: "App-Id", values: ["<app id>"] }
     ]
     first: 1
     sort: HEIGHT_DESC
@@ -160,20 +169,41 @@ a single GraphQL query:
 }
 ```
 
+The `owners:` filter is not optional. Arweave tags are a free-for-all:
+anyone can publish a blob carrying this tag set, and an unpinned
+`HEIGHT_DESC` query would hand whoever published last the "latest"
+slot — a phishing vector for a page users type credentials into. The
+owner address is `base64url(sha256(uncompressed secp256k1 pubkey))` —
+the normalized form gateways index for Ethereum-signed data items —
+and is printed by the publish script on every run that has a signing
+key. Record it with the txid.
+
 The most recent confirmed entry's body is the txid of the latest
 forever-page. The pointer is itself an Arweave blob, so this discovery
 mechanism does not depend on any Tarn-operated service.
 
+### The bootstrap page (the user-facing consumer of the pointer)
+
+Users shouldn't run GraphQL queries. The
+[forever-bootstrap](../bootstrap/README.md) is the user-facing half of
+this mechanism: a tiny page, published once per app, that runs the
+owner-pinned discovery query, verifies the result, and forwards the
+user — its txid is the one permanent recovery URL an app puts in kits
+and docs. Build it with `scripts/build-bootstrap.mjs`; publish it with
+`publish-forever.mjs --bootstrap`.
+
 ### Recording and sharing the txid
 
-After a successful publish, record the txid in operator notes and
-include it in user-facing recovery copy:
+After a successful publish, record the txid and owner address in
+operator notes and include them in user-facing recovery copy:
 
-- The "save your kit" UI can include the URL
-  `https://arweave.net/<txid>` so users save a link that survives
-  vendor death.
-- The txid itself can be embedded in printed kit material as a
-  literal Arweave URL.
+- The headline link in kits should be the app's
+  [bootstrap URL](../bootstrap/README.md) — it always reaches the
+  newest page, and never changes across re-publishes.
+- The just-published page txid (`https://arweave.net/<txid>`) goes in
+  as the pinned fallback line: that exact copy works forever, no
+  lookup involved, even if a fully compromised operator key publishes
+  malicious "latest" pages later.
 
 ### Idempotency and re-publishes
 

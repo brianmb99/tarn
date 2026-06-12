@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https:; base-uri 'none'; form-action 'none'">
+  <title>__APP_NAME__ — data recovery</title>
+  <meta name="description" content="Permanent entry point to the __APP_NAME__ recovery page. Finds the latest published recovery page on Arweave and forwards you to it.">
+  <style>__INLINE_CSS__</style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>__APP_NAME__ — recover your data</h1>
+      <p class="lede">
+        This is the permanent link for __APP_NAME__ data recovery. It
+        looks up the newest published recovery page on Arweave and takes
+        you there. You will enter your credentials on that page — never
+        on this one.
+      </p>
+    </header>
+
+    <div id="status" class="status" aria-live="polite">Loading…</div>
+
+    <section id="latest" class="card hidden">
+      <h2>Latest recovery page</h2>
+      <p>
+        Version <strong id="latest-version"></strong>,
+        published <span id="latest-date"></span>.
+      </p>
+      <a id="latest-link" class="primary" href="#">Continue to the recovery page</a>
+      <p class="hint">
+        The destination is a permanent, unchangeable copy. If you prefer a
+        bookmark that can never change at all, bookmark the destination
+        itself: <a id="latest-url" class="pinned-url" href="#"></a>
+      </p>
+    </section>
+
+    <details id="versions" class="explainer hidden">
+      <summary>All published versions</summary>
+      <p class="hint">
+        Every recovery page ever published for __APP_NAME__, newest
+        first. If the latest version misbehaves, any older version keeps
+        working forever.
+      </p>
+      <ul id="versions-list"></ul>
+    </details>
+
+    <section id="fallback" class="card hidden">
+      <h2>Lookup failed — use the built-in fallback</h2>
+      <p>
+        The latest-version lookup did not succeed right now. That does
+        not affect your data. Use the recovery page that was current when
+        this link was created — it works forever:
+      </p>
+      <p><a id="fallback-link" class="pinned-url" href="#"></a></p>
+      <details class="explainer">
+        <summary>Technical details</summary>
+        <ul id="errors"></ul>
+      </details>
+    </section>
+
+    <details class="explainer">
+      <summary>What is this page?</summary>
+      <p>
+        __APP_NAME__ stores your data, encrypted, on Arweave — a permanent
+        storage network. Recovery pages (which decrypt your data entirely
+        in your browser) are published to Arweave too, but Arweave content
+        can never be edited, so each improved recovery page lives at a new
+        address. This small page is the stable front door: it finds the
+        newest recovery page published by the app's operator and forwards
+        you to it.
+      </p>
+      <p>
+        Lookups are pinned to the operator's signing key, so only pages
+        the operator actually published can ever be offered here. This
+        page takes no input and asks for no credentials.
+      </p>
+    </details>
+
+    <footer>
+      <p>
+        Built from the <code>@tarn/recover</code> reference bootstrap.
+        Source: <a href="https://github.com/brianmb99/tarn">brianmb99/tarn</a>.
+      </p>
+    </footer>
+  </main>
+
+  <script type="application/json" id="bootstrap-config">__BOOTSTRAP_CONFIG__</script>
+  <script type="module">__INLINE_JS__</script>
+</body>
+</html>

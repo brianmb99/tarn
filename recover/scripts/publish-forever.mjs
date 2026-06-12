@@ -7,15 +7,30 @@
  * loop.
  *
  * Usage:
- *   node recover/scripts/publish-forever.mjs [options]
+ *   node recover/scripts/publish-forever.mjs --app-id <id> [options]
  *
  * Options:
+ *   --app-id <id>         REQUIRED. The app whose page this is (stamped as
+ *                         the `App-Id` tag on the page AND the pointer).
+ *                         Each app's pointer chain is queried by App-Id, so
+ *                         two apps publishing through this script never
+ *                         collide on "latest".
  *   --signing-key <hex>   Operator's Arweave-billable signing key
  *                         (secp256k1 hex; same shape as APP_SIGNING_KEY in
- *                         api/.dev.vars). May also be supplied via the
- *                         TARN_OPERATOR_WALLET env var.
- *   --file <path>         Path to the bundled forever.html. Defaults to
- *                         `recover/dist/forever.html`.
+ *                         api/.dev.vars — but it MUST be a different key;
+ *                         see docs/OPERATIONS.md "Operator publish key").
+ *                         May also be supplied via the TARN_OPERATOR_WALLET
+ *                         env var.
+ *   --bootstrap           Publish a bootstrap page (Type=forever-bootstrap)
+ *                         instead of a forever-page. Bootstrap pages are
+ *                         the small "find the latest page and forward me"
+ *                         artifact built by scripts/build-bootstrap.mjs;
+ *                         their txid is the permanent URL users bookmark.
+ *                         Implies no pointer blob (the bootstrap IS the
+ *                         stable entry point) and smaller size bounds.
+ *   --file <path>         Path to the page artifact. Defaults to
+ *                         `recover/dist/forever.html` (or
+ *                         `recover/dist/bootstrap.html` with --bootstrap).
  *   --confirm             Actually publish. Without this flag the script
  *                         runs in DRY-RUN mode (default): no signing, no
  *                         network calls, just shows what *would* happen.
@@ -46,9 +61,30 @@
  *
  *   We use an Arweave-native pointer: each publish ALSO writes a tiny
  *   `Type=forever-page-pointer` blob whose body is the just-published
- *   forever-page txid. Discovery: query
- *   `App=tarn-recover,Type=forever-page-pointer` and pick the most
- *   recent confirmed entry; its body is the latest forever-page txid.
+ *   forever-page txid. Discovery is a single GraphQL query — and it MUST
+ *   be owner-pinned, because Arweave tags are a free-for-all (anyone can
+ *   publish a blob carrying our tag set, and an unpinned HEIGHT_DESC
+ *   query would hand them the "latest" slot — a phishing vector for a
+ *   page users type credentials into):
+ *
+ *     {
+ *       transactions(
+ *         owners: ["<operator owner address — printed by this script>"]
+ *         tags: [
+ *           { name: "App",    values: ["tarn-recover"] }
+ *           { name: "Type",   values: ["forever-page-pointer"] }
+ *           { name: "App-Id", values: ["<app id>"] }
+ *         ]
+ *         first: 1
+ *         sort: HEIGHT_DESC
+ *       ) { edges { node { id } } }
+ *     }
+ *
+ *   The owner address is base64url(sha256(uncompressed secp256k1 pubkey))
+ *   — the normalized form every gateway indexes for Ethereum-signed
+ *   data items. This script derives and prints it on every run that has
+ *   a signing key; record it, it is the trust anchor the bootstrap page
+ *   pins (see scripts/build-bootstrap.mjs).
  *
  *   This keeps the discovery story Tarn-server-independent — the
  *   `@tarn/recover` durability story is "Arweave gateway is enough,"
@@ -73,6 +109,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
+import { secp256k1 } from '@noble/curves/secp256k1';
+
 import { buildSignedDataItem, uploadSignedDataItem } from '../../api/src/turbo.js';
 
 // ============ Constants ============
@@ -84,6 +122,15 @@ import { buildSignedDataItem, uploadSignedDataItem } from '../../api/src/turbo.j
 // something" or "the bundle blew up" failure modes.
 const MIN_PAGE_BYTES = 50 * 1024;       // 50 KB — well below current bundle
 const MAX_PAGE_BYTES = 5 * 1024 * 1024; // 5 MB — well above forecast growth
+
+// Bounds for the bootstrap artifact (--bootstrap). The bootstrap is
+// deliberately tiny — vanilla JS, no SDK — so a forever-page-sized
+// bootstrap means the wrong file is being published.
+const MIN_BOOTSTRAP_BYTES = 2 * 1024;    // 2 KB
+const MAX_BOOTSTRAP_BYTES = 256 * 1024;  // 256 KB
+
+// App ids are lowercase slugs (same shape the live API accepts).
+const APP_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 const DEFAULT_GATEWAYS = ['https://arweave.net'];
 
@@ -102,18 +149,22 @@ const VERIFY_RETRY_BACKOFF_MS = 10_000;
  */
 export function parseArgs(argv) {
   const flags = {
+    appId: null,
     signingKey: null,
     file: null,
     confirm: false,
+    bootstrap: false,
     skipPointer: false,
     skipVerify: false,
     gateways: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--signing-key') flags.signingKey = argv[++i];
+    if (a === '--app-id') flags.appId = argv[++i];
+    else if (a === '--signing-key') flags.signingKey = argv[++i];
     else if (a === '--file') flags.file = argv[++i];
     else if (a === '--confirm') flags.confirm = true;
+    else if (a === '--bootstrap') flags.bootstrap = true;
     else if (a === '--skip-pointer') flags.skipPointer = true;
     else if (a === '--skip-verify') flags.skipVerify = true;
     else if (a === '--gateway') flags.gateways.push(argv[++i]);
@@ -129,44 +180,63 @@ export function parseArgs(argv) {
   return flags;
 }
 
+// ============ Owner address ============
+
+/**
+ * Derive the normalized Arweave owner address for the operator's
+ * secp256k1 signing key: base64url(sha256(uncompressed pubkey bytes)).
+ * This is the value gateways index in `owner.address` for Ethereum-signed
+ * (ANS-104 sig type 3) data items, and therefore the value the
+ * owner-pinned discovery query and the bootstrap page filter on.
+ */
+export function deriveOwnerAddress(signingKeyHex) {
+  const hex = signingKeyHex.startsWith('0x') ? signingKeyHex.slice(2) : signingKeyHex;
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error('deriveOwnerAddress: signing key must be 32 bytes of hex');
+  }
+  const pubkey = secp256k1.getPublicKey(hex, false); // uncompressed, 65 bytes
+  return createHash('sha256').update(pubkey).digest('base64url');
+}
+
 // ============ Pre-publish verification ============
 
 /**
  * Verify the page artifact exists, has a sane size, and looks like HTML.
  * Returns the buffer + sha256 hex. Throws on failure; the script catches
- * and exits non-zero with the message.
+ * and exits non-zero with the message. Size bounds differ by artifact
+ * kind: forever-pages bundle the whole SDK, bootstraps must stay tiny.
  */
-export async function preflightCheck(filePath) {
+export async function preflightCheck(filePath, { minBytes = MIN_PAGE_BYTES, maxBytes = MAX_PAGE_BYTES, label = 'forever-page' } = {}) {
   if (!existsSync(filePath)) {
     throw new Error(
-      `forever-page not found at ${filePath}. Run \`npm run build:forever\` first.`,
+      `${label} not found at ${filePath}. Run the matching build script first.`,
     );
   }
   const bytes = await readFile(filePath);
   const size = bytes.byteLength;
-  if (size < MIN_PAGE_BYTES) {
+  if (size < minBytes) {
     throw new Error(
-      `forever-page at ${filePath} is suspiciously small (${size} bytes < ${MIN_PAGE_BYTES} min). ` +
+      `${label} at ${filePath} is suspiciously small (${size} bytes < ${minBytes} min). ` +
         `Did the build truncate? Try a clean rebuild.`,
     );
   }
-  if (size > MAX_PAGE_BYTES) {
+  if (size > maxBytes) {
     throw new Error(
-      `forever-page at ${filePath} is suspiciously large (${size} bytes > ${MAX_PAGE_BYTES} max). ` +
+      `${label} at ${filePath} is suspiciously large (${size} bytes > ${maxBytes} max). ` +
         `Did a dependency balloon? Inspect the bundle before publishing.`,
     );
   }
   const head = bytes.subarray(0, 256).toString('utf8').toLowerCase();
   if (!head.includes('<!doctype html>')) {
     throw new Error(
-      `forever-page at ${filePath} does not start with <!DOCTYPE html>. ` +
-        `Is this actually the forever-page artifact?`,
+      `${label} at ${filePath} does not start with <!DOCTYPE html>. ` +
+        `Is this actually the ${label} artifact?`,
     );
   }
   const tail = bytes.subarray(Math.max(0, bytes.byteLength - 256)).toString('utf8').toLowerCase();
   if (!tail.includes('</html>')) {
     throw new Error(
-      `forever-page at ${filePath} does not end with </html>. ` +
+      `${label} at ${filePath} does not end with </html>. ` +
         `The bundle looks truncated.`,
     );
   }
@@ -176,31 +246,43 @@ export async function preflightCheck(filePath) {
 
 // ============ Tag construction ============
 
+function assertAppId(appId, fn) {
+  if (!appId || typeof appId !== 'string' || !APP_ID_RE.test(appId)) {
+    throw new Error(`${fn}: appId must be a lowercase slug (got ${JSON.stringify(appId)})`);
+  }
+}
+
 /**
  * Build the Arweave tag set for a `forever-page` blob.
  *
  * Tag scheme:
  *   App          = 'tarn-recover'   — package namespace
  *   Type         = 'forever-page'   — what this blob is
+ *   App-Id       = '<app id>'       — which app's themed page this is
  *   Version      = '<pkg version>'  — version of @tarn/recover that produced it
  *   Sha256       = '<hex>'          — integrity reference
  *   Content-Type = 'text/html'      — gateway serves it inline
  *
- * Discoverability: `App=tarn-recover,Type=forever-page` enumerates every
- * published reference page across history. `Sha256=<hex>` lookup tells
- * you whether a given byte-blob has ever been published before.
+ * Discoverability: `App=tarn-recover,Type=forever-page,App-Id=<id>`
+ * (owner-pinned — see the file header) enumerates every published page
+ * for one app across history. Without App-Id, two apps publishing
+ * through this script would share one pointer chain and fight over
+ * "latest". `Sha256=<hex>` lookup tells you whether a given byte-blob
+ * has ever been published before.
  */
-export function buildForeverPageTags({ version, sha256 }) {
+export function buildForeverPageTags({ version, sha256, appId }) {
   if (!version || typeof version !== 'string') {
     throw new Error('buildForeverPageTags: version must be a non-empty string');
   }
   if (!/^[0-9a-f]{64}$/i.test(sha256)) {
     throw new Error('buildForeverPageTags: sha256 must be a 64-char hex string');
   }
+  assertAppId(appId, 'buildForeverPageTags');
   return [
     { name: 'Content-Type', value: 'text/html' },
     { name: 'App', value: 'tarn-recover' },
     { name: 'Type', value: 'forever-page' },
+    { name: 'App-Id', value: appId },
     { name: 'Version', value: version },
     { name: 'Sha256', value: sha256 },
   ];
@@ -211,15 +293,41 @@ export function buildForeverPageTags({ version, sha256 }) {
  * "latest" discovery layer described in the file header. The pointer
  * body is the txid of the just-published forever-page.
  */
-export function buildPointerTags({ version }) {
+export function buildPointerTags({ version, appId }) {
   if (!version || typeof version !== 'string') {
     throw new Error('buildPointerTags: version must be a non-empty string');
   }
+  assertAppId(appId, 'buildPointerTags');
   return [
     { name: 'Content-Type', value: 'text/plain' },
     { name: 'App', value: 'tarn-recover' },
     { name: 'Type', value: 'forever-page-pointer' },
+    { name: 'App-Id', value: appId },
     { name: 'Version', value: version },
+  ];
+}
+
+/**
+ * Build the Arweave tag set for a `forever-bootstrap` blob — the tiny
+ * stable-URL page built by scripts/build-bootstrap.mjs. Bootstraps get
+ * their own Type so they never show up in forever-page enumeration, and
+ * no pointer: the bootstrap's own txid is the permanent URL.
+ */
+export function buildBootstrapPageTags({ version, sha256, appId }) {
+  if (!version || typeof version !== 'string') {
+    throw new Error('buildBootstrapPageTags: version must be a non-empty string');
+  }
+  if (!/^[0-9a-f]{64}$/i.test(sha256)) {
+    throw new Error('buildBootstrapPageTags: sha256 must be a 64-char hex string');
+  }
+  assertAppId(appId, 'buildBootstrapPageTags');
+  return [
+    { name: 'Content-Type', value: 'text/html' },
+    { name: 'App', value: 'tarn-recover' },
+    { name: 'Type', value: 'forever-bootstrap' },
+    { name: 'App-Id', value: appId },
+    { name: 'Version', value: version },
+    { name: 'Sha256', value: sha256 },
   ];
 }
 
@@ -307,22 +415,39 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
     return { ok: true, exitCode: 0, dryRun: true, help: true };
   }
 
+  if (!flags.appId || !APP_ID_RE.test(flags.appId)) {
+    const msg = flags.appId
+      ? `--app-id must be a lowercase slug (got ${JSON.stringify(flags.appId)}).`
+      : 'Missing --app-id. Every publish stamps an App-Id tag so per-app pointer chains never collide.';
+    logger.error(msg);
+    logger.error('Run with --help for usage.');
+    return { ok: false, exitCode: 1, error: msg };
+  }
+
   const here = dirname(fileURLToPath(import.meta.url));
   const root = resolve(here, '..');
-  const filePath = resolve(flags.file || resolve(root, 'dist', 'forever.html'));
+  const artifactKind = flags.bootstrap ? 'forever-bootstrap' : 'forever-page';
+  const defaultFile = flags.bootstrap ? 'bootstrap.html' : 'forever.html';
+  const filePath = resolve(flags.file || resolve(root, 'dist', defaultFile));
 
   // Read package version (used as the Version tag).
   const pkgRaw = await readFile(resolve(root, 'package.json'), 'utf8');
   const pkg = JSON.parse(pkgRaw);
   const version = String(pkg.version);
 
-  logger.log('=== @tarn/recover forever-page publisher ===\n');
+  logger.log(`=== @tarn/recover ${artifactKind} publisher ===\n`);
   logger.log(`Package version: ${version}`);
+  logger.log(`App id:          ${flags.appId}`);
   logger.log(`Source file:     ${filePath}`);
 
   let preflight;
   try {
-    preflight = await preflightCheck(filePath);
+    preflight = await preflightCheck(
+      filePath,
+      flags.bootstrap
+        ? { minBytes: MIN_BOOTSTRAP_BYTES, maxBytes: MAX_BOOTSTRAP_BYTES, label: 'forever-bootstrap' }
+        : {},
+    );
   } catch (err) {
     logger.error(`\n[FATAL] Pre-publish check failed: ${err.message}`);
     return { ok: false, exitCode: 1, error: err.message };
@@ -330,9 +455,26 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
   logger.log(`Size:            ${preflight.size} bytes (${(preflight.size / 1024).toFixed(1)} KB)`);
   logger.log(`SHA-256:         ${preflight.sha256}\n`);
 
-  const tags = buildForeverPageTags({ version, sha256: preflight.sha256 });
+  const tagInput = { version, sha256: preflight.sha256, appId: flags.appId };
+  const tags = flags.bootstrap
+    ? buildBootstrapPageTags(tagInput)
+    : buildForeverPageTags(tagInput);
   logger.log('Tags:');
   for (const t of tags) logger.log(`  ${t.name} = ${t.value}`);
+
+  // Print the owner address whenever a key is available (dry-run included).
+  // This is the trust anchor: the value the owner-pinned discovery query and
+  // the bootstrap page filter on. Operators record it alongside the txid.
+  const availableKey = flags.signingKey || process.env.TARN_OPERATOR_WALLET || null;
+  if (availableKey) {
+    try {
+      logger.log(`\nOwner address:   ${deriveOwnerAddress(availableKey)}`);
+      logger.log('(base64url(sha256(pubkey)) — the `owners:` pin for discovery queries and the bootstrap build)');
+    } catch (err) {
+      logger.error(`\n[FATAL] Could not derive owner address from signing key: ${err.message}`);
+      return { ok: false, exitCode: 1, error: err.message };
+    }
+  }
 
   // Always warn that publishing creates a new permanent record. Even
   // byte-identical re-publishes get a new txid (data-item signatures
@@ -346,7 +488,9 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
   if (!flags.confirm) {
     logger.log('\n--- DRY RUN ---');
     logger.log('No signing, no network calls. Re-run with --confirm to publish for real.');
-    if (!flags.skipPointer) {
+    if (flags.bootstrap) {
+      logger.log('Bootstrap mode: no pointer blob — the bootstrap txid itself is the permanent URL.');
+    } else if (!flags.skipPointer) {
       logger.log('Would also publish a `forever-page-pointer` blob pointing at the new txid.');
     }
     return {
@@ -363,7 +507,7 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
 
   // ============ Real publish from here on ============
 
-  const signingKey = flags.signingKey || process.env.TARN_OPERATOR_WALLET || null;
+  const signingKey = availableKey;
   if (!signingKey) {
     const msg =
       'Missing operator signing key. Pass --signing-key <hex> or set TARN_OPERATOR_WALLET env var.';
@@ -371,7 +515,7 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
     return { ok: false, exitCode: 1, error: msg };
   }
 
-  logger.log('\n=== Publishing forever-page ===');
+  logger.log(`\n=== Publishing ${artifactKind} ===`);
   let pageResult;
   try {
     pageResult = await publishToArweave({ bytes: preflight.bytes, tags, signingKey });
@@ -385,12 +529,12 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
   }
 
   let pointerResult = null;
-  if (!flags.skipPointer) {
+  if (!flags.skipPointer && !flags.bootstrap) {
     logger.log('\n=== Publishing forever-page-pointer ===');
     try {
       pointerResult = await publishToArweave({
         bytes: new TextEncoder().encode(pageResult.txid),
-        tags: buildPointerTags({ version }),
+        tags: buildPointerTags({ version, appId: flags.appId }),
         signingKey,
       });
       logger.log(`  txid:  ${pointerResult.txid}`);
@@ -428,17 +572,26 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
   }
 
   logger.log('\n=== Published ===\n');
-  logger.log(`forever-page txid: ${pageResult.txid}`);
+  logger.log(`${artifactKind} txid: ${pageResult.txid}`);
   logger.log(`Gateway URLs:`);
   logger.log(`  https://arweave.net/${pageResult.txid}`);
-  logger.log(`  https://g8way.io/${pageResult.txid}`);
+  logger.log(`  https://permagate.io/${pageResult.txid}`);
   if (pointerResult) {
     logger.log(`\nforever-page-pointer txid: ${pointerResult.txid}`);
     logger.log(`  https://arweave.net/${pointerResult.txid}`);
   }
-  logger.log(
-    `\nRecord this txid in operator notes and share with users as the canonical recovery URL.`,
-  );
+  logger.log(`\nOwner address: ${deriveOwnerAddress(signingKey)}`);
+  if (flags.bootstrap) {
+    logger.log(
+      `\nRecord the txid + owner address in operator notes. The bootstrap txid is the ` +
+        `permanent recovery URL for app '${flags.appId}' — it goes in kits, docs, and bookmarks.`,
+    );
+  } else {
+    logger.log(
+      `\nRecord the txid + owner address in operator notes. Kits should carry the app's ` +
+        `bootstrap URL as the headline link and this page txid as the pinned fallback.`,
+    );
+  }
 
   return {
     ok: true,
@@ -455,11 +608,18 @@ export async function run(argv, { logger = console, fetchImpl } = {}) {
 }
 
 function printUsage(logger) {
-  logger.log(`Usage: node recover/scripts/publish-forever.mjs [options]
+  logger.log(`Usage: node recover/scripts/publish-forever.mjs --app-id <id> [options]
 
 Options:
+  --app-id <id>         REQUIRED. App id stamped as the App-Id tag (per-app
+                        pointer chains; lowercase slug).
   --signing-key <hex>   Operator signing key (or TARN_OPERATOR_WALLET env var).
-  --file <path>         Path to forever.html (default: recover/dist/forever.html).
+                        Must be the dedicated publish key, NOT the API's
+                        APP_SIGNING_KEY — see docs/OPERATIONS.md.
+  --bootstrap           Publish a forever-bootstrap page (Type=forever-bootstrap,
+                        no pointer; default file recover/dist/bootstrap.html).
+  --file <path>         Path to the artifact (default: recover/dist/forever.html,
+                        or dist/bootstrap.html with --bootstrap).
   --confirm             Actually publish (default is DRY RUN).
   --skip-pointer        Don't publish the "latest" pointer blob.
   --skip-verify         Don't fetch + hash-check from a gateway after publish.
