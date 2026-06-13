@@ -2941,6 +2941,16 @@ export class TarnClient {
         passkeyKEK,
         wrappedDataKey: wrapped_data_key,
       });
+      // tarn#74 — the pre-repair hydration deferred when the sharing_keys
+      // blob referenced the (then-missing) latest gen. The repair filled
+      // #dekByGen in, and the blob itself is preserved verbatim across
+      // envelope mutations, so hydrating from the original envelope now
+      // succeeds — the repaired passkey session is sharing-complete (#73).
+      if (!this.#sharingKeyPair) {
+        await this.#hydrateSharingKeysFromEnvelope(wrapped_data_key, {
+          requireForPasswordSession: false,
+        });
+      }
     }
 
     return { dataLookupKey: this.#dataLookupKey! };
@@ -3044,6 +3054,23 @@ export class TarnClient {
     }
     const dek = this.#dekByGen?.get(parsed.sharingKeys.gen);
     if (!dek) {
+      // tarn#74 — a stale passkey credential (Phase 6.x) unwraps only the
+      // gens wrapped for it, which legitimately excludes the latest gen the
+      // blob references. Throwing here would kill the authenticate before
+      // the stale-repair / StalePasskeyError flow can run. Defer instead:
+      // slots stay null (same posture as the absent-blob passkey case) and
+      // the caller re-hydrates after the repair fills the missing gen in.
+      // Password sessions unwrap the FULL chain, so a missing gen there is
+      // genuine corruption and still throws.
+      if (!opts.requireForPasswordSession) {
+        console.warn(
+          `[TarnClient] sharing_keys blob references DEK gen ${parsed.sharingKeys.gen}, ` +
+          'which this session has not unwrapped (stale credential?) — deferring sharing-identity hydration',
+        );
+        this.#sharingKeyPair = null;
+        this.#shareSigningKeyPair = null;
+        return;
+      }
       throw new Error(
         `sharing_keys blob references DEK gen ${parsed.sharingKeys.gen}, which this session could not unwrap`,
       );
