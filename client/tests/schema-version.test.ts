@@ -122,6 +122,12 @@ class VersionMockClient implements ITarnClient {
   async unshareContent(): Promise<unknown> {
     return {};
   }
+  async seedConnectionShares(): Promise<unknown> {
+    return {};
+  }
+  async getOutboundShareContentIds(): Promise<string[]> {
+    return [];
+  }
   async readShareLog(): Promise<Record<string, { tx_id: string; cek: string }>> {
     return {};
   }

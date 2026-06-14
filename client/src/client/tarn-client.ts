@@ -55,6 +55,11 @@ export type IUnderlyingClient =
     login(username: string, password: string, opts?: Record<string, unknown>): Promise<unknown>;
     recoverAccount(args: Record<string, unknown>): Promise<unknown>;
     serializeSession(): Promise<string>;
+    // Sharing §6.6 backfill: app hook supplying records to seed new
+    // connections' logs with.
+    setInitialShareSeedProvider(
+      provider: ((connection: unknown) => Promise<Record<string, string[]>>) | null,
+    ): void;
   };
 
 /**
@@ -213,6 +218,23 @@ export class TarnClient<S extends AnySchema> {
     // assignment.
     Object.assign(client as unknown as Record<string, unknown>, collections);
     return client as TarnClient<S> & CollectionsOf<S>;
+  }
+
+  // ============ Sharing config ============
+
+  /**
+   * Register an app hook that supplies which records to seed a NEW
+   * connection's share-log with, so a friend sees the user's existing
+   * library the moment they connect (sharing §6.6 backfill). The provider
+   * returns `{ [collectionName]: primaryKey[] }`; the SDK resolves each key
+   * to its tx_id + content key and packs them into the connection's initial
+   * snapshot. Pass `null` to clear. See also `tarn.<collection>.shareManyTo`
+   * / `listSharedWith` for the reconciliation backstop.
+   */
+  setInitialShareSeedProvider(
+    provider: ((connection: unknown) => Promise<Record<string, string[]>>) | null,
+  ): void {
+    this.#underlying.setInitialShareSeedProvider(provider);
   }
 
   // ============ Auth (top-level) ============

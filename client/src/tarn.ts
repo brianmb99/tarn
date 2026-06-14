@@ -123,8 +123,10 @@ import {
   OP_REMOVE,
   OP_SNAPSHOT,
   OP_ROTATE_IDENTITY,
+  MAX_LOG_BLOB_PLAINTEXT_BYTES,
 } from './share-log.js';
 import { repairPrfExtensionBuffers } from './passkeys/prf.js';
+import { deriveEid } from './collections/eid.js';
 
 // Local type aliases used throughout the class.
 import type {
@@ -488,6 +490,14 @@ export class TarnClient {
   // verbatim across envelope mutations (passkey add/remove, credential
   // change) the same way passkey wrappings are.
   #sharingKeysBlob: SharingKeysBlob | null = null;
+  // Optional app-supplied hook (sharing §6.6 backfill). When set, the SDK
+  // calls it at every NEW-connection seq-0 snapshot publish to learn which
+  // records to seed the connection's log with — so a friend sees the user's
+  // existing library the moment they connect, not just records saved after.
+  // Returns `{ [collectionName]: primaryKey[] }`; the SDK resolves each to
+  // its tx_id + content key internally (apps never see those). The platform
+  // stays app-agnostic: it asks the app WHAT to share, and handles HOW.
+  #initialShareSeedProvider: ((connection: any) => Promise<Record<string, string[]>> ) | null = null;
   #replayNonceCache: ReplayNonceCache = makeReplayNonceCache();
 
   // Per-connection share-log state (issue #15, Section 5b). Map keyed on the
@@ -4576,15 +4586,14 @@ export class TarnClient {
     await this.#savePendingRequestsRecord(pendingState, pendingUpdated);
 
     // Publish the seq=0 snapshot to our outbound-to-connection log (sharing §6.6).
-    // Default state is empty — apps with "share my full library" semantics
-    // should call _publishInitialSnapshot directly with their state, but the
-    // platform-layer SDK is app-agnostic so we can't enumerate content here.
-    // The snapshot is the bridge from §6 (handshake) into §8 (share log):
-    // a single-entry log exists, ready for ongoing operations to land at
-    // seq=1+.
+    // If the app registered an initial-share seed provider, the snapshot is
+    // born populated with the user's existing library (no empty placeholder,
+    // no second round trip); otherwise it's the historical empty bootstrap.
+    // The snapshot is the bridge from §6 (handshake) into §8 (share log).
     let initialSnapshotTxid = null;
     try {
-      const snap = await this._publishInitialSnapshot(newConnection);
+      const seedState = await this.#buildSeedState(newConnection);
+      const snap = await this.#publishSeedSnapshot(newConnection, seedState);
       initialSnapshotTxid = snap.txid;
     } catch (err: any) {
       // Don't roll back the connection addition if the snapshot publish fails —
@@ -5528,6 +5537,153 @@ export class TarnClient {
       verified,
       publishedAt: fetched.publishedAt ?? null,
     };
+  }
+
+  /**
+   * Register an app hook that supplies which records to seed a NEW
+   * connection's share-log with (sharing §6.6 backfill). Called by the SDK
+   * at every new-connection seq-0 publish (both the accepter's and the
+   * inviter's auto-accept). Returns `{ [collectionName]: primaryKey[] }`;
+   * the SDK resolves each key to its tx_id + content key and packs them into
+   * the connection's initial snapshot — so a friend sees the user's existing
+   * library the instant they connect, with no separate "share everything"
+   * round trip and no empty placeholder entry.
+   *
+   * Pass `null` to clear. The provider runs inside the handshake publish, so
+   * keep it cheap (return current ids; the SDK does the resolution).
+   */
+  setInitialShareSeedProvider(
+    provider: ((connection: any) => Promise<Record<string, string[]>>) | null,
+  ): void {
+    if (provider != null && typeof provider !== 'function') {
+      throw new Error('setInitialShareSeedProvider(): provider must be a function or null');
+    }
+    this.#initialShareSeedProvider = provider ?? null;
+  }
+
+  /**
+   * Ask the registered seed provider (if any) what to seed `connection`'s
+   * log with, and resolve it to a share-state map. Returns `{}` when no
+   * provider is set or it yields nothing — the historical empty-snapshot
+   * behavior. Never throws: a provider error degrades to an empty seed.
+   */
+  async #buildSeedState(connection: any): Promise<Record<string, { tx_id: string; cek: string }>> {
+    if (!this.#initialShareSeedProvider) return {};
+    let seed: Record<string, string[]> | null = null;
+    try {
+      seed = await this.#initialShareSeedProvider(connection);
+    } catch (err: any) {
+      console.warn(`[TarnClient] initial-share seed provider threw: ${err?.message || err}`);
+      return {};
+    }
+    return await this.#resolveShareSeed(seed);
+  }
+
+  /**
+   * Resolve `{ [collection]: primaryKey[] }` to a share-state map
+   * `{ contentId: { tx_id, cek } }`. TOLERANT by design: a key that can't be
+   * resolved (deleted record, unfetchable blob, missing share key) is skipped
+   * with a warning rather than aborting the whole backfill — a partial shelf
+   * beats no shelf.
+   */
+  async #resolveShareSeed(
+    seed: Record<string, string[]> | null | undefined,
+  ): Promise<Record<string, { tx_id: string; cek: string }>> {
+    const state: Record<string, { tx_id: string; cek: string }> = {};
+    if (!seed || typeof seed !== 'object') return state;
+    for (const [collection, keys] of Object.entries(seed)) {
+      if (!Array.isArray(keys)) continue;
+      for (const key of keys) {
+        if (typeof key !== 'string' || key.length === 0) continue;
+        try {
+          const eid = await deriveEid(this.#appId, collection, key);
+          const entry = await this.getEntryByEid(collection, eid);
+          if (!entry) continue; // deleted / never existed — skip
+          const cek = await this.getShareKey(entry.txid);
+          if (!cek) continue; // blob unfetchable — skip
+          state[`${collection}:${key}`] = { tx_id: entry.txid, cek };
+        } catch (err: any) {
+          console.warn(`[TarnClient] seed resolve skip ${collection}:${key}: ${err?.message || err}`);
+        }
+      }
+    }
+    return state;
+  }
+
+  /**
+   * Publish a share-state map to a connection's log, sized to the share-log
+   * blob cap: as much as fits goes in the seq-0 SNAPSHOT; any remainder
+   * (only for libraries beyond ~1,300 records) lands as individual `add`
+   * deltas on top. The reader reconstructs snapshot + deltas into the full
+   * state, so the result is identical regardless of how it was split.
+   */
+  async #publishSeedSnapshot(
+    connection: any,
+    state: Record<string, { tx_id: string; cek: string }>,
+  ): Promise<any> {
+    const ids = Object.keys(state);
+    if (ids.length === 0) {
+      return await this._publishInitialSnapshot(connection, { state: {} });
+    }
+    // Budget the snapshot's `state` plaintext under the blob cap, leaving
+    // headroom for the operation envelope + ECDSA signature + AAD.
+    const BUDGET = Math.floor(MAX_LOG_BLOB_PLAINTEXT_BYTES * 0.8);
+    const snapshotState: Record<string, { tx_id: string; cek: string }> = {};
+    const remaining: string[] = [];
+    let used = 256; // base op overhead estimate
+    for (const id of ids) {
+      const e = state[id]!;
+      const cost = id.length + (e.tx_id?.length || 0) + (e.cek?.length || 0) + 32;
+      if (used + cost <= BUDGET || Object.keys(snapshotState).length === 0) {
+        snapshotState[id] = e;
+        used += cost;
+      } else {
+        remaining.push(id);
+      }
+    }
+    const snap = await this._publishInitialSnapshot(connection, { state: snapshotState });
+    for (const id of remaining) {
+      try {
+        await this.shareContent(connection, id, state[id]!.tx_id, state[id]!.cek);
+      } catch (err: any) {
+        console.warn(`[TarnClient] seed delta for ${id} failed: ${err?.message || err}`);
+      }
+    }
+    return snap;
+  }
+
+  /**
+   * Public backfill primitive (used by `Collection.shareManyTo`): resolve
+   * `{ [collection]: primaryKey[] }` and publish it as the connection's
+   * outbound state via a snapshot (+ deltas if oversized). Idempotent in
+   * effect — re-running with the same desired set re-establishes that state.
+   * The boot-time reconciliation backstop calls this to repair a connection
+   * whose handshake-time seed didn't land.
+   */
+  async seedConnectionShares(connection: any, seed: Record<string, string[]>): Promise<any> {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'seedConnectionShares: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
+    const state = await this.#resolveShareSeed(seed);
+    return await this.#publishSeedSnapshot(connection, state);
+  }
+
+  /**
+   * Return the content-ids currently shared with `connection` (our OUTBOUND
+   * state to them). Used by the backfill reconciliation to diff desired vs
+   * actual and avoid needless re-publishes.
+   */
+  async getOutboundShareContentIds(connection: any): Promise<string[]> {
+    if (!this.#shareSigningKeyPair || !this.#sharingKeyPair) {
+      throw new TarnPasskeyOnlyError(
+        'getOutboundShareContentIds: requires a password-authenticated session — sign in with username + password first.',
+      );
+    }
+    await this.#hydrateOutboundState(connection);
+    const st = this.#tentativeOutboundState(connection) || {};
+    return Object.keys(st);
   }
 
   /**
@@ -6776,11 +6932,12 @@ export class TarnClient {
         // Publish our seq=0 snapshot to the new connection's outbound log
         // (sharing §6.6). We're the side that originated the connection request;
         // the accepting side already published their seq=0 inside
-        // acceptConnectionRequest. Empty state by default — apps that want to
-        // pre-populate should call _publishInitialSnapshot themselves with
-        // explicit state.
+        // acceptConnectionRequest. If an initial-share seed provider is set,
+        // the snapshot is seeded with our existing library (sharing §6.6
+        // backfill); otherwise it's the historical empty bootstrap.
         try {
-          await this._publishInitialSnapshot(newConnection);
+          const seedState = await this.#buildSeedState(newConnection);
+          await this.#publishSeedSnapshot(newConnection, seedState);
         } catch (err: any) {
           console.warn(
             `[TarnClient] processing accept from ${v.normalized.senderUsername}: initial snapshot publish failed: ${err.message}`,

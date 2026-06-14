@@ -367,6 +367,20 @@ class StubUnderlying implements IUnderlyingClient {
     if (state) delete state[contentId];
     return { ok: true };
   }
+  async seedConnectionShares(c: ShareConnection, seed: Record<string, string[]>) {
+    let state = this.shareLogStateByConnection.get(c.share_pub);
+    if (!state) { state = {}; this.shareLogStateByConnection.set(c.share_pub, state); }
+    for (const [collection, keys] of Object.entries(seed)) {
+      for (const key of keys) state[`${collection}:${key}`] = { tx_id: `tx-${key}`, cek: `cek-${key}` };
+    }
+    return { ok: true };
+  }
+  async getOutboundShareContentIds(c: ShareConnection) {
+    return Object.keys(this.shareLogStateByConnection.get(c.share_pub) ?? {});
+  }
+  setInitialShareSeedProvider(_provider: ((connection: unknown) => Promise<Record<string, string[]>>) | null) {
+    /* no-op stub */
+  }
   async readShareLog(c: ShareConnection) {
     return this.shareLogStateByConnection.get(c.share_pub) ?? {};
   }

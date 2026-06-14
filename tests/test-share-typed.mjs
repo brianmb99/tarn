@@ -58,6 +58,7 @@ function makeSchema() {
           bookId: 'string',
           title: 'string',
           author: 'string?',
+          isPrivate: 'boolean?',
         },
         shareable: true,
       },
@@ -144,9 +145,83 @@ await test('recipient.books.listShared SEES the shared book (the regression)', a
   assert(shared[0].title === 'The Mountain', `title mismatch: ${shared[0]?.title}`);
 });
 
+// ============ Backfill: existing library shared on connect (§6.6) ============
+//
+// The gap this closes: shareWithAll only fans out at save-time to whoever is
+// connected THEN. A friend added later saw nothing. With a registered seed
+// provider, the connection's seq-0 snapshot is born carrying the user's whole
+// public library — so a friend sees the existing shelf the instant they
+// connect, with no empty placeholder entry.
+
+console.log('\n=== Backfill: existing library seeded on connect ===');
+
+const ownerUsername = randomUsername();
+const friendUsername = randomUsername();
+const owner = await makeTypedClient();
+const friend = await makeTypedClient();
+let ownerConnOfFriend, friendConnOfOwner;
+
+await test('owner + friend register; owner builds a library FIRST (3 public, 1 private)', async () => {
+  const o = await owner.register(ownerUsername, 'pw-o-' + Date.now(), { recoveryAcknowledged: true });
+  await forceAllowRulesForAccount(o.dataLookupKey);
+  const f = await friend.register(friendUsername, 'pw-f-' + Date.now(), { recoveryAcknowledged: true });
+  await forceAllowRulesForAccount(f.dataLookupKey);
+
+  await owner.books.create({ bookId: 'pub1', title: 'Public One', isPrivate: false });
+  await owner.books.create({ bookId: 'pub2', title: 'Public Two', isPrivate: false });
+  await owner.books.create({ bookId: 'pub3', title: 'Public Three' }); // absent === public
+  await owner.books.create({ bookId: 'priv1', title: 'Secret', isPrivate: true });
+  await sleep(300);
+});
+
+await test('owner registers a seed provider returning current PUBLIC bookIds', async () => {
+  owner.setInitialShareSeedProvider(async () => {
+    const all = await owner.books.list();
+    return { books: all.filter(b => b.isPrivate !== true).map(b => b.bookId) };
+  });
+});
+
+await test('handshake AFTER the library exists', async () => {
+  const send = await owner.connections.invite(friendUsername);
+  await sleep(300);
+  const incoming = await friend.connections.listIncomingRequests();
+  const req = incoming.find(r => r.request_nonce === send.requestNonce);
+  assert(req, 'friend did not see the request');
+  await friend.connections.accept(req.request_nonce);
+  await sleep(300);
+  await owner.connections.listIncomingRequests(); // owner processes accept, seeds seq-0
+  await sleep(300);
+  ownerConnOfFriend = (await owner.connections.list()).find(c => c.username === friendUsername);
+  friendConnOfOwner = (await friend.connections.list()).find(c => c.username === ownerUsername);
+  assert(ownerConnOfFriend && friendConnOfOwner, 'handshake incomplete');
+});
+
+await test('friend sees ALL 3 public books immediately on connect — and NOT the private one', async () => {
+  const shared = await friend.books.listShared(friendConnOfOwner);
+  const ids = shared.map(b => b.bookId).sort();
+  assert(ids.length === 3, `expected 3 backfilled books, got ${ids.length}: ${JSON.stringify(ids)}`);
+  assert(JSON.stringify(ids) === JSON.stringify(['pub1', 'pub2', 'pub3']), `unexpected set: ${JSON.stringify(ids)}`);
+  assert(!ids.includes('priv1'), 'private book leaked into the backfill');
+});
+
+await test('seq-0 is born populated — no wasted empty snapshot (owner outbound = 3)', async () => {
+  const outbound = await owner.books.listSharedWith(ownerConnOfFriend);
+  assert(outbound.sort().join(',') === 'pub1,pub2,pub3', `owner outbound state wrong: ${JSON.stringify(outbound)}`);
+});
+
+await test('backstop: shareManyTo re-seeds an arbitrary set (reconciliation/recovery path)', async () => {
+  // Simulate drift repair: re-seed only pub1+pub2 explicitly.
+  await owner.books.shareManyTo(ownerConnOfFriend, ['pub1', 'pub2']);
+  await sleep(300);
+  const shared = (await friend.books.listShared(friendConnOfOwner)).map(b => b.bookId).sort();
+  assert(shared.includes('pub1') && shared.includes('pub2'), `re-seed lost books: ${JSON.stringify(shared)}`);
+});
+
 await test('cleanup', async () => {
   await sender.account.delete();
   await recipient.account.delete();
+  await owner.account.delete();
+  await friend.account.delete();
 });
 
 console.log('\n=== Summary ===');

@@ -146,6 +146,18 @@ export interface ITarnClient {
   unshareContent(connection: ShareConnection, contentId: string): Promise<unknown>;
 
   /**
+   * Backfill a connection's outbound log with a set of records, as a snapshot
+   * (+ deltas if oversized). `seed` is `{ [collection]: primaryKey[] }`.
+   */
+  seedConnectionShares(
+    connection: ShareConnection,
+    seed: Record<string, string[]>,
+  ): Promise<unknown>;
+
+  /** Content-ids currently shared with a connection (our outbound state). */
+  getOutboundShareContentIds(connection: ShareConnection): Promise<string[]>;
+
+  /**
    * Read a connection's share-log and return the resolved state map:
    * `{ [contentId]: { tx_id, cek } }`.
    */

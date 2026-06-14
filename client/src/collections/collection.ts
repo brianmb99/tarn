@@ -538,6 +538,33 @@ export class Collection<TRecord extends Record<string, unknown>> {
   }
 
   /**
+   * Share many records with ONE connection in a single operation — the
+   * "show this friend my whole shelf" primitive (sharing §6.6 backfill).
+   * Publishes the set as a snapshot (the SDK splits to deltas if it exceeds
+   * the share-log blob cap). Tolerant: records that can't be resolved are
+   * skipped, not fatal. Used for the boot-time reconciliation backstop and
+   * for re-seeding after a reconnect.
+   */
+  async shareManyTo(connection: ShareConnection, primaryKeys: string[]): Promise<void> {
+    this.#assertShareable('shareManyTo');
+    await this.#client.seedConnectionShares(connection, { [this.#name]: primaryKeys });
+  }
+
+  /**
+   * The primaryKeys in THIS collection currently shared with `connection`
+   * (our outbound state). Lets an app diff desired-vs-actual to decide
+   * whether a (re-)backfill is needed without re-publishing blindly.
+   */
+  async listSharedWith(connection: ShareConnection): Promise<string[]> {
+    this.#assertShareable('listSharedWith');
+    const prefix = this.#contentIdPrefix();
+    const ids = await this.#client.getOutboundShareContentIds(connection);
+    return ids
+      .filter((id) => id.startsWith(prefix))
+      .map((id) => id.slice(prefix.length));
+  }
+
+  /**
    * Fetch and decrypt every record this connection has shared with us under
    * this collection. Reads the connection's share-log (one request per page),
    * fetches each blob from Tarn, decrypts with the shareKey, and returns the

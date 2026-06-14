@@ -41,6 +41,7 @@ class MockTarnClient implements ITarnClient {
   getEntriesCalls: string[] = [];
   shareCalls: ShareCall[] = [];
   unshareCalls: UnshareCall[] = [];
+  seedCalls: Array<{ connection: ShareConnection; seed: Record<string, string[]> }> = [];
   readShareLogCalls = 0;
   syncShareLogCalls = 0;
   shareLogStateByConnection = new Map<string, Record<string, { tx_id: string; cek: string }>>();
@@ -215,6 +216,28 @@ class MockTarnClient implements ITarnClient {
     const state = this.shareLogStateByConnection.get(connection.share_pub);
     if (state) delete state[contentId];
     return { ok: true };
+  }
+
+  async seedConnectionShares(
+    connection: ShareConnection,
+    seed: Record<string, string[]>,
+  ): Promise<unknown> {
+    this.seedCalls.push({ connection, seed });
+    let state = this.shareLogStateByConnection.get(connection.share_pub);
+    if (!state) {
+      state = {};
+      this.shareLogStateByConnection.set(connection.share_pub, state);
+    }
+    for (const [collection, keys] of Object.entries(seed)) {
+      for (const key of keys) {
+        state[`${collection}:${key}`] = { tx_id: `tx-${key}`, cek: `cek-${key}` };
+      }
+    }
+    return { ok: true };
+  }
+
+  async getOutboundShareContentIds(connection: ShareConnection): Promise<string[]> {
+    return Object.keys(this.shareLogStateByConnection.get(connection.share_pub) ?? {});
   }
 
   async readShareLog(
@@ -906,6 +929,51 @@ describe('Collection.share', () => {
     assert.equal(mock.shareCalls[0]!.shareKey, 'mock-sk-1');
     assert.equal(mock.shareCalls[1]!.txid, 'mock-tx-2');
     assert.equal(mock.shareCalls[1]!.shareKey, 'mock-sk-2');
+  });
+});
+
+describe('Collection.shareManyTo / listSharedWith (backfill)', () => {
+  let mock: MockTarnClient;
+  let books: Collection<BookRecord>;
+
+  beforeEach(async () => {
+    mock = new MockTarnClient();
+    mock.connections = [conn1, conn2];
+    books = makeBooks(mock);
+    await books.create({ bookId: 'b1', title: 'One', isPrivate: false });
+    await books.create({ bookId: 'b2', title: 'Two', isPrivate: false });
+  });
+
+  it('shareManyTo seeds one connection with the given keys, namespaced to the collection', async () => {
+    await books.shareManyTo(conn1, ['b1', 'b2']);
+    assert.equal(mock.seedCalls.length, 1);
+    const call = mock.seedCalls[0]!;
+    assert.equal(call.connection, conn1);
+    assert.deepEqual(call.seed, { books: ['b1', 'b2'] });
+  });
+
+  it('listSharedWith returns the collection primaryKeys shared with a connection (prefix stripped, other collections filtered)', async () => {
+    // Seed both a books entry and a foreign-collection entry on the same log.
+    await books.shareManyTo(conn1, ['b1', 'b2']);
+    mock.shareLogStateByConnection.get(conn1.share_pub)!['notes:n9'] = { tx_id: 'x', cek: 'y' };
+
+    const shared = await books.listSharedWith(conn1);
+    assert.deepEqual(shared.sort(), ['b1', 'b2']);
+  });
+
+  it('listSharedWith is empty for a connection nothing was shared with', async () => {
+    assert.deepEqual(await books.listSharedWith(conn2), []);
+  });
+
+  it('shareManyTo throws when the collection is not shareable', async () => {
+    const settingsCol = createCollection<{ key: string; value: unknown }>({
+      client: mock,
+      appId: 'bookish',
+      name: 'settings',
+      def: { primaryKey: 'key', fields: { key: 'string', value: 'json' }, shareable: false },
+      schemaVersion: 4,
+    });
+    await assert.rejects(() => settingsCol.shareManyTo(conn1, ['x']), /requires the collection to declare shareable: true/);
   });
 });
 
