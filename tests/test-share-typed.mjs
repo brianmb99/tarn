@@ -217,11 +217,72 @@ await test('backstop: shareManyTo re-seeds an arbitrary set (reconciliation/reco
   assert(shared.includes('pub1') && shared.includes('pub2'), `re-seed lost books: ${JSON.stringify(shared)}`);
 });
 
+// ============ getShareKey resolves across DEK generations (tarn#73 fallout) ============
+//
+// changeCredentials() advances #currentGen with a fresh DEK; books written
+// before it stay wrapped under the prior gen. getShareKey must unwrap with the
+// generation that actually wrapped each blob, not just #currentGen — otherwise
+// every pre-rotation book is silently dropped from a share seed (the migrated-
+// account console flood). The handshake here happens AFTER the gen bump, using
+// the stable enveloped sharing key, so this isolates the cross-gen unwrap.
+
+console.log('\n=== getShareKey crosses DEK generations after a credential change ===');
+
+const gOwnerUsername = randomUsername();
+const gFriendUsername = randomUsername();
+const gOwner = await makeTypedClient();
+const gFriend = await makeTypedClient();
+let gOwnerConnOfFriend, gFriendConnOfOwner;
+
+await test('owner writes a book under gen 1, then changeCredentials bumps the generation', async () => {
+  const o = await gOwner.register(gOwnerUsername, 'pw-go-' + Date.now(), { recoveryAcknowledged: true });
+  await forceAllowRulesForAccount(o.dataLookupKey);
+  const f = await gFriend.register(gFriendUsername, 'pw-gf-' + Date.now(), { recoveryAcknowledged: true });
+  await forceAllowRulesForAccount(f.dataLookupKey);
+
+  // Written under gen 1 — its CEK is wrapped with the gen-1 DEK only.
+  await gOwner.books.create({ bookId: 'old-gen', title: 'Pre-Rotation', isPrivate: false });
+  await sleep(200);
+
+  // Advance the generation (passing the account key preserves the recovery
+  // factor — same call the real migration made). The gen-1 DEK stays in the
+  // chain; the book's CEK remains unwrappable ONLY with it.
+  await gOwner.account.changeCredentials(gOwnerUsername, 'pw-go2-' + Date.now(), { phrase: o.accountKey });
+  await sleep(200);
+});
+
+await test('friend sees the pre-rotation book on connect (getShareKey crosses gens)', async () => {
+  gOwner.setInitialShareSeedProvider(async () => {
+    const all = await gOwner.books.list();
+    return { books: all.filter(b => b.isPrivate !== true).map(b => b.bookId) };
+  });
+  const send = await gOwner.connections.invite(gFriendUsername);
+  await sleep(300);
+  const incoming = await gFriend.connections.listIncomingRequests();
+  const req = incoming.find(r => r.request_nonce === send.requestNonce);
+  assert(req, 'friend did not see the request');
+  await gFriend.connections.accept(req.request_nonce);
+  await sleep(300);
+  await gOwner.connections.listIncomingRequests(); // owner seeds seq-0
+  await sleep(300);
+  gOwnerConnOfFriend = (await gOwner.connections.list()).find(c => c.username === gFriendUsername);
+  gFriendConnOfOwner = (await gFriend.connections.list()).find(c => c.username === gOwnerUsername);
+  assert(gOwnerConnOfFriend && gFriendConnOfOwner, 'handshake incomplete');
+
+  const shared = (await gFriend.books.listShared(gFriendConnOfOwner)).map(b => b.bookId);
+  assert(
+    shared.includes('old-gen'),
+    `pre-rotation book dropped — getShareKey did not cross DEK generations. saw: ${JSON.stringify(shared)}`,
+  );
+});
+
 await test('cleanup', async () => {
   await sender.account.delete();
   await recipient.account.delete();
   await owner.account.delete();
   await friend.account.delete();
+  await gOwner.account.delete();
+  await gFriend.account.delete();
 });
 
 console.log('\n=== Summary ===');

@@ -85,7 +85,8 @@ import {
   addOutboundPending,
   addInboundPending,
   removeOutboundPending,
-  removeInboundPending,
+  markRequestConsumed,
+  isRequestConsumed,
   CONNECTIONS_CONTENT_ID,
   PENDING_REQUESTS_CONTENT_ID,
   INFO_CONNECTION_REQUEST,
@@ -4109,31 +4110,53 @@ export class TarnClient {
    * the blob is unfetchable or malformed.
    */
   async #recoverShareKey(txid: string): Promise<string | null> {
-    const dek = this.#dekByGen!.get(this.#currentGen!);
-    if (!dek) return null;
+    if (!this.#dekByGen || this.#dekByGen.size === 0) return null;
     const blob = await this.#fetchBlob(txid);
     if (!blob || !hasTarnBlobMagic(blob)) return null;
 
-    try {
-      const wrappedCEK = blob.slice(
-        TARN_BLOB_MAGIC_LEN,
-        TARN_BLOB_MAGIC_LEN + TARN_WRAPPED_CEK_LEN,
-      );
-      // Unwrap as raw bytes — we want the CEK material, not a CryptoKey, so
-      // we can re-encode it as base64url for the share-log wire format.
-      const cekBytes = new Uint8Array(
-        await crypto.subtle.unwrapKey(
-          'raw', bs(wrappedCEK), dek.kwKey, 'AES-KW',
-          { name: 'AES-GCM' }, true, ['decrypt'],
-        ).then((k) => crypto.subtle.exportKey('raw', k)) as ArrayBuffer,
-      );
-      const shareKey = bytesToBase64Url(cekBytes);
-      this.#cacheShareKey(txid, shareKey);
-      return shareKey;
-    } catch (err: any) {
-      console.warn(`[TarnClient] getShareKey: unwrap failed for ${txid}:`, err?.message || err);
-      return null;
+    const wrappedCEK = blob.slice(
+      TARN_BLOB_MAGIC_LEN,
+      TARN_BLOB_MAGIC_LEN + TARN_WRAPPED_CEK_LEN,
+    );
+
+    // A blob's CEK is wrapped under the DEK generation that was current when
+    // the blob was WRITTEN — which may be older than #currentGen once a
+    // credential change has advanced the chain (e.g. the tarn#73 migration).
+    // Unwrapping with only the current gen would AES-KW-fail (OperationError)
+    // for every pre-rotation blob, silently dropping those books from a share
+    // seed and flooding the console. So try the current gen first (the common
+    // case), then fall back across the rest of the chain newest-first. AES-KW
+    // carries an integrity check, so a wrong-gen key throws rather than
+    // yielding garbage — only the generation that actually wrapped it succeeds.
+    const gens = [...this.#dekByGen.keys()].sort((a, b) => {
+      if (a === this.#currentGen) return -1;
+      if (b === this.#currentGen) return 1;
+      return b - a;
+    });
+
+    for (const gen of gens) {
+      const dek = this.#dekByGen.get(gen);
+      if (!dek) continue;
+      try {
+        // Unwrap as raw bytes — we want the CEK material, not a CryptoKey, so
+        // we can re-encode it as base64url for the share-log wire format.
+        const cekBytes = new Uint8Array(
+          await crypto.subtle.unwrapKey(
+            'raw', bs(wrappedCEK), dek.kwKey, 'AES-KW',
+            { name: 'AES-GCM' }, true, ['decrypt'],
+          ).then((k) => crypto.subtle.exportKey('raw', k)) as ArrayBuffer,
+        );
+        const shareKey = bytesToBase64Url(cekBytes);
+        this.#cacheShareKey(txid, shareKey);
+        return shareKey;
+      } catch {
+        // Wrong generation for this blob — try the next one.
+      }
     }
+    console.warn(
+      `[TarnClient] getShareKey: unwrap failed for ${txid} across ${gens.length} DEK generation(s)`,
+    );
+    return null;
   }
 
   // ============ SHARING (issue #13) ============
@@ -4382,6 +4405,15 @@ export class TarnClient {
         const validation = validateConnectionRequestPayload(payload, this.#appId);
         if (!validation.valid) continue;
 
+        // Already accepted-then-(maybe)-removed: a consumed request-nonce is a
+        // permanent tombstone. Without this, a removed invite-connection
+        // resurrects on the next poll because its redemption blob still lives
+        // in our inbox and would be re-auto-accepted. A genuine re-invite uses
+        // a fresh nonce, so legitimate reconnection is unaffected.
+        if (isRequestConsumed(pendingRecord, validation.normalized.nonceBase64Url)) {
+          continue;
+        }
+
         // Skip requests from senders we've already connected to. This handles
         // the "request blob replayed on a fresh device" case cleanly — the
         // user isn't prompted to re-accept someone they're already connected
@@ -4467,6 +4499,11 @@ export class TarnClient {
           const match = (issuedRecord.invites || []).find((i: any) => i.token_id === cand.viaInviteToken);
           if (!match) continue;
           try {
+            // The invite's `label` is the issuer's OWN label for the connection
+            // they're forming (an app may pre-name the invitee). It is applied
+            // to the issuer's connection record here, by design. Apps must NOT
+            // pass the issuer's own display name as the invite label — that is
+            // what `recipient_metadata.display_name` is for.
             await this.acceptConnectionRequest(cand.requestNonce, { label: match.label || null });
             (autoAccepted || (autoAccepted = new Set())).add(cand.requestNonce);
           } catch (err: any) {
@@ -4582,7 +4619,11 @@ export class TarnClient {
     const connectionsUpdated = upsertConnection(connectionsState.record, newConnection);
     await this.#saveConnectionsRecord(connectionsState, connectionsUpdated);
 
-    const pendingUpdated = removeInboundPending(pendingState.record, requestNonce);
+    // Consume (not merely remove) the request: drop it from inbound AND record
+    // the nonce in the persistent tombstone so it can never be re-surfaced or
+    // re-auto-accepted — even after this connection is later removed. This is
+    // what stops a removed invite-connection from resurrecting on the next poll.
+    const pendingUpdated = markRequestConsumed(pendingState.record, requestNonce);
     await this.#savePendingRequestsRecord(pendingState, pendingUpdated);
 
     // Publish the seq=0 snapshot to our outbound-to-connection log (sharing §6.6).
@@ -5623,7 +5664,7 @@ export class TarnClient {
   ): Promise<any> {
     const ids = Object.keys(state);
     if (ids.length === 0) {
-      return await this._publishInitialSnapshot(connection, { state: {} });
+      return await this._publishInitialSnapshot(connection, { state: {}, retryOn409: true });
     }
     // Budget the snapshot's `state` plaintext under the blob cap, leaving
     // headroom for the operation envelope + ECDSA signature + AAD.
@@ -5641,7 +5682,7 @@ export class TarnClient {
         remaining.push(id);
       }
     }
-    const snap = await this._publishInitialSnapshot(connection, { state: snapshotState });
+    const snap = await this._publishInitialSnapshot(connection, { state: snapshotState, retryOn409: true });
     for (const id of remaining) {
       try {
         await this.shareContent(connection, id, state[id]!.tx_id, state[id]!.cek);
@@ -5698,16 +5739,22 @@ export class TarnClient {
    * methods once those land.
    *
    * @param {Object} connection
-   * @param {{ state?: Object }} [opts]
+   * @param {{ state?: Object, retryOn409?: boolean }} [opts]
    */
   async _publishInitialSnapshot(connection: any, opts: any = {}): Promise<any> {
     const state = opts.state ?? {};
+    // When re-establishing a connection whose pairwise tag already carries a
+    // prior epoch's log (e.g. remove-then-re-invite the same peer), a seq-0
+    // publish collides (409). retryOn409 lets the publish primitive re-discover
+    // the log head and resume past it — a SNAPSHOT replaces recipient state
+    // wholesale, so resuming yields the same result as a fresh seq-0. Opt in
+    // only when the caller asks; default stays strict for genuinely-new logs.
     const result = await this._publishShareLogEntry(connection, {
       type: OP_SNAPSHOT,
       state,
       snapshot_at: Math.floor(Date.now() / 1000),
       prior_seq: null,
-    });
+    }, opts.retryOn409 ? { retryOn409: true } : {});
     // Seed the outbound state cache so subsequent shareContent / etc. emit
     // meaningful auto-snapshots without re-reading the log.
     this.#outboundStateCache.set(connection.share_pub, {

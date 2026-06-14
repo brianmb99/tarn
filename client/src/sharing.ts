@@ -616,14 +616,27 @@ export type PendingRequestsRecord = {
   version: 1;
   outbound: PendingEntry[];
   inbound: PendingEntry[];
+  // Request-nonces we have already accepted (and thus consumed). A consumed
+  // nonce is never re-surfaced or re-auto-accepted — even after the resulting
+  // connection is later removed. Without this tombstone, an invite-redemption
+  // blob (which lives permanently in our inbox) re-materializes the removed
+  // connection on the very next poll. Optional for backward-compat: records
+  // written before this field default to an empty list on read.
+  consumed?: string[];
 };
+
+// Cap the consumed-nonce tombstone list so it can't grow without bound over an
+// account's lifetime. It only needs to outlive the inbox-window in which a
+// redemption blob is still re-fetchable; a generous cap covers far more than
+// any real friend count, and we keep the most recent entries.
+const CONSUMED_NONCE_CAP = 1000;
 
 export function emptyConnectionsRecord(appId: string): ConnectionsRecord {
   return { app_id: appId, version: 1, connections: [] };
 }
 
 export function emptyPendingRequestsRecord(appId: string): PendingRequestsRecord {
-  return { app_id: appId, version: 1, outbound: [], inbound: [] };
+  return { app_id: appId, version: 1, outbound: [], inbound: [], consumed: [] };
 }
 
 /**
@@ -747,6 +760,30 @@ export function removeOutboundPending(record: PendingRequestsRecord, requestNonc
 export function removeInboundPending(record: PendingRequestsRecord, requestNonce: string): PendingRequestsRecord {
   ensurePendingShape(record);
   return { ...record, inbound: record.inbound.filter((i: PendingEntry) => i.request_nonce !== requestNonce) };
+}
+
+/**
+ * Mark a request-nonce as consumed: drop any matching inbound entry AND record
+ * the nonce in the `consumed` tombstone so it can never be re-surfaced or
+ * re-auto-accepted (the resurrection fix). Idempotent; caps the tombstone list.
+ */
+export function markRequestConsumed(record: PendingRequestsRecord, requestNonce: string): PendingRequestsRecord {
+  ensurePendingShape(record);
+  const inbound = record.inbound.filter((i: PendingEntry) => i.request_nonce !== requestNonce);
+  const prior = Array.isArray(record.consumed) ? record.consumed : [];
+  let consumed = prior;
+  if (typeof requestNonce === 'string' && requestNonce.length > 0 && !prior.includes(requestNonce)) {
+    consumed = [...prior, requestNonce];
+    if (consumed.length > CONSUMED_NONCE_CAP) {
+      consumed = consumed.slice(consumed.length - CONSUMED_NONCE_CAP);
+    }
+  }
+  return { ...record, inbound, consumed };
+}
+
+/** Whether a request-nonce has already been consumed (accepted). */
+export function isRequestConsumed(record: PendingRequestsRecord, requestNonce: string): boolean {
+  return !!record && Array.isArray(record.consumed) && record.consumed.includes(requestNonce);
 }
 
 function ensurePendingShape(record: PendingRequestsRecord): void {

@@ -44,6 +44,8 @@ import {
   addInboundPending,
   removeOutboundPending,
   removeInboundPending,
+  markRequestConsumed,
+  isRequestConsumed,
   CONNECTIONS_CONTENT_ID,
   PENDING_REQUESTS_CONTENT_ID,
 } from '../../client/src/sharing.js';
@@ -531,5 +533,45 @@ describe('pending requests record', () => {
   it('content_id constants are stable', () => {
     assert.equal(CONNECTIONS_CONTENT_ID, 'tarn-connections-v1');
     assert.equal(PENDING_REQUESTS_CONTENT_ID, 'tarn-pending-requests-v1');
+  });
+
+  it('markRequestConsumed tombstones the nonce and drops it from inbound', () => {
+    let r = emptyPendingRequestsRecord('bookish');
+    r = addInboundPending(r, { request_nonce: 'X', sender_email: 'a@x.y' });
+    r = addInboundPending(r, { request_nonce: 'Y', sender_email: 'b@x.y' });
+    assert.equal(isRequestConsumed(r, 'X'), false);
+
+    r = markRequestConsumed(r, 'X');
+    // Dropped from inbound...
+    assert.equal(r.inbound.length, 1);
+    assert.equal(r.inbound[0].request_nonce, 'Y');
+    // ...and remembered as consumed.
+    assert.equal(isRequestConsumed(r, 'X'), true);
+    assert.equal(isRequestConsumed(r, 'Y'), false);
+
+    // Idempotent: re-consuming the same nonce doesn't duplicate it.
+    r = markRequestConsumed(r, 'X');
+    assert.equal(r.consumed.filter((n) => n === 'X').length, 1);
+  });
+
+  it('consumed survives across a re-add (resurrection defense)', () => {
+    // Accept X, then "remove the friend" (we don't model the connections
+    // record here) and re-poll: a consumed nonce must still read as consumed
+    // so it is never re-auto-accepted.
+    let r = emptyPendingRequestsRecord('bookish');
+    r = addInboundPending(r, { request_nonce: 'X', sender_email: 'a@x.y' });
+    r = markRequestConsumed(r, 'X');
+    // Re-discovering the same blob would addInboundPending again — but the
+    // poll loop checks isRequestConsumed first and skips, so inbound stays
+    // clean and the nonce stays tombstoned.
+    assert.equal(isRequestConsumed(r, 'X'), true);
+  });
+
+  it('isRequestConsumed tolerates legacy records without a consumed list', () => {
+    const legacy = { app_id: 'bookish', version: 1, outbound: [], inbound: [] };
+    assert.equal(isRequestConsumed(legacy, 'anything'), false);
+    // And markRequestConsumed initializes the list on such a record.
+    const upgraded = markRequestConsumed(legacy, 'Z');
+    assert.equal(isRequestConsumed(upgraded, 'Z'), true);
   });
 });

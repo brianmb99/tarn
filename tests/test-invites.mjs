@@ -370,9 +370,44 @@ await test('11. createInviteToken does not include the payload_key in any HTTP b
   }
 });
 
-// ============ 12. App invite_url_template GET happy path + 404 (already covered above) ============
+// ============ 12. Removed invite-connection must not resurrect on re-poll ============
 
-// (already tested as cases 1 and 2.)
+await test('12. removed invite-connection does NOT resurrect on re-poll (consumed-nonce tombstone)', async () => {
+  await resetState();
+  const inviter = new TarnClient(API_BASE, INVITE_APP_ID);
+  await registerWithRules(inviter, randomEmail(), 'pw-' + Date.now());
+  const invite = await inviter.createInviteToken({ label: 'Ghost', expiry_days: 7 });
+  const fragment = invite.invite_url.split('#')[1];
+
+  await resetState();
+  const recipient = new TarnClient(API_BASE, INVITE_APP_ID);
+  await registerWithRules(recipient, randomEmail(), 'pw-' + Date.now());
+  await recipient.redeemInviteToken(invite.token_id, fragment);
+
+  // Inviter auto-accepts on first poll → 1 connection.
+  await sleep(150);
+  await inviter.listIncomingRequests();
+  let conns = await inviter.listConnections();
+  assert(conns.length === 1, `expected 1 connection after auto-accept, got ${conns.length}`);
+
+  // Inviter removes the friend.
+  await inviter.removeConnection(conns[0]);
+  conns = await inviter.listConnections();
+  assert(conns.length === 0, `expected 0 connections after removal, got ${conns.length}`);
+
+  // The redemption request blob still lives in the inviter's inbox. A re-poll
+  // re-discovers it — but the consumed-nonce tombstone must suppress
+  // re-auto-accept. Without the fix, the connection resurrects here.
+  await sleep(150);
+  await inviter.listIncomingRequests();
+  conns = await inviter.listConnections();
+  assert(conns.length === 0, `removed connection RESURRECTED on re-poll: got ${conns.length}`);
+
+  // And a second re-poll stays clean (idempotent across polls).
+  await inviter.listIncomingRequests();
+  conns = await inviter.listConnections();
+  assert(conns.length === 0, `removed connection resurrected on second re-poll: got ${conns.length}`);
+});
 
 // ============ Summary ============
 
