@@ -30,7 +30,7 @@ import {
   INFO_CONNECTION_ACCEPT,
 } from '../client/src/sharing.js';
 import {
-  seedTestApp, DEFAULT_APP_ID, randomEmail, forceAllowRulesForAccount, sleep,
+  seedTestApp, DEFAULT_APP_ID, randomEmail, forceAllowRulesForAccount, sleep, connectionTo,
 } from './helpers.mjs';
 
 const BASE_URL = process.argv[2] || 'http://localhost:8787';
@@ -111,7 +111,12 @@ await test('Bob listIncomingRequests() returns Alice\'s request', async () => {
   await sleep(150);
   const inbox = await bob.listIncomingRequests();
   assert(inbox.length === 1, `expected 1 incoming, got ${inbox.length}`);
-  assert(inbox[0].senderUsername === aliceEmail, `wrong sender: ${inbox[0].senderUsername}`);
+  // Privacy change: senderUsername is now an opaque share_pub fingerprint, NOT
+  // Alice's email. Verify the sender by the real identity (share_pub) instead.
+  const aliceSharePub = (await bob.getRecipientShareKey(aliceEmail)).sharePubBase64Url;
+  assert(inbox[0].senderSharePubBase64Url === aliceSharePub, `wrong sender share_pub: ${inbox[0].senderSharePubBase64Url}`);
+  assert(typeof inbox[0].senderUsername === 'string' && inbox[0].senderUsername.length > 0
+    && inbox[0].senderUsername !== aliceEmail, `senderUsername should be a non-email fingerprint, got ${inbox[0].senderUsername}`);
   assert(inbox[0].requestNonce === requestNonce, 'request nonce mismatch');
   assert(inbox[0].message === 'hi from alice', `wrong message: ${inbox[0].message}`);
   assert(inbox[0].senderAppId === DEFAULT_APP_ID, 'app_id should match');
@@ -126,7 +131,9 @@ await test('Bob acceptConnectionRequest() adds Alice to Bob\'s connections', asy
 
   const connections = await bob.listConnections();
   assert(connections.length === 1, `Bob should have 1 connection, got ${connections.length}`);
-  assert(connections[0].username === aliceEmail, `wrong connection username: ${connections[0].username}`);
+  // Matched by share_pub now (username no longer carries the peer's email).
+  assert((await connectionTo(bob, aliceEmail)) != null, 'Alice not found in Bob\'s connections by share_pub');
+  assert(connections[0].username !== aliceEmail, 'connection.username must not leak the peer email');
 
   const pending = await bob.getPendingRequests();
   assert(pending.inbound.length === 0, 'Bob inbound should be empty after accept');
@@ -141,7 +148,8 @@ await test('Alice listIncomingRequests() processes accept, adds Bob to her conne
 
   const connections = await alice.listConnections();
   assert(connections.length === 1, `Alice should have 1 connection, got ${connections.length}`);
-  assert(connections[0].username === bobEmail, `wrong connection username: ${connections[0].username}`);
+  assert((await connectionTo(alice, bobEmail)) != null, 'Bob not found in Alice\'s connections by share_pub');
+  assert(connections[0].username !== bobEmail, 'connection.username must not leak the peer email');
 
   const pending = await alice.getPendingRequests();
   assert(pending.outbound.length === 0, 'Alice outbound should be empty after accept-process');

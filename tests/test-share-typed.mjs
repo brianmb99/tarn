@@ -106,12 +106,15 @@ await test('handshake: sender invites, recipient accepts (typed connections name
   // Sender processes the accept (publishes its own seq=0 snapshot).
   await sender.connections.listIncomingRequests();
 
+  // Each client has exactly one connection here, and `username` no longer
+  // carries the peer email (privacy change → it's a share_pub fingerprint), so
+  // take the sole connection rather than matching by username.
   const senderConns = await sender.connections.list();
-  senderConnOfRecipient = senderConns.find(c => c.username === recipientUsername);
+  senderConnOfRecipient = senderConns[0];
   assert(senderConnOfRecipient, 'recipient not in sender connections');
 
   const recipientConns = await recipient.connections.list();
-  recipientConnOfSender = recipientConns.find(c => c.username === senderUsername);
+  recipientConnOfSender = recipientConns[0];
   assert(recipientConnOfSender, 'sender not in recipient connections');
 });
 
@@ -191,8 +194,8 @@ await test('handshake AFTER the library exists', async () => {
   await sleep(300);
   await owner.connections.listIncomingRequests(); // owner processes accept, seeds seq-0
   await sleep(300);
-  ownerConnOfFriend = (await owner.connections.list()).find(c => c.username === friendUsername);
-  friendConnOfOwner = (await friend.connections.list()).find(c => c.username === ownerUsername);
+  ownerConnOfFriend = (await owner.connections.list())[0];     // sole connection
+  friendConnOfOwner = (await friend.connections.list())[0];    // sole connection
   assert(ownerConnOfFriend && friendConnOfOwner, 'handshake incomplete');
 });
 
@@ -265,8 +268,8 @@ await test('friend sees the pre-rotation book on connect (getShareKey crosses ge
   await sleep(300);
   await gOwner.connections.listIncomingRequests(); // owner seeds seq-0
   await sleep(300);
-  gOwnerConnOfFriend = (await gOwner.connections.list()).find(c => c.username === gFriendUsername);
-  gFriendConnOfOwner = (await gFriend.connections.list()).find(c => c.username === gOwnerUsername);
+  gOwnerConnOfFriend = (await gOwner.connections.list())[0];   // sole connection
+  gFriendConnOfOwner = (await gFriend.connections.list())[0];  // sole connection
   assert(gOwnerConnOfFriend && gFriendConnOfOwner, 'handshake incomplete');
 
   const shared = (await gFriend.books.listShared(gFriendConnOfOwner)).map(b => b.bookId);

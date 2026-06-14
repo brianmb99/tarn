@@ -4264,8 +4264,16 @@ export class TarnClient {
     }
 
     const senderSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
+    // Privacy: identify ourselves to the peer by our share_pub FINGERPRINT, not
+    // our login username (which is the user's email in app deployments). The
+    // peer already receives `sender_share_pub` in this same payload, so the
+    // fingerprint reveals nothing new — but the raw email never goes on the
+    // wire. `sender_email` is a legacy wire-field name; it now carries this
+    // opaque sender id. Nothing reads it post-handshake (display-only), so this
+    // is safe. (Wire-compatible: it's still a non-empty string.)
+    const senderId = await fingerprintSharePub(this.#sharingKeyPair.publicKey);
     const payload = buildConnectionRequestPayload({
-      senderUsername: this.#username!,
+      senderUsername: senderId,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -4574,8 +4582,11 @@ export class TarnClient {
     }
 
     const senderSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
+    // Privacy: send our share_pub fingerprint as the sender id, never the raw
+    // email. See sendConnectionRequest for the full rationale.
+    const senderId = await fingerprintSharePub(this.#sharingKeyPair.publicKey);
     const payload = buildConnectionAcceptPayload({
-      senderUsername: this.#username!,
+      senderUsername: senderId,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,
@@ -5098,8 +5109,10 @@ export class TarnClient {
     // username) and tagged with via_invite_token so the inviter's auto-accept
     // path matches it.
     const senderSigningPubBase64 = await exportPublicKey(this.#shareSigningKeyPair!.publicKey);
+    // Privacy: send our share_pub fingerprint as the sender id, never the raw
+    // email. `myFingerprint` was already computed above for the redeem call.
     const reqPayload = buildConnectionRequestPayload({
-      senderUsername: this.#username!,
+      senderUsername: myFingerprint,
       senderSharePub: this.#sharingKeyPair.publicKey,
       senderSigningPubBase64,
       senderAppId: this.#appId,

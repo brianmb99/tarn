@@ -32,7 +32,7 @@ import {
   OP_ADD, OP_UPDATE, OP_ROTATE, OP_REMOVE, OP_SNAPSHOT,
 } from '../client/src/share-log.js';
 import {
-  seedTestApp, DEFAULT_APP_ID, randomUsername, forceAllowRulesForAccount, sleep,
+  seedTestApp, DEFAULT_APP_ID, randomUsername, forceAllowRulesForAccount, sleep, connectionTo,
 } from './helpers.mjs';
 
 const BASE_URL = process.argv[2] || 'http://localhost:8787';
@@ -107,11 +107,9 @@ await test('Alice sends connection request, Bob accepts (publishes seq=0 snapsho
 await test('Alice processes the accept (publishes her own seq=0 snapshot)', async () => {
   await sleep(300);
   await alice.listIncomingRequests();
-  const aliceConnections = await alice.listConnections();
-  bobConnectionOfAlice = aliceConnections.find(f => f.username === bobUsername);
+  bobConnectionOfAlice = await connectionTo(alice, bobUsername);
   assert(bobConnectionOfAlice, 'Bob not in Alice\'s connections record');
-  const bobConnections = await bob.listConnections();
-  aliceConnectionOfBob = bobConnections.find(f => f.username === aliceUsername);
+  aliceConnectionOfBob = await connectionTo(bob, aliceUsername);
   assert(aliceConnectionOfBob, 'Alice not in Bob\'s connections record');
 });
 
@@ -609,8 +607,8 @@ await test('Charlie + Diana register and connection each other', async () => {
   await diana.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await charlie.listIncomingRequests();
-  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.username === dianaUsername);
-  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.username === charlieUsername);
+  charlieConnectionOfDiana = await connectionTo(charlie, dianaUsername);
+  dianaConnectionOfCharlie = await connectionTo(diana, charlieUsername);
   assert(charlieConnectionOfDiana, 'Charlie missing Diana');
   assert(dianaConnectionOfCharlie, 'Diana missing Charlie');
 });
@@ -622,13 +620,11 @@ await test('removeConnection (silent): connection dropped from listConnections, 
     'arweave-rev-1',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
   );
-  const before = await charlie.listConnections();
-  assert(before.some(f => f.username === dianaUsername), 'Diana should still be a connection');
+  assert(((await connectionTo(charlie, dianaUsername)) != null), 'Diana should still be a connection');
   const r = await charlie.removeConnection(charlieConnectionOfDiana);
   assert(r.removed === true, 'removeConnection should report removal');
   assert(!r.notifications, 'silent removeConnection should not produce notifications');
-  const after = await charlie.listConnections();
-  assert(!after.some(f => f.username === dianaUsername), 'Diana should be gone after removeConnection');
+  assert(((await connectionTo(charlie, dianaUsername)) == null), 'Diana should be gone after removeConnection');
 });
 
 await test('removeConnection (idempotent): re-removing a non-connection returns removed:false', async () => {
@@ -644,8 +640,8 @@ await test('Re-establish Charlie+Diana for notify-mode test', async () => {
   await charlie.acceptConnectionRequest(send2.requestNonce);
   await sleep(200);
   await diana.listIncomingRequests();
-  charlieConnectionOfDiana = (await charlie.listConnections()).find(f => f.username === dianaUsername);
-  dianaConnectionOfCharlie = (await diana.listConnections()).find(f => f.username === charlieUsername);
+  charlieConnectionOfDiana = await connectionTo(charlie, dianaUsername);
+  dianaConnectionOfCharlie = await connectionTo(diana, charlieUsername);
   assert(charlieConnectionOfDiana, 'Re-connection failed for Charlie');
   assert(dianaConnectionOfCharlie, 'Re-connection failed for Diana');
   // Charlie publishes 2 add ops to have something to revoke.
@@ -729,11 +725,10 @@ await test('Eve registers, connections Frank and Gary, shares same content with 
   await sleep(200);
   await eve.listIncomingRequests();
 
-  const eveConnections = await eve.listConnections();
-  frankConnectionOfEve = eveConnections.find(f => f.username === frankUsername);
-  garyConnectionOfEve = eveConnections.find(f => f.username === garyUsername);
-  eveConnectionOfFrank = (await frank.listConnections()).find(f => f.username === eveUsername);
-  eveConnectionOfGary = (await gary.listConnections()).find(f => f.username === eveUsername);
+  frankConnectionOfEve = await connectionTo(eve, frankUsername);
+  garyConnectionOfEve = await connectionTo(eve, garyUsername);
+  eveConnectionOfFrank = await connectionTo(frank, eveUsername);
+  eveConnectionOfGary = await connectionTo(gary, eveUsername);
   assert(frankConnectionOfEve && garyConnectionOfEve, 'Eve\'s connection list incomplete');
   assert(eveConnectionOfFrank && eveConnectionOfGary, 'Frank/Gary missing Eve');
 
@@ -796,8 +791,8 @@ await test('Helen + Ivan register + handshake; Helen shares a content item', asy
   await sleep(200);
   await helen.listIncomingRequests();
 
-  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.username === ivanUsername);
-  helenConnectionOfIvan = (await ivan.listConnections()).find(f => f.username === helenUsername);
+  ivanConnectionOfHelen = await connectionTo(helen, ivanUsername);
+  helenConnectionOfIvan = await connectionTo(ivan, helenUsername);
   assert(ivanConnectionOfHelen, 'Helen missing Ivan');
   assert(helenConnectionOfIvan, 'Ivan missing Helen');
   helenSharePubBeforeRotate = helenConnectionOfIvan.share_pub;
@@ -849,7 +844,7 @@ await test('Ivan syncs: connection record untouched, entries still verify (tarn#
 await test('Helen publishes a new share post-rotation; Ivan picks it up via sync', async () => {
   // Helen's connections record was updated by changeCredentials: but the
   // ivanConnectionOfHelen reference is stale post-rotation. Refresh it.
-  ivanConnectionOfHelen = (await helen.listConnections()).find(f => f.username === ivanUsername);
+  ivanConnectionOfHelen = await connectionTo(helen, ivanUsername);
   await helen.shareContent(
     ivanConnectionOfHelen,
     'post-rotate-target',
@@ -859,7 +854,7 @@ await test('Helen publishes a new share post-rotation; Ivan picks it up via sync
   await sleep(300);
   // Refresh Ivan's connection pointer too.
   const ivanConnections = await ivan.listConnections();
-  const helenFromIvan = ivanConnections.find(f => f.username !== helenUsername || f.share_pub) || ivanConnections[0];
+  const helenFromIvan = (await connectionTo(ivan, helenUsername)) || ivanConnections[0];
   const stateAfter = await ivan.syncShareLog(helenFromIvan);
   assert(stateAfter['post-rotate-target'], 'Ivan should pick up post-rotation share via NEW-log keys');
 });
@@ -897,7 +892,7 @@ await test('Karl + Lily register and connection each other', async () => {
   await lily.acceptConnectionRequest(send.requestNonce);
   await sleep(200);
   await karl.listIncomingRequests();
-  lilyConnectionOfKarl = (await karl.listConnections()).find(c => c.username === lilyUsername);
+  lilyConnectionOfKarl = await connectionTo(karl, lilyUsername);
   assert(lilyConnectionOfKarl, 'Karl missing Lily');
 });
 
@@ -927,7 +922,7 @@ await test('muteConnection is idempotent', async () => {
 await test('muting does NOT block readShareLog from surfacing the connection', async () => {
   // Lily shares something so Karl has content to read.
   await lily.shareContent(
-    (await lily.listConnections()).find(c => c.username === karlUsername),
+    await connectionTo(lily, karlUsername),
     'mute-visibility-test',
     'arweave-mute-test',
     bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),

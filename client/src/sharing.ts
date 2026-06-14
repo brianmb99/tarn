@@ -259,8 +259,20 @@ export async function hpkeOpen(opts: {
 }
 
 // ============ CONNECTION REQUEST / ACCEPT PAYLOADS ============
+//
+// PRIVACY NOTE on `sender_email` (and the matching `senderUsername` opt /
+// normalized field): the wire key is named `sender_email` for historical
+// reasons, but as of 2026-06 the SDK populates it with the sender's share_pub
+// FINGERPRINT — an opaque, non-PII id — NOT the user's login email. The peer
+// already receives `sender_share_pub` in the same payload, so the fingerprint
+// adds no information; this keeps the raw email off the wire. Nothing reads
+// this value post-handshake (it is display-only — connections are keyed by
+// share_pub), so the rename was value-only and the field name is kept for
+// backward wire compatibility with older clients.
 
 export type BuildConnectionRequestOpts = {
+  /** Opaque sender id placed in `sender_email`. The SDK passes a share_pub
+   *  fingerprint, never the login email. See the privacy note above. */
   senderUsername: string;
   senderSharePub: Uint8Array;
   senderSigningPubBase64: string;
@@ -273,6 +285,7 @@ export type BuildConnectionRequestOpts = {
 
 export type ConnectionRequestPayload = {
   type: 'connection_request';
+  /** Legacy name; carries an opaque sender fingerprint, not an email. */
   sender_email: string;
   sender_share_pub: string;
   sender_signing_pub: string;
@@ -433,6 +446,7 @@ export type BuildConnectionAcceptOpts = {
 
 export type ConnectionAcceptPayload = {
   type: 'connection_accept';
+  /** Legacy name; carries an opaque sender fingerprint, not an email. */
   sender_email: string;
   sender_share_pub: string;
   sender_signing_pub: string;

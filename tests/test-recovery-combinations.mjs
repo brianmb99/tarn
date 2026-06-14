@@ -40,6 +40,7 @@ import {
   randomUsername,
   forceAllowRulesForAccount,
   sleep,
+  connectionTo,
 } from './helpers.mjs';
 import { VirtualAuthenticator, installPasskeyTestEnv } from './helpers/virtual-authenticator.mjs';
 
@@ -473,7 +474,7 @@ await test('recoverAccount clears the read-state cache; post-recovery share read
   await sleep(300);
   await alice.listIncomingRequests();
 
-  let bobConnOfAlice = (await alice.listConnections()).find(f => f.username === bobUser);
+  let bobConnOfAlice = await connectionTo(alice, bobUser);
   assert(bobConnOfAlice, 'Alice must have Bob as a connection');
 
   // Alice shares an item and reads her own outbound state so a read-state
@@ -510,7 +511,7 @@ await test('recoverAccount clears the read-state cache; post-recovery share read
   // Post-recovery, Alice's connection record + keys rotated. Re-resolve the
   // connection and prove a share read works on the ROTATED keys (no stale-key
   // decrypt failure). The connection pointer is refreshed from her record.
-  bobConnOfAlice = (await alice.listConnections()).find(f => f.username === bobUser);
+  bobConnOfAlice = await connectionTo(alice, bobUser);
   assert(bobConnOfAlice, 'Alice still has Bob as a connection post-recovery');
   const postState = await alice.readShareLog(bobConnOfAlice, { refresh: true });
   assert(typeof postState === 'object' && postState !== null, 'post-recovery share read must return a state map on rotated keys');

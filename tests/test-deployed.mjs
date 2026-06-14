@@ -23,6 +23,7 @@ import {
   deriveAllKeys, exportPublicKey, wrapDataKey, signChallenge,
   encodeSharePub, deriveShareLookupKey,
 } from '../client/src/crypto.js';
+import { connectionTo } from './helpers.mjs';
 
 const API_BASE = process.argv[2];
 const APP_ID = process.argv[3];
@@ -931,14 +932,12 @@ await test('Two test users register + complete a mutual handshake against the de
 
   // Bob accepts.
   await handshakeBob.acceptConnectionRequest(handshakeRequestNonce);
-  const bobConnections = await handshakeBob.listConnections();
-  assert(bobConnections.some(f => f.username === handshakeAliceUsername), 'Alice not in Bob\'s connections');
+  assert((await connectionTo(handshakeBob, handshakeAliceUsername)) != null, 'Alice not in Bob\'s connections');
 
   // Alice processes the accept.
   await sleep(500);
   await handshakeAlice.listIncomingRequests();
-  const aliceConnections = await handshakeAlice.listConnections();
-  assert(aliceConnections.some(f => f.username === handshakeBobUsername), 'Bob not in Alice\'s connections');
+  assert((await connectionTo(handshakeAlice, handshakeBobUsername)) != null, 'Bob not in Alice\'s connections');
 });
 
 // ============ 9. SHARE LOG (issue #15, Section 5b) ============
@@ -949,10 +948,8 @@ await test('Connections from §8 can publish + fetch share log entries with veri
   // Re-resolve the connection records on each side. Section 8 left Alice + Bob
   // mutually connected; the seq=0 snapshots were already published by the
   // handshake-acceptance flow.
-  const aliceConnections = await handshakeAlice.listConnections();
-  const bobConnections = await handshakeBob.listConnections();
-  const bobConnectionOfAlice = aliceConnections.find(f => f.username === handshakeBobUsername);
-  const aliceConnectionOfBob = bobConnections.find(f => f.username === handshakeAliceUsername);
+  const bobConnectionOfAlice = await connectionTo(handshakeAlice, handshakeBobUsername);
+  const aliceConnectionOfBob = await connectionTo(handshakeBob, handshakeAliceUsername);
   assert(bobConnectionOfAlice, 'Bob missing from Alice\'s connections');
   assert(aliceConnectionOfBob, 'Alice missing from Bob\'s connections');
 
@@ -1018,10 +1015,8 @@ console.log('\n=== 9b. Share log read flow + multi-device retry (Section 5c) ===
 
 await test('readShareLog: Bob bootstraps Alice\'s log, sees content shared by Alice', async () => {
   // Re-resolve connection records (handshakeAlice/Bob persist from §8/§9).
-  const aliceConnections = await handshakeAlice.listConnections();
-  const bobConnections = await handshakeBob.listConnections();
-  const bobConnectionOfAlice = aliceConnections.find(f => f.username === handshakeBobUsername);
-  const aliceConnectionOfBob = bobConnections.find(f => f.username === handshakeAliceUsername);
+  const bobConnectionOfAlice = await connectionTo(handshakeAlice, handshakeBobUsername);
+  const aliceConnectionOfBob = await connectionTo(handshakeBob, handshakeAliceUsername);
   assert(bobConnectionOfAlice && aliceConnectionOfBob, 'connection records missing');
 
   const cek1 = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
@@ -1039,10 +1034,8 @@ await test('readShareLog: Bob bootstraps Alice\'s log, sees content shared by Al
 });
 
 await test('syncShareLog: incremental update + remove flows through to Bob', async () => {
-  const aliceConnections = await handshakeAlice.listConnections();
-  const bobConnections = await handshakeBob.listConnections();
-  const bobConnectionOfAlice = aliceConnections.find(f => f.username === handshakeBobUsername);
-  const aliceConnectionOfBob = bobConnections.find(f => f.username === handshakeAliceUsername);
+  const bobConnectionOfAlice = await connectionTo(handshakeAlice, handshakeBobUsername);
+  const aliceConnectionOfBob = await connectionTo(handshakeBob, handshakeAliceUsername);
 
   await handshakeAlice.updateShareContent(bobConnectionOfAlice, 'deploy-5c-A', 'tx-5c-A-v2');
   await handshakeAlice.unshareContent(bobConnectionOfAlice, 'deploy-5c-B');
@@ -1155,8 +1148,8 @@ await test('Pat + Quinn register + handshake against deployed API', async () => 
   await quinn.acceptConnectionRequest(send.requestNonce);
   await sleep(500);
   await pat.listIncomingRequests();
-  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.username === quinnUsername);
-  patConnectionOfQuinn = (await quinn.listConnections()).find(f => f.username === patUsername);
+  quinnConnectionOfPat = await connectionTo(pat, quinnUsername);
+  patConnectionOfQuinn = await connectionTo(quinn, patUsername);
   assert(quinnConnectionOfPat, 'Pat missing Quinn after handshake');
   assert(patConnectionOfQuinn, 'Quinn missing Pat after handshake');
   patSharePubBeforeRotate = patConnectionOfQuinn.share_pub;
@@ -1197,7 +1190,7 @@ await test('Pat publishes a post-rotation share; Quinn picks it up via NEW-log k
   // Refresh references — Pat's connection record was updated by the rotation
   // (no, actually Pat's view of Quinn is unchanged; only Quinn's view of
   // Pat rotated). But re-fetch defensively.
-  quinnConnectionOfPat = (await pat.listConnections()).find(f => f.username === quinnUsername);
+  quinnConnectionOfPat = await connectionTo(pat, quinnUsername);
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   await pat.shareContent(quinnConnectionOfPat, 'rot-target-2-postrotate', 'arweave-rot-post', cek);
@@ -1219,8 +1212,7 @@ console.log('\n=== 9d. Mute lifecycle (per-side filter, syncs across devices) ==
 
 await test('muteConnection persists; isMuted reflects state; unmute reverses; multi-device sync', async () => {
   // Reuse handshake Alice + Bob from §8 — they're still mutual connections.
-  const aliceConnections = await handshakeAlice.listConnections();
-  const bobOfAlice = aliceConnections.find(c => c.username === handshakeBobUsername);
+  const bobOfAlice = await connectionTo(handshakeAlice, handshakeBobUsername);
   assert(bobOfAlice, 'Alice missing Bob (handshake §8 setup gone?)');
 
   // Baseline.
@@ -1242,8 +1234,7 @@ await test('muteConnection persists; isMuted reflects state; unmute reverses; mu
 
   // Read flow not short-circuited: Alice can still read Bob's outbound log.
   // (The setup published a seq=0 snapshot from Bob during §8 acceptance.)
-  const bobAlice = await handshakeBob.listConnections();
-  const aliceOfBob = bobAlice.find(c => c.username === handshakeAliceUsername);
+  const aliceOfBob = await connectionTo(handshakeBob, handshakeAliceUsername);
   const cek = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   await handshakeBob.shareContent(aliceOfBob, 'mute-visibility-deployed', 'arweave-mute-deploy', cek);

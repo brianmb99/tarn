@@ -77,3 +77,28 @@ export async function forceAllowRulesForAccount(dataLookupKey) {
     { cwd: new URL('../api', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'), stdio: 'pipe', timeout: 15000 },
   );
 }
+
+/**
+ * Find `client`'s connection to the peer identified by `peerUsername`, matched
+ * by SHARE_PUB (the stable connection key) rather than by username.
+ *
+ * As of the 2026-06 privacy change, a connection's `username` no longer carries
+ * the peer's email — the handshake sends a share_pub fingerprint, not the login
+ * id. Tests must therefore locate connections by share_pub. We resolve the
+ * peer's share_pub via the discovery endpoint (unchanged by the privacy work —
+ * discovery still derives from the username), then match. Requires the peer to
+ * be share-discoverable (the test-registration default).
+ *
+ * @param {object} client       a TarnClient
+ * @param {string} peerUsername the peer's registration username (email)
+ * @returns {Promise<object|null>} the matching connection record, or null
+ */
+export async function connectionTo(client, peerUsername) {
+  let sharePub = null;
+  try {
+    sharePub = (await client.getRecipientShareKey(peerUsername)).sharePubBase64Url;
+  } catch { /* not discoverable / not found → null */ }
+  if (!sharePub) return null;
+  const conns = await client.listConnections();
+  return conns.find(c => c.share_pub === sharePub) || null;
+}
