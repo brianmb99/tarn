@@ -298,6 +298,38 @@ const theirs = await tarn.notes.listShared(friends[0]);
 
 Calling `share()` on a non-`shareable` collection throws — the schema is the gate.
 
+#### Seeding a new friend with your existing library (§6.6 backfill)
+
+`share`/`shareWithAll` publish at the moment you call them — so a friend
+added *after* you built your library would see nothing until you re-save.
+Register a seed provider and the SDK seeds each new connection's first
+snapshot with the records you name, at handshake time — one write, no empty
+placeholder entry, on both the inviter and accepter sides:
+
+```js
+// Set once. Called by the SDK at every new-connection handshake; return the
+// ids to seed. The SDK resolves each to its tx_id + content key for you.
+tarn.setInitialShareSeedProvider(async () => ({
+  notes: (await tarn.notes.list())
+    .filter(n => !n.secret)         // your app's privacy rule — the SDK never sees it
+    .map(n => n.noteId),
+}));
+```
+
+For repair/reconciliation (a handshake-time seed that didn't land, a
+connection that predates the provider, or drift while offline), two
+primitives let you diff and re-seed without blind re-publishing:
+
+```js
+const shared  = await tarn.notes.listSharedWith(friend);   // ids currently shared with them
+const missing = desiredIds.filter(id => !shared.includes(id));
+await tarn.notes.shareManyTo(friend, missing);             // one snapshot (+deltas if huge)
+```
+
+Both are tolerant: an unresolvable record is skipped, not fatal. The
+snapshot is sized to the share-log blob cap (~1,300 records); larger sets
+spill to deltas automatically.
+
 ---
 
 ## Connections
