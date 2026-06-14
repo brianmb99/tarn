@@ -259,9 +259,12 @@ await test('changeCredentials PRESERVES the phrase (does not rotate recovery_loo
   const before = await d1Query(
     `SELECT recovery_lookup_key FROM accounts WHERE data_lookup_key = '${dlk}'`,
   );
+  // NB: `rotatePhrase` is NOT a changeCredentials option — it belongs to
+  // recoverAccount / rotateAccountKey, and changeCredentials' strict
+  // assertKnownOpts (correctly) rejects unknown keys. changeCredentials
+  // preserves the recovery factor by design; we assert that directly below.
   const ccRes = await client.changeCredentials(randomUsername(), 'case2-cc-' + Date.now(), {
     phrase: reg.accountKey,
-    rotatePhrase: true, // ignored by changeCredentials — proves the no-op
   });
   // changeCredentials does not surface a rotated accountKey.
   assert(ccRes.accountKey === undefined, 'changeCredentials must NOT return a rotated accountKey');
@@ -438,22 +441,29 @@ await test('stale-passkey repair with wrong password fails cleanly; correct pass
 });
 
 // ============================================================================
-// CASE 5 — after recoverAccount(), a share-log read uses the ROTATED keys
-//          correctly (the per-connection read-state caches were invalidated).
+// CASE 5 — after recoverAccount() of a post-#73 account, the enveloped sharing
+//          identity is RESTORED (not rotated), so per-connection read-state
+//          caches stay valid and are deliberately KEPT.
 //
-// Recovery rotates share_priv/signing_priv and clears #readStateCache. If the
-// cache were NOT invalidated, a post-recovery read could serve state computed
-// under the OLD keys. We assert the cache-invalidation behavior directly (the
-// practical level for this harness) and then prove an actual share read works
-// through the rotated keys.
+// Recovery unwraps the DEK via the recovery factor and decrypts the unchanged
+// sharing + share-signing keys; share_priv does not rotate, so a connection's
+// pair keys and its warmed read-state cache remain valid. tarn.ts gates the
+// cache-clear on `if (!recoveredIdentity)` (the minted-new-identity / pre-#73
+// migration branch only). We assert the cache is retained and that a real
+// post-recovery share read still works on the (unchanged) keys.
 // ============================================================================
 
-console.log('\n=== Case 5: post-recovery share-log read uses rotated keys (cache invalidated) ===');
+console.log('\n=== Case 5: post-recovery read on the restored (post-#73) identity (caches kept) ===');
 
-await test('recoverAccount clears the read-state cache; post-recovery share read works on rotated keys', async () => {
-  // Alice shares with Bob, Bob reads (warming Bob is irrelevant here — the
-  // subject is the recovering party, Alice, whose OUTBOUND keys rotate and
-  // whose caches must be dropped).
+await test('recoverAccount of a restored (post-#73) identity keeps the still-valid read-state cache; read works', async () => {
+  // Post-#73, recovery RESTORES Alice's enveloped sharing identity (the
+  // recovery factor unwraps the DEK, which decrypts the unchanged sharing +
+  // share-signing keys). Her share_priv does NOT rotate, so the connection's
+  // pair keys — and the warmed per-connection read-state cache — stay VALID.
+  // tarn.ts deliberately KEEPS the caches in this path (it gates the
+  // cache-clear on `if (!recoveredIdentity)`, i.e. only the minted-new-identity
+  // / pre-#73 migration branch). We assert the cache is retained AND that a
+  // real post-recovery read still works.
   const alice = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const bob = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const aliceUser = randomUsername();
@@ -492,9 +502,7 @@ await test('recoverAccount clears the read-state cache; post-recovery share read
   assert(cachedBefore, 'precondition: Alice should have a warmed read-state cache entry');
 
   // Alice loses her password and recovers ON THE SAME CLIENT that holds the
-  // warm read-state cache, so we can observe the in-process invalidation
-  // directly. recoverAccount rotates share_priv/signing_priv and must
-  // wholesale-clear #readStateCache (tarn.ts: `this.#readStateCache.clear()`).
+  // warm read-state cache, so we can observe the in-process behavior directly.
   const recovered = await alice.recoverAccount({
     phrase: aliceReg.accountKey,
     newUsername: randomUsername(),
@@ -502,15 +510,14 @@ await test('recoverAccount clears the read-state cache; post-recovery share read
   });
   assert(recovered.dataLookupKey === aliceReg.dataLookupKey, 'recovery preserves Alice DLK');
 
+  // Identity restored (post-#73) → share keys unchanged → the warmed cache is
+  // still valid, and recovery deliberately KEEPS it (a non-disruptive recovery
+  // that leaves friendships and their read caches intact).
   const cachedAfter = alice._peekReadStateCache(bobConnOfAlice.share_pub);
-  assert(
-    cachedAfter === undefined || cachedAfter === null,
-    'recoverAccount must wholesale-invalidate the read-state cache (got a stale entry)',
-  );
+  assert(cachedAfter, 'recoverAccount of a restored identity must KEEP the still-valid read-state cache');
 
-  // Post-recovery, Alice's connection record + keys rotated. Re-resolve the
-  // connection and prove a share read works on the ROTATED keys (no stale-key
-  // decrypt failure). The connection pointer is refreshed from her record.
+  // Re-resolve the connection and prove a real share read still works on the
+  // (unchanged) keys — no stale-key decrypt failure.
   bobConnOfAlice = await connectionTo(alice, bobUser);
   assert(bobConnOfAlice, 'Alice still has Bob as a connection post-recovery');
   const postState = await alice.readShareLog(bobConnOfAlice, { refresh: true });
