@@ -3814,6 +3814,13 @@ export class TarnClient {
 
     let cursor = (await getCursor(this.#appId, this.#dataLookupKey, type)) ?? '0:';
 
+    // Perf instrumentation (opt-in via globalThis.__tarnPerf). Splits the cost
+    // into serial network paging vs per-entry blob-cache write + decrypt — the
+    // two suspected cold-sync bottlenecks. Emits one concise line at the end.
+    const perfNow = () => (typeof performance !== 'undefined' ? performance.now() : 0);
+    const __t0 = perfNow();
+    let __tNet = 0, __tProc = 0, __pages = 0, __live = 0, __del = 0;
+
     // Loop until we drain the delta. Each iteration is bounded by the
     // server's page cap (~25 events). Typical case: 1 page with 0 events
     // (warm poll, nothing changed). Catch-up after a long pause may take
@@ -3823,7 +3830,9 @@ export class TarnClient {
       const url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&since=${encodeURIComponent(cursor)}`;
       // tarn#60 — authenticated read (see getEntries). #requireAuth() ran at
       // the top of this method, so #jwt is present.
+      const __tn = perfNow();
       const res = await this.#fetch(url, { auth: true });
+      __tNet += perfNow() - __tn; __pages++;
       if (res.status !== 200) {
         throw new Error(`getEntriesSince failed: ${res.json?.error || res.status}`);
       }
@@ -3831,7 +3840,7 @@ export class TarnClient {
       const wireEntries = res.json.entries || [];
       for (const evt of wireEntries) {
         if (evt.deleted) {
-          if (evt.eid) arrivalOrder.push({ kind: 'delete', eid: evt.eid });
+          if (evt.eid) { arrivalOrder.push({ kind: 'delete', eid: evt.eid }); __del++; }
           continue;
         }
         if (!evt.data) {
@@ -3843,8 +3852,10 @@ export class TarnClient {
         // subsequent #fetchBlob(txid) hits IDB instead of going back over
         // the network. The bytes we already have are the bytes the caller
         // would need.
+        const __tp = perfNow();
         await setCachedBlob(this.#appId, this.#dataLookupKey, evt.txid, blobBytes);
         const data = await this.#decryptBlob(blobBytes, evt.tags);
+        __tProc += perfNow() - __tp; __live++;
         arrivalOrder.push({
           kind: 'live',
           eid: evt.eid ?? null,
@@ -3856,6 +3867,13 @@ export class TarnClient {
 
       cursor = res.json.pagination?.cursor ?? cursor;
       if (!res.json.pagination?.hasMore) break;
+    }
+
+    if ((globalThis as any).__tarnPerf && (__live + __del) > 0) {
+      console.log(
+        `[tarn-perf] getEntriesSince(${type}): ${__live} live, ${__del} del, ${__pages} pages, ` +
+        `${(perfNow() - __t0).toFixed(0)}ms total — network ${__tNet.toFixed(0)}ms, blob+decrypt ${__tProc.toFixed(0)}ms`,
+      );
     }
 
     // Persist the final cursor so the next call resumes from here. We do
