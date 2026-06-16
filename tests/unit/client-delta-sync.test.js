@@ -24,7 +24,7 @@ import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { TarnClient } from '../../client/src/tarn.js';
 import { getCachedBlob } from '../../client/src/blob-cache.js';
-import { getCursor } from '../../client/src/sync-cursor.js';
+import { getCursor, setCursor } from '../../client/src/sync-cursor.js';
 
 const APP = 'bookish';
 const PASSWORD = 'delta-sync-pass-2026';
@@ -110,10 +110,20 @@ async function setUp({ collectionType, payloads }) {
   return { client, dlk, captured };
 }
 
+// Seed a non-'0:' cursor so getEntriesSince takes the WARM delta-loop path
+// instead of the cold bulk-bootstrap fast path. The delta-loop tests below
+// (deletions, pagination, cross-page dedup, warm cursor reuse) are about that
+// path specifically; on a real cold start those events would arrive on a
+// subsequent poll, after the bulk bootstrap. Cold-start behavior is covered by
+// the dedicated 'cold first sync' test below + tests/test-cold-bootstrap.mjs.
+async function seedWarmCursor(dlk, type = 'books') {
+  await setCursor(APP, dlk, type, '1:tx-warm-seed');
+}
+
 describe('getEntriesSince — basic delta flow', () => {
   afterEach(restoreFetch);
 
-  it('first sync returns all events and persists a cursor', async () => {
+  it('cold first sync bulk-bootstraps live state and seeds the cursor', async () => {
     const { client, dlk, captured } = await setUp({
       collectionType: 'books',
       payloads: [
@@ -122,18 +132,22 @@ describe('getEntriesSince — basic delta flow', () => {
       ],
     });
 
-    const nextCursor = `${Date.now()}:${captured[1].txid}`;
+    // Cold start (no cursor) → bulk path: a single metadata-list request
+    // (?key=…&limit=500, NOT ?since=). createEntry pre-cached the ciphertexts,
+    // so the blob fan-out is satisfied from the blob cache (no per-blob
+    // network calls) — the network-fan-out + per-account read path is covered
+    // by tests/test-cold-bootstrap.mjs against a real API.
     mockFetch([
       {
         status: 200,
         body: JSON.stringify({
-          entries: captured.map((c) => ({
+          entries: captured.map((c, i) => ({
             eid: c.eid,
             txid: c.txid,
             tags: c.tags,
-            data: bytesToBase64(c.body),
+            cachedAt: 1000 + i, // ascending; max defines the seed
           })),
-          pagination: { cursor: nextCursor, hasMore: false },
+          pagination: { hasMore: false, cursor: null },
         }),
       },
     ]);
@@ -143,11 +157,17 @@ describe('getEntriesSince — basic delta flow', () => {
     assert.equal(delta.deleted.length, 0);
     assert.deepEqual(delta.entries.map((e) => e.data.id).sort(), ['b1', 'b2']);
 
-    // Cursor persisted in IDB for the next call.
-    const persisted = await getCursor(APP, dlk, 'books');
-    assert.equal(persisted, nextCursor);
+    // Exactly one network call — the bulk metadata list. Blobs were cache hits.
+    assert.equal(fetchCalls.length, 1, 'cold bootstrap should issue one bulk-list request');
+    assert.ok(!fetchCalls[0].url.includes('since='), 'cold start must NOT use the delta endpoint');
+    assert.ok(fetchCalls[0].url.includes('limit=500'), 'cold start uses the bulk metadata-list path');
 
-    // Inline blobs landed in the blob cache.
+    // Cursor seeded to max(cachedAt:txid) over the live heads, so a warm poll
+    // resumes from the end of history. captured[1] has the max cachedAt (1001).
+    const persisted = await getCursor(APP, dlk, 'books');
+    assert.equal(persisted, `1001:${captured[1].txid}`);
+
+    // Blobs remain available in the cache for downstream reads.
     for (const c of captured) {
       const cached = await getCachedBlob(APP, dlk, c.txid);
       assert.ok(cached instanceof Uint8Array, `blob for ${c.txid} should be cached`);
@@ -159,6 +179,7 @@ describe('getEntriesSince — basic delta flow', () => {
       collectionType: 'books',
       payloads: [{ id: 'b1', title: 'only' }],
     });
+    await seedWarmCursor(dlk); // warm path: not a cold bootstrap
 
     const firstCursor = `1000:${captured[0].txid}`;
     mockFetch([
@@ -210,7 +231,8 @@ describe('getEntriesSince — deletion events', () => {
   afterEach(restoreFetch);
 
   it('surfaces deleted Eids via the deleted array (no tombstone vocabulary)', async () => {
-    const { client } = await setUp({ collectionType: 'books', payloads: [] });
+    const { client, dlk } = await setUp({ collectionType: 'books', payloads: [] });
+    await seedWarmCursor(dlk); // deletions arrive via the warm delta loop
 
     const cursor = `9999:tx-final`;
     mockFetch([
@@ -232,10 +254,11 @@ describe('getEntriesSince — deletion events', () => {
   });
 
   it('mixes entry and deletion events in a single delta', async () => {
-    const { client, captured } = await setUp({
+    const { client, dlk, captured } = await setUp({
       collectionType: 'books',
       payloads: [{ id: 'b1', title: 'lives' }],
     });
+    await seedWarmCursor(dlk);
 
     const cursor = `5000:tx-last`;
     mockFetch([
@@ -271,10 +294,11 @@ describe('getEntriesSince — last-event-per-Eid semantics', () => {
     // replay through the delta endpoint. The Eid will appear on page 1 as
     // a live event and then on page 2 as a delete event — simulating an
     // Eid whose rows happen to straddle the server's 25-row page cut.
-    const { client, captured } = await setUp({
+    const { client, dlk, captured } = await setUp({
       collectionType: 'books',
       payloads: [{ id: 'b1', title: 'eventually-deleted' }],
     });
+    await seedWarmCursor(dlk);
     const splitEid = captured[0].eid;
 
     mockFetch([
@@ -316,10 +340,11 @@ describe('getEntriesSince — last-event-per-Eid semantics', () => {
     // Reverse scenario: delete on page 1, recreate on page 2. The Eid
     // should end up in `entries` with the recreated data — the delete
     // is shadowed.
-    const { client, captured } = await setUp({
+    const { client, dlk, captured } = await setUp({
       collectionType: 'books',
       payloads: [{ id: 'b1', title: 'recreated' }],
     });
+    await seedWarmCursor(dlk);
     const recreateEid = captured[0].eid;
 
     mockFetch([
@@ -370,6 +395,7 @@ describe('getEntriesSince — internal pagination', () => {
         { id: 'b2', title: 'page2' },
       ],
     });
+    await seedWarmCursor(dlk); // exercise the multi-page warm delta loop
 
     const cursor1 = `100:${captured[0].txid}`;
     const cursor2 = `200:${captured[1].txid}`;

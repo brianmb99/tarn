@@ -3765,6 +3765,111 @@ export class TarnClient {
   }
 
   /**
+   * Cold-bootstrap fetch for the delta path: pull the full live state of a
+   * type via the BULK metadata-list + concurrent blob fan-out (the proven
+   * `getEntries` shape), returning the rich per-entry shape the delta cursor
+   * needs to seed itself: `{ eid, txid, cachedAt, tags, data }`.
+   *
+   * Why this exists separately from the `?since=` delta loop: on a truly cold
+   * sync (no cursor) the delta loop walks the entire event history serially at
+   * ~25 inline-blob events per page — dozens of sequential round trips, which
+   * on a high-latency link dominates sign-in time. The bulk path instead reads
+   * resolved live heads (one row per Eid, server-side tombstone/Prev-chain
+   * collapsing) as metadata in 500-row pages, then fetches the blobs CONCURRENTLY.
+   * Wall-clock collapses from "N serial pages" to "≈ N/CONCURRENCY waves".
+   *
+   * Rate-bucket: the blob fan-out passes `accountKey` so each read spends the
+   * per-ACCOUNT budget, not the shared per-IP one — a 500-entry bootstrap is a
+   * large burst and would otherwise eat ~half the per-IP hourly cap in one shot
+   * (and collide with other accounts behind the same NAT, and with a repeated
+   * cleared-cache resync). All reads here are the caller's OWN data.
+   *
+   * Partial-failure semantics mirror `getEntries`: a transient mid-fan-out
+   * failure throws `TarnPartialListError` rather than silently returning a
+   * short list. The caller (`getEntriesSince`) catches it and falls back to the
+   * slow-but-proven delta loop, so a bootstrap hiccup degrades to today's
+   * behavior instead of failing the sync.
+   */
+  async #bootstrapEntries(type: string): Promise<
+    Array<{ eid: string | null; txid: string; cachedAt: number; tags: any[]; data: any }>
+  > {
+    // 1. Paginate the resolved live-entry METADATA (per-account read path —
+    //    same list endpoint getEntries uses). 500 rows/page, start-after-txid
+    //    cursor. Each row carries eid + cachedAt + tags (entries.js list shape).
+    const allRawEntries: Array<{ txid: string; eid: string | null; cachedAt: number; tags: any[] }> = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 50; page++) { // safety: 50 × 500 = 25,000 entries
+      let url = `/api/v1/entries?app=${this.#appId}&type=${type}&key=${this.#dataLookupKey}&limit=500`;
+      if (cursor) url += `&cursor=${cursor}`;
+      const res = await this.#fetch(url, { auth: true });
+      if (res.status !== 200) {
+        throw new Error(`cold bootstrap failed: ${res.json?.error || res.status}`);
+      }
+      for (const e of (res.json.entries || [])) {
+        allRawEntries.push({
+          txid: e.txid,
+          eid: e.eid ?? null,
+          cachedAt: e.cachedAt,
+          tags: e.tags || [],
+        });
+      }
+      if (!res.json.pagination?.hasMore) break;
+      cursor = res.json.pagination.cursor;
+      if (!cursor) break;
+    }
+
+    // 2. Concurrent blob fetch + decrypt. Same CONCURRENCY and strict-mode
+    //    partial-failure aggregation as getEntries (tarn#51): a transient
+    //    blob-fetch failure must surface as a TarnPartialListError, never
+    //    collapse to "record absent".
+    const out: Array<{ eid: string | null; txid: string; cachedAt: number; tags: any[]; data: any }> = [];
+    const CONCURRENCY = 20;
+    const failedTxids: string[] = [];
+    let firstFetchError: unknown = undefined;
+
+    for (let i = 0; i < allRawEntries.length; i += CONCURRENCY) {
+      const batch = allRawEntries.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(async (entry) => {
+        const blobBytes = await this.#fetchBlob(entry.txid, {
+          strict: true,
+          accountKey: this.#dataLookupKey!,
+        });
+        if (!blobBytes) return null; // genuine 404 / malformed — skip
+        const data = await this.#decryptBlob(blobBytes, entry.tags);
+        return { eid: entry.eid, txid: entry.txid, cachedAt: entry.cachedAt, tags: entry.tags, data };
+      }));
+
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j]!;
+        if (result.status === 'fulfilled') {
+          if (result.value) out.push(result.value);
+          continue;
+        }
+        const reason: any = result.reason;
+        const isFetchFailure =
+          reason instanceof TarnRateLimitError
+          || /^blob fetch for /.test(reason?.message ?? '')
+          || reason?.name === 'TypeError'
+          || reason?.code === 'ECONNRESET'
+          || reason?.code === 'ENOTFOUND';
+        if (isFetchFailure) {
+          const txid = batch[j]?.txid;
+          if (txid) failedTxids.push(txid);
+          if (firstFetchError === undefined) firstFetchError = reason;
+        } else {
+          console.warn(`Failed to decrypt entry:`, reason?.message);
+        }
+      }
+    }
+
+    if (failedTxids.length > 0) {
+      throw new TarnPartialListError({ entries: out, failedTxids, cause: firstFetchError });
+    }
+
+    return out;
+  }
+
+  /**
    * Delta-sync read: returns the events that have happened since the last
    * call (or since the beginning, on first call). The SDK maintains the
    * cursor internally — persisted in IndexedDB per (appId, dlk, type), so
@@ -3820,6 +3925,65 @@ export class TarnClient {
     const perfNow = () => (typeof performance !== 'undefined' ? performance.now() : 0);
     const __t0 = perfNow();
     let __tNet = 0, __tProc = 0, __pages = 0, __live = 0, __del = 0;
+
+    // Cold-start fast path. A `'0:'` cursor means "no delta position yet" —
+    // a fresh device, cleared site data, or first login. The serial delta
+    // loop below would walk the ENTIRE event history at ~25 inline-blob
+    // events per page (dozens of sequential round trips on a large library),
+    // which dominates cold sign-in latency on a high-latency link. Instead,
+    // pull the resolved live state in bulk (metadata pages + concurrent blob
+    // fan-out) and seed the cursor so subsequent WARM polls resume from the
+    // end of history with no replay.
+    //
+    // Correctness of the seed: the bulk path returns every live head, so the
+    // max (cachedAt, txid) over them — under the SAME (cached_at ASC, txid
+    // ASC) ordering the server's delta cursor uses — is at or below the true
+    // end of history. Any row ABOVE the seed is necessarily a tombstone or a
+    // superseded row (no live head can exceed the max-over-live), so the next
+    // poll re-delivers at most some `deleted` events, which are idempotent on
+    // the consumer (removing an Eid not in local state is a no-op). No live
+    // entry can be skipped. If the bulk fetch finds nothing (empty or
+    // all-deleted account) or fails transiently, we fall through to the
+    // proven delta loop below — the fast path is a pure optimization.
+    if (cursor === '0:') {
+      try {
+        const boot = await this.#bootstrapEntries(type);
+        if (boot.length > 0) {
+          let seed = boot[0]!;
+          for (const e of boot) {
+            if (e.cachedAt > seed.cachedAt
+              || (e.cachedAt === seed.cachedAt && e.txid > seed.txid)) {
+              seed = e;
+            }
+          }
+          await setCursor(
+            this.#appId, this.#dataLookupKey, type,
+            `${seed.cachedAt}:${seed.txid}`,
+          );
+          if ((globalThis as any).__tarnPerf) {
+            console.log(
+              `[tarn-perf] getEntriesSince(${type}) cold-bootstrap: ${boot.length} live via bulk path, ` +
+              `${(perfNow() - __t0).toFixed(0)}ms, seed=${seed.cachedAt}:${seed.txid}`,
+            );
+          }
+          return {
+            entries: boot.map(e => ({ eid: e.eid, txid: e.txid, data: e.data, tags: e.tags })),
+            deleted: [],
+          };
+        }
+        // 0 live entries: empty or fully-deleted account. Fall through to the
+        // delta loop, which scans (cheaply, on an empty/small set) and advances
+        // the cursor past any tombstone-only history.
+      } catch (err) {
+        // Bootstrap is a fast-path optimization. ANY failure (TarnPartialListError
+        // on a transient blob gap, rate limit, network) degrades to the
+        // slow-but-correct delta loop rather than failing the whole sync.
+        console.warn(
+          `[TarnClient] cold bootstrap failed for '${type}', falling back to delta loop:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
 
     // Loop until we drain the delta. Each iteration is bounded by the
     // server's page cap (~25 events). Typical case: 1 page with 0 events
@@ -7999,7 +8163,10 @@ export class TarnClient {
    * data" recovery path — direct GraphQL + gateway reads with no Tarn
    * dependency — belongs in its own artifact, not here.
    */
-  async #fetchBlob(txid: string, opts: { strict?: boolean } = {}): Promise<Uint8Array | null> {
+  async #fetchBlob(
+    txid: string,
+    opts: { strict?: boolean; accountKey?: string } = {},
+  ): Promise<Uint8Array | null> {
     // Cache check first. Txids are Arweave content hashes — blob bytes are
     // immutable forever — so a cache hit needs no validation. This collapses
     // warm-list reads from N network round trips to zero, which is the
@@ -8019,7 +8186,20 @@ export class TarnClient {
       // for the recovery/advanced paths that may run without a live session.
       const headers: Record<string, string> = {};
       if (this.#jwt) headers['Authorization'] = `Bearer ${this.#jwt}`;
-      const res = await this.#fetchRaw(`/api/v1/entries/${txid}`, { method: 'GET', headers });
+      // Optional `accountKey`: when set, the by-txid route buckets the read on
+      // the per-ACCOUNT limit instead of per-IP (see handleEntryById). The
+      // cold-bootstrap fan-out passes it so a burst of own-data blob fetches
+      // spends the account's dedicated budget rather than the shared per-IP
+      // one — critical because the burst is large (one read per live entry)
+      // and per-IP is shared across every account behind a NAT and across a
+      // repeated cleared-cache resync. Only valid for the caller's OWN data:
+      // the route 404s if `entry.lookup_key !== key`, which holds here because
+      // accountKey === this.#dataLookupKey and we only fan out over our own
+      // entries.
+      const path = opts.accountKey
+        ? `/api/v1/entries/${txid}?key=${opts.accountKey}`
+        : `/api/v1/entries/${txid}`;
+      const res = await this.#fetchRaw(path, { method: 'GET', headers });
       if (res.status === 200) {
         const text = await res.text();
         try {

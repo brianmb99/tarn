@@ -20,16 +20,21 @@ const MAX_WRITES_PER_HOUR = 100;
 // the same WiFi). Per-account keying gives every authenticated user their own
 // bucket, independent of network topology.
 //
-// 1000/hr is the conservative starting point suggested in tarn#31. Reads
-// happen in bursts during sync (delta-poll + per-entry blob fetch) so a
-// higher value than the 100/hr write limit is appropriate. Easy to raise
-// once we have telemetry on real session footprints.
-const MAX_READS_PER_HOUR_PER_ACCOUNT = 1000;
+// Reads happen in bursts during sync (delta-poll + per-entry blob fetch) so a
+// higher value than the 100/hr write limit is appropriate. Raised from the
+// tarn#31 starting point of 1000 to 3000 to accommodate cold-bootstrap: on a
+// fresh device the SDK pulls a library's full live state via the bulk path —
+// one blob read per live entry, routed through THIS per-account bucket (the
+// fan-out passes `key`). A ~500-entry library is ~500 reads in one burst, and
+// a user may resync a few times within the hour (cleared cache during testing,
+// multiple tabs), so 3000 leaves comfortable headroom. Reads are cheap and
+// don't drain the Arweave wallet, so the ceiling is generous by design.
+const MAX_READS_PER_HOUR_PER_ACCOUNT = 3000;
 
 // Unauthenticated read fallback (handleEntryById with no `key` param). Same
-// numeric cap as the per-account limit — the cap shape is "1000 reads/hour
-// per identifier"; the identifier is dlk when we have one, IP-hash otherwise.
-const MAX_READS_PER_HOUR_PER_IP = 1000;
+// numeric cap as the per-account limit — the cap shape is "N reads/hour per
+// identifier"; the identifier is dlk when we have one, IP-hash otherwise.
+const MAX_READS_PER_HOUR_PER_IP = 3000;
 
 export async function checkWriteRateLimit(env, dataLookupKey) {
   const hour = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
