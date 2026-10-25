@@ -7760,6 +7760,15 @@ export class TarnClient {
   }
 
   /**
+   * Called when a silent re-auth learns this device's server session is gone.
+   * The schema wrapper registers a handler that clears its storage adapter.
+   * Passing null removes the handler.
+   */
+  setRemoteSignOutHandler(handler: (() => void) | null): void {
+    this.#remoteSignOutHandler = handler;
+  }
+
+  /**
    * Forget this account's local state on this origin (issue #71):
    *
    *   1. Wipe the per-account IndexedDB caches for the current (appId, dlk)
@@ -7781,15 +7790,6 @@ export class TarnClient {
    *
    * @returns {Promise<void>}
    */
-  /**
-   * Called when a silent re-auth learns this device's server session is gone.
-   * The schema wrapper registers a handler that clears its storage adapter.
-   * Passing null removes the handler.
-   */
-  setRemoteSignOutHandler(handler: (() => void) | null): void {
-    this.#remoteSignOutHandler = handler;
-  }
-
   async clearSession() {
     // Wipe first, while #dataLookupKey is still whatever the caller had —
     // clearSession never nulls fields, but ordering it before the wrapping-
