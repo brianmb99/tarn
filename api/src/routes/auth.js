@@ -500,7 +500,15 @@ export async function handleVerify(request, env, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, recovery_lookup_key, nonce, signature, previous_sid, device_label } = body;
+  const {
+    credential_lookup_key,
+    recovery_lookup_key,
+    nonce,
+    signature,
+    previous_sid,
+    device_label,
+    require_previous_sid,
+  } = body;
   const lookupKey = credential_lookup_key || recovery_lookup_key;
   if (!lookupKey || !nonce || !signature) {
     return errorResponse('lookup_key, nonce, and signature are required', 400, cors);
@@ -593,16 +601,22 @@ export async function handleVerify(request, env, cors) {
   // signature check has succeeded so an unauthenticated caller can't grow the
   // sessions table.
   //
-  // previous_sid_status is set only when the caller supplied previous_sid on
-  // a user-role verify. 'reused' means that row was still live for this dlk;
-  // 'not_found' means it was missing (revoked or idle-pruned) and a new sid
-  // was minted. The field is omitted when no previous_sid was sent so older
-  // clients keep working. The verify still returns 200 either way.
-  let previousSidStatus;
+  // Silent refresh opts in with require_previous_sid. After the idle prune
+  // (a 90-day-idle row counts as missing), a supplied previous_sid with no
+  // row is a remote sign-out: 401, no insert, no JWT. The flag without
+  // previous_sid is ignored. Callers that omit the flag still reuse or mint.
   if (jwtPayload.role === 'user') {
     const nowSeconds = Math.floor(Date.now() / 1000);
     await pruneStaleSessions(env, jwtPayload.sub, nowSeconds);
-    const session = await createOrReuseSession(env, {
+    if (require_previous_sid === true && previous_sid) {
+      const existing = await env.DB.prepare(
+        'SELECT sid FROM sessions WHERE sid = ?1 AND data_lookup_key = ?2'
+      ).bind(previous_sid, jwtPayload.sub).first();
+      if (!existing) {
+        return errorResponse('session_not_found', 401, cors);
+      }
+    }
+    const sid = await createOrReuseSession(env, {
       dlk: jwtPayload.sub,
       app: jwtPayload.app,
       deviceLabel: device_label,
@@ -610,10 +624,7 @@ export async function handleVerify(request, env, cors) {
       previousSid: previous_sid,
       nowSeconds,
     });
-    jwtPayload.sid = session.sid;
-    if (previous_sid) {
-      previousSidStatus = session.reused ? 'reused' : 'not_found';
-    }
+    jwtPayload.sid = sid;
   }
 
   // Issue JWT
@@ -624,9 +635,6 @@ export async function handleVerify(request, env, cors) {
   // account_key concept — omit the field for them.
   if (accountKeyStored !== null) {
     responseBody.account_key_stored = accountKeyStored;
-  }
-  if (previousSidStatus) {
-    responseBody.previous_sid_status = previousSidStatus;
   }
   return jsonResponse(responseBody, 200, cors);
 }

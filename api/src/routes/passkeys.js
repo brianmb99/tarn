@@ -842,7 +842,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
   };
   const nowSeconds = Math.floor(Date.now() / 1000);
   await pruneStaleSessions(env, account.data_lookup_key, nowSeconds);
-  const session = await createOrReuseSession(env, {
+  const sid = await createOrReuseSession(env, {
     dlk: account.data_lookup_key,
     app: account.app,
     deviceLabel: device_label || null,
@@ -850,7 +850,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
     previousSid: previous_sid,
     nowSeconds,
   });
-  jwtPayload.sid = session.sid;
+  jwtPayload.sid = sid;
 
   // Issue #28: Passkey-authenticated JWTs live 7 days. A passkey-only session
   // has no `#signingKeyPair` to re-sign a challenge, so the client caps the

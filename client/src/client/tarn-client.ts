@@ -158,9 +158,9 @@ export class TarnClient<S extends AnySchema> {
       appId: args.appId,
     });
 
-    // Remote sign-out (previous_sid_status: 'not_found' on a silent refresh)
-    // clears the protocol client's wrapping key. Also drop the blob this
-    // adapter is holding, the same way session.clear() / revokeAll() do.
+    // Remote sign-out (silent refresh got 401 session_not_found) clears the
+    // protocol client's wrapping key. Also drop the blob this adapter is
+    // holding, the same way session.clear() / revokeAll() do.
     const hookable = args.underlying as IUnderlyingClient & {
       setRemoteSignOutHandler?(handler: (() => void) | null): void;
     };

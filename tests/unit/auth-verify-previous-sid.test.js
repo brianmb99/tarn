@@ -1,15 +1,16 @@
-// /auth/verify reports whether a supplied previous_sid was reused.
+// /auth/verify session continuity, including the opt-in reject.
 //
-// The status code stays 200 in every case so clients that predate the field
-// keep working. The field itself is how a current client learns that its
-// server-side session row is gone (revoked or idle-pruned) without the
-// server refusing to mint a replacement sid.
+// require_previous_sid === true with a previous_sid whose row is gone
+// (revoked, another account, or idle-pruned) is 401 session_not_found:
+// no new row, no JWT. The flag without previous_sid is ignored. Omitting
+// the flag keeps the old mint-or-reuse behaviour.
 //
 // Run: node --import tsx --test tests/unit/auth-verify-previous-sid.test.js
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleVerify } from '../../api/src/routes/auth.js';
+import { SESSION_IDLE_SECONDS } from '../../api/src/sessions.js';
 
 const DLK = 'ab'.repeat(32);
 const CLK = 'cd'.repeat(32);
@@ -94,7 +95,13 @@ function makeEnv({ sessions }) {
             throw new Error(`mock D1 first() unsupported SQL: ${sql}`);
           },
           async run() {
-            if (sql.startsWith('DELETE FROM sessions')) return { success: true };
+            if (sql.startsWith('DELETE FROM sessions')) {
+              const [dlk, cutoff] = params;
+              for (const [sid, row] of [...rows]) {
+                if (row.data_lookup_key === dlk && row.last_seen_at < cutoff) rows.delete(sid);
+              }
+              return { success: true };
+            }
             if (sql.startsWith('UPDATE sessions SET last_seen_at')) {
               const [lastSeen, sid] = params;
               const row = rows.get(sid);
@@ -123,68 +130,157 @@ async function verify(body, sessions = []) {
   return { status: res.status, json, rows: env.DB._rows };
 }
 
-describe('POST /auth/verify previous_sid_status', () => {
-  it('omits the field when no previous_sid was sent, and still returns 200', async () => {
+function liveRow(sid, lastSeen = 10) {
+  return {
+    sid,
+    data_lookup_key: DLK,
+    app: APP,
+    created_at: 10,
+    last_seen_at: lastSeen,
+    device_label: null,
+    via_recovery: 0,
+  };
+}
+
+describe('POST /auth/verify require_previous_sid', () => {
+  it('401s with no row and no jwt when the required previous sid is gone', async () => {
     const nonce = 'ab'.repeat(32);
     const { status, json, rows } = await verify({
       credential_lookup_key: CLK,
       nonce,
       signature: await signNonce(nonce),
+      previous_sid: 'sid-revoked',
+      require_previous_sid: true,
     });
-    assert.equal(status, 200);
-    assert.equal(Object.hasOwn(json, 'previous_sid_status'), false);
-    assert.equal(json.expiresIn, 900);
-    assert.equal(json.account_key_stored, true);
-    const claims = decodeJwtPayload(json.jwt);
-    assert.equal(typeof claims.sid, 'string');
-    assert.equal(rows.has(claims.sid), true, 'a new session row was minted');
+    assert.equal(status, 401);
+    assert.deepEqual(json, { error: 'session_not_found' });
+    assert.equal(Object.hasOwn(json, 'jwt'), false);
+    assert.equal(rows.size, 0, 'reject path must not insert a session row');
   });
 
-  it("returns previous_sid_status 'reused' and keeps the same sid when the row is live", async () => {
+  it('treats a 90-day-idle previous sid as missing after prune', async () => {
     const nonce = 'cd'.repeat(32);
+    const now = Math.floor(Date.now() / 1000);
     const { status, json, rows } = await verify({
       credential_lookup_key: CLK,
       nonce,
       signature: await signNonce(nonce),
-      previous_sid: 'sid-live',
+      previous_sid: 'sid-idle',
+      require_previous_sid: true,
     }, [
-      { sid: 'sid-live', data_lookup_key: DLK, app: APP, created_at: 10, last_seen_at: 10, device_label: null, via_recovery: 0 },
+      liveRow('sid-idle', now - SESSION_IDLE_SECONDS - 1),
     ]);
-    assert.equal(status, 200);
-    assert.equal(json.previous_sid_status, 'reused');
-    assert.equal(decodeJwtPayload(json.jwt).sid, 'sid-live');
-    assert.equal(rows.size, 1, 'no second row');
-    assert.ok(rows.get('sid-live').last_seen_at > 10, 'last_seen_at bumped');
+    assert.equal(status, 401);
+    assert.equal(json.error, 'session_not_found');
+    assert.equal(Object.hasOwn(json, 'jwt'), false);
+    assert.equal(rows.has('sid-idle'), false, 'idle row was pruned');
+    assert.equal(rows.size, 0, 'no replacement row');
   });
 
-  it("returns previous_sid_status 'not_found' and mints a new sid when the row is gone", async () => {
+  it('401s when the previous sid belongs to a different account', async () => {
     const nonce = 'ef'.repeat(32);
+    const other = {
+      sid: 'sid-other',
+      data_lookup_key: 'ff'.repeat(32),
+      app: APP,
+      created_at: 10,
+      last_seen_at: Math.floor(Date.now() / 1000),
+      device_label: null,
+      via_recovery: 0,
+    };
+    const { status, json, rows } = await verify({
+      credential_lookup_key: CLK,
+      nonce,
+      signature: await signNonce(nonce),
+      previous_sid: 'sid-other',
+      require_previous_sid: true,
+    }, [other]);
+    assert.equal(status, 401);
+    assert.equal(json.error, 'session_not_found');
+    assert.equal(Object.hasOwn(json, 'jwt'), false);
+    assert.equal(rows.size, 1);
+    assert.equal(rows.has('sid-other'), true, 'the other account row is untouched');
+  });
+
+  it('ignores require_previous_sid when previous_sid is absent and mints', async () => {
+    const nonce = '11'.repeat(32);
+    const { status, json, rows } = await verify({
+      credential_lookup_key: CLK,
+      nonce,
+      signature: await signNonce(nonce),
+      require_previous_sid: true,
+    });
+    assert.equal(status, 200);
+    assert.equal(Object.hasOwn(json, 'previous_sid_status'), false);
+    assert.equal(json.expiresIn, 900);
+    const claims = decodeJwtPayload(json.jwt);
+    assert.equal(typeof claims.sid, 'string');
+    assert.equal(rows.has(claims.sid), true);
+    assert.equal(rows.size, 1);
+  });
+
+  it('ignores the flag when previous_sid is an empty string', async () => {
+    const nonce = '22'.repeat(32);
+    const { status, json, rows } = await verify({
+      credential_lookup_key: CLK,
+      nonce,
+      signature: await signNonce(nonce),
+      previous_sid: '',
+      require_previous_sid: true,
+    });
+    assert.equal(status, 200);
+    assert.equal(rows.has(decodeJwtPayload(json.jwt).sid), true);
+  });
+
+  it('mints a new sid when previous_sid is gone and the flag is absent', async () => {
+    const nonce = '33'.repeat(32);
     const { status, json, rows } = await verify({
       credential_lookup_key: CLK,
       nonce,
       signature: await signNonce(nonce),
       previous_sid: 'sid-revoked',
     });
-    assert.equal(status, 200, 'old clients must still get a JWT');
-    assert.equal(json.previous_sid_status, 'not_found');
+    assert.equal(status, 200);
+    assert.equal(Object.hasOwn(json, 'previous_sid_status'), false);
     const sid = decodeJwtPayload(json.jwt).sid;
     assert.notEqual(sid, 'sid-revoked');
     assert.equal(rows.has(sid), true);
-    assert.equal(rows.has('sid-revoked'), false);
+    assert.equal(rows.size, 1);
   });
 
-  it("returns 'not_found' when previous_sid belongs to a different account", async () => {
-    const nonce = '11'.repeat(32);
-    const { status, json } = await verify({
+  it('reuses a live previous sid when the flag is set', async () => {
+    const nonce = '44'.repeat(32);
+    const seen = Math.floor(Date.now() / 1000) - 120;
+    const { status, json, rows } = await verify({
       credential_lookup_key: CLK,
       nonce,
       signature: await signNonce(nonce),
-      previous_sid: 'sid-other',
+      previous_sid: 'sid-live',
+      require_previous_sid: true,
     }, [
-      { sid: 'sid-other', data_lookup_key: 'ff'.repeat(32), app: APP, created_at: 10, last_seen_at: 10, device_label: null, via_recovery: 0 },
+      liveRow('sid-live', seen),
     ]);
     assert.equal(status, 200);
-    assert.equal(json.previous_sid_status, 'not_found');
-    assert.notEqual(decodeJwtPayload(json.jwt).sid, 'sid-other');
+    assert.equal(Object.hasOwn(json, 'previous_sid_status'), false);
+    assert.equal(decodeJwtPayload(json.jwt).sid, 'sid-live');
+    assert.equal(rows.size, 1, 'no second row');
+    assert.ok(rows.get('sid-live').last_seen_at > seen, 'last_seen_at bumped');
+  });
+
+  it('reuses a live previous sid when the flag is absent', async () => {
+    const nonce = '55'.repeat(32);
+    const seen = Math.floor(Date.now() / 1000) - 120;
+    const { status, json, rows } = await verify({
+      credential_lookup_key: CLK,
+      nonce,
+      signature: await signNonce(nonce),
+      previous_sid: 'sid-live',
+    }, [
+      liveRow('sid-live', seen),
+    ]);
+    assert.equal(status, 200);
+    assert.equal(decodeJwtPayload(json.jwt).sid, 'sid-live');
+    assert.equal(rows.size, 1);
+    assert.ok(rows.get('sid-live').last_seen_at > seen);
   });
 });

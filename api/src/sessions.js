@@ -56,10 +56,6 @@ export async function pruneStaleSessions(env, dlk, nowSeconds) {
  * `previousSid` is supplied and still present. Reuse path bumps last_seen_at
  * to keep the row from being lazy-pruned. Insert path creates a new row
  * with created_at = last_seen_at = nowSeconds.
- *
- * `reused` is true only when `previousSid` resolved to a live row for this
- * dlk. Callers that were handed a previous sid and see `reused: false` know
- * the row was missing (revoked or idle-pruned) and a new sid was minted.
  */
 export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaRecovery, previousSid, nowSeconds }) {
   if (previousSid) {
@@ -72,7 +68,7 @@ export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaReco
       ).bind(nowSeconds, previousSid).run();
       // Refresh the cache: this isolate just confirmed the row is active.
       _sessionCache.set(previousSid, { active: true, cachedAt: Date.now() });
-      return { sid: previousSid, reused: true };
+      return previousSid;
     }
   }
 
@@ -89,7 +85,7 @@ export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaReco
     viaRecovery ? 1 : 0,
   ).run();
   _sessionCache.set(sid, { active: true, cachedAt: Date.now() });
-  return { sid, reused: false };
+  return sid;
 }
 
 /**

@@ -1285,8 +1285,8 @@ export class TarnClient {
     }
     this.#recoveryLookupKey = null;
 
-    // Verify. Interactive: a not_found previous_sid must not sign the user
-    // out — they just proved the password and a replacement sid is correct.
+    // Verify. Interactive, so a missing server session mints a new sid
+    // instead of signing the user out — they just proved the password.
     await this.#verifyChallenge(challengeRes.json.nonce, { interactive: true });
     this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
@@ -8136,6 +8136,10 @@ export class TarnClient {
     };
     const sentPreviousSid = !!this.#sid;
     if (sentPreviousSid) body.previous_sid = this.#sid;
+    // Silent refresh of a sid we still hold must not mint a replacement if
+    // the server row is gone. Interactive sign-in never sends the flag.
+    const requirePreviousSid = !opts.interactive && sentPreviousSid;
+    if (requirePreviousSid) body.require_previous_sid = true;
     if (this.#pendingDeviceLabel != null) body.device_label = this.#pendingDeviceLabel;
 
     const verifyRes = await this.#fetch('/api/v1/auth/verify', {
@@ -8147,22 +8151,21 @@ export class TarnClient {
     // next call (the caller would supply it again).
     this.#pendingDeviceLabel = null;
 
-    if (verifyRes.status !== 200) {
-      throw new Error(`Verify failed: ${verifyRes.json?.error}`);
-    }
-
-    // Silent refresh of a session the server no longer has (revoked or
-    // idle-pruned). Do not keep the replacement JWT — that is what used to
-    // let "sign out other devices" bounce. Interactive sign-in (login,
-    // register, recovery, credential change) is allowed to take the new sid.
-    // An older server omits the field; keep today's behaviour then.
+    // 401 is returned here as-is (#fetch does not retry or swallow 4xx).
+    // Only the opt-in reject signs the device out. Any other non-200,
+    // including a 401 we did not ask for, stays a verify failure. An older
+    // server ignores the flag and returns 200 with a new JWT; keep it.
     if (
-      !opts.interactive &&
-      sentPreviousSid &&
-      verifyRes.json?.previous_sid_status === 'not_found'
+      requirePreviousSid &&
+      verifyRes.status === 401 &&
+      verifyRes.json?.error === 'session_not_found'
     ) {
       await this.#signOutRevokedSession();
       throw new TarnNotAuthenticatedError('Session was signed out from another device');
+    }
+
+    if (verifyRes.status !== 200) {
+      throw new Error(`Verify failed: ${verifyRes.json?.error}`);
     }
 
     this.#jwt = verifyRes.json.jwt;

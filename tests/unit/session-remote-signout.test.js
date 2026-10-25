@@ -1,7 +1,7 @@
-// A silent JWT refresh that learns the server no longer has this device's
-// session (previous_sid_status: 'not_found') must sign the device out.
-// 'reused' and a missing field (older server) keep today's behaviour.
-// Interactive login/register must not take this path.
+// A silent JWT refresh that sent require_previous_sid and gets
+// 401 { error: 'session_not_found' } must sign the device out.
+// A 200 (older server that ignores the flag, or a reused sid) keeps the
+// JWT. Interactive login/register never send the flag.
 //
 // Run: node --import tsx --test tests/unit/session-remote-signout.test.js
 
@@ -92,21 +92,15 @@ async function expiredSession(email, sid = 'sid-device') {
   return { client: resumed, blob: stale, originalBlob: blob };
 }
 
-function refreshMock(previousSidStatus) {
+function refreshMock(verifyResponse) {
   const calls = { verifyBodies: [] };
-  const freshExp = Math.floor(Date.now() / 1000) + 900;
   globalThis.fetch = async (url, opts) => {
     const u = String(url);
     if (u.includes('/auth/challenge')) return respond(200, { nonce: 'c'.repeat(64) });
     if (u.includes('/auth/verify')) {
       const body = JSON.parse(opts.body);
       calls.verifyBodies.push(body);
-      const json = {
-        jwt: fakeJwt(freshExp, 'sid-replacement'),
-        account_key_stored: true,
-      };
-      if (previousSidStatus !== undefined) json.previous_sid_status = previousSidStatus;
-      return respond(200, json);
+      return verifyResponse;
     }
     return respond(200, { sessions: [] });
   };
@@ -124,14 +118,16 @@ const schema = defineSchema({
   },
 });
 
-describe('remote sign-out on previous_sid_status', () => {
+describe('remote sign-out on require_previous_sid', () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
   });
 
-  it("not_found signs the device out, clears the blob, and throws TarnNotAuthenticatedError", async () => {
+  it('401 session_not_found signs the device out, clears the blob, calls the handler, and throws TarnNotAuthenticatedError', async () => {
     const { client, blob } = await expiredSession('remote-not-found@example.com', 'sid-revoked');
-    const calls = refreshMock('not_found');
+    let handlerCalls = 0;
+    client.setRemoteSignOutHandler(() => { handlerCalls += 1; });
+    const calls = refreshMock(respond(401, { error: 'session_not_found' }));
 
     await assert.rejects(
       () => client.listSessions(),
@@ -143,8 +139,10 @@ describe('remote sign-out on previous_sid_status', () => {
     );
     assert.equal(calls.verifyBodies.length, 1);
     assert.equal(calls.verifyBodies[0].previous_sid, 'sid-revoked');
+    assert.equal(calls.verifyBodies[0].require_previous_sid, true);
     assert.equal(client.isLoggedIn(), false);
-    assert.equal(client._testJwt(), null, 'replacement JWT must not be kept');
+    assert.equal(client._testJwt(), null, 'no JWT is kept');
+    assert.equal(handlerCalls, 1);
 
     // A follow-up call must not mint yet another session.
     await assert.rejects(() => client.listSessions(), TarnNotAuthenticatedError);
@@ -157,29 +155,40 @@ describe('remote sign-out on previous_sid_status', () => {
     );
   });
 
-  it('reused keeps the session and the replacement JWT', async () => {
-    const { client, blob } = await expiredSession('remote-reused@example.com', 'sid-live');
-    const calls = refreshMock('reused');
-    const sessions = await client.listSessions();
-    assert.deepEqual(sessions, []);
-    assert.equal(calls.verifyBodies[0].previous_sid, 'sid-live');
+  it('a 200 from an older server keeps the minted JWT', async () => {
+    const { client, blob } = await expiredSession('remote-old-server@example.com', 'sid-old-server');
+    let handlerCalls = 0;
+    client.setRemoteSignOutHandler(() => { handlerCalls += 1; });
+    const minted = fakeJwt(Math.floor(Date.now() / 1000) + 900, 'sid-replacement');
+    const calls = refreshMock(respond(200, { jwt: minted, account_key_stored: true }));
+    await client.listSessions();
+    assert.equal(calls.verifyBodies[0].previous_sid, 'sid-old-server');
+    assert.equal(calls.verifyBodies[0].require_previous_sid, true);
     assert.equal(client.isLoggedIn(), true);
-    assert.ok(client._testJwt(), 'replacement JWT is kept');
+    assert.equal(client._testJwt(), minted);
+    assert.equal(handlerCalls, 0);
     assert.ok(await TarnClient.resumeSession(API, APP, blob), 'wrapping key was not cleared');
   });
 
-  it('a missing previous_sid_status (older server) keeps today\'s behaviour', async () => {
-    const { client, blob } = await expiredSession('remote-absent@example.com', 'sid-old-server');
-    const calls = refreshMock(undefined);
-    await client.listSessions();
-    assert.equal(calls.verifyBodies[0].previous_sid, 'sid-old-server');
-    assert.equal(Object.hasOwn(calls.verifyBodies[0], 'previous_sid'), true);
+  it('any other non-200 stays a verify failure and does not sign out', async () => {
+    const { client, blob } = await expiredSession('remote-other-401@example.com', 'sid-other');
+    let handlerCalls = 0;
+    client.setRemoteSignOutHandler(() => { handlerCalls += 1; });
+    refreshMock(respond(401, { error: 'Invalid signature' }));
+    await assert.rejects(
+      () => client.listSessions(),
+      (err) => {
+        assert.equal(err instanceof TarnNotAuthenticatedError, false);
+        assert.match(err.message, /Verify failed: Invalid signature/);
+        return true;
+      },
+    );
     assert.equal(client.isLoggedIn(), true);
-    assert.ok(client._testJwt());
+    assert.equal(handlerCalls, 0);
     assert.ok(await TarnClient.resumeSession(API, APP, blob));
   });
 
-  it('login that sends previous_sid does not sign out on not_found', async () => {
+  it('login sends previous_sid but never require_previous_sid', async () => {
     let registerBody;
     globalThis.fetch = async (url, opts) => {
       const u = String(url);
@@ -199,6 +208,7 @@ describe('remote sign-out on previous_sid_status', () => {
     assert.ok(registerBody?.wrapped_data_key);
 
     let verifyBody;
+    const minted = fakeJwt(Math.floor(Date.now() / 1000) + 900, 'sid-after-login');
     globalThis.fetch = async (url, opts) => {
       const u = String(url);
       if (u.includes('/auth/challenge')) {
@@ -211,33 +221,35 @@ describe('remote sign-out on previous_sid_status', () => {
       }
       verifyBody = JSON.parse(opts.body);
       return respond(200, {
-        jwt: fakeJwt(Math.floor(Date.now() / 1000) + 900, 'sid-after-login'),
-        previous_sid_status: 'not_found',
+        jwt: minted,
         account_key_stored: true,
       });
     };
     const result = await client.login(email, PASSWORD);
     assert.equal(result.dataLookupKey, 'd'.repeat(64));
     assert.equal(verifyBody.previous_sid, 'sid-before-login');
+    assert.equal(Object.hasOwn(verifyBody, 'require_previous_sid'), false);
     assert.equal(client.isLoggedIn(), true);
-    assert.ok(String(client._testJwt()).length > 0);
-    // Still able to persist — signing keys and the DEK chain were not wiped.
+    assert.equal(client._testJwt(), minted);
     assert.equal(typeof await client.serializeSession(), 'string');
   });
 
-  it('register ignores not_found when it did not send previous_sid', async () => {
-    globalThis.fetch = async (url) => {
+  it('register does not send the flag and stays logged in', async () => {
+    let verifyBody;
+    globalThis.fetch = async (url, opts) => {
       const u = String(url);
       if (u.includes('/auth/register')) return respond(201, { data_lookup_key: 'd'.repeat(64) });
       if (u.includes('/auth/challenge')) return respond(200, { nonce: 'a'.repeat(64) });
+      verifyBody = JSON.parse(opts.body);
       return respond(200, {
         jwt: fakeJwt(Math.floor(Date.now() / 1000) + 3600, 'sid-reg'),
-        previous_sid_status: 'not_found',
         account_key_stored: false,
       });
     };
     const client = new TarnClient(API, APP);
     await client.register('remote-register@example.com', PASSWORD, { recoveryAcknowledged: true });
+    assert.equal(Object.hasOwn(verifyBody, 'require_previous_sid'), false);
+    assert.equal(Object.hasOwn(verifyBody, 'previous_sid'), false);
     assert.equal(client.isLoggedIn(), true);
     assert.ok(client._testJwt());
   });
@@ -257,7 +269,7 @@ describe('remote sign-out on previous_sid_status', () => {
     assert.equal(wrapped.isLoggedIn(), true);
     assert.ok(await storage.read(), 'resume re-persisted a blob');
 
-    const calls = refreshMock('not_found');
+    const calls = refreshMock(respond(401, { error: 'session_not_found' }));
     await assert.rejects(
       () => wrapped.session.listDevices(),
       (err) => {
@@ -267,6 +279,7 @@ describe('remote sign-out on previous_sid_status', () => {
       },
     );
     assert.equal(calls.verifyBodies[0].previous_sid, 'sid-wrapped');
+    assert.equal(calls.verifyBodies[0].require_previous_sid, true);
     assert.equal(wrapped.isLoggedIn(), false);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(await storage.read(), null, 'storage adapter blob cleared via #onLogout');

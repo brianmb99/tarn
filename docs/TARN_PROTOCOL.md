@@ -1471,7 +1471,7 @@ This is a real escalation, even with a non-extractable wrapping key. Apps with s
 What persistence costs:
 
 1. **Same-origin XSS becomes pseudo-persistent.** An attacker who lands code execution on the origin can call `resumeSession()` on the persisted blob and act as the user for as long as that blob is valid. Validity is a 90-day idle deadline that slides forward whenever the session is re-serialized (the schema wrapper does this on every successful resume) and a 365-day absolute cap measured from the last interactive sign-in. An in-page XSS can still act as the user for that whole window — the SDK cannot tell the attacker from the app.
-2. **Server-side revocation signs out the official client.** Deleting a session row (`DELETE /api/v1/sessions/:sid`, or the idle prune) invalidates that sid's JWT. The official client sends `previous_sid` on its next silent re-auth; when the row is gone the server returns `previous_sid_status: "not_found"` (still HTTP 200, so older clients keep working) and the client discards the replacement JWT, wipes the local blob, and surfaces a signed-out error. A modified client that ignores the field can still accept the replacement sid the server mints. `changeCredentials()` remains the strong kill switch: it rotates the signing key and the DEK chain, which a stolen blob cannot follow.
+2. **Server-side revocation signs out the official client.** Deleting a session row (`DELETE /api/v1/sessions/:sid`, or the idle prune) invalidates that sid's JWT. The official client sends `previous_sid` and `require_previous_sid: true` on its next silent re-auth. When the row is gone the server responds `401 { "error": "session_not_found" }` without inserting a row or issuing a JWT, and the client wipes the local blob and surfaces a signed-out error. A client that omits the flag (an older SDK, or a modified client) still receives a freshly minted sid. `changeCredentials()` remains the strong kill switch: it rotates the signing key and the DEK chain, which a stolen blob cannot follow.
 3. **Cross-tab attack visibility.** All same-origin tabs can read each other's IndexedDB and localStorage. An attacker on one tab can resume the session on another. This is identical to the existing same-origin XSS surface and is not new.
 
 What persistence does NOT cost:
@@ -1569,7 +1569,7 @@ client.clearSession(): Promise<void>
 ### Known v1 gaps
 
 - **Passkey-only sessions still expire with their 7-day JWT.** A passkey session has no signing key with which to refresh the JWT, so the persisted blob is capped at that token's `exp`. JWT renewal for passkey sessions is future work. Password sessions slide as described above.
-- **Revocation is enforced by the official client, not by refusing `/auth/verify`.** The verify response stays 200 and still mints a replacement sid when `previous_sid` is missing, so a modified client (or any client that ignores `previous_sid_status`) can keep a password device alive after a remote sign-out. `changeCredentials()` — rotating the signing key and the DEK chain — remains the strong kill switch. See [Section 7.5](#server-side-session-management-section-75-issue-20).
+- **Clients that omit `require_previous_sid` still get a replacement sid.** `/auth/verify` mints a new row when `previous_sid` is absent, or when it is present but the caller does not opt into the reject. Older SDKs and a modified client that drops the flag can keep a password device alive after a remote sign-out. `changeCredentials()` — rotating the signing key and the DEK chain — remains the strong kill switch. See [Section 7.5](#server-side-session-management-section-75-issue-20).
 - **Browser-only.** The IndexedDB + non-extractable WebCrypto storage strategy is browser-specific. Tarn-on-Node and Tarn-on-React-Native session persistence are deferred — the API surface (`serializeSession` / `resumeSession`) is intentionally storage-agnostic in shape so a future implementation can swap backends without changing the surface.
 - **No share-log cache participation.** Persisted sessions hydrate share-log state on first read/sync from Arweave, just like fresh logins. Pure perf optimization, not a correctness gap.
 
@@ -1628,6 +1628,7 @@ Body: {
   nonce,
   signature,
   previous_sid?: string,        // optional — see "session continuity" below
+  require_previous_sid?: true,  // optional — with previous_sid, reject instead of minting when that row is gone
   device_label?: string,        // optional — max 64 chars; stored on new sessions only
 }
 ```
@@ -1638,11 +1639,13 @@ The SDK's `#requireAuth` silently re-authenticates when the JWT expires. Without
 
 To prevent that, `/auth/verify` accepts an optional `previous_sid`:
 
-- **Present and active for the same `data_lookup_key`:** server reuses the sid, updates `last_seen_at`, returns a fresh JWT with the same `sid` and `previous_sid_status: "reused"`. No new row.
-- **Present, but the row is missing** (revoked, or removed by the idle prune) **for this `data_lookup_key`:** server mints a new sid and returns `previous_sid_status: "not_found"` alongside the new JWT. HTTP status stays 200 so older clients, which ignore the field, keep working. The official SDK, on a *silent* refresh, treats `not_found` as a remote sign-out: it discards the new JWT, wipes the persisted blob, and throws `TarnNotAuthenticatedError`. An interactive sign-in (`login`, `register`, `recoverAccount`, `changeCredentials`) accepts the new sid — the user just proved a credential.
-- **Absent:** the field is omitted from the response and the server mints a new sid. This is the pre-continuity client path.
+- **Present and active for the same `data_lookup_key`:** server reuses the sid, updates `last_seen_at`, and returns a fresh JWT with the same `sid`. No new row. This holds whether or not `require_previous_sid` is set.
+- **Present, the row is missing** (revoked, or removed by the idle prune) **for this `data_lookup_key`, and `require_previous_sid` is exactly `true`:** server responds `401 { "error": "session_not_found" }`. No insert, no JWT. The official SDK sends the flag only on a silent refresh. On that 401 it wipes the persisted blob and throws `TarnNotAuthenticatedError`. Interactive sign-in (`login`, `register`, `recoverAccount`, `changeCredentials`) does not send the flag.
+- **Present, the row is missing, and the flag is absent** (or not exactly `true`): server mints a new sid and returns 200 with a JWT. Older clients and interactive sign-in take this path. A client that just proved a credential gets a new device row.
+- **`require_previous_sid` without `previous_sid`:** the flag is ignored and the server mints a new sid.
+- **`previous_sid` absent:** server mints a new sid. This is the pre-continuity client path.
 
-The SDK extracts `sid` from its current JWT (decoding the payload, no signature check needed since the SDK trusts its own state) and passes it as `previous_sid` on every re-verify. Result: one row per device-installation per app, persisting until either the user revokes it or the lazy-prune step (next paragraph) removes it as stale. A revoked password device that still holds its signing key can no longer silently replace the deleted row; the next JWT refresh signs that device out.
+The SDK extracts `sid` from its current JWT (decoding the payload, no signature check needed since the SDK trusts its own state) and passes it as `previous_sid` on every re-verify. A silent refresh also sends `require_previous_sid: true`. Result: one row per device-installation per app, persisting until either the user revokes it or the lazy-prune step (next paragraph) removes it as stale. A revoked password device that still holds its signing key cannot silently replace the deleted row; the next JWT refresh is rejected and that device signs out. An older server that ignores the flag still returns 200 with a new JWT, and the client keeps it.
 
 #### Lazy pruning
 
@@ -1653,7 +1656,7 @@ DELETE FROM sessions
 WHERE data_lookup_key = ?1 AND last_seen_at < ?2
 ```
 
-with `?2 = now - 90 days` (`SESSION_IDLE_SECONDS`). This bounds the table to sessions used in the last 90 days per account. A user who hasn't authenticated for 90 days gets a clean slate; an active user keeps their existing rows. The same constant is the client blob's sliding idle window, so a device that opens the app inside the window both slides its local blob and keeps its server row.
+with `?2 = now - 90 days` (`SESSION_IDLE_SECONDS`). This bounds the table to sessions used in the last 90 days per account. A user who hasn't authenticated for 90 days gets a clean slate; an active user keeps their existing rows. Prune runs before the `require_previous_sid` lookup, so a 90-day-idle row counts as missing and a silent refresh is rejected instead of minting a replacement. The same constant is the client blob's sliding idle window, so a device that opens the app inside the window both slides its local blob and keeps its server row.
 
 ### New endpoints
 
@@ -1776,7 +1779,7 @@ client.recoverAccount({ ..., deviceLabel?: string })
 
 ### Known v1 gaps
 
-- **90-day pruning window.** The lazy-prune step deletes sessions idle for more than 90 days, so a user who logs in once and never returns eventually disappears from `listSessions`. Password JWTs are 15 minutes, so the row outlives any single token; the row is what revocation and the device list key off of. For long-term audit logging, a separate "session-history Arweave-pinned audit log" would be a different piece of work; not v1. A silent refresh that finds the row already gone also leaves the replacement sid the server just minted sitting until this prune (the official client discards that JWT and does not use it).
+- **90-day pruning window.** The lazy-prune step deletes sessions idle for more than 90 days, so a user who logs in once and never returns eventually disappears from `listSessions`. Password JWTs are 15 minutes, so the row outlives any single token; the row is what revocation and the device list key off of. For long-term audit logging, a separate "session-history Arweave-pinned audit log" would be a different piece of work; not v1. A silent refresh that opts in with `require_previous_sid` does not mint a replacement when the row is already gone.
 - **Revocation latency up to 5 seconds.** Bounded by the isolate cache TTL. Acceptable trade-off for amortized D1 reads. If a use case demands sub-second revocation, the cache TTL can be lowered or disabled per-environment via a config.
 - **No device-grouping heuristics.** The SDK's `previous_sid` continuity keeps it to one row per device-installation, but a single user with two browser profiles on the same physical machine has two rows. Apps that want to group by physical device must rely on app-supplied `device_label` to disambiguate.
 - **App-role JWTs are stateless.** Per-app session tracking would require a separate `app_sessions` table and is out of scope for 7.5.
