@@ -627,6 +627,9 @@ export class TarnClient {
   // refresh does not move it. serializeSession refuses to extend the blob
   // past this instant plus SESSION_ABSOLUTE_MAX_SECONDS.
   #authenticatedAt: number | null = null;
+  // Set by the schema wrapper so a remote sign-out also drops the blob from
+  // the app's storage adapter. The protocol client clears IndexedDB itself.
+  #remoteSignOutHandler: (() => void) | null = null;
   // One-shot device label consumed by the next #authenticate call. Set by
   // register/login/recoverAccount; cleared after the verify body is built.
   #pendingDeviceLabel: string | null = null;
@@ -814,7 +817,7 @@ export class TarnClient {
     }
     this.#recoveryLookupKey = recoveryLookupKey;
 
-    await this.#authenticate();
+    await this.#authenticate({ interactive: true });
     this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     return {
@@ -1140,7 +1143,7 @@ export class TarnClient {
       this.#issuedInvitesState = null;
     }
     this.#jwt = null; // force re-auth under the new credentials
-    await this.#authenticate();
+    await this.#authenticate({ interactive: true });
     this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     // §13.5 step 8: publish a fresh seq=0 snapshot to every connection's NEW
@@ -1282,8 +1285,9 @@ export class TarnClient {
     }
     this.#recoveryLookupKey = null;
 
-    // Verify
-    await this.#verifyChallenge(challengeRes.json.nonce);
+    // Verify. Interactive: a not_found previous_sid must not sign the user
+    // out — they just proved the password and a replacement sid is correct.
+    await this.#verifyChallenge(challengeRes.json.nonce, { interactive: true });
     this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     return { dataLookupKey: this.#dataLookupKey };
@@ -1663,7 +1667,7 @@ export class TarnClient {
       this.#issuedInvitesState = null;
     }
 
-    await this.#authenticate();
+    await this.#authenticate({ interactive: true });
     this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     // §13.5 step 8: publish a fresh seq=0 snapshot to every connection's NEW
@@ -7777,6 +7781,15 @@ export class TarnClient {
    *
    * @returns {Promise<void>}
    */
+  /**
+   * Called when a silent re-auth learns this device's server session is gone.
+   * The schema wrapper registers a handler that clears its storage adapter.
+   * Passing null removes the handler.
+   */
+  setRemoteSignOutHandler(handler: (() => void) | null): void {
+    this.#remoteSignOutHandler = handler;
+  }
+
   async clearSession() {
     // Wipe first, while #dataLookupKey is still whatever the caller had —
     // clearSession never nulls fields, but ordering it before the wrapping-
@@ -8096,7 +8109,7 @@ export class TarnClient {
     );
   }
 
-  async #authenticate() {
+  async #authenticate(opts: { interactive?: boolean } = {}) {
     const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
       retry: true, // fresh nonce per call — safe to retry
@@ -8107,10 +8120,10 @@ export class TarnClient {
       throw new Error(`Challenge failed: ${challengeRes.json?.error}`);
     }
 
-    await this.#verifyChallenge(challengeRes.json.nonce);
+    await this.#verifyChallenge(challengeRes.json.nonce, opts);
   }
 
-  async #verifyChallenge(nonce: string): Promise<void> {
+  async #verifyChallenge(nonce: string, opts: { interactive?: boolean } = {}): Promise<void> {
     const signature = await signChallenge(this.#signingKeyPair!.privateKey, nonce);
 
     // Section 7.5: send the previous sid (if any) so the server reuses the
@@ -8121,7 +8134,8 @@ export class TarnClient {
       nonce,
       signature,
     };
-    if (this.#sid) body.previous_sid = this.#sid;
+    const sentPreviousSid = !!this.#sid;
+    if (sentPreviousSid) body.previous_sid = this.#sid;
     if (this.#pendingDeviceLabel != null) body.device_label = this.#pendingDeviceLabel;
 
     const verifyRes = await this.#fetch('/api/v1/auth/verify', {
@@ -8137,6 +8151,20 @@ export class TarnClient {
       throw new Error(`Verify failed: ${verifyRes.json?.error}`);
     }
 
+    // Silent refresh of a session the server no longer has (revoked or
+    // idle-pruned). Do not keep the replacement JWT — that is what used to
+    // let "sign out other devices" bounce. Interactive sign-in (login,
+    // register, recovery, credential change) is allowed to take the new sid.
+    // An older server omits the field; keep today's behaviour then.
+    if (
+      !opts.interactive &&
+      sentPreviousSid &&
+      verifyRes.json?.previous_sid_status === 'not_found'
+    ) {
+      await this.#signOutRevokedSession();
+      throw new TarnNotAuthenticatedError('Session was signed out from another device');
+    }
+
     this.#jwt = verifyRes.json.jwt;
     this.#sid = this.#extractSidFromJwt(this.#jwt);
     // Phase 3: server returns account_key_stored on user-role verify so the
@@ -8144,6 +8172,22 @@ export class TarnClient {
     if (typeof verifyRes.json.account_key_stored === 'boolean') {
       this.#accountKeyStored = verifyRes.json.account_key_stored;
     }
+  }
+
+  /**
+   * Drop local credentials after the server reports this device's sid is gone.
+   * Mirrors revokeAllSessions' local half, and also nulls the signing key and
+   * DEK chain so isLoggedIn() is false and a later call cannot silently mint
+   * another sid. The handler lets the schema wrapper clear its storage blob.
+   */
+  async #signOutRevokedSession(): Promise<void> {
+    try { await this.clearSession(); } catch { /* wrapping-key wipe is best-effort */ }
+    this.#jwt = null;
+    this.#sid = null;
+    this.#signingKeyPair = null;
+    this.#dekByGen = null;
+    this.#currentGen = null;
+    try { this.#remoteSignOutHandler?.(); } catch { /* storage clear is best-effort */ }
   }
 
   /**
