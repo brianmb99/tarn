@@ -842,7 +842,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
   };
   const nowSeconds = Math.floor(Date.now() / 1000);
   await pruneStaleSessions(env, account.data_lookup_key, nowSeconds);
-  const sid = await createOrReuseSession(env, {
+  const session = await createOrReuseSession(env, {
     dlk: account.data_lookup_key,
     app: account.app,
     deviceLabel: device_label || null,
@@ -850,7 +850,7 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
     previousSid: previous_sid,
     nowSeconds,
   });
-  jwtPayload.sid = sid;
+  jwtPayload.sid = session.sid;
 
   // Issue #28: Passkey-authenticated JWTs live for the full 7-day session-blob
   // lifetime. The SDK's `#ensureFreshJwt` has no refresh path for passkey-only

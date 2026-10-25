@@ -592,10 +592,17 @@ export async function handleVerify(request, env, cors) {
   // App-role JWTs stay stateless. Run prune + createOrReuse only after the
   // signature check has succeeded so an unauthenticated caller can't grow the
   // sessions table.
+  //
+  // previous_sid_status is set only when the caller supplied previous_sid on
+  // a user-role verify. 'reused' means that row was still live for this dlk;
+  // 'not_found' means it was missing (revoked or idle-pruned) and a new sid
+  // was minted. The field is omitted when no previous_sid was sent so older
+  // clients keep working. The verify still returns 200 either way.
+  let previousSidStatus;
   if (jwtPayload.role === 'user') {
     const nowSeconds = Math.floor(Date.now() / 1000);
     await pruneStaleSessions(env, jwtPayload.sub, nowSeconds);
-    const sid = await createOrReuseSession(env, {
+    const session = await createOrReuseSession(env, {
       dlk: jwtPayload.sub,
       app: jwtPayload.app,
       deviceLabel: device_label,
@@ -603,7 +610,10 @@ export async function handleVerify(request, env, cors) {
       previousSid: previous_sid,
       nowSeconds,
     });
-    jwtPayload.sid = sid;
+    jwtPayload.sid = session.sid;
+    if (previous_sid) {
+      previousSidStatus = session.reused ? 'reused' : 'not_found';
+    }
   }
 
   // Issue JWT
@@ -614,6 +624,9 @@ export async function handleVerify(request, env, cors) {
   // account_key concept — omit the field for them.
   if (accountKeyStored !== null) {
     responseBody.account_key_stored = accountKeyStored;
+  }
+  if (previousSidStatus) {
+    responseBody.previous_sid_status = previousSidStatus;
   }
   return jsonResponse(responseBody, 200, cors);
 }

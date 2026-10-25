@@ -9,7 +9,10 @@
 // App-role JWTs are stateless (no sid) and bypass everything in this module.
 
 export const MAX_DEVICE_LABEL_LEN = 64;
-const STALE_SESSION_CUTOFF_SECONDS = 24 * 60 * 60; // 24h
+// Idle window for a sessions row. A row whose last_seen_at is older than
+// this is deleted on the next /auth/verify (or passkey authenticate) for
+// that account. Matches the client blob's sliding idle window.
+export const SESSION_IDLE_SECONDS = 90 * 24 * 60 * 60;
 const LAST_SEEN_REFRESH_SECONDS = 60;
 
 let SESSION_CACHE_TTL_MS = 5_000;
@@ -37,12 +40,12 @@ export function validateDeviceLabel(label) {
 
 /**
  * Lazy-prune sessions for a given data_lookup_key. Deletes rows whose
- * last_seen_at is older than `nowSeconds - 24h`. Called at the start of
- * /auth/verify so an active user's table stays bounded; an inactive user
- * gets a clean slate next time they log in.
+ * last_seen_at is older than `nowSeconds - SESSION_IDLE_SECONDS` (90 days).
+ * Called at the start of /auth/verify so an active user's table stays
+ * bounded; an inactive user gets a clean slate next time they log in.
  */
 export async function pruneStaleSessions(env, dlk, nowSeconds) {
-  const cutoff = nowSeconds - STALE_SESSION_CUTOFF_SECONDS;
+  const cutoff = nowSeconds - SESSION_IDLE_SECONDS;
   await env.DB.prepare(
     'DELETE FROM sessions WHERE data_lookup_key = ?1 AND last_seen_at < ?2'
   ).bind(dlk, cutoff).run();
@@ -53,6 +56,10 @@ export async function pruneStaleSessions(env, dlk, nowSeconds) {
  * `previousSid` is supplied and still present. Reuse path bumps last_seen_at
  * to keep the row from being lazy-pruned. Insert path creates a new row
  * with created_at = last_seen_at = nowSeconds.
+ *
+ * `reused` is true only when `previousSid` resolved to a live row for this
+ * dlk. Callers that were handed a previous sid and see `reused: false` know
+ * the row was missing (revoked or idle-pruned) and a new sid was minted.
  */
 export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaRecovery, previousSid, nowSeconds }) {
   if (previousSid) {
@@ -65,7 +72,7 @@ export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaReco
       ).bind(nowSeconds, previousSid).run();
       // Refresh the cache: this isolate just confirmed the row is active.
       _sessionCache.set(previousSid, { active: true, cachedAt: Date.now() });
-      return previousSid;
+      return { sid: previousSid, reused: true };
     }
   }
 
@@ -82,7 +89,7 @@ export async function createOrReuseSession(env, { dlk, app, deviceLabel, viaReco
     viaRecovery ? 1 : 0,
   ).run();
   _sessionCache.set(sid, { active: true, cachedAt: Date.now() });
-  return sid;
+  return { sid, reused: false };
 }
 
 /**
