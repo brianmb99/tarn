@@ -16,7 +16,24 @@ concurrency:
   group: tarn-deploy-api-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
+  secret-scope:
+    name: Cloudflare token is approval-gated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cloudflare credentials must not be repository secrets
+        env:
+          REPO_LEVEL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$REPO_LEVEL_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN is a repository secret, so any workflow can deploy without approval. Delete it under Settings > Secrets and variables > Actions and add it to the production environment instead."
+            exit 1
+          fi
+          echo "OK: no repository-level CLOUDFLARE_API_TOKEN."
+
   check:
     name: API bundle + migrations check
     if: github.event_name == 'pull_request'
@@ -44,9 +61,12 @@ jobs:
   deploy:
     name: Deploy to production
     if: github.event_name != 'pull_request'
+    needs: secret-scope
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: production
+    environment:
+      name: production
+      url: https://api.tarn.dev/api/v1/health
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,12 +114,24 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CI: "true"
         run: npx wrangler deploy
+      - name: Health check
+        run: |
+          for host in api.tarn.dev api.getbookish.app; do
+            ok=false
+            for attempt in 1 2 3 4 5 6; do
+              body=$(curl -sS -m 15 "https://$host/api/v1/health" || true)
+              if echo "$body" | grep -q '"healthy":true'; then ok=true; break; fi
+              sleep 10
+            done
+            echo "$host: $body"
+            $ok || { echo "::error::$host is not healthy after the deploy."; exit 1; }
+          done
       - name: Post-deploy smoke test
         env:
           TARN_APP_KEY_BOOKISH: ${{ secrets.TARN_APP_KEY_BOOKISH }}
         run: |
           if [ -z "$TARN_APP_KEY_BOOKISH" ]; then
-            echo "::warning::TARN_APP_KEY_BOOKISH is not in the production environment, so the smoke test did not run. The deploy is not verified."
+            echo "::notice::TARN_APP_KEY_BOOKISH is not in the production environment, so only the health check ran (no end-to-end smoke test)."
             exit 0
           fi
           node --import tsx tests/test-deployed.mjs https://api.tarn.dev bookish "$TARN_APP_KEY_BOOKISH"
