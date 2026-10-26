@@ -18,10 +18,11 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: |
             package-lock.json
+            api/package-lock.json
             client/package-lock.json
 
       # Root has a small toolchain (tsx + typescript) used to run the JS unit
@@ -29,6 +30,12 @@ jobs:
       # toolchain. Both lockfiles are checked into the repo; `npm ci` enforces
       # exact-version installs from them.
       - name: Install root devDependencies
+        run: npm ci
+
+      # tests/unit imports api/src, which needs the worker's own dependencies
+      # (@noble/curves, @simplewebauthn/server).
+      - name: Install API dependencies
+        working-directory: api
         run: npm ci
 
       - name: Install client dependencies
@@ -50,7 +57,7 @@ jobs:
         working-directory: client
         run: npm test
 
-      # 418 JS unit tests in tests/unit/ covering the underlying client's
+      # JS unit tests in tests/unit/ covering the underlying client's
       # crypto + sharing + auth flows. Run via tsx so .js import specifiers in
       # the test files resolve to .ts source modules.
       - name: JS unit tests
