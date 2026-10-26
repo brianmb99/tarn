@@ -30,9 +30,9 @@ The generator requires Python with `reportlab` and `markdown-it-py` (`python -m 
 
 ## Git Workflow
 
-- **Two branches:** `main` (stable) and `dev` (all development work).
-- All work goes on `dev`. **Never push to `main`** — merging is a human decision.
-- Do not create feature branches.
+- `dev` is the integration branch. Open a pull request into `dev`. Do not commit straight to `dev`.
+- CI (`.github/workflows/ci.yml`) runs on that pull request: typecheck, client tests, `npm run test:unit`, and the SDK build, on Node 22.
+- **Never push to `main`.** Do not merge your own pull request unless Brian has explicitly said agents may merge once CI is green.
 
 ## Repo Structure
 
@@ -51,8 +51,14 @@ The generator requires Python with `reportlab` and `markdown-it-py` (`python -m 
 
 ## Deployment
 
-- Deploy: `cd api && npx wrangler deploy`
-- Apply remote migrations: `cd api && npx wrangler d1 migrations apply tarn-api --remote`
+- Production deploys go through the **Deploy API** workflow (`.github/workflows/deploy-api.yml`). To request one, push a tag named `api-deploy-<yyyymmdd-hhmm>` on a commit that is on `dev`. The deploy job waits for Brian's approval on the GitHub `production` environment, then applies D1 migrations, runs `wrangler deploy`, and runs the smoke test below. Do not deploy from a checkout, and only request a deploy after Brian has said yes to it.
+- The same commands, for a human who already has Wrangler credentials:
+
+```
+cd api && npx wrangler d1 migrations apply tarn-api --remote
+cd api && npx wrangler deploy
+```
+
 - **After every deploy, run the post-deployment smoke test:**
   ```
   node tests/test-deployed.mjs https://api.tarn.dev bookish <TARN_APP_KEY_BOOKISH>
