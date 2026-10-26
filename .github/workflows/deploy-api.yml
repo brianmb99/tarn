@@ -1,0 +1,105 @@
+name: Deploy API
+
+# Production deploys of api/ (api.tarn.dev and api.getbookish.app).
+# Request one by pushing a tag named api-deploy-* on a commit that is on dev,
+# or by running this workflow on dev. The deploy job then waits for approval
+# on the "production" environment, which holds the Cloudflare credentials.
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    tags: ['api-deploy-*']
+  workflow_dispatch:
+
+concurrency:
+  group: tarn-deploy-api-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: API bundle + migrations check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - name: Install API dependencies
+        working-directory: api
+        run: npm ci
+      - name: Bundle the worker without deploying
+        working-directory: api
+        run: npx wrangler deploy --dry-run --outdir "${RUNNER_TEMP}/bundle"
+      - name: Apply every migration to a fresh local D1
+        working-directory: api
+        env:
+          CI: "true"
+        run: npx wrangler d1 migrations apply tarn-api --local --persist-to "${RUNNER_TEMP}/d1"
+
+  deploy:
+    name: Deploy to production
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a commit that is on dev
+        run: |
+          git fetch origin dev
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/dev; then
+            echo "::error::$GITHUB_SHA is not on dev. Deploys only ship commits that are on dev."
+            exit 1
+          fi
+      - name: Require Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to the production environment."
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            api/package-lock.json
+            client/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix api
+          npm ci --prefix client
+      - name: Apply D1 migrations
+        working-directory: api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: "true"
+        run: npx wrangler d1 migrations apply tarn-api --remote
+      - name: Deploy worker
+        working-directory: api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: "true"
+        run: npx wrangler deploy
+      - name: Post-deploy smoke test
+        env:
+          TARN_APP_KEY_BOOKISH: ${{ secrets.TARN_APP_KEY_BOOKISH }}
+        run: |
+          if [ -z "$TARN_APP_KEY_BOOKISH" ]; then
+            echo "::warning::TARN_APP_KEY_BOOKISH is not in the production environment, so the smoke test did not run. The deploy is not verified."
+            exit 0
+          fi
+          node --import tsx tests/test-deployed.mjs https://api.tarn.dev bookish "$TARN_APP_KEY_BOOKISH"
