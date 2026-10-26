@@ -339,9 +339,10 @@ export function installPasskeyTestEnv({ origin = 'http://localhost:3000', rpId =
     seenChallenges: [],
   };
 
-  // Stash originals for restore.
+  // Stash originals for restore. Node 22's navigator is a configurable
+  // getter with no setter, so save the descriptor and redefine it.
   const originals = {
-    navigator: globalThis.navigator,
+    navigator: Object.getOwnPropertyDescriptor(globalThis, 'navigator'),
     PublicKeyCredential: globalThis.PublicKeyCredential,
     fetch: globalThis.fetch,
   };
@@ -434,7 +435,12 @@ export function installPasskeyTestEnv({ origin = 'http://localhost:3000', rpId =
     },
   };
 
-  globalThis.navigator = { credentials };
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: { credentials },
+  });
 
   // Patch fetch to inject Origin header.
   const realFetch = originals.fetch;
@@ -463,7 +469,11 @@ export function installPasskeyTestEnv({ origin = 'http://localhost:3000', rpId =
       };
     },
     restore() {
-      globalThis.navigator = originals.navigator;
+      if (originals.navigator) {
+        Object.defineProperty(globalThis, 'navigator', originals.navigator);
+      } else {
+        delete globalThis.navigator;
+      }
       globalThis.PublicKeyCredential = originals.PublicKeyCredential;
       globalThis.fetch = originals.fetch;
     },

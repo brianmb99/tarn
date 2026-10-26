@@ -73,6 +73,22 @@ function restoreFetch() {
   fetchCalls = [];
   fetchResponses = [];
 }
+
+// Node 22 exposes globalThis.navigator as a configurable getter with no
+// setter. Assignment throws in strict mode; redefine the property instead.
+function stubNavigator(stub) {
+  const prior = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: stub,
+  });
+  return () => {
+    if (prior) Object.defineProperty(globalThis, 'navigator', prior);
+    else delete globalThis.navigator;
+  };
+}
 function fakeJwt(label = 'jwt') {
   const b64url = (s) => btoa(s).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
   const header = b64url('{"alg":"none"}');
@@ -109,10 +125,9 @@ describe('PRF detection', () => {
   });
 
   it('passkeysSupported() returns false when isUserVerifyingPlatformAuthenticatorAvailable is false', async () => {
-    const originalNav = globalThis.navigator;
     const originalPK = globalThis.PublicKeyCredential;
+    const restoreNav = stubNavigator({ credentials: {} });
     try {
-      globalThis.navigator = { credentials: {} };
       globalThis.PublicKeyCredential = {
         isUserVerifyingPlatformAuthenticatorAvailable: async () => false,
         getClientCapabilities: async () => ({ prf: true }),
@@ -121,16 +136,15 @@ describe('PRF detection', () => {
       const supported = await client.passkeysSupported();
       assert.equal(supported, false);
     } finally {
-      globalThis.navigator = originalNav;
+      restoreNav();
       globalThis.PublicKeyCredential = originalPK;
     }
   });
 
   it('passkeysSupported() returns true when both platform-authenticator and PRF caps are present', async () => {
-    const originalNav = globalThis.navigator;
     const originalPK = globalThis.PublicKeyCredential;
+    const restoreNav = stubNavigator({ credentials: {} });
     try {
-      globalThis.navigator = { credentials: {} };
       globalThis.PublicKeyCredential = {
         isUserVerifyingPlatformAuthenticatorAvailable: async () => true,
         getClientCapabilities: async () => ({ prf: true }),
@@ -139,7 +153,7 @@ describe('PRF detection', () => {
       const supported = await client.passkeysSupported();
       assert.equal(supported, true);
     } finally {
-      globalThis.navigator = originalNav;
+      restoreNav();
       globalThis.PublicKeyCredential = originalPK;
     }
   });
@@ -150,10 +164,9 @@ describe('PRF detection', () => {
     // The advertisement is browser-level; PRF support is per-authenticator.
     // We don't gate on it — verified 2026-05-07 (PRF consistency test passed
     // on Chrome/Windows + Android via Google Password Manager).
-    const originalNav = globalThis.navigator;
     const originalPK = globalThis.PublicKeyCredential;
+    const restoreNav = stubNavigator({ credentials: {} });
     try {
-      globalThis.navigator = { credentials: {} };
       globalThis.PublicKeyCredential = {
         isUserVerifyingPlatformAuthenticatorAvailable: async () => true,
         getClientCapabilities: async () => ({ prf: false }),
@@ -162,7 +175,7 @@ describe('PRF detection', () => {
       const supported = await client.passkeysSupported();
       assert.equal(supported, true);
     } finally {
-      globalThis.navigator = originalNav;
+      restoreNav();
       globalThis.PublicKeyCredential = originalPK;
     }
   });
@@ -173,10 +186,9 @@ describe('PRF detection', () => {
     // — basic platform authenticator + PublicKeyCredential is enough to
     // surface passkey UX. If PRF turns out to be unavailable at register
     // time, registerPasskey throws with a useful error.
-    const originalNav = globalThis.navigator;
     const originalPK = globalThis.PublicKeyCredential;
+    const restoreNav = stubNavigator({ credentials: {} });
     try {
-      globalThis.navigator = { credentials: {} };
       globalThis.PublicKeyCredential = {
         isUserVerifyingPlatformAuthenticatorAvailable: async () => true,
         // no getClientCapabilities
@@ -185,7 +197,7 @@ describe('PRF detection', () => {
       const supported = await client.passkeysSupported();
       assert.equal(supported, true);
     } finally {
-      globalThis.navigator = originalNav;
+      restoreNav();
       globalThis.PublicKeyCredential = originalPK;
     }
   });
@@ -515,7 +527,6 @@ function bytesToB64Url(bytes) {
 }
 
 function installPrfStub({ credentialId, prfSecret }) {
-  const originalNav = globalThis.navigator;
   const originalPK = globalThis.PublicKeyCredential;
   const originalAtob = globalThis.atob;
   const originalBtoa = globalThis.btoa;
@@ -527,7 +538,7 @@ function installPrfStub({ credentialId, prfSecret }) {
   PKShim.isUserVerifyingPlatformAuthenticatorAvailable = async () => true;
   PKShim.getClientCapabilities = async () => ({ prf: true });
   globalThis.PublicKeyCredential = PKShim;
-  globalThis.navigator = {
+  const restoreNav = stubNavigator({
     credentials: {
       async get(opts) {
         // Build a minimal PublicKeyCredential-shape response. The SDK
@@ -555,9 +566,9 @@ function installPrfStub({ credentialId, prfSecret }) {
         };
       },
     },
-  };
+  });
   return () => {
-    globalThis.navigator = originalNav;
+    restoreNav();
     globalThis.PublicKeyCredential = originalPK;
     if (!originalAtob) delete globalThis.atob;
     if (!originalBtoa) delete globalThis.btoa;
