@@ -313,8 +313,9 @@ export class TarnRateLimitError extends Error {
  *
  * Raised by `#requireAuth()` — the gate every authenticated method passes
  * through. A freshly-constructed client, a client after `clearSession()`, or
- * a resumed session whose 7-day blob cap has elapsed all surface this on the
- * next authenticated call.
+ * a resumed session whose blob has expired (idle window or the absolute cap
+ * from the last interactive sign-in) all surface this on the next
+ * authenticated call.
  */
 export class TarnNotAuthenticatedError extends Error {
   constructor(message: string) {
@@ -451,6 +452,25 @@ export class TarnEnvelopeConflictError extends Error {
     this.name = 'TarnEnvelopeConflictError';
     this.attempts = args.attempts;
     this.operationType = args.operationType;
+  }
+}
+
+// Persisted-session lifetimes. The idle window slides forward each time the
+// blob is re-serialized (the schema wrapper does that on every successful
+// resume). The absolute cap does not slide: it is measured from the last
+// interactive credential sign-in, not from silent JWT refresh.
+export const SESSION_IDLE_SECONDS = 90 * 24 * 60 * 60;
+export const SESSION_ABSOLUTE_MAX_SECONDS = 365 * 24 * 60 * 60;
+
+function readJwtExp(jwt: string | null): number | null {
+  if (!jwt) return null;
+  try {
+    const parts = jwt.split('.');
+    if (parts.length < 2 || !parts[1]) return null;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
   }
 }
 
@@ -602,6 +622,14 @@ export class TarnClient {
   // Sent back as `previous_sid` on /auth/verify so the server reuses the same
   // sessions row instead of minting a fresh one. Null until the first verify.
   #sid: string | null = null;
+  // Unix seconds of the last interactive credential sign-in (register, login,
+  // recoverAccount, authenticateWithPasskey, changeCredentials). Silent JWT
+  // refresh does not move it. serializeSession refuses to extend the blob
+  // past this instant plus SESSION_ABSOLUTE_MAX_SECONDS.
+  #authenticatedAt: number | null = null;
+  // Set by the schema wrapper so a remote sign-out also drops the blob from
+  // the app's storage adapter. The protocol client clears IndexedDB itself.
+  #remoteSignOutHandler: (() => void) | null = null;
   // One-shot device label consumed by the next #authenticate call. Set by
   // register/login/recoverAccount; cleared after the verify body is built.
   #pendingDeviceLabel: string | null = null;
@@ -789,7 +817,8 @@ export class TarnClient {
     }
     this.#recoveryLookupKey = recoveryLookupKey;
 
-    await this.#authenticate();
+    await this.#authenticate({ interactive: true });
+    this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     return {
       dataLookupKey: this.#dataLookupKey,
@@ -1114,7 +1143,8 @@ export class TarnClient {
       this.#issuedInvitesState = null;
     }
     this.#jwt = null; // force re-auth under the new credentials
-    await this.#authenticate();
+    await this.#authenticate({ interactive: true });
+    this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     // §13.5 step 8: publish a fresh seq=0 snapshot to every connection's NEW
     // outbound log under the new pair keys. Only meaningful if we ran
@@ -1255,8 +1285,10 @@ export class TarnClient {
     }
     this.#recoveryLookupKey = null;
 
-    // Verify
-    await this.#verifyChallenge(challengeRes.json.nonce);
+    // Verify. Interactive, so a missing server session mints a new sid
+    // instead of signing the user out — they just proved the password.
+    await this.#verifyChallenge(challengeRes.json.nonce, { interactive: true });
+    this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     return { dataLookupKey: this.#dataLookupKey };
   }
@@ -1635,7 +1667,8 @@ export class TarnClient {
       this.#issuedInvitesState = null;
     }
 
-    await this.#authenticate();
+    await this.#authenticate({ interactive: true });
+    this.#authenticatedAt = Math.floor(Date.now() / 1000);
 
     // §13.5 step 8: publish a fresh seq=0 snapshot to every connection's NEW
     // outbound log so the recipient bootstraps the new log with the
@@ -2883,6 +2916,7 @@ export class TarnClient {
     //    and is hydrated below, so share-log reads/publishes work here.
     this.#jwt = jwt;
     this.#sid = this.#extractSidFromJwt(jwt);
+    this.#authenticatedAt = Math.floor(Date.now() / 1000);
     this.#dataLookupKey = data_lookup_key;
     this.#dekByGen = unwrapped.dekByGen;
     this.#currentGen = unwrapped.currentGen;
@@ -7308,8 +7342,10 @@ export class TarnClient {
    * Serialize the in-memory session into an opaque base64url blob suitable for
    * `localStorage`. The blob is encrypted under an AES-256-GCM wrapping key
    * stored in IndexedDB (`tarn-session.keys["wrapping-key-v1"]`,
-   * `extractable: false`). The blob hard-expires 7 days after creation; the
-   * SDK does not auto-refresh on use.
+   * `extractable: false`). `expiresAt` is the earlier of a 90-day idle
+   * deadline (moved forward each time this method runs) and 365 days after
+   * the last interactive sign-in. Passkey-only sessions are also capped at
+   * the JWT's `exp`, since they cannot refresh it.
    *
    * Apps MUST treat the result as opaque. The plaintext schema is documented
    * in the protocol doc only so the threat model can be reasoned about.
@@ -7330,7 +7366,20 @@ export class TarnClient {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const expiresAt = now + 7 * 24 * 60 * 60; // 7-day hard cap, no refresh-on-use
+    // Interactive sign-in stamps #authenticatedAt. A logged-in client that
+    // reaches serialize without one starts the absolute clock here.
+    if (this.#authenticatedAt == null) this.#authenticatedAt = now;
+    const authenticatedAt = this.#authenticatedAt;
+    let expiresAt = Math.min(
+      now + SESSION_IDLE_SECONDS,
+      authenticatedAt + SESSION_ABSOLUTE_MAX_SECONDS,
+    );
+    // No signing key → passkey-only. The JWT cannot be refreshed, so a blob
+    // that outlives it cannot make authenticated calls.
+    if (!this.#signingKeyPair) {
+      const jwtExp = readJwtExp(this.#jwt);
+      if (jwtExp != null) expiresAt = Math.min(expiresAt, jwtExp);
+    }
 
     // Password-derived signing key — optional on passkey-only sessions.
     let signingPrivateKeyB64: string | null = null;
@@ -7409,6 +7458,8 @@ export class TarnClient {
       v: 3,
       createdAt: now,
       expiresAt,
+      // Optional for readers of older blobs (resume falls back to createdAt).
+      authenticatedAt,
       apiBase: this.#apiBase,
       appId: this.#appId,
       dataLookupKey: this.#dataLookupKey,
@@ -7455,8 +7506,10 @@ export class TarnClient {
 
   /**
    * Resume a previously-serialized session. Returns a logged-in `TarnClient`
-   * if the blob is well-formed, decryptable on this origin, schema v1, and
-   * not past `expiresAt`. Returns `null` for any recoverable failure
+   * if the blob is well-formed, decryptable on this origin, schema v3, not
+   * past `expiresAt`, and not past the absolute cap (365 days from
+   * `authenticatedAt`, or from `createdAt` when that field is absent).
+   * Returns `null` for any recoverable failure
    * (expired, tampered, schema-mismatched, wrong origin, missing fields,
    * malformed JSON, IndexedDB error). Apps fall back to the login UI on null.
    *
@@ -7536,6 +7589,13 @@ export class TarnClient {
 
       const nowSeconds = opts._nowSeconds != null ? opts._nowSeconds : Math.floor(Date.now() / 1000);
       if (typeof payload.expiresAt !== 'number' || nowSeconds >= payload.expiresAt) return null;
+      // Blobs written before authenticatedAt existed use createdAt, which is
+      // the last time that blob was serialized — the closest stamp we have.
+      const authenticatedAt = typeof payload.authenticatedAt === 'number'
+        ? payload.authenticatedAt
+        : payload.createdAt;
+      if (typeof authenticatedAt !== 'number' || !Number.isFinite(authenticatedAt)) return null;
+      if (nowSeconds >= authenticatedAt + SESSION_ABSOLUTE_MAX_SECONDS) return null;
 
       // Rehydrate keys. Signing keys are optional — only imported when present.
       let signingPrivateKey: CryptoKey | null = null;
@@ -7641,6 +7701,7 @@ export class TarnClient {
       // "requires password-authenticated session" error.
       client.#jwt = payload.jwt || null;
       client.#sid = typeof payload.sid === 'string' ? payload.sid : null;
+      client.#authenticatedAt = authenticatedAt;
       client.#dataLookupKey = payload.dataLookupKey;
       client.#dekByGen = dekByGen;
       client.#currentGen = payload.currentGen;
@@ -7696,6 +7757,15 @@ export class TarnClient {
       // is the recoverable signal so apps can uniformly fall back to login UI.
       return null;
     }
+  }
+
+  /**
+   * Called when a silent re-auth learns this device's server session is gone.
+   * The schema wrapper registers a handler that clears its storage adapter.
+   * Passing null removes the handler.
+   */
+  setRemoteSignOutHandler(handler: (() => void) | null): void {
+    this.#remoteSignOutHandler = handler;
   }
 
   /**
@@ -8039,7 +8109,7 @@ export class TarnClient {
     );
   }
 
-  async #authenticate() {
+  async #authenticate(opts: { interactive?: boolean } = {}) {
     const challengeRes = await this.#fetch('/api/v1/auth/challenge', {
       method: 'POST',
       retry: true, // fresh nonce per call — safe to retry
@@ -8050,10 +8120,10 @@ export class TarnClient {
       throw new Error(`Challenge failed: ${challengeRes.json?.error}`);
     }
 
-    await this.#verifyChallenge(challengeRes.json.nonce);
+    await this.#verifyChallenge(challengeRes.json.nonce, opts);
   }
 
-  async #verifyChallenge(nonce: string): Promise<void> {
+  async #verifyChallenge(nonce: string, opts: { interactive?: boolean } = {}): Promise<void> {
     const signature = await signChallenge(this.#signingKeyPair!.privateKey, nonce);
 
     // Section 7.5: send the previous sid (if any) so the server reuses the
@@ -8064,7 +8134,12 @@ export class TarnClient {
       nonce,
       signature,
     };
-    if (this.#sid) body.previous_sid = this.#sid;
+    const sentPreviousSid = !!this.#sid;
+    if (sentPreviousSid) body.previous_sid = this.#sid;
+    // Silent refresh of a sid we still hold must not mint a replacement if
+    // the server row is gone. Interactive sign-in never sends the flag.
+    const requirePreviousSid = !opts.interactive && sentPreviousSid;
+    if (requirePreviousSid) body.require_previous_sid = true;
     if (this.#pendingDeviceLabel != null) body.device_label = this.#pendingDeviceLabel;
 
     const verifyRes = await this.#fetch('/api/v1/auth/verify', {
@@ -8075,6 +8150,19 @@ export class TarnClient {
     // The label is one-shot — even on failure we shouldn't reuse it on the
     // next call (the caller would supply it again).
     this.#pendingDeviceLabel = null;
+
+    // 401 is returned here as-is (#fetch does not retry or swallow 4xx).
+    // Only the opt-in reject signs the device out. Any other non-200,
+    // including a 401 we did not ask for, stays a verify failure. An older
+    // server ignores the flag and returns 200 with a new JWT; keep it.
+    if (
+      requirePreviousSid &&
+      verifyRes.status === 401 &&
+      verifyRes.json?.error === 'session_not_found'
+    ) {
+      await this.#signOutRevokedSession();
+      throw new TarnNotAuthenticatedError('Session was signed out from another device');
+    }
 
     if (verifyRes.status !== 200) {
       throw new Error(`Verify failed: ${verifyRes.json?.error}`);
@@ -8087,6 +8175,22 @@ export class TarnClient {
     if (typeof verifyRes.json.account_key_stored === 'boolean') {
       this.#accountKeyStored = verifyRes.json.account_key_stored;
     }
+  }
+
+  /**
+   * Drop local credentials after the server reports this device's sid is gone.
+   * Mirrors revokeAllSessions' local half, and also nulls the signing key and
+   * DEK chain so isLoggedIn() is false and a later call cannot silently mint
+   * another sid. The handler lets the schema wrapper clear its storage blob.
+   */
+  async #signOutRevokedSession(): Promise<void> {
+    try { await this.clearSession(); } catch { /* wrapping-key wipe is best-effort */ }
+    this.#jwt = null;
+    this.#sid = null;
+    this.#signingKeyPair = null;
+    this.#dekByGen = null;
+    this.#currentGen = null;
+    try { this.#remoteSignOutHandler?.(); } catch { /* storage clear is best-effort */ }
   }
 
   /**

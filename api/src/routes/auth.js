@@ -500,7 +500,15 @@ export async function handleVerify(request, env, cors) {
     return errorResponse('Invalid JSON body', 400, cors);
   }
 
-  const { credential_lookup_key, recovery_lookup_key, nonce, signature, previous_sid, device_label } = body;
+  const {
+    credential_lookup_key,
+    recovery_lookup_key,
+    nonce,
+    signature,
+    previous_sid,
+    device_label,
+    require_previous_sid,
+  } = body;
   const lookupKey = credential_lookup_key || recovery_lookup_key;
   if (!lookupKey || !nonce || !signature) {
     return errorResponse('lookup_key, nonce, and signature are required', 400, cors);
@@ -592,9 +600,22 @@ export async function handleVerify(request, env, cors) {
   // App-role JWTs stay stateless. Run prune + createOrReuse only after the
   // signature check has succeeded so an unauthenticated caller can't grow the
   // sessions table.
+  //
+  // Silent refresh opts in with require_previous_sid. After the idle prune
+  // (a 90-day-idle row counts as missing), a supplied previous_sid with no
+  // row is a remote sign-out: 401, no insert, no JWT. The flag without
+  // previous_sid is ignored. Callers that omit the flag still reuse or mint.
   if (jwtPayload.role === 'user') {
     const nowSeconds = Math.floor(Date.now() / 1000);
     await pruneStaleSessions(env, jwtPayload.sub, nowSeconds);
+    if (require_previous_sid === true && previous_sid) {
+      const existing = await env.DB.prepare(
+        'SELECT sid FROM sessions WHERE sid = ?1 AND data_lookup_key = ?2'
+      ).bind(previous_sid, jwtPayload.sub).first();
+      if (!existing) {
+        return errorResponse('session_not_found', 401, cors);
+      }
+    }
     const sid = await createOrReuseSession(env, {
       dlk: jwtPayload.sub,
       app: jwtPayload.app,

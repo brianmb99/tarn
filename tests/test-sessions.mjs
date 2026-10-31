@@ -354,7 +354,7 @@ await test('11. lazy-prune removes stale rows on next /auth/verify', async () =>
   const c = new TarnClient(API_BASE, DEFAULT_APP_ID);
   const { dataLookupKey } = await c.register(randomUsername(), 'pw', { recoveryAcknowledged: true });
 
-  // Insert a stale row directly (last_seen_at = 1, well past 24h).
+  // Insert a stale row directly (last_seen_at = 1, well past the 90-day idle window).
   const { execSync } = await import('child_process');
   const sql = `INSERT INTO sessions (sid, data_lookup_key, app, created_at, last_seen_at, device_label, via_recovery) VALUES ('stale-test-${Date.now()}', '${dataLookupKey}', '${DEFAULT_APP_ID}', 1, 1, 'old', 0)`;
   execSync(

@@ -357,8 +357,8 @@ await test('resumeSession: expired blob (via _nowSeconds) returns null', async (
   await client.register(username, 'x', { recoveryAcknowledged: true });
   const blob = await client.serializeSession();
 
-  // Pretend it's 8 days from now — past the 7-day cap baked into expiresAt.
-  const future = Math.floor(Date.now() / 1000) + 8 * 24 * 60 * 60;
+  // Pretend it's 91 days from now — past the 90-day idle window baked into expiresAt.
+  const future = Math.floor(Date.now() / 1000) + 91 * 24 * 60 * 60;
   const result = await TarnClient.resumeSession(API_BASE, DEFAULT_APP_ID, blob, { _nowSeconds: future });
   assert(result === null, 'expired blob must resume to null');
 

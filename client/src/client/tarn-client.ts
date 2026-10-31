@@ -157,12 +157,21 @@ export class TarnClient<S extends AnySchema> {
       schemaVersion: schemaInner.version,
       appId: args.appId,
     });
+
+    // Remote sign-out (silent refresh got 401 session_not_found) clears the
+    // protocol client's wrapping key. Also drop the blob this adapter is
+    // holding, the same way session.clear() / revokeAll() do.
+    const hookable = args.underlying as IUnderlyingClient & {
+      setRemoteSignOutHandler?(handler: (() => void) | null): void;
+    };
+    hookable.setRemoteSignOutHandler?.(() => this.#onLogout());
   }
 
   /**
    * Construct a TarnClient. Resumes any persisted session via the storage
    * adapter — if the resume succeeds, the returned client is already
-   * logged in. Otherwise, the app calls `login()` or `register()`.
+   * logged in and the persisted blob's idle expiry is slid forward.
+   * Otherwise, the app calls `login()` or `register()`.
    */
   static async create<S extends AnySchema>(
     config: TarnClientCreateConfig<S>,
@@ -187,11 +196,16 @@ export class TarnClient<S extends AnySchema> {
       if (config.underlying) return config.underlying(config.apiBase, config.appId);
       return new LegacyTarnClient(config.apiBase, config.appId) as unknown as IUnderlyingClient;
     };
+    // True only when the bundled resumer returns a client. The test
+    // `underlying` factory passes `resume: null` and must not re-persist.
+    let resumedSession = false;
     const resume: Resumer | null = config.underlying
       ? null
       : async (api, app, blob) => {
           const resumed = await LegacyTarnClient.resumeSession(api, app, blob);
-          return resumed ? (resumed as unknown as IUnderlyingClient) : null;
+          if (!resumed) return null;
+          resumedSession = true;
+          return resumed as unknown as IUnderlyingClient;
         };
     const underlying = await resolveUnderlying({
       apiBase: config.apiBase,
@@ -217,6 +231,10 @@ export class TarnClient<S extends AnySchema> {
     // the dynamic key set into the type system; runtime is just an
     // assignment.
     Object.assign(client as unknown as Record<string, unknown>, collections);
+    if (resumedSession) {
+      // Slide the blob's idle expiry forward. Non-fatal, same as login.
+      await client.#persistSession();
+    }
     return client as TarnClient<S> & CollectionsOf<S>;
   }
 

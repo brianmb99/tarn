@@ -1470,8 +1470,8 @@ This is a real escalation, even with a non-extractable wrapping key. Apps with s
 
 What persistence costs:
 
-1. **Same-origin XSS becomes pseudo-persistent.** An attacker who lands code execution on the origin can call `resumeSession()` on the persisted blob and act as the user up to the blob's `expiresAt`. This is bounded by the 7-day max age and by the absence of refresh-on-use (see lifecycle).
-2. **No server-side revocation in v1.** A user who suspects their device is compromised cannot tell the API "log out all sessions." The mitigation is `changeCredentials()` — which rotates the signing key and the DEK chain, and the SDK clears the IndexedDB wrapping key as a side effect, rendering all previously-emitted blobs on this origin unreadable. v2 will add per-session identifiers and an explicit revoke endpoint so a user can invalidate sessions without changing credentials.
+1. **Same-origin XSS becomes pseudo-persistent.** An attacker who lands code execution on the origin can call `resumeSession()` on the persisted blob and act as the user for as long as that blob is valid. Validity is a 90-day idle deadline that slides forward whenever the session is re-serialized (the schema wrapper does this on every successful resume) and a 365-day absolute cap measured from the last interactive sign-in. An in-page XSS can still act as the user for that whole window — the SDK cannot tell the attacker from the app.
+2. **Server-side revocation signs out the official client.** Deleting a session row (`DELETE /api/v1/sessions/:sid`, or the idle prune) invalidates that sid's JWT. The official client sends `previous_sid` and `require_previous_sid: true` on its next silent re-auth. When the row is gone the server responds `401 { "error": "session_not_found" }` without inserting a row or issuing a JWT, and the client wipes the local blob and surfaces a signed-out error. A client that omits the flag (an older SDK, or a modified client) still receives a freshly minted sid. `changeCredentials()` remains the strong kill switch: it rotates the signing key and the DEK chain, which a stolen blob cannot follow.
 3. **Cross-tab attack visibility.** All same-origin tabs can read each other's IndexedDB and localStorage. An attacker on one tab can resume the session on another. This is identical to the existing same-origin XSS surface and is not new.
 
 What persistence does NOT cost:
@@ -1486,16 +1486,16 @@ The plaintext payload below is what gets encrypted under the at-rest wrapping ke
 
 ```json
 {
-  "v": 1,
+  "v": 3,
   "createdAt": <unix-seconds>,
   "expiresAt": <unix-seconds>,
+  "authenticatedAt": <unix-seconds>,
   "apiBase": "https://api.tarn.dev",
   "appId": "bookish",
   "username": "user@example.com",
   "dataLookupKey": "<64-char hex>",
   "credentialLookupKey": "<64-char hex>",
-  "kdfVersion": 2,
-  "envelopeVersion": 4,
+  "sid": "<uuid or null>",
   "currentGen": 2,
   "dekByGen": [
     { "gen": 1, "rawBytes": "<base64 32 bytes>" },
@@ -1514,7 +1514,9 @@ The plaintext payload below is what gets encrypted under the at-rest wrapping ke
 }
 ```
 
-The `credential_encryption_key` is intentionally NOT persisted — once the DEK chain is unwrapped at login, the KEK becomes dead state on the client (no code path reads it post-login). Re-deriving it would require the password, which we do not have. Persistence carries the unwrapped DEKs directly, sidestepping the KEK entirely. The recovery factor's `wrappingsByGen` is preserved verbatim (per-gen AES-KW ciphertext bytes) so a subsequent `changeCredentials()` can re-emit the recovery wrappings without requiring the user to re-enter the phrase, matching the in-memory `#recoveryFactorMeta` semantics.
+`authenticatedAt` is the unix time of the last interactive credential sign-in (register, login, recoverAccount, authenticateWithPasskey, or changeCredentials). Silent JWT refresh does not move it. Blobs written before the field existed omit it; `resumeSession` falls back to `createdAt`. `expiresAt` is the idle deadline, not a fixed creation-time cap — see lifecycle.
+
+v3 also persists `credentialEncryptionKey` (so passkey register/remove works after a reload), `sid`, and the share-signing material. Password-derived fields are null on a passkey-only session. `kdfVersion` / `envelopeVersion` from earlier writeups of this section are not part of a v3 blob; resume rejects any `v` other than 3. The recovery factor's `wrappingsByGen` is preserved verbatim (per-gen AES-KW ciphertext bytes) so a subsequent `changeCredentials()` can re-emit the recovery wrappings without requiring the user to re-enter the phrase, matching the in-memory `#recoveryFactorMeta` semantics.
 
 ### At-rest encryption
 
@@ -1532,10 +1534,12 @@ The SDK creates the wrapping key on first call to `serializeSession()`. Subseque
 
 ### Lifecycle
 
-1. **Creation.** App authenticates via `login()`, `register()`, or `recoverAccount()`. App calls `await client.serializeSession()` and stores the returned blob (typically in `localStorage`).
-2. **Resume.** On a subsequent page load, app calls `await TarnClient.resumeSession(apiBase, appId, blob)`. If the blob is well-formed, decryptable on this origin, schema-version `1`, and not past `expiresAt`, returns a logged-in `TarnClient`. Otherwise returns `null` — caller falls back to the login UI.
-3. **Expiry.** Hard 7-day max age, baked into the blob's `expiresAt` field at creation. The SDK does NOT auto-refresh expiry on use — a "fresh" blob is only emitted by an explicit `serializeSession()` call. This bounds the worst-case window of a quiet exfil-and-replay attack.
-4. **Invalidation events.** `changeCredentials()`, `recoverAccount()`, and `deleteAccount()` all rotate the signing key and the DEK chain. The SDK clears the IndexedDB wrapping key on each, rendering all previously-emitted blobs on this origin unreadable. Apps that want continued persistence must re-call `serializeSession()` after these events.
+1. **Creation.** App authenticates via `login()`, `register()`, `recoverAccount()`, or `authenticateWithPasskey()`. That interactive sign-in stamps `authenticatedAt`. App calls `await client.serializeSession()` and stores the returned blob (typically in `localStorage`). The schema-first `TarnClient.create()` wrapper persists automatically after those calls.
+2. **Resume.** On a subsequent page load, app calls `await TarnClient.resumeSession(apiBase, appId, blob)` (the schema wrapper does this inside `TarnClient.create()`). If the blob is well-formed, decryptable on this origin, schema-version `3`, not past `expiresAt`, and not past `authenticatedAt + 365 days`, returns a logged-in `TarnClient`. Otherwise returns `null` — caller falls back to the login UI. A successful resume re-serializes the blob so the idle deadline slides forward.
+3. **Expiry.** Two clocks, both enforced in `resumeSession`:
+   - **Idle.** `expiresAt = min(now + 90 days, authenticatedAt + 365 days)` at each `serializeSession()`. Opening the app (resume + re-persist) moves the 90-day deadline forward. It never moves the 365-day absolute cap, and silent JWT refresh does not count as a new sign-in.
+   - **Passkey-only.** A session with no password signing key cannot refresh its JWT, so `expiresAt` is additionally capped at the JWT `exp` (7 days today). A blob that outlived the JWT could not make authenticated calls.
+4. **Invalidation events.** `changeCredentials()`, `recoverAccount()`, and `deleteAccount()` all rotate the signing key and the DEK chain. The SDK clears the IndexedDB wrapping key on each, rendering all previously-emitted blobs on this origin unreadable. Apps that want continued persistence must re-call `serializeSession()` after these events. Remote revocation of this device's server session (see Section 7.5) also wipes the blob on the official client the next time it silently refreshes.
 5. **Explicit logout.** `await client.clearSession()` deletes the IndexedDB wrapping key. Subsequent `resumeSession()` calls return `null` for any pre-existing blob.
 
 The `expiresAt` field is enforced client-side. A motivated attacker with code execution on the origin could in principle tamper with the field before it's encrypted (the SDK is in their JS context; they can call any of its functions). v1 accepts this — the threat is upper-bounded by the existing in-page-XSS exposure, which is itself the dominant risk this section is documenting.
@@ -1564,8 +1568,8 @@ client.clearSession(): Promise<void>
 
 ### Known v1 gaps
 
-- **No server-side revocation.** Addressed in [Section 7.5](#server-side-session-management-section-75-issue-20) below — per-session identifiers + revoke endpoints. Until 7.5 ships, "log out all devices" requires `changeCredentials()`.
-- **No idle expiry.** Blobs expire only at the hard 7-day mark; an actively-used session has no separate idle timeout. Apps that want shorter idle windows can implement them by calling `clearSession()` from their own activity tracker.
+- **Passkey-only sessions still expire with their 7-day JWT.** A passkey session has no signing key with which to refresh the JWT, so the persisted blob is capped at that token's `exp`. JWT renewal for passkey sessions is future work. Password sessions slide as described above.
+- **Clients that omit `require_previous_sid` still get a replacement sid.** `/auth/verify` mints a new row when `previous_sid` is absent, or when it is present but the caller does not opt into the reject. Older SDKs and a modified client that drops the flag can keep a password device alive after a remote sign-out. `changeCredentials()` — rotating the signing key and the DEK chain — remains the strong kill switch. See [Section 7.5](#server-side-session-management-section-75-issue-20).
 - **Browser-only.** The IndexedDB + non-extractable WebCrypto storage strategy is browser-specific. Tarn-on-Node and Tarn-on-React-Native session persistence are deferred — the API surface (`serializeSession` / `resumeSession`) is intentionally storage-agnostic in shape so a future implementation can swap backends without changing the surface.
 - **No share-log cache participation.** Persisted sessions hydrate share-log state on first read/sync from Arweave, just like fresh logins. Pure perf optimization, not a correctness gap.
 
@@ -1624,6 +1628,7 @@ Body: {
   nonce,
   signature,
   previous_sid?: string,        // optional — see "session continuity" below
+  require_previous_sid?: true,  // optional — with previous_sid, reject instead of minting when that row is gone
   device_label?: string,        // optional — max 64 chars; stored on new sessions only
 }
 ```
@@ -1634,21 +1639,24 @@ The SDK's `#requireAuth` silently re-authenticates when the JWT expires. Without
 
 To prevent that, `/auth/verify` accepts an optional `previous_sid`:
 
-- **Present and active for the same `data_lookup_key`:** server reuses the sid, updates `last_seen_at`, returns a fresh JWT with the same `sid`. No new row.
-- **Absent, expired, or revoked:** server mints a new sid, inserts a new row. Returns the new sid in the JWT.
+- **Present and active for the same `data_lookup_key`:** server reuses the sid, updates `last_seen_at`, and returns a fresh JWT with the same `sid`. No new row. This holds whether or not `require_previous_sid` is set.
+- **Present, the row is missing** (revoked, or removed by the idle prune) **for this `data_lookup_key`, and `require_previous_sid` is exactly `true`:** server responds `401 { "error": "session_not_found" }`. No insert, no JWT. The official SDK sends the flag only on a silent refresh. On that 401 it wipes the persisted blob and throws `TarnNotAuthenticatedError`. Interactive sign-in (`login`, `register`, `recoverAccount`, `changeCredentials`) does not send the flag.
+- **Present, the row is missing, and the flag is absent** (or not exactly `true`): server mints a new sid and returns 200 with a JWT. Older clients and interactive sign-in take this path. A client that just proved a credential gets a new device row.
+- **`require_previous_sid` without `previous_sid`:** the flag is ignored and the server mints a new sid.
+- **`previous_sid` absent:** server mints a new sid. This is the pre-continuity client path.
 
-The SDK extracts `sid` from its current JWT (decoding the payload, no signature check needed since the SDK trusts its own state) and passes it as `previous_sid` on every re-verify. Result: one row per device-installation per app, persisting until either the user revokes it or the lazy-prune step (next paragraph) removes it as stale.
+The SDK extracts `sid` from its current JWT (decoding the payload, no signature check needed since the SDK trusts its own state) and passes it as `previous_sid` on every re-verify. A silent refresh also sends `require_previous_sid: true`. Result: one row per device-installation per app, persisting until either the user revokes it or the lazy-prune step (next paragraph) removes it as stale. A revoked password device that still holds its signing key cannot silently replace the deleted row; the next JWT refresh is rejected and that device signs out. An older server that ignores the flag still returns 200 with a new JWT, and the client keeps it.
 
 #### Lazy pruning
 
-At the start of `/auth/verify`, before minting a new sid, the server runs:
+At the start of `/auth/verify` and of passkey authenticate, before minting a new sid, the server runs:
 
 ```sql
 DELETE FROM sessions
 WHERE data_lookup_key = ?1 AND last_seen_at < ?2
 ```
 
-with `?2 = now - 24h`. This bounds the table to "sessions used in the last 24h" per account. A user who hasn't logged in for a day gets a clean slate; an active user keeps their existing rows.
+with `?2 = now - 90 days` (`SESSION_IDLE_SECONDS`). This bounds the table to sessions used in the last 90 days per account. A user who hasn't authenticated for 90 days gets a clean slate; an active user keeps their existing rows. Prune runs before the `require_previous_sid` lookup, so a 90-day-idle row counts as missing and a silent refresh is rejected instead of minting a replacement. The same constant is the client blob's sliding idle window, so a device that opens the app inside the window both slides its local blob and keeps its server row.
 
 ### New endpoints
 
@@ -1771,7 +1779,7 @@ client.recoverAccount({ ..., deviceLabel?: string })
 
 ### Known v1 gaps
 
-- **24h pruning window.** The lazy-prune step deletes sessions older than 24h, so a user who logs in once and never returns has no surfacing in `listSessions` even if their JWT is still valid (it isn't — JWT TTL is 15 min). For long-term audit logging, a separate "session-history Arweave-pinned audit log" would be a different piece of work; not v1.
+- **90-day pruning window.** The lazy-prune step deletes sessions idle for more than 90 days, so a user who logs in once and never returns eventually disappears from `listSessions`. Password JWTs are 15 minutes, so the row outlives any single token; the row is what revocation and the device list key off of. For long-term audit logging, a separate "session-history Arweave-pinned audit log" would be a different piece of work; not v1. A silent refresh that opts in with `require_previous_sid` does not mint a replacement when the row is already gone.
 - **Revocation latency up to 5 seconds.** Bounded by the isolate cache TTL. Acceptable trade-off for amortized D1 reads. If a use case demands sub-second revocation, the cache TTL can be lowered or disabled per-environment via a config.
 - **No device-grouping heuristics.** The SDK's `previous_sid` continuity keeps it to one row per device-installation, but a single user with two browser profiles on the same physical machine has two rows. Apps that want to group by physical device must rely on app-supplied `device_label` to disambiguate.
 - **App-role JWTs are stateless.** Per-app session tracking would require a separate `app_sessions` table and is out of scope for 7.5.

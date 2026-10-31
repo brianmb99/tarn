@@ -852,10 +852,10 @@ export async function handlePasskeyAuthenticate(request, env, ctx, cors) {
   });
   jwtPayload.sid = sid;
 
-  // Issue #28: Passkey-authenticated JWTs live for the full 7-day session-blob
-  // lifetime. The SDK's `#ensureFreshJwt` has no refresh path for passkey-only
-  // sessions (no `#signingKeyPair` to re-sign a challenge nonce), so a short
-  // TTL would silently break the session well before the blob expires.
+  // Issue #28: Passkey-authenticated JWTs live 7 days. A passkey-only session
+  // has no `#signingKeyPair` to re-sign a challenge, so the client caps the
+  // persisted blob at this JWT's exp. A shorter TTL would end the session
+  // with no way to refresh it.
   const jwt = await signJWT(jwtPayload, env.JWT_SECRET, PASSKEY_JWT_TTL_SECONDS);
   writePasskeyAudit(ctx, env, request, account.data_lookup_key, 'passkey_authenticate');
 

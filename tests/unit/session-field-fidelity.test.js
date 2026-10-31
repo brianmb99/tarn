@@ -89,6 +89,7 @@ const EXPECTED_PAYLOAD_KEYS = [
   'v',
   'createdAt',
   'expiresAt',
+  'authenticatedAt',
   'apiBase',
   'appId',
   'dataLookupKey',
@@ -155,6 +156,7 @@ describe('SDK-4 — session serialize/resume field fidelity', () => {
       );
     }
     assert.equal(typeof payload.accountKeyStored, 'boolean', 'accountKeyStored persisted');
+    assert.equal(typeof payload.authenticatedAt, 'number', 'authenticatedAt persisted');
   });
 
   it('ROUND-TRIP: resume → re-serialize is byte-identical for every field', async () => {
