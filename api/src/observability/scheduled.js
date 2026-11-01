@@ -3,8 +3,11 @@
 //
 //   1. Readiness — APP_SIGNING_KEY parseable + Turbo reachable (shared with
 //      /health).
-//   2. Drift — per-namespace D1 vs Arweave-GraphQL comparison with a lag window
-//      (drift.js).
+//   2. Drift — per-namespace check that every Tarn-signed Arweave record which
+//      settled inside the recent window is a key D1 already has (drift.js).
+//      Counts are not compared: Arweave keeps history, D1 keeps current rows.
+//      This does not detect a targeted delete from `accounts` that leaves
+//      `entries` intact, or any miss older than the window.
 //   3. Funding — Turbo wallet balance + runway (funding.js), flag LOW_FUNDING.
 //   4. Cleanup — prune dead aux rows (cleanup.js).
 //   5. Mirror failures — self-heal (re-upload) failed background ("waitUntil")
@@ -23,6 +26,9 @@ import { getAddress } from '../ans104.js';
 import {
   TRACKED_NAMESPACES,
   DEFAULT_LAG_WINDOW_MS,
+  DEFAULT_DRIFT_WINDOW_MS,
+  keyOfForNamespace,
+  selectCheckedEdges,
   compareNamespace,
   summarizeDrift,
 } from './drift.js';
@@ -84,29 +90,37 @@ export async function checkReadiness(env, { fetchImpl = fetch } = {}) {
   return result;
 }
 
-// ============ ARWEAVE GRAPHQL (count edges by namespace) ============
+// ============ ARWEAVE GRAPHQL (recent edges by namespace) ============
 
 /**
- * Page through Arweave GraphQL for one namespace's edges, collecting block
- * timestamps so the drift comparison can apply the lag window. Capped at
- * `maxPages` to stay within the cron's time budget — for drift we only need
- * enough recent edges to compare against the lag window, not full history.
+ * Page through Arweave GraphQL for one namespace's edges (newest first),
+ * including owner and tags so the drift check can keep only Tarn-signed
+ * records and, for app-reg, read the Lk key.
  *
- * Resilient: returns { edges, error } and never throws.
+ * Stops early once the last edge of a page is older than `windowStartMs` —
+ * later pages are history and cannot affect the window. Capped at `maxPages`.
+ * If that cap is hit while the last edge is still inside the window (or newer),
+ * `truncated` is true. Truncation is reported; it is not drift by itself.
+ *
+ * Resilient: returns { edges, error, truncated } and never throws.
  */
-async function fetchNamespaceEdges({ appTag, type }, { fetchImpl = fetch, maxPages = 5, pageSize = 100 } = {}) {
+async function fetchNamespaceEdges(
+  { appTag, type },
+  { fetchImpl = fetch, maxPages = 5, pageSize = 100, windowStartMs = null } = {},
+) {
   const tags = [{ name: 'Type', values: [type] }];
   if (appTag) tags.unshift({ name: 'App', values: [appTag] });
 
   const q = `query($after:String,$first:Int,$tags:[TagFilter!]){
     transactions(after:$after,first:$first,sort:HEIGHT_DESC,tags:$tags){
       pageInfo{hasNextPage}
-      edges{cursor node{id block{timestamp height}}}
+      edges{cursor node{id block{timestamp height} owner{address} tags{name value}}}
     }
   }`;
 
   const all = [];
   let after = null;
+  let truncated = false;
   for (let page = 0; page < maxPages; page++) {
     try {
       const res = await fetchImpl(ARWEAVE_GRAPHQL, {
@@ -115,54 +129,92 @@ async function fetchNamespaceEdges({ appTag, type }, { fetchImpl = fetch, maxPag
         body: JSON.stringify({ query: q, variables: { after, first: pageSize, tags } }),
         signal: AbortSignal.timeout(10000),
       });
-      if (!res.ok) return { edges: all, error: `http_${res.status}` };
+      if (!res.ok) return { edges: all, error: `http_${res.status}`, truncated: false };
       const json = await res.json();
-      if (json.errors?.length) return { edges: all, error: json.errors[0].message };
+      if (json.errors?.length) return { edges: all, error: json.errors[0].message, truncated: false };
       const txns = json.data?.transactions;
       const edges = txns?.edges || [];
       all.push(...edges);
       if (edges.length === 0 || !txns.pageInfo?.hasNextPage) break;
+      const lastTs = edges[edges.length - 1]?.node?.block?.timestamp;
+      // HEIGHT_DESC: the last edge is the oldest on this page. Once it is
+      // already before the window, every later page is history.
+      if (windowStartMs != null && lastTs != null && lastTs * 1000 < windowStartMs) break;
       after = edges[edges.length - 1].cursor;
+      if (page === maxPages - 1) truncated = true;
     } catch (err) {
-      return { edges: all, error: err?.message || 'graphql_failed' };
+      return { edges: all, error: err?.message || 'graphql_failed', truncated: false };
     }
   }
-  return { edges: all, error: null };
+  return { edges: all, error: null, truncated };
 }
 
-// ============ D1 COUNTS (per namespace) ============
+// ============ D1 KEY LOOKUP (per namespace) ============
+
+// Fixed map. Table and column are never taken from request or GraphQL input.
+// cred / passkey-reg / app-config all land in `entries` via upsertWriteThrough
+// (txid = data-item id). share tables store their own txid. app-reg is keyed
+// by app_id because a CLI uploader does not write `entries`.
+const D1_KEY_SOURCE = {
+  cred: { table: 'entries', column: 'txid' },
+  'passkey-reg': { table: 'entries', column: 'txid' },
+  'app-config': { table: 'entries', column: 'txid' },
+  'app-reg': { table: 'apps', column: 'app_id' },
+  'share-inbox': { table: 'share_inbox', column: 'txid' },
+  'share-inbox-accept': { table: 'share_inbox', column: 'txid' },
+  'share-log': { table: 'share_log', column: 'txid' },
+};
+
+// D1 rejects a prepared statement with more than 100 bound parameters.
+const D1_IN_CHUNK = 100;
 
 /**
- * Resolve D1's count + latest-activity ms for a namespace. The cred / app-reg /
- * passkey-reg / app-config namespaces are identity-plane tables;
- * share-inbox / share-log have their own tables. We map each tracked namespace
- * to the D1 table that caches it. Never throws.
+ * Which of `keys` already exist in the namespace's D1 table.
+ * Runs `SELECT <column> AS k FROM <table> WHERE <column> IN (?1, ...)` in
+ * chunks of at most 100. Never throws. No query when `keys` is empty.
+ *
+ * @param {Object} db
+ * @param {string} ns
+ * @param {string[]} keys
+ * @returns {Promise<{known: Set<string>, error: string|null}>}
  */
-async function d1NamespaceState(db, ns) {
-  // Map namespace -> { sql for count, sql for latest } using the table that
-  // caches that Arweave Type. NOTE: entries are not part of this set (entries
-  // are the data plane and have their own /status counts); the identity-plane
-  // namespaces are what the recoverability audit is about.
-  const map = {
-    cred:               { count: 'SELECT COUNT(*) AS c FROM accounts', latest: 'SELECT MAX(created_at) AS m FROM accounts' },
-    'app-reg':          { count: 'SELECT COUNT(*) AS c FROM apps', latest: 'SELECT MAX(created_at) AS m FROM apps' },
-    'passkey-reg':      { count: 'SELECT COUNT(*) AS c FROM passkey_credentials', latest: 'SELECT MAX(created_at) AS m FROM passkey_credentials' },
-    // app-config writes mirror to Arweave but D1 stores them as accounts.rules_json
-    // (not a row count) — count accounts that HAVE rules set as the comparable signal.
-    'app-config':       { count: 'SELECT COUNT(*) AS c FROM accounts WHERE rules_json IS NOT NULL', latest: 'SELECT MAX(created_at) AS m FROM accounts WHERE rules_json IS NOT NULL' },
-    'share-inbox':      { count: "SELECT COUNT(*) AS c FROM share_inbox WHERE blob_type = 'connection-request-v1'", latest: "SELECT MAX(published_at) AS m FROM share_inbox WHERE blob_type = 'connection-request-v1'" },
-    'share-inbox-accept': { count: "SELECT COUNT(*) AS c FROM share_inbox WHERE blob_type = 'connection-accept-v1'", latest: "SELECT MAX(published_at) AS m FROM share_inbox WHERE blob_type = 'connection-accept-v1'" },
-    'share-log':        { count: 'SELECT COUNT(*) AS c FROM share_log', latest: 'SELECT MAX(published_at) AS m FROM share_log' },
-  };
-  const q = map[ns];
-  if (!q) return { count: 0, latestMs: null, error: 'unknown_namespace' };
+async function d1KnownKeys(db, ns, keys) {
+  const src = D1_KEY_SOURCE[ns];
+  if (!src) return { known: new Set(), error: 'unknown_namespace' };
+  if (!keys || keys.length === 0) return { known: new Set(), error: null };
+  const known = new Set();
   try {
-    const cRow = await db.prepare(q.count).first();
-    const lRow = await db.prepare(q.latest).first();
-    return { count: cRow?.c ?? 0, latestMs: lRow?.m ?? null, error: null };
+    for (let i = 0; i < keys.length; i += D1_IN_CHUNK) {
+      const chunk = keys.slice(i, i + D1_IN_CHUNK);
+      const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(', ');
+      const sql = `SELECT ${src.column} AS k FROM ${src.table} WHERE ${src.column} IN (${placeholders})`;
+      const result = await db.prepare(sql).bind(...chunk).all();
+      const rows = result?.results;
+      if (!Array.isArray(rows)) return { known: new Set(), error: 'd1_failed' };
+      for (const row of rows) {
+        if (row?.k != null) known.add(row.k);
+      }
+    }
+    return { known, error: null };
   } catch (err) {
-    return { count: 0, latestMs: null, error: err?.message || 'd1_failed' };
+    return { known: new Set(), error: err?.message || 'd1_failed' };
   }
+}
+
+function skippedComparison(ns, gqlErr, d1Err, truncated = false) {
+  return {
+    ns,
+    drift: false,
+    reason: `comparison skipped (gql=${gqlErr || 'ok'}, d1=${d1Err || 'ok'})`,
+    checked: 0,
+    missing: 0,
+    missingSample: [],
+    inFlight: 0,
+    outsideWindow: 0,
+    foreign: 0,
+    incomplete: true,
+    truncated: !!truncated,
+  };
 }
 
 // ============ ORCHESTRATOR ============
@@ -190,6 +242,7 @@ export async function runScheduledChecks(env, opts = {}) {
   const fetchImpl = opts.fetchImpl || fetch;
   const now = opts.now ?? Date.now();
   const lagWindowMs = num(env, 'DRIFT_LAG_WINDOW_MS', DEFAULT_LAG_WINDOW_MS);
+  const windowMs = num(env, 'DRIFT_WINDOW_MS', DEFAULT_DRIFT_WINDOW_MS);
   const runwayFloorDays = num(env, 'TURBO_RUNWAY_FLOOR_DAYS', DEFAULT_RUNWAY_FLOOR_DAYS);
   const minBalanceWinc = num(env, 'TURBO_MIN_BALANCE_WINC', DEFAULT_MIN_BALANCE_WINC);
 
@@ -205,43 +258,61 @@ export async function runScheduledChecks(env, opts = {}) {
   report.checks.readiness = readiness;
   if (!readiness.ok) report.flags.push('NOT_READY');
 
-  // 2. Drift
+  // 2. Drift — a Tarn-signed record that settled inside the window but that
+  // D1 has no key for. A GraphQL or D1 failure marks that namespace incomplete
+  // (drift: false) rather than paging on a comparison we could not finish.
+  // Truncation (hit maxPages while still inside the window) is reported per
+  // namespace and is not drift by itself. A delete from `accounts` that leaves
+  // `entries` intact, and anything older than the window, are not detected.
   try {
+    let ownerAddress = null;
+    try {
+      if (env.APP_SIGNING_KEY) ownerAddress = getAddress(env.APP_SIGNING_KEY);
+    } catch {
+      ownerAddress = null;
+    }
+    const settledCutoffMs = now - lagWindowMs;
+    const windowStartMs = settledCutoffMs - windowMs;
     const comparisons = [];
     for (const spec of TRACKED_NAMESPACES) {
-      const [{ edges, error: gqlErr }, d1] = await Promise.all([
-        fetchNamespaceEdges(spec, { fetchImpl }),
-        d1NamespaceState(env.DB, spec.ns),
-      ]);
-      if (gqlErr || d1.error) {
-        // Can't compare reliably — record the namespace as "unknown", not drift.
-        comparisons.push({
-          ns: spec.ns,
-          drift: false,
-          reason: `comparison skipped (gql=${gqlErr || 'ok'}, d1=${d1.error || 'ok'})`,
-          d1Count: d1.count,
-          arweaveSettled: null,
-          arweaveInFlight: null,
-          shortfall: 0,
-          latestSettledMs: null,
-          d1LatestMs: d1.latestMs,
-          incomplete: true,
-        });
+      const { edges, error: gqlErr, truncated } = await fetchNamespaceEdges(spec, {
+        fetchImpl,
+        windowStartMs,
+      });
+      if (gqlErr) {
+        comparisons.push(skippedComparison(spec.ns, gqlErr, null, truncated));
         continue;
       }
-      comparisons.push(
-        compareNamespace({
+      const keyOf = keyOfForNamespace(spec.ns);
+      const selected = selectCheckedEdges({
+        edges,
+        keyOf,
+        now,
+        lagWindowMs,
+        windowMs,
+        ownerAddress,
+      });
+      const d1 = await d1KnownKeys(env.DB, spec.ns, selected.checked);
+      if (d1.error) {
+        comparisons.push(skippedComparison(spec.ns, null, d1.error, truncated));
+        continue;
+      }
+      comparisons.push({
+        ...compareNamespace({
           ns: spec.ns,
-          d1Count: d1.count,
-          d1LatestMs: d1.latestMs,
-          arweaveEdges: edges,
+          edges,
+          knownKeys: d1.known,
+          keyOf,
           now,
           lagWindowMs,
+          windowMs,
+          ownerAddress,
         }),
-      );
+        truncated: !!truncated,
+      });
     }
     const drift = summarizeDrift(comparisons);
-    report.checks.drift = { ...drift, lagWindowMs };
+    report.checks.drift = { ...drift, lagWindowMs, windowMs };
     if (!drift.healthy) report.flags.push('DRIFT');
   } catch (err) {
     report.checks.drift = { error: err?.message || 'drift_failed', healthy: true };
